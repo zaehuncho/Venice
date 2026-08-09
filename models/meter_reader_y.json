@@ -1,0 +1,13 @@
+{
+  "arch": "meter_reader_y_cnn_v1",
+  "input": "y_128x48",
+  "outputs": [
+    "fill_frac",
+    "green_top_frac",
+    "green_bottom_frac",
+    "present",
+    "log_var"
+  ],
+  "best_val_fill_mae_pct": 2.581251951364371,
+  "trained_on": "meter_reader_y_data.npz"
+}

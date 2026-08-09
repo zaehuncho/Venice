@@ -1,0 +1,59 @@
+// Windows version resource — the CUSTOMER-FACING identity of the executable.
+//
+// This is what Task Manager reads: the Processes tab shows FileDescription (and
+// falls back to the raw filename when it is absent, which is why the app used to
+// appear as "OrionNative.exe" there). Explorer's Properties > Details pane and the
+// file tooltip read the same block.
+//
+// Deliberate split, per the 2026-08-04 Venice rebrand rule:
+//   - Customer-visible strings here say "Venice".
+//   - The FILENAME stays OrionNative.exe. It is pinned by
+//     test_internal_orion_runtime_contracts_are_not_rebranded, referenced by the
+//     updater, and used by the deep-link owner check. Renaming it breaks updates.
+// So Task Manager's Details tab still lists OrionNative.exe (filename column)
+// while the Description column and the Processes tab both read "Venice". That is
+// intended, not an oversight.
+//
+// IDI_ICON1 is declared FIRST because Windows uses the lowest-numbered icon
+// resource as the application icon in Explorer, the taskbar, and Alt-Tab. Before
+// this file existed the exe carried NO embedded icon at all — the window icon was
+// only set at runtime via QApplication::setWindowIcon, so the shell showed a
+// generic default until the Qt app was up. Embedding it fixes the pre-launch and
+// shortcut icon.
+
+#include <windows.h>
+
+IDI_ICON1 ICON "@VENICE_ICON_PATH@"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"  // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "Venice"
+            VALUE "FileDescription",  "Venice"
+            VALUE "FileVersion",      "@PROJECT_VERSION@.0"
+            VALUE "InternalName",     "Venice"
+            VALUE "LegalCopyright",   "Copyright (C) Venice"
+            VALUE "OriginalFilename", "OrionNative.exe"
+            VALUE "ProductName",      "Venice"
+            VALUE "ProductVersion",   "@PROJECT_VERSION@.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

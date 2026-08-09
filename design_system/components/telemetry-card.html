@@ -1,0 +1,39 @@
+<!-- @dsCard group="Components" name="Telemetry card" subtitle="Metric value cards, neutral + status tones" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Telemetry card</title>
+<style>
+:root{
+--success:#22C55E;--warning:#F59E0B;--danger:#EF4444;
+--bgShell:#0A0D12;--bgSidebar:#0F141C;--borderSoft:#243044;
+--tPrimary:#F4F7FA;--tMuted:#8A96A8;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.grid{display:flex;gap:16px;flex-wrap:wrap}
+.tc{position:relative;width:180px;border-radius:14px;border:1px solid var(--borderSoft);background:var(--bgSidebar);padding:14px 14px 14px 16px}
+.bar{position:absolute;left:0;top:10px;bottom:10px;width:3px;border-radius:1.5px}
+.t{font-size:11px;font-weight:600;color:var(--tMuted)}
+.v{font-size:24px;font-weight:600;margin-top:6px}
+.d{font-size:12px;color:var(--tMuted);margin-top:6px}
+.success{border-color:rgba(34,197,94,.45)} .success .bar{background:var(--success)}
+.warning{border-color:rgba(245,158,11,.45)} .warning .bar{background:var(--warning)}
+.danger{border-color:rgba(239,68,68,.45)} .danger .bar{background:var(--danger)}
+</style>
+</head>
+<body>
+<h1>Telemetry card</h1>
+<p class="sub">Compact metric readout: caption title, 24px value, detail line, optional tone bar.</p>
+<div class="grid">
+<div class="tc"><div class="t">CAPTURE FPS</div><div class="v">60</div><div class="d">wgc · 1280×720</div></div>
+<div class="tc success"><div class="bar"></div><div class="t">GREEN RATE</div><div class="v">94%</div><div class="d">last 35 shots</div></div>
+<div class="tc warning"><div class="bar"></div><div class="t">RTT JITTER</div><div class="v">8.4 ms</div><div class="d">elevated</div></div>
+<div class="tc danger"><div class="bar"></div><div class="t">FRAME AGE</div><div class="v">4200 ms</div><div class="d">feed stalled</div></div>
+</div>
+</body>
+</html>

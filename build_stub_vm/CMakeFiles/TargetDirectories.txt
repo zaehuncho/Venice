@@ -1,0 +1,3 @@
+C:/Users/aaron/Desktop/NexusVision/build_stub_vm/CMakeFiles/orion_stub_x64.dir
+C:/Users/aaron/Desktop/NexusVision/build_stub_vm/CMakeFiles/ALL_BUILD.dir
+C:/Users/aaron/Desktop/NexusVision/build_stub_vm/CMakeFiles/ZERO_CHECK.dir

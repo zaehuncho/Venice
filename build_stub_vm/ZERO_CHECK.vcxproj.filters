@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\aaron\Desktop\NexusVision\build_stub_vm\CMakeFiles\1a67a4f53a980aa37c3c6ad494f6500f\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{B17AD33D-89DF-3303-9634-22A32B59D4F5}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

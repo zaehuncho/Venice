@@ -1,0 +1,15 @@
+# Keep source diffs stable across Windows agents and CI. Git still auto-detects
+# binary content; explicit binary rules protect the large fixture/runtime files.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.dll binary
+*.exe binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.pt binary
+*.sys binary

@@ -1,0 +1,46 @@
+{
+  "_comment": "Orion release manifest consumed by OrionSetup.exe. Ships next to the exe (and is embedded as a resource fallback). REPLACE every 'url' with the real release-host URL (must be https://) and every 'sha256' with the real lowercase-hex SHA-256 of that exact file. size_bytes drives the meter total (sum of downloadable components = 305 MB here); size_text is what the checklist shows. A sha256 of 64 zeros is a DEV-ONLY placeholder that skips verification — do NOT ship to end users with placeholder hashes. Set \"production\": true (below) or build with -DORION_REQUIRE_VERIFIED to make placeholder hashes ABORT the install instead of being skipped.",
+  "version": "1.0.0",
+  "production": false,
+  "components": [
+    {
+      "name": "Orion core & interface",
+      "kind": "archive",
+      "url": "https://releases.orion.gg/v1.0.0/orion-core.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 172000000,
+      "size_text": "172 MB"
+    },
+    {
+      "name": "Detection engine",
+      "kind": "archive",
+      "url": "https://releases.orion.gg/v1.0.0/detection-engine.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 78000000,
+      "size_text": "78 MB"
+    },
+    {
+      "name": "Remote Play client",
+      "kind": "archive",
+      "url": "https://releases.orion.gg/v1.0.0/remote-play-client.zip",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 41000000,
+      "size_text": "41 MB"
+    },
+    {
+      "name": "ViGEmBus & HidHide drivers",
+      "kind": "driver",
+      "url": "https://releases.orion.gg/v1.0.0/orion-drivers-setup.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 14000000,
+      "size_text": "14 MB",
+      "target": "orion-drivers-setup.exe",
+      "args": "/quiet /norestart"
+    },
+    {
+      "name": "Shortcuts & first-run setup",
+      "kind": "step",
+      "size_text": "—"
+    }
+  ]
+}

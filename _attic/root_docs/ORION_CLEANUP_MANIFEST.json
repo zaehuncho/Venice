@@ -1,0 +1,374 @@
+﻿{
+    "timestamp":  "20260602-044031",
+    "root":  "C:\\Users\\Administrator\\Desktop\\NexusVision",
+    "legacy_destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031",
+    "moved":  [
+                  {
+                      "path":  ".azure",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\.azure"
+                  },
+                  {
+                      "path":  ".github",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\.github"
+                  },
+                  {
+                      "path":  "analysis_cosmic_static",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\analysis_cosmic_static"
+                  },
+                  {
+                      "path":  "re_analysis",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\re_analysis"
+                  },
+                  {
+                      "path":  "downloads",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\downloads"
+                  },
+                  {
+                      "path":  "nexus-server",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus-server"
+                  },
+                  {
+                      "path":  "build_protected_release.ps1",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\build_protected_release.ps1"
+                  },
+                  {
+                      "path":  "decompyle3_main.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\decompyle3_main.py"
+                  },
+                  {
+                      "path":  "install_nexus_service.bat",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\install_nexus_service.bat"
+                  },
+                  {
+                      "path":  "launcher_daemon.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\launcher_daemon.py"
+                  },
+                  {
+                      "path":  "launcher_decompiled.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\launcher_decompiled.py"
+                  },
+                  {
+                      "path":  "launcher_disasm.txt",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\launcher_disasm.txt"
+                  },
+                  {
+                      "path":  "launcher_identity.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\launcher_identity.py"
+                  },
+                  {
+                      "path":  "launcher_strings.txt",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\launcher_strings.txt"
+                  },
+                  {
+                      "path":  "launcher_theme.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\launcher_theme.py"
+                  },
+                  {
+                      "path":  "NETX_IMPLEMENTATION_PROMPT.md",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\NETX_IMPLEMENTATION_PROMPT.md"
+                  },
+                  {
+                      "path":  "nexus_audit_log.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_audit_log.py"
+                  },
+                  {
+                      "path":  "nexus_calibration.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_calibration.py"
+                  },
+                  {
+                      "path":  "nexus_contest.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_contest.py"
+                  },
+                  {
+                      "path":  "nexus_crypto.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_crypto.py"
+                  },
+                  {
+                      "path":  "nexus_learning.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_learning.py"
+                  },
+                  {
+                      "path":  "nexus_pairing.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_pairing.py"
+                  },
+                  {
+                      "path":  "nexus_release_trust.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_release_trust.py"
+                  },
+                  {
+                      "path":  "nexus_runtime_guard.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_runtime_guard.py"
+                  },
+                  {
+                      "path":  "nexus_runtime_paths.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_runtime_paths.py"
+                  },
+                  {
+                      "path":  "nexus_security.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_security.py"
+                  },
+                  {
+                      "path":  "nexus_server_client.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_server_client.py"
+                  },
+                  {
+                      "path":  "nexus_svc.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_svc.py"
+                  },
+                  {
+                      "path":  "nexus_svc_bridge.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_svc_bridge.py"
+                  },
+                  {
+                      "path":  "nexus_transport_security.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_transport_security.py"
+                  },
+                  {
+                      "path":  "nexus_update_verifier.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_update_verifier.py"
+                  },
+                  {
+                      "path":  "nexus_vision.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\nexus_vision.py"
+                  },
+                  {
+                      "path":  "Nexus_Vision_Launcher.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\Nexus_Vision_Launcher.py"
+                  },
+                  {
+                      "path":  "Orion.spec",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\Orion.spec"
+                  },
+                  {
+                      "path":  "OrionFast.spec",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\OrionFast.spec"
+                  },
+                  {
+                      "path":  "pyinstxtractor.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\pyinstxtractor.py"
+                  },
+                  {
+                      "path":  "read_env.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\read_env.py"
+                  },
+                  {
+                      "path":  "rename_win.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\rename_win.py"
+                  },
+                  {
+                      "path":  "run_cvpython.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\run_cvpython.py"
+                  },
+                  {
+                      "path":  "run_nexus_vision_py311.bat",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\run_nexus_vision_py311.bat"
+                  },
+                  {
+                      "path":  "scan_large.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\scan_large.py"
+                  },
+                  {
+                      "path":  "scratch_analyze_ch.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\scratch_analyze_ch.py"
+                  },
+                  {
+                      "path":  "secure_config.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\secure_config.py"
+                  },
+                  {
+                      "path":  "setup_nexus.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\setup_nexus.py"
+                  },
+                  {
+                      "path":  "sign_orion.ps1",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\sign_orion.ps1"
+                  },
+                  {
+                      "path":  "start_packet_service.pyw",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\start_packet_service.pyw"
+                  },
+                  {
+                      "path":  "test_server_integration.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\test_server_integration.py"
+                  },
+                  {
+                      "path":  "title.ps1",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\title.ps1"
+                  },
+                  {
+                      "path":  "set_test_mode.bat",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\set_test_mode.bat"
+                  },
+                  {
+                      "path":  "stop",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\stop"
+                  },
+                  {
+                      "path":  "scripts\\run_security_checks.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\scripts\\run_security_checks.py"
+                  },
+                  {
+                      "path":  "scripts\\verify_release.ps1",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\scripts\\verify_release.ps1"
+                  },
+                  {
+                      "path":  "scripts\\clean_workspace.ps1",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\scripts\\clean_workspace.ps1"
+                  },
+                  {
+                      "path":  "tools\\release",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tools\\release"
+                  },
+                  {
+                      "path":  "tools\\re_extract.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tools\\re_extract.py"
+                  },
+                  {
+                      "path":  "tools\\re_report.txt",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tools\\re_report.txt"
+                  },
+                  {
+                      "path":  "tools\\__pycache__",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tools\\__pycache__"
+                  },
+                  {
+                      "path":  "tests\\security",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tests\\security"
+                  },
+                  {
+                      "path":  "tests\\launcher_smoke.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tests\\launcher_smoke.py"
+                  },
+                  {
+                      "path":  "tests\\security_bypass_probe.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tests\\security_bypass_probe.py"
+                  },
+                  {
+                      "path":  "tests\\__pycache__",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\tests\\__pycache__"
+                  },
+                  {
+                      "path":  "docs\\ARCHITECTURE.md",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\docs\\ARCHITECTURE.md"
+                  },
+                  {
+                      "path":  "docs\\HANDOFF.md",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\docs\\HANDOFF.md"
+                  },
+                  {
+                      "path":  "docs\\RELEASE_CHECKLIST.md",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\docs\\RELEASE_CHECKLIST.md"
+                  },
+                  {
+                      "path":  "docs\\SECURITY_MODEL.md",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\docs\\SECURITY_MODEL.md"
+                  },
+                  {
+                      "path":  "docs\\reports",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\docs\\reports"
+                  },
+                  {
+                      "path":  "remote_play_screen.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\remote_play_screen.py"
+                  },
+                  {
+                      "path":  "monitor_exports.py",
+                      "destination":  "C:\\Users\\Administrator\\Desktop\\NEXUS SOURCE CODES\\NexusVision-legacy-20260602-044031\\monitor_exports.py"
+                  }
+              ],
+    "deleted":  [
+                    {
+                        "path":  ".pytest_cache"
+                    },
+                    {
+                        "path":  "__pycache__"
+                    },
+                    {
+                        "path":  ".venv311"
+                    },
+                    {
+                        "path":  "archive"
+                    },
+                    {
+                        "path":  "build"
+                    },
+                    {
+                        "path":  "release"
+                    },
+                    {
+                        "path":  "logs"
+                    },
+                    {
+                        "path":  "nexus.db"
+                    },
+                    {
+                        "path":  "nexus_server.db"
+                    },
+                    {
+                        "path":  "nexus_svc.log"
+                    },
+                    {
+                        "path":  "remote_output.log"
+                    },
+                    {
+                        "path":  "security_events.log"
+                    },
+                    {
+                        "path":  "minimap_player_counter.py",
+                        "reason":  "unused Orion module removed"
+                    },
+                    {
+                        "path":  "meter_tracker.py",
+                        "reason":  "unused Orion module removed"
+                    },
+                    {
+                        "path":  "perfect_release_engine.py",
+                        "reason":  "unused Orion module removed"
+                    },
+                    {
+                        "path":  "shot_intelligence.py",
+                        "reason":  "unused Orion module removed"
+                    },
+                    {
+                        "path":  "orion_sync_model.py",
+                        "reason":  "unused Orion module removed"
+                    },
+                    {
+                        "path":  "two_k_vision_api.py",
+                        "reason":  "unused Orion module removed"
+                    }
+                ],
+    "skipped":  [
+
+                ],
+    "kept_orion_runtime":  [
+                               "native_orion",
+                               "assets",
+                               "meter_styles",
+                               "vendor",
+                               "tools",
+                               "scripts",
+                               "tests",
+                               "docs",
+                               "settings.json",
+                               "settings.json.sig",
+                               "license_cache.enc",
+                               "chiaki_backend.py",
+                               "remote_play_orchestrator.py",
+                               "controller_remap.py",
+                               "virtual_controller.py",
+                               "remote_play_cv.py",
+                               "remote_play_client.py",
+                               "meter_detector.py",
+                               "rtt_sync_engine.py",
+                               "orion_player_count.py",
+                               "ViGEmClient.dll",
+                               "court_profiles.json",
+                               "learning.json",
+                               "orion_bw_centroids.json",
+                               "codesigning",
+                               ".vault",
+                               "README.md",
+                               "version.json"
+                           ]
+}

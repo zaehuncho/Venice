@@ -1,0 +1,75 @@
+{
+  "schema": "orion.latency_factory_prior.v1",
+  "model_id": "venice-e2e-route-prior",
+  "model_version": "sha256-b30441a654b9",
+  "generated_by": "tools/timing/build_latency_factory_prior.py",
+  "generated_from": {
+    "logs": [
+      "latency_prior_evidence_20260806_scope461dcd.log"
+    ],
+    "accepted_labels": 87,
+    "evidence_route": "capture_card+pipe",
+    "evidence_window_utc": "2026-08-05T23:18:45Z/2026-08-06T22:32:37Z",
+    "recency_half_life_hours": 12.0,
+    "effective_sample_size": 74.868,
+    "regime_means_ms": [
+      212.15,
+      235.3
+    ],
+    "posterior_predictive_sd_ms": 36.773,
+    "regime_straddle_floor_ms": 14.35,
+    "note": "ONE route has ever been measured. Only capture-card-pipe carries evidence_n>0; the other three profiles are that same evidence propagated with explicit ignorance terms. They are NOT four independent measurements."
+  },
+  "profiles": [
+    {
+      "name": "capture-card-pipe",
+      "scope_contains": [
+        "controller=pipe",
+        "capture_card"
+      ],
+      "mean_ms": 220.9,
+      "sd_ms": 36.8,
+      "evidence_n": 87,
+      "evidence_route": "capture_card+pipe",
+      "evidence_window_utc": "2026-08-05T23:18:45Z/2026-08-06T22:32:37Z",
+      "derivation": "recency-weighted mean of all accepted labels (half-life 12h); sd = max(posterior-predictive, regime-straddle floor)"
+    },
+    {
+      "name": "decoder-pipe",
+      "scope_contains": [
+        "controller=pipe",
+        "decoder"
+      ],
+      "mean_ms": 220.9,
+      "sd_ms": 41.5,
+      "evidence_n": 0,
+      "evidence_route": "never measured",
+      "evidence_window_utc": "",
+      "derivation": "controller half shares capture-card-pipe evidence; video half never measured -- mean unchanged, sd widened by an independent uniform +/-33.3ms (2 frame periods @60Hz) ignorance term"
+    },
+    {
+      "name": "capture-card-vigem",
+      "scope_contains": [
+        "capture_card"
+      ],
+      "mean_ms": 229.2,
+      "sd_ms": 41.5,
+      "evidence_n": 0,
+      "evidence_route": "never measured",
+      "evidence_window_utc": "",
+      "derivation": "video half shares capture-card-pipe evidence; controller half never measured -- mean shifted by exactly one console input-poll period (8.3ms), the only physically-motivated ViGEm delta; sd widened by an independent uniform +/-33.2ms (4 poll periods) ignorance term"
+    },
+    {
+      "name": "decoder-vigem",
+      "scope_contains": [
+        "decoder"
+      ],
+      "mean_ms": 229.2,
+      "sd_ms": 45.7,
+      "evidence_n": 0,
+      "evidence_route": "never measured",
+      "evidence_window_utc": "",
+      "derivation": "neither half ever measured -- one poll period of ViGEm shift on the capture-card-pipe mean, sd widened by BOTH independent ignorance terms"
+    }
+  ]
+}

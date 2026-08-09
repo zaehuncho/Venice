@@ -1,0 +1,37 @@
+<!-- @dsCard group="Components" name="Status pill" subtitle="Neutral / success / warning / danger, pulsing dot" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Status pill</title>
+<style>
+:root{
+--accent:#7C3AED;--success:#22C55E;--successDim:#143322;--warning:#F59E0B;--warningDim:#332712;
+--danger:#EF4444;--dangerDim:#351A1E;--bgSidebar:#0F141C;--borderSoft:#243044;
+--bgShell:#0A0D12;--tPrimary:#F4F7FA;--tMuted:#8A96A8;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.pill{height:30px;display:inline-flex;align-items:center;gap:7px;padding:0 12px;border-radius:15px;border:1px solid var(--borderSoft);background:var(--bgSidebar);font-size:12px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+.success{background:var(--successDim);border-color:var(--success)} .success .dot{background:var(--success);animation:pulse 2.2s ease-in-out infinite}
+.warning{background:var(--warningDim);border-color:var(--warning)} .warning .dot{background:var(--warning);animation:pulse 2.2s ease-in-out infinite}
+.danger{background:var(--dangerDim);border-color:var(--danger)} .danger .dot{background:var(--danger);animation:pulse 2.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+</style>
+</head>
+<body>
+<h1>Status pill</h1>
+<p class="sub">30px pill, 7px status dot (pulses on non-neutral tones), "label: status" text.</p>
+<div class="row">
+<span class="pill"><span class="dot"></span>Controller: Connected</span>
+<span class="pill success"><span class="dot"></span>Stream: Live</span>
+<span class="pill warning"><span class="dot"></span>Network: Jitter</span>
+<span class="pill danger"><span class="dot"></span>Safe Mode: Active</span>
+</div>
+</body>
+</html>

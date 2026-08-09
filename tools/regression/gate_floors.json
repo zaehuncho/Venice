@@ -1,0 +1,30 @@
+{
+  "_comment": "Committed detection-quality floors for the OFFLINE regression gate. Measured on HEAD over each session's coarse-located SHOT WINDOW (ORION_GATE_WINDOW=900 frames), set with a safety margin below the measured HEAD value. Per-session entries OVERRIDE the shared _default (merged). Do NOT loosen a floor to make a regression pass. See docs/REGRESSION_GATES.md.",
+  "_measured_on_head": {
+    "session_20260707_135309": {"shots": 9, "rate": 0.963, "maxgap": 3, "falselock": 0, "clips": 0, "glitch": 0, "median_peak": 93.9, "cam": 0.892},
+    "session_20260707_175017": {"shots": 10, "rate": 0.895, "maxgap": 3, "falselock": 0, "clips": 0, "glitch": 0, "median_peak": 90.6, "cam": 0.867},
+    "session_20260707_121446": {"shots": 4, "rate": 0.941, "maxgap": 3, "falselock": 0, "clips": 0, "glitch": 0, "median_peak": 70.4, "cam": 0.883, "note": "contested/early-release shots genuinely peak ~70 on HEAD -> per-session peak floor"},
+    "session_20260706_190737": {"shots": 9, "rate": 0.964, "maxgap": 3, "falselock": 0, "clips": 0, "glitch": 0, "median_peak": 91.0, "cam": 0.883},
+    "session_20260704_210801": {"shots": 14, "rate": 0.942, "maxgap": 3, "falselock": 0, "clips": 0, "glitch": 0, "median_peak": 94.0, "cam": 0.915, "fill_vs_chain_within5pp": 0.543}
+  },
+  "_default": {
+    "n_shots_min": 2,
+    "within_shot_detect_rate_min": 0.85,
+    "within_shot_maxgap_max": 5,
+    "offshot_falselock_episodes_max": 0,
+    "top_clips_max": 0,
+    "mid_rise_glitches_max": 0,
+    "within_shot_ghost_frames_max": 0,
+    "median_shot_peak_min": 82.0,
+    "camera_adapt_min": 0.78,
+    "fill_vs_chain_within5pp_min": null
+  },
+  "session_20260707_121446": {
+    "_note": "contested/early-release shots genuinely peak ~70 on HEAD",
+    "median_shot_peak_min": 60.0
+  },
+  "session_20260704_210801": {
+    "_note": "fade reference; has a serving-chain cache so the fill-vs-chain gate is active",
+    "fill_vs_chain_within5pp_min": 0.40
+  }
+}

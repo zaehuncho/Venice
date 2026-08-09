@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Production sidecar compiler. Keep pinned so release artifacts are reproducible.
+Nuitka==4.1.3
+
+# Detached Ed25519 signing for release_manifest.json and update_manifest.json.
+cryptography==50.0.0

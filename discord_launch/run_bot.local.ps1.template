@@ -1,0 +1,34 @@
+# Orion License Bot — LOCAL HOST RUNNER (template).
+# 1) COPY this file to run_bot.local.ps1 (gitignored via *.local.ps1 — secrets stay out of git).
+# 2) Fill in the four values below (token from Discord Dev Portal -> Bot; bot secret must equal
+#    SSM /orion/bot_service_secret; IDs via Discord Developer Mode -> right-click -> Copy ID).
+# 3) Install as an auto-restarting service:  .\install_bot_service.ps1   (run as admin once)
+#    Or run it in the foreground for a first test:  .\run_bot.local.ps1
+#
+# The bot is a GATEWAY bot (discord.py): it must run 24/7 for /claim_trial, /hwid_reset,
+# /killswitch, /deliver to exist in the server. Do NOT set a Discord "Interactions Endpoint URL" —
+# that mode fights the gateway bot.
+
+$env:DISCORD_BOT_TOKEN = "PASTE-BOT-TOKEN"
+$env:ORION_BOT_SECRET  = "PASTE-VALUE-OF-SSM-/orion/bot_service_secret"
+$env:ORION_GUILD_ID    = "PASTE-SERVER-ID"
+$env:CUSTOMER_ROLE_ID  = "PASTE-CUSTOMER-ROLE-ID"     # optional but recommended
+$env:LIFETIME_ROLE_ID  = "PASTE-LIFETIME-ROLE-ID"     # optional
+$env:TRIAL_ROLE_ID     = "PASTE-TRIAL-ROLE-ID"        # optional
+# Direct origin on purpose: the worker/bot path bypasses Cloudflare (M2M secret is the auth).
+$env:ORION_API_BASE    = "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com"
+
+# Auto-restart loop: a network blip or Discord reconnect failure must not kill the bot for good.
+# Backs off 30s between restarts; logs to discord_launch\bot.log (rotated at ~5MB).
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$log  = Join-Path $root "bot.log"
+while ($true) {
+    if ((Test-Path $log) -and ((Get-Item $log).Length -gt 5MB)) {
+        Move-Item -Force $log "$log.1"
+    }
+    ("[{0}] bot starting" -f (Get-Date -Format s)) | Out-File -Append -Encoding utf8 $log
+    & "C:\Python314\python.exe" (Join-Path $root "orion_bot.py") *>> $log
+    ("[{0}] bot exited (code {1}) - restarting in 30s" -f (Get-Date -Format s), $LASTEXITCODE) |
+        Out-File -Append -Encoding utf8 $log
+    Start-Sleep -Seconds 30
+}

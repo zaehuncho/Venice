@@ -1,0 +1,55 @@
+<!-- @dsCard group="Foundations" name="Typography & shape" subtitle="Type ramp, fonts, radii, spacing" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Typography & shape</title>
+<style>
+:root{
+--bgShell:#0A0D12;--bgCard:#121925;--borderSoft:#243044;--accent:#7C3AED;
+--tPrimary:#F4F7FA;--tMuted:#8A96A8;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;--mono:'Cascadia Mono',ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.glabel{color:var(--tMuted);font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin:18px 0 10px}
+.specimen{display:flex;align-items:baseline;gap:14px;padding:8px 0;border-bottom:1px solid var(--borderSoft)}
+.tag{color:var(--tMuted);font-family:var(--mono);font-size:11px;width:150px;flex:none}
+.mono{font-family:var(--mono)}
+.shapes,.space{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.box{background:var(--bgCard);border:1px solid var(--borderSoft)}
+.shape{width:84px;height:60px;display:flex;align-items:center;justify-content:center;color:var(--tMuted);font-size:11px;font-family:var(--mono)}
+.sb{background:var(--accent);height:24px;border-radius:4px}
+.cap{color:var(--tMuted);font-size:11px;font-family:var(--mono);text-align:center;margin-top:4px}
+</style>
+</head>
+<body>
+<h1>Typography &amp; shape</h1>
+<p class="sub">UI font: Segoe UI Variable · Mono: Cascadia Mono</p>
+
+<div class="glabel">Type ramp</div>
+<div class="specimen"><span class="tag">display · 24 · 600</span><span style="font-size:24px;font-weight:600">Orion Remote Play</span></div>
+<div class="specimen"><span class="tag">title · 15 · 600</span><span style="font-size:15px;font-weight:600">Live Capture</span></div>
+<div class="specimen"><span class="tag">body · 13</span><span style="font-size:13px">Meter detection active — timing engine armed.</span></div>
+<div class="specimen"><span class="tag">caption · 11</span><span style="font-size:11px;color:var(--tMuted)">fill 87% · green FOUND · RISING</span></div>
+<div class="specimen"><span class="tag">mono · 11</span><span class="mono" style="font-size:11px">anchor=1 score=0.94 med_h=150</span></div>
+
+<div class="glabel">Radii</div>
+<div class="shapes">
+<div><div class="box shape" style="border-radius:14px">14</div><div class="cap">radiusCard</div></div>
+<div><div class="box shape" style="border-radius:10px">10</div><div class="cap">radiusControl</div></div>
+<div><div class="box shape" style="border-radius:15px">15</div><div class="cap">radiusPill</div></div>
+</div>
+
+<div class="glabel">Spacing scale</div>
+<div class="space">
+<div><div class="sb" style="width:4px"></div><div class="cap">4 xs</div></div>
+<div><div class="sb" style="width:8px"></div><div class="cap">8 sm</div></div>
+<div><div class="sb" style="width:12px"></div><div class="cap">12 md</div></div>
+<div><div class="sb" style="width:16px"></div><div class="cap">16 lg</div></div>
+<div><div class="sb" style="width:24px"></div><div class="cap">24 xl</div></div>
+</div>
+</body>
+</html>

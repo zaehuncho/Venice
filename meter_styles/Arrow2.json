@@ -1,0 +1,129 @@
+{
+  "style": "Arrow2",
+  "_comment_track_b": "default_bands/confidence/envelope/calibration are the SimpleMeterReader + ColorCalibrator config blocks (plan B1). default_bands are EXACTLY the shipped reader constants and the v1 envelope EQUALS them (learning strictly narrows). The legacy 'colors'/'search' blocks below belong to the OLD serving chain only -- the simple reader NEVER loads them (Red low 170 / right 1915 would regress the decor guard day-one).",
+  "default_bands": {
+    "Red": { "low": [0, 0, 220], "high": [60, 60, 255], "space": "bgr" },
+    "Green": { "low": [38, 90, 90], "high": [85, 255, 255], "space": "hsv" }
+  },
+  "confidence": {
+    "initial": 1.0,
+    "minimum": 0.95,
+    "rate": 0.01,
+    "rate_armed": 0.004
+  },
+  "envelope": {
+    "red": { "low": [0, 0, 220], "high": [60, 60, 255] },
+    "green": { "low": [38, 90, 90], "high": [85, 255, 255] }
+  },
+  "calibration": {
+    "commit_peak_min": 70,
+    "commit_frames_min": 8,
+    "red_mad_max": 60,
+    "green_hue_mad_max": 8,
+    "frozen_shots": 5,
+    "clip_k": 3.5,
+    "red_halfwidth_floor": [10, 10, 12],
+    "red_halfwidth_cap": [45, 45, 30],
+    "green_hue_halfwidth_floor": 4,
+    "green_hue_halfwidth_cap": 18,
+    "channel_gap": 80
+  },
+  "search": {
+    "left": 5,
+    "top": 216,
+    "right": 1915,
+    "bottom": 920
+  },
+  "contour": {
+    "w_min": 2,
+    "w_max": 40,
+    "h_min": 20,
+    "h_max": 182
+  },
+  "colors": {
+    "Purple": {
+      "low": [
+        170,
+        0,
+        165
+      ],
+      "high": [
+        255,
+        85,
+        255
+      ]
+    },
+    "White": {
+      "low": [
+        235,
+        235,
+        235
+      ],
+      "high": [
+        255,
+        255,
+        255
+      ]
+    },
+    "Orange": {
+      "low": [
+        0,
+        80,
+        190
+      ],
+      "high": [
+        55,
+        170,
+        255
+      ]
+    },
+    "Yellow": {
+      "low": [
+        0,
+        170,
+        145
+      ],
+      "high": [
+        70,
+        255,
+        255
+      ]
+    },
+    "Red": {
+      "low": [
+        0,
+        0,
+        170
+      ],
+      "high": [
+        70,
+        70,
+        255
+      ]
+    },
+    "Green": {
+      "low": [
+        0,
+        180,
+        0
+      ],
+      "high": [
+        70,
+        255,
+        70
+      ]
+    },
+    "Cyan": {
+      "low": [
+        170,
+        110,
+        0
+      ],
+      "high": [
+        255,
+        230,
+        80
+      ]
+    }
+  }
+}

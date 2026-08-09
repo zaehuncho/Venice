@@ -1,0 +1,46 @@
+<!-- @dsCard group="Components" name="Card" subtitle="Neutral + tone accents (accent / success / warning / danger)" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Card</title>
+<style>
+:root{
+--accent:#7C3AED;--success:#22C55E;--warning:#F59E0B;--danger:#EF4444;
+--bgShell:#0A0D12;--bgCardTop:#161E2C;--bgCardBottom:#101622;
+--borderSoft:#243044;--hairlineLight:rgba(82,71,88,.34);
+--tPrimary:#F4F7FA;--tMuted:#8A96A8;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.grid{display:flex;gap:16px;flex-wrap:wrap}
+.card{position:relative;width:240px;border-radius:14px;border:1px solid var(--borderSoft);
+background:linear-gradient(180deg,var(--bgCardTop),var(--bgCardBottom));padding:16px;
+box-shadow:0 2px 0 rgba(6,9,14,.55)}
+.card::before{content:"";position:absolute;left:14px;right:14px;top:1px;height:1px;background:var(--hairlineLight)}
+.card.tone{padding-left:18px}
+.bar{position:absolute;left:0;top:10px;bottom:10px;width:3px;border-radius:1.5px}
+.title{font-size:13px;font-weight:600}
+.subt{font-size:12px;color:var(--tMuted);margin-top:3px}
+.bodyline{margin-top:12px;font-size:12px;color:var(--tMuted)}
+.accent{border-color:rgba(124,58,237,.45)} .accent .bar{background:var(--accent)}
+.success{border-color:rgba(34,197,94,.45)} .success .bar{background:var(--success)}
+.warning{border-color:rgba(245,158,11,.45)} .warning .bar{background:var(--warning)}
+.danger{border-color:rgba(239,68,68,.45)} .danger .bar{background:var(--danger)}
+</style>
+</head>
+<body>
+<h1>Card</h1>
+<p class="sub">Top-lit gradient surface, 1px light catch, soft elevation, optional tone accent bar.</p>
+<div class="grid">
+<div class="card"><div class="title">Live Capture</div><div class="subt">Connected · 1280×720</div><div class="bodyline">Neutral tone — default surface.</div></div>
+<div class="card tone accent"><div class="bar"></div><div class="title">Detection</div><div class="subt">Template anchor armed</div><div class="bodyline">tone="accent"</div></div>
+<div class="card tone success"><div class="bar"></div><div class="title">Timing</div><div class="subt">Greens locked</div><div class="bodyline">tone="success"</div></div>
+<div class="card tone warning"><div class="bar"></div><div class="title">Network</div><div class="subt">Jitter elevated</div><div class="bodyline">tone="warning"</div></div>
+<div class="card tone danger"><div class="bar"></div><div class="title">Safe Mode</div><div class="subt">Frame feed stalled</div><div class="bodyline">tone="danger"</div></div>
+</div>
+</body>
+</html>

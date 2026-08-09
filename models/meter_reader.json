@@ -1,0 +1,13 @@
+{
+  "input_h": 96,
+  "input_w": 32,
+  "normalize": "div255",
+  "outputs": [
+    "fill_frac",
+    "green_top_frac",
+    "green_bottom_frac"
+  ],
+  "arch": "meter_reader_cnn_v1",
+  "best_val_fill_mae_pct": 2.1160595401628446,
+  "trained_on": "synth+real_masked"
+}

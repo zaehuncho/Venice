@@ -1,0 +1,52 @@
+<!-- @dsCard group="Foundations" name="Colour palette" subtitle="Accent, surfaces, borders, text, status" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Colour palette</title>
+<style>
+:root{
+--accent:#7C3AED;--accentHover:#9460F0;--accentPressed:#6425C9;--accentBorder:#A98BF3;
+--bgShell:#0A0D12;--bgSidebar:#0F141C;--bgCard:#121925;--bgCardHover:#16202E;--bgField:#080C12;--bgCardTop:#161E2C;--bgCardBottom:#101622;
+--borderSoft:#243044;--borderStrong:#364863;--hairline:#1B2738;--focus:#4F8CFF;
+--tPrimary:#F4F7FA;--tSecondary:#C3CDDB;--tMuted:#8A96A8;--tFaint:#566273;
+--success:#22C55E;--warning:#F59E0B;--danger:#EF4444;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.group{margin-bottom:20px}
+.glabel{color:var(--tMuted);font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin-bottom:8px}
+.row{display:flex;flex-wrap:wrap;gap:10px}
+.swatch{width:120px;border:1px solid var(--borderSoft);border-radius:10px;overflow:hidden;background:var(--bgCard)}
+.chip{height:54px}
+.meta{padding:7px 9px}
+.name{font-size:12px;font-weight:600}
+.hex{font-size:11px;color:var(--tMuted);font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<h1>Colour palette</h1>
+<p class="sub">Derived from Theme.qml. Accent is user-pickable (default #7C3AED); everything else is fixed.</p>
+
+<div class="group"><div class="glabel">Accent</div><div class="row" id="accent"></div></div>
+<div class="group"><div class="glabel">Surfaces</div><div class="row" id="surface"></div></div>
+<div class="group"><div class="glabel">Borders</div><div class="row" id="border"></div></div>
+<div class="group"><div class="glabel">Text</div><div class="row" id="text"></div></div>
+<div class="group"><div class="glabel">Status</div><div class="row" id="status"></div></div>
+
+<script>
+const sets={
+accent:[["accent","#7C3AED"],["accentHover","#9460F0"],["accentPressed","#6425C9"],["accentBorder","#A98BF3"]],
+surface:[["bgShell","#0A0D12"],["bgSidebar","#0F141C"],["bgCard","#121925"],["bgCardHover","#16202E"],["bgField","#080C12"],["bgCardTop","#161E2C"],["bgCardBottom","#101622"]],
+border:[["borderSoft","#243044"],["borderStrong","#364863"],["hairline","#1B2738"],["focusRing","#4F8CFF"]],
+text:[["textPrimary","#F4F7FA"],["textSecondary","#C3CDDB"],["textMuted","#8A96A8"],["textFaint","#566273"]],
+status:[["success","#22C55E"],["successDim","#143322"],["warning","#F59E0B"],["warningDim","#332712"],["danger","#EF4444"],["dangerDim","#351A1E"]]
+};
+for(const k in sets){const el=document.getElementById(k);sets[k].forEach(([n,h])=>{
+el.insertAdjacentHTML("beforeend",`<div class="swatch"><div class="chip" style="background:${h}"></div><div class="meta"><div class="name">${n}</div><div class="hex">${h}</div></div></div>`);});}
+</script>
+</body>
+</html>

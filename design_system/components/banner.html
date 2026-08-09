@@ -1,0 +1,37 @@
+<!-- @dsCard group="Components" name="Banner" subtitle="ORION header — icon tile, title, subtitle, starfield" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Banner</title>
+<style>
+:root{
+--accent:#7C3AED;--accentFaint:rgba(124,58,237,.07);--bgShell:#0A0D12;--bgSidebar:#0F141C;
+--borderSoft:#243044;--tPrimary:#F4F7FA;--tMuted:#8A96A8;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.banner{position:relative;height:120px;border-radius:14px;background:var(--bgSidebar);border:1px solid var(--borderSoft);overflow:hidden;display:flex;align-items:center;justify-content:center}
+.banner::after{content:"";position:absolute;inset:0;border-radius:14px;border:1px solid var(--accentFaint);pointer-events:none}
+.stars{position:absolute;inset:0;background-image:radial-gradient(1px 1px at 20% 30%,#556,transparent),radial-gradient(1px 1px at 70% 60%,#445,transparent),radial-gradient(1px 1px at 40% 80%,#556,transparent),radial-gradient(1px 1px at 85% 25%,#445,transparent),radial-gradient(1px 1px at 55% 40%,#667,transparent);opacity:.65}
+.inner{position:relative;display:flex;align-items:center;gap:14px}
+.tile{width:58px;height:58px;border-radius:18px;background:#0B0F14;border:1px solid var(--accent);display:flex;align-items:center;justify-content:center;font-size:25px;font-weight:600}
+.title{font-size:28px;font-weight:600;letter-spacing:1.5px}
+.bsub{font-size:13px;color:var(--tMuted);margin-top:2px}
+</style>
+</head>
+<body>
+<h1>Banner</h1>
+<p class="sub">OrionBanner — branded header with an interactive starfield backdrop.</p>
+<div class="banner">
+<div class="stars"></div>
+<div class="inner">
+<div class="tile">O</div>
+<div><div class="title">ORION</div><div class="bsub">Remote Play control panel</div></div>
+</div>
+</div>
+</body>
+</html>

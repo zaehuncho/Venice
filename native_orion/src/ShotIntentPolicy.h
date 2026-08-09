@@ -1,0 +1,287 @@
+#pragma once
+
+#include "OrionTypes.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace orion {
+
+// ControllerState stick axes are normalized to [-127, 127], while the
+// configured thresholds are percentages. Keep this conversion shared with
+// AutomationEngine so the early reader wake and the later hold-to-own decision
+// cross on the exact same physical sample.
+inline constexpr double kStickUnitScale = 1.27;
+
+[[nodiscard]] inline double rawStickThreshold(double configuredThreshold) noexcept
+{
+    return std::abs(configuredThreshold) * kStickUnitScale;
+}
+
+// Hardware intent is deliberately detected before AutomationEngine's hold-to-own
+// debounce.  The debounce protects controller ownership from quick dribble/pump
+// gestures, but the vision reader must be awake on the first physical input frame or
+// it can miss the meter's appearance/early trajectory.  Only vertical-dominant stick
+// gestures qualify; horizontal/diagonal dribbles never open the reader gate.
+struct ShotIntentEdges {
+    bool square = false;
+    bool stickUp = false;
+    bool stickDown = false;
+
+    [[nodiscard]] bool any() const noexcept
+    {
+        return square || stickUp || stickDown;
+    }
+};
+
+// Canonical right-stick shot predicate shared by the first-edge reader wake
+// and AutomationEngine's later hold-to-own debounce.  Keeping the vertical
+// threshold and lateral-dominance rule here prevents a diagonal dribble from
+// being owned by automation after the reader correctly refused to wake (or the
+// inverse: a real vertical shot waking the reader but never becoming owned).
+[[nodiscard]] inline bool verticalStickShotIntent(const ControllerState& state,
+                                                  bool up,
+                                                  double threshold,
+                                                  double lateralMaxRatio) noexcept
+{
+    const double y = static_cast<double>(state.rightStickY);
+    const double x = static_cast<double>(state.rightStickX);
+    const double rawThreshold = rawStickThreshold(threshold);
+    const bool crosses = up ? y <= -rawThreshold : y >= rawThreshold;
+    const double lateralLimit = std::max(1.0, lateralMaxRatio * std::abs(y));
+    return crosses && std::abs(x) <= lateralLimit;
+}
+
+// Canonical physical-end predicate for every shot-control recovery boundary.
+// A selected controller report is required: transport absence is not evidence
+// that Square was released or that the right stick returned to center.
+[[nodiscard]] inline bool shotInputControlsNeutral(
+    const ControllerState& state,
+    double stickUpThreshold,
+    double stickDownThreshold) noexcept
+{
+    const double neutralRadius = std::min(
+        rawStickThreshold(stickUpThreshold),
+        rawStickThreshold(stickDownThreshold));
+    return !state.square()
+        && std::hypot(static_cast<double>(state.rightStickX),
+                      static_cast<double>(state.rightStickY)) < neutralRadius;
+}
+
+inline ShotIntentEdges shotIntentEdges(const ControllerState& current,
+                                       const ControllerState& previous,
+                                       double stickUpThreshold,
+                                       double stickDownThreshold,
+                                       double lateralMaxRatio = 0.70) noexcept
+{
+    // Cross is the in-game call-for-ball/pass request.  It is competing context
+    // for a Go-To and must never mint a reader-wake epoch from a simultaneous
+    // RS-up sample.  The stateful tracker below additionally requires a real
+    // neutral stick after such an overlap before it can emit a later edge.
+    const bool currentUp = !current.cross() && verticalStickShotIntent(
+        current, true, stickUpThreshold, lateralMaxRatio);
+    const bool previousUp = !previous.cross() && verticalStickShotIntent(
+        previous, true, stickUpThreshold, lateralMaxRatio);
+    const bool currentDown = verticalStickShotIntent(
+        current, false, stickDownThreshold, lateralMaxRatio);
+    const bool previousDown = verticalStickShotIntent(
+        previous, false, stickDownThreshold, lateralMaxRatio);
+
+    ShotIntentEdges edges;
+    edges.square = current.square() && !previous.square();
+    edges.stickUp = currentUp && !previousUp;
+    edges.stickDown = currentDown && !previousDown;
+    return edges;
+}
+
+// Stateful first-edge detector for the controller -> reader wake/shot-epoch seam.
+//
+// AutomationEngine already requires three consecutive Square-UP polls before it
+// treats a physical hold as released.  The reader wake path must use the same
+// lifetime: if it used a raw previous/current comparison, one false-UP poll and
+// the following still-held sample minted a second physical-shot epoch, reset the
+// reader, and erased otherwise-valid ownership proof.  This tracker debounces
+// same-gesture release without delaying the initial DOWN edge.
+//
+// Up <-> down is an explicit new right-stick gesture and remains an immediate
+// cross-direction edge, matching the existing AutomationEngine latch semantics.
+class ShotIntentEdgeTracker final {
+public:
+    static constexpr int kReleaseSamples = 3;
+
+    [[nodiscard]] ShotIntentEdges update(
+        const ControllerState& current,
+        double stickUpThreshold,
+        double stickDownThreshold,
+        double lateralMaxRatio = 0.70) noexcept
+    {
+        const bool rawCurrentUp = verticalStickShotIntent(
+            current, true, stickUpThreshold, lateralMaxRatio);
+        const bool currentDown = verticalStickShotIntent(
+            current, false, stickDownThreshold, lateralMaxRatio);
+        const bool rightStickNeutral = std::hypot(
+            static_cast<double>(current.rightStickX),
+            static_cast<double>(current.rightStickY))
+            < rawStickThreshold(stickUpThreshold);
+
+        // A Cross/RS-up overlap is ambiguous gameplay input, not a Go-To shot.
+        // Latch the suppression until a physically neutral right stick is seen;
+        // otherwise releasing Cross while the same RS-up is still held would
+        // manufacture a fresh shot edge one poll later.
+        if (current.cross() && (rawCurrentUp || stickUpLatched_)) {
+            stickUpBlockedUntilNeutral_ = true;
+        }
+        if (stickUpBlockedUntilNeutral_ && rightStickNeutral) {
+            stickUpBlockedUntilNeutral_ = false;
+        }
+        const bool currentUp = rawCurrentUp && !current.cross()
+            && !stickUpBlockedUntilNeutral_;
+
+        // Preserve the established direct cross-direction gesture contract.
+        if (currentUp) {
+            releaseImmediately(stickDownLatched_, stickDownInactiveSamples_);
+        } else if (currentDown) {
+            releaseImmediately(stickUpLatched_, stickUpInactiveSamples_);
+        }
+
+        ShotIntentEdges edges;
+        edges.square = updateGesture(
+            current.square(), squareLatched_, squareInactiveSamples_);
+        edges.stickUp = updateGesture(
+            currentUp, stickUpLatched_, stickUpInactiveSamples_);
+        edges.stickDown = updateGesture(
+            currentDown, stickDownLatched_, stickDownInactiveSamples_);
+
+        // A missing HID/RawInput transport report can never stand in for a
+        // physical release. Suppress every edge until the reappeared selected
+        // device proves all shot controls neutral for the normal three-sample
+        // release lifetime. The third neutral report only clears the fence; a
+        // later real DOWN/deflection is the first report allowed to emit.
+        if (transportRecoveryAwaitingNeutral_) {
+            if (shotInputControlsNeutral(
+                    current, stickUpThreshold, stickDownThreshold)) {
+                transportRecoveryNeutralSamples_ = std::min(
+                    kReleaseSamples, transportRecoveryNeutralSamples_ + 1);
+            } else {
+                transportRecoveryNeutralSamples_ = 0;
+            }
+            if (transportRecoveryNeutralSamples_ >= kReleaseSamples) {
+                transportRecoveryAwaitingNeutral_ = false;
+                transportRecoveryNeutralSamples_ = 0;
+            }
+            return {};
+        }
+        return edges;
+    }
+
+    // Entered only after a previously-live selected controller becomes
+    // unavailable. Preserve every gesture latch: only update() calls carrying
+    // real selected-device reports may prove the required physical neutral.
+    void beginTransportRecovery() noexcept
+    {
+        transportRecoveryAwaitingNeutral_ = true;
+        transportRecoveryNeutralSamples_ = 0;
+    }
+
+    [[nodiscard]] bool transportRecoveryActive() const noexcept
+    {
+        return transportRecoveryAwaitingNeutral_;
+    }
+
+    void reset() noexcept
+    {
+        squareLatched_ = false;
+        stickUpLatched_ = false;
+        stickDownLatched_ = false;
+        stickUpBlockedUntilNeutral_ = false;
+        squareInactiveSamples_ = kReleaseSamples;
+        stickUpInactiveSamples_ = kReleaseSamples;
+        stickDownInactiveSamples_ = kReleaseSamples;
+        transportRecoveryAwaitingNeutral_ = false;
+        transportRecoveryNeutralSamples_ = 0;
+    }
+
+private:
+    [[nodiscard]] static bool updateGesture(
+        bool active, bool& latched, int& inactiveSamples) noexcept
+    {
+        if (active) {
+            inactiveSamples = 0;
+            if (!latched) {
+                latched = true;
+                return true;
+            }
+            return false;
+        }
+
+        inactiveSamples = std::min(kReleaseSamples, inactiveSamples + 1);
+        if (inactiveSamples >= kReleaseSamples) {
+            latched = false;
+        }
+        return false;
+    }
+
+    static void releaseImmediately(bool& latched, int& inactiveSamples) noexcept
+    {
+        latched = false;
+        inactiveSamples = kReleaseSamples;
+    }
+
+    bool squareLatched_ = false;
+    bool stickUpLatched_ = false;
+    bool stickDownLatched_ = false;
+    bool stickUpBlockedUntilNeutral_ = false;
+    int squareInactiveSamples_ = kReleaseSamples;
+    int stickUpInactiveSamples_ = kReleaseSamples;
+    int stickDownInactiveSamples_ = kReleaseSamples;
+    bool transportRecoveryAwaitingNeutral_ = false;
+    int transportRecoveryNeutralSamples_ = 0;
+};
+
+// [DPAD-UP BYPASS HOTKEY 2026-08-08] Rising-edge latch for the physical D-pad Up
+// meter-delay bypass-on-defense hotkey (owner-requested). A PASSIVE observer of
+// the selected physical pad report: it never consumes, rewrites, or delays the
+// report — D-pad Up keeps mirroring to the console for menu navigation — and it
+// carries no shot or fire authority. The latch reuses the shot-intent release
+// debounce (kReleaseSamples consecutive not-held polls, same as Square) so one
+// dropped/false-UP poll mid-hold cannot mint a second toggle.
+//
+// `connected` gates EMISSION only, never the latch: a press held from the
+// launcher stays latched across connect and must not fire retroactively; only a
+// fresh physical press inside a connected session emits an edge. Symmetrically,
+// a hold that survives a disconnect/reconnect never replays its edge.
+class DpadUpEdgeTracker final {
+public:
+    static constexpr int kReleaseSamples = ShotIntentEdgeTracker::kReleaseSamples;
+
+    // Returns true exactly once per physical press, and only when `connected`.
+    [[nodiscard]] bool update(bool held, bool connected) noexcept
+    {
+        bool edge = false;
+        if (held) {
+            inactiveSamples_ = 0;
+            if (!latched_) {
+                latched_ = true;
+                edge = true;
+            }
+        } else {
+            inactiveSamples_ = std::min(kReleaseSamples, inactiveSamples_ + 1);
+            if (inactiveSamples_ >= kReleaseSamples) {
+                latched_ = false;
+            }
+        }
+        return edge && connected;
+    }
+
+    void reset() noexcept
+    {
+        latched_ = false;
+        inactiveSamples_ = kReleaseSamples;
+    }
+
+private:
+    bool latched_ = false;
+    int inactiveSamples_ = kReleaseSamples;
+};
+
+} // namespace orion

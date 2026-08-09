@@ -1,0 +1,94 @@
+{
+    "bias_pct": -0.4,
+    "ema_fill_per_frame": 0.21129462275121208,
+    "ema_green_ratio": 0.02094510654693218,
+    "global_appear_to_tip_ms": 250.5342715168595,
+    "global_hold_to_release_ms": 565.739299074094,
+    "global_rise_velocity_pct_ms": 0.3610739895215379,
+    "lead_rebaselined": false,
+    "learned_latency_ms": 75,
+    "learned_phase_physical_ms": 306.9498338396335,
+    "per_level": {
+        "HEAVY": {
+            "nudge_pct": -0.24250000000000002
+        },
+        "LIGHT": {
+            "nudge_pct": -1.0449999975928514
+        },
+        "MODERATE": {
+            "nudge_pct": -0.6328626221142585
+        },
+        "OPEN": {
+            "nudge_pct": -1.455
+        },
+        "SMOTHERED": {
+            "nudge_pct": -1.5
+        }
+    },
+    "probe_spawn_offset_ms": 0,
+    "shot_type_appear_to_tip_ms": {
+        "Left Fade": 380.1336680468754,
+        "No Dip": 381.8217148437514,
+        "Standstill": 409.4047314386532
+    },
+    "shot_type_cal_phase": {
+        "Go-To": 0,
+        "Left Fade": 0,
+        "Left Fade|tempo": 0,
+        "Post Fade": 0,
+        "Post Fade|tempo": 0,
+        "Right Fade": 0,
+        "Right Fade|tempo": 0,
+        "Standstill": 0,
+        "Standstill|tempo": 0
+    },
+    "shot_type_feedforward_ms": {
+        "Back Fade": 880,
+        "Front Fade": 880,
+        "Go-To": 1850,
+        "Left Fade": 849.5946990980228,
+        "Moving": 520,
+        "No Dip": 348.25064887071494,
+        "Post Fade": 848.1906929376898,
+        "Right Fade": 770.0566118623127,
+        "Standstill": 468.87080299391596,
+        "Standstill|tempo": 693.3711379948072
+    },
+    "shot_type_latency_ms": {
+    },
+    "shot_type_learned_offset_ms": {
+        "Back Fade": 0,
+        "Front Fade": 0,
+        "Go-To": -23.1413142328714,
+        "Left Fade": 30.405300901977295,
+        "Post Fade": 31.809307062310143,
+        "Right Fade": 109.94338813768728,
+        "Standstill": -37.42353024050936
+    },
+    "shot_type_meter_to_release_ms": {
+        "Back Fade": 340,
+        "Front Fade": 340,
+        "Go-To": 230,
+        "Left Fade": 340,
+        "No Dip": 93.76125933972071,
+        "Post Fade": 167.32649999999558,
+        "Right Fade": 340,
+        "Standstill": 340,
+        "Standstill|tempo": 368.4407709944062
+    },
+    "shot_type_rtt_baseline_ms": {
+        "Left Fade": 9.753340696557533,
+        "Right Fade": 3.0916414312360203,
+        "Standstill": 13.59238617791533
+    },
+    "shot_type_velocity_prior_pct_ms": {
+        "Go-To": 0.26063132387482024,
+        "Left Fade": 0.24462712796245056,
+        "No Dip": 0.3976550309977384,
+        "Post Fade": 0.43293541758055765,
+        "Right Fade": 0.23028313549320742,
+        "Standstill": 0.22995820784871857,
+        "Standstill|tempo": 0.2533480011506478
+    },
+    "version": 3
+}

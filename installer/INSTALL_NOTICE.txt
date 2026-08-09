@@ -1,0 +1,23 @@
+Venice — first-install notice
+==============================
+
+Windows may show a security warning the first time you run this installer:
+
+    "Windows protected your PC"
+    Microsoft Defender SmartScreen prevented an unrecognized app
+    from starting.
+
+This appears because the installer isn't code-signed yet. It is not a virus
+warning — it is the standard warning Windows shows any new indie software
+whose publisher hasn't accumulated install reputation.
+
+To install:
+
+  1. Click "More info"
+  2. Click "Run anyway"
+
+A code-signed version is coming in the first update. Once you've installed
+Venice, the built-in updater will deliver it automatically — you'll never see
+this warning again.
+
+Questions or issues: <your support channel>

@@ -1,0 +1,9 @@
+# Orion native sidecar/runtime dependencies
+opencv-python>=4.8.0
+numpy>=1.26.0
+requests>=2.31.0
+pywin32>=306; platform_system == "Windows"
+ping3>=4.0.4; platform_system == "Windows"
+# Optional: Windows Graphics Capture frame source (frame_source='wgc' / ORION_WGC=1).
+# Import-guarded — the bot falls back to the decoder pipe / GDI when it's absent.
+windows-capture>=2.0.0; platform_system == "Windows"

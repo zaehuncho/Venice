@@ -1,0 +1,52 @@
+<!-- @dsCard group="Components" name="Buttons" subtitle="Primary & Danger · normal / hover / pressed / disabled" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Buttons</title>
+<style>
+:root{
+--accent:#7C3AED;--accentHover:#9460F0;--accentPressed:#6425C9;--accentBorder:#A98BF3;--accentBorderHi:#B79BF6;
+--danger:#EF4444;--dangerHover:#F05252;--dangerPressed:#B91C1C;--dangerBorder:#F87171;--dangerBorderHi:#FCA5A5;
+--bgShell:#0A0D12;--disabled:#17202C;--borderSoft:#243044;
+--tPrimary:#F4F7FA;--tMuted:#8A96A8;--tFaint:#566273;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.glabel{color:var(--tMuted);font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin:6px 0 10px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
+.btn{height:40px;min-width:128px;padding:0 18px;border-radius:10px;border:1px solid;font:600 13px var(--ui);color:#fff;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}
+.state{font-size:11px;color:var(--tMuted);font-family:ui-monospace,monospace;align-self:center}
+.p{background:var(--accent);border-color:var(--accentBorder)}
+.p.hover{background:var(--accentHover);border-color:var(--accentBorderHi)}
+.p.press{background:var(--accentPressed);transform:scale(.97)}
+.d{background:var(--danger);border-color:var(--dangerBorder)}
+.d.hover{background:var(--dangerHover);border-color:var(--dangerBorderHi)}
+.d.press{background:var(--dangerPressed);transform:scale(.97)}
+.dis{background:var(--disabled);border-color:var(--borderSoft);color:var(--tFaint);cursor:not-allowed}
+</style>
+</head>
+<body>
+<h1>Buttons</h1>
+<p class="sub">PrimaryButton (accent) and DangerButton. 40px tall, 10px radius, DemiBold 13.</p>
+
+<div class="glabel">Primary</div>
+<div class="row">
+<button class="btn p">Start Stream</button><span class="state">normal</span>
+<button class="btn p hover">Start Stream</button><span class="state">hover</span>
+<button class="btn p press">Start Stream</button><span class="state">pressed</span>
+<button class="btn dis">Streaming</button><span class="state">disabled</span>
+</div>
+
+<div class="glabel">Danger</div>
+<div class="row">
+<button class="btn d">Disconnect</button><span class="state">normal</span>
+<button class="btn d hover">Disconnect</button><span class="state">hover</span>
+<button class="btn d press">Disconnect</button><span class="state">pressed</span>
+<button class="btn dis">Disconnect</button><span class="state">disabled</span>
+</div>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# ⚠️ VERIFY BEFORE DEPLOYING. As of 2026-08-04 no Worker named "orion-license-bot"
+# exists on account 991bf3f7aae56a88579b48475294ff2a. The two that DO exist are
+# "orion-discord-bot" (2026-07-03) and "license-redeem-proxy" (2026-06-23).
+# Deploying with this name publishes a THIRD Worker instead of updating the one
+# Discord's Interactions Endpoint URL actually points at — the commands would
+# silently keep hitting the old code. Set this to that Worker's real name first.
+name = "orion-license-bot"
+main = "orion_worker.js"
+compatibility_date = "2025-01-15"   # must be recent enough for Ed25519 in Web Crypto
+
+# Non-secret config only. NEVER put the bot token / public key / bot secret here —
+# set those with:  wrangler secret put DISCORD_PUBLIC_KEY  (and DISCORD_APP_ID, ORION_BOT_SECRET)
+[vars]
+ORION_API_BASE = "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com"
+# Gumroad storefront base for /purchase buy buttons: "<base>/<product-slug>".
+# TODO: replace <seller> with the real Gumroad subdomain before deploying —
+# /purchase renders a "store links unavailable" warning while this is wrong.
+GUMROAD_BASE = "https://<seller>.gumroad.com/l"
+
+# No KV namespace needed — the killswitch lives in the Lambda's DynamoDB so it
+# actually disables the launcher (gates /api/activate + the heartbeat).

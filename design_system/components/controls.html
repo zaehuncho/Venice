@@ -1,0 +1,50 @@
+<!-- @dsCard group="Components" name="Controls" subtitle="ThemedSlider + DashboardToggle, on/off" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orion — Controls</title>
+<style>
+:root{
+--accent:#7C3AED;--accentBorder:#A98BF3;--bgShell:#0A0D12;--borderSoft:#243044;
+--tPrimary:#F4F7FA;--tMuted:#8A96A8;
+--ui:'Segoe UI Variable','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bgShell);color:var(--tPrimary);font-family:var(--ui);padding:24px}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--tMuted);font-size:12px;margin:0 0 20px}
+.glabel{color:var(--tMuted);font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin:6px 0 12px}
+.field{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+.lbl{width:130px;font-size:12px;color:var(--tMuted)}
+
+/* slider */
+.track{position:relative;width:280px;height:6px;border-radius:3px;background:var(--borderSoft)}
+.fill{position:absolute;left:0;top:0;height:100%;border-radius:3px;background:var(--accent)}
+.handle{position:absolute;top:50%;width:20px;height:20px;border-radius:50%;background:#F4F7FA;border:2px solid var(--accent);transform:translate(-50%,-50%)}
+
+/* toggle */
+.tog{position:relative;width:48px;height:26px;border-radius:13px;border:1px solid var(--borderSoft);background:#1B2430}
+.tog.on{background:var(--accent);border-color:var(--accentBorder)}
+.knob{position:absolute;top:3px;left:4px;width:20px;height:20px;border-radius:50%;background:#93A4C7}
+.tog.on .knob{left:auto;right:4px;background:#fff}
+.state{font-size:11px;color:var(--tMuted);font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<h1>Controls</h1>
+<p class="sub">ThemedSlider (accent fill, light handle) and DashboardToggle (48×26).</p>
+
+<div class="glabel">Slider</div>
+<div class="field"><span class="lbl">early/late offset</span>
+<div class="track"><div class="fill" style="width:35%"></div><div class="handle" style="left:35%"></div></div>
+<span class="state">35</span></div>
+<div class="field"><span class="lbl">confidence</span>
+<div class="track"><div class="fill" style="width:70%"></div><div class="handle" style="left:70%"></div></div>
+<span class="state">70</span></div>
+
+<div class="glabel">Toggle</div>
+<div class="field"><span class="lbl">Tempo mode</span><div class="tog on"><div class="knob"></div></div><span class="state">on</span></div>
+<div class="field"><span class="lbl">No-dip</span><div class="tog"><div class="knob"></div></div><span class="state">off</span></div>
+</body>
+</html>
