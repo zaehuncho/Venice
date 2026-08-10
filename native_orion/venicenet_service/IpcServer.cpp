@@ -45,6 +45,11 @@ std::string envOr(const char* name, const std::string& fallback)
     if (_dupenv_s(&buf, &len, name) == 0 && buf) {
         std::string v(buf);
         free(buf);
+        // Null it: _dupenv_s succeeds with a non-null pointer to "" for a variable that
+        // EXISTS but is EMPTY, and that path falls through to the free below. Without this
+        // the same block is freed twice -> heap corruption, at token-publish time, in a
+        // LocalSystem service.
+        buf = nullptr;
         if (!v.empty()) {
             return v;
         }
@@ -628,10 +633,17 @@ void IpcServer::handleClient(std::uintptr_t sockHandle)
     q->close();
     hub_.removeClient(q);
     onClientDisconnected(q);
-    ::closesocket(sock);
+    // shutdown -> join -> close, in that order. The writer thread can be parked inside
+    // ::send() on this socket; closing it here would free the SOCKET value while that send
+    // is still in flight, and Winsock is free to hand the same value to the next accepted
+    // connection. The old writer's queued lines -- which include privileged packet and
+    // meter_delay events -- would then be written into a DIFFERENT client's stream, before
+    // that client has authenticated. shutdown() unblocks the send without freeing the value.
+    ::shutdown(sock, SD_BOTH);
     if (writer.joinable()) {
         writer.join();
     }
+    ::closesocket(sock);
 }
 
 void IpcServer::onClientDisconnected(const std::shared_ptr<ClientQueue>& q)

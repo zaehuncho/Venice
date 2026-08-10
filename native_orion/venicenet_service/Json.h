@@ -154,7 +154,7 @@ public:
         size_t pos = 0;
         skipWs(text, pos);
         JsonValue value;
-        if (!parseValue(text, pos, value)) {
+        if (!parseValue(text, pos, value, 0)) {
             out = JsonValue();
             return false;
         }
@@ -270,14 +270,24 @@ private:
         }
     }
 
-    static bool parseValue(const std::string& t, size_t& pos, JsonValue& out)
+    // Nesting cap. The IPC line limit is 16 KiB (kMaxCommandLineBytes) and IpcServer parses
+    // every line BEFORE the auth check, so without this any unauthenticated process that can
+    // reach 127.0.0.1:47291 could send "[[[[..." x16000 and drive ~16000 recursive frames --
+    // each carrying a local JsonValue -- straight through the default 1 MB thread stack,
+    // taking down a LocalSystem service. The protocol's real documents nest 2-3 deep.
+    static constexpr int kMaxParseDepth = 32;
+
+    static bool parseValue(const std::string& t, size_t& pos, JsonValue& out, int depth)
     {
+        // >=, not >: depth is 0-based, so this makes kMaxParseDepth the count of nesting
+        // levels actually allowed (32 accepted, the 33rd rejected) rather than one more.
+        if (depth >= kMaxParseDepth) return false;
         skipWs(t, pos);
         if (pos >= t.size()) return false;
         const char c = t[pos];
         switch (c) {
-        case '{': return parseObject(t, pos, out);
-        case '[': return parseArray(t, pos, out);
+        case '{': return parseObject(t, pos, out, depth);
+        case '[': return parseArray(t, pos, out, depth);
         case '"': {
             std::string s;
             if (!parseString(t, pos, s)) return false;
@@ -291,7 +301,7 @@ private:
         }
     }
 
-    static bool parseObject(const std::string& t, size_t& pos, JsonValue& out)
+    static bool parseObject(const std::string& t, size_t& pos, JsonValue& out, int depth)
     {
         out = makeObject();
         ++pos; // '{'
@@ -309,7 +319,7 @@ private:
             if (pos >= t.size() || t[pos] != ':') return false;
             ++pos;
             JsonValue value;
-            if (!parseValue(t, pos, value)) return false;
+            if (!parseValue(t, pos, value, depth + 1)) return false;
             out.set(key, std::move(value));
             skipWs(t, pos);
             if (pos >= t.size()) return false;
@@ -325,7 +335,7 @@ private:
         }
     }
 
-    static bool parseArray(const std::string& t, size_t& pos, JsonValue& out)
+    static bool parseArray(const std::string& t, size_t& pos, JsonValue& out, int depth)
     {
         out = makeArray();
         ++pos; // '['
@@ -336,7 +346,7 @@ private:
         }
         while (true) {
             JsonValue value;
-            if (!parseValue(t, pos, value)) return false;
+            if (!parseValue(t, pos, value, depth + 1)) return false;
             out.append(std::move(value));
             skipWs(t, pos);
             if (pos >= t.size()) return false;

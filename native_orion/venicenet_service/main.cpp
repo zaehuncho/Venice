@@ -337,13 +337,24 @@ private:
                 }
                 dispatch(buf.data(), recvLen);
             }
+            // Close ONLY if we won the race to claim the handle. stop() and requestRestart()
+            // both close handle_ and null it under this same mutex; the guard below exists
+            // precisely because they can, so closing unconditionally afterwards is a double
+            // close. WinDivert handles are kernel handles and the value can already have been
+            // reissued -- to the intercept's own handle, whose delay would then die silently --
+            // and under strict handle checking a stale close raises EXCEPTION_INVALID_HANDLE
+            // and takes the whole LocalSystem service down.
+            bool owned = false;
             {
                 std::lock_guard<std::mutex> lock(handleMutex_);
                 if (handle_ == handle) {
                     handle_ = nullptr;
+                    owned = true;
                 }
             }
-            lib_->close(handle);
+            if (owned) {
+                lib_->close(handle);
+            }
         }
     }
 

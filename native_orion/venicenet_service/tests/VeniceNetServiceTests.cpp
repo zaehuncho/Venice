@@ -547,10 +547,56 @@ void testArgRouting()
     CHECK(!meterArmRequested({}, "").first);
 }
 
+// The IPC line cap is 16 KiB and IpcServer parses EVERY line before the auth check,
+// so an unauthenticated peer on 127.0.0.1 controls this parser's recursion depth
+// directly. Without a cap, "[[[[..." x16000 overflows the 1 MB thread stack and kills a
+// LocalSystem service. Reject deep nesting; keep accepting real protocol documents.
+void testJsonParserDepthLimit()
+{
+    // Legitimate protocol shapes still parse. The real ones nest 2-3 deep.
+    JsonValue ok;
+    CHECK(JsonValue::parse("{\"cmd\":\"set_meter_delay\",\"args\":{\"ms\":200}}", ok));
+    CHECK(ok.isObject());
+    CHECK(ok.getString("cmd") == "set_meter_delay");
+    CHECK(ok.has("args"));
+    JsonValue nested;
+    CHECK(JsonValue::parse("{\"a\":{\"b\":{\"c\":[1,2,{\"d\":true}]}}}", nested));
+    CHECK(nested.isObject());
+    CHECK(nested.has("a"));
+
+    // Right at the cap: 32 nested arrays parse, 33 do not. Asserting both sides
+    // pins the boundary so a later refactor cannot quietly drop the guard by
+    // making the limit enormous.
+    {
+        JsonValue atCap;
+        CHECK(JsonValue::parse(std::string(32, '[') + std::string(32, ']'), atCap));
+        JsonValue overCap;
+        CHECK(!JsonValue::parse(std::string(33, '[') + std::string(33, ']'), overCap));
+    }
+
+    // The attack itself, at the real 16 KiB line cap. Must return false, not crash.
+    // Unterminated on purpose: a hostile peer has no reason to close its brackets.
+    {
+        JsonValue bomb;
+        CHECK(!JsonValue::parse(std::string(16000, '['), bomb));
+        CHECK(bomb.isNull());
+    }
+    {
+        JsonValue bomb;
+        CHECK(!JsonValue::parse(std::string(8000, '{'), bomb));
+    }
+    // Balanced, so only the depth guard can reject it.
+    {
+        JsonValue bomb;
+        CHECK(!JsonValue::parse(std::string(8000, '[') + std::string(8000, ']'), bomb));
+    }
+}
+
 } // namespace
 
 int main()
 {
+    testJsonParserDepthLimit();
     testSlewCapAndTokenBucket();
     testSnapToTargetReenablesFastPath();
     testBufferOverflowReleasesOldestInOrder();
