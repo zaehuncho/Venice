@@ -2676,10 +2676,27 @@ void RemotePlaySession::onSidecarStderr()
             // reads as one more diagnostic. State the consequence in the customer's terms: from
             // here on every press falls through and only a restart recovers. Emitted AFTER the
             // cause so the log keeps "what happened" then "what it means"; once per session.
-            if (isAuthorityDeath && !authorityDeathAnnounced_) {
+            //
+            // Deliberately NOT keyed on isAuthorityDeath. That predicate is correctly BROAD -- all
+            // three of its lines must bypass the warn throttle -- but only ONE of them means the
+            // bot is actually dead. "Latency authority reset" is logged UNCONDITIONALLY by
+            // _replace_latency_authority (remote_play_orchestrator.py:2899, outside the if), which
+            // routine transitions call: notably capture_negotiated_mode_attested on the FIRST
+            // successful attestation of every fresh session, and the source-generation transition
+            // on every Remote Play reconnect. Keying the announcement on the broad predicate would
+            // scare the customer into restarting a perfectly healthy session AND latch the
+            // once-per-session flag, silencing the real revocation if it happened later -- the
+            // exact opposite of the point. "capture_route_mismatch" is likewise emitted by the
+            // high-rate throttled Detector-frame-rejected line. Only "warm timing revoked"
+            // (remote_play_orchestrator.py:3138) is unique to the one-way revocation itself.
+            //
+            // ASCII-only literal on purpose: this file has no UTF-8 BOM and the build sets no
+            // /utf-8, so a non-ASCII dash would mojibake under a non-UTF-8 active code page. Same
+            // rule, same reason, as captureResolution() in RemotePlaySession.h.
+            if (!authorityDeathAnnounced_ && trimmed.contains("warm timing revoked")) {
                 authorityDeathAnnounced_ = true;
                 emit setupMessage(QStringLiteral(
-                    "TIMING DISABLED — the capture card changed route mid-session, so shot timing "
+                    "TIMING DISABLED - the capture card changed route mid-session, so shot timing "
                     "cannot be trusted and the bot will stop firing. Close Venice and reopen it to "
                     "recover. If it repeats, close anything else using the capture card (OBS, "
                     "Camera, a browser tab) before reconnecting."));
