@@ -35,7 +35,7 @@ stays honest and the label stays inside valid training windows.
 Usage:
   python tools/training/prepare_release_cue_labels.py "<video1>" ["<video2>" ...] \
       [--videos-list kept_videos.txt] [--out logs/diagnostics/release_cue_labels.json] \
-      [--model models/orion_pose2k_n_v2.pt] [--meter-color Purple] [--handedness Right] \
+      [--model models/orion_pose2k_n_v3.pt] [--meter-color Purple] [--handedness Right] \
       [--frames 0] [--min-tip-fill 70] [--source owner]
 
 --videos-list lines are "path" or "path<TAB>handedness": the optional second column is a
@@ -108,20 +108,33 @@ def _ema_tau(arr, tau_ms, dt_ms):
     return out
 
 
-def extract_trajectories(video_path, pose, mdet, handedness, frames_cap, step):
+def extract_trajectories(video_path, pose, mdet, handedness, frames_cap, step, pose_batch=16,
+                         min_tip_fill=0.0):
     """Per-sampled-frame arrays: t, wrist_y, hip_y, ankle_y, meter fill, meter detected,
-    plus the locked-player and meter bboxes ([x, y, w, h] raw pixels; NaN when absent)."""
+    plus the locked-player and meter bboxes ([x, y, w, h] raw pixels; NaN when absent).
+
+    Returns (arrs, anchors, n_collapsed) -- release anchors are found internally now.
+
+    TWO-PASS (2026-08-09 speedup): pass A decodes once running ONLY the meter detector
+    (strictly per-frame in temporal order -- detector state unchanged); the release anchors
+    are computed from it; pass B decodes again and runs BATCHED pose only on the sampled
+    frames inside the cue windows of anchors that pass min_tip_fill ([release-1.45s,
+    release+0.25s], a margin around WIN_BEFORE_S and JUMP_HI_S). Everything downstream
+    (label_cues_for_shot, coverage) reads only window slices, so labels are identical to
+    the old full-frame pose pass while skipping ~90% of pose work (junk anchors -- median
+    25% fill -- skip pose entirely). Pose frames outside every window stay NaN.
+    """
     import cv2
 
     shooting = KP_WRIST_L if str(handedness).strip().lower().startswith("l") else KP_WRIST_R
     other = KP_WRIST_R if shooting == KP_WRIST_L else KP_WRIST_L
 
+    # ---- pass A: meter only ------------------------------------------------------------------
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
     if step <= 0:
         step = 2 if fps > 80 else 1
     rows = []
-    pboxes = []  # locked player bbox per sampled frame, top-left [x, y, w, h]
     mboxes = []  # meter bbox per sampled frame, top-left [x, y, w, h]
     i = proc = 0
     while frames_cap <= 0 or proc < frames_cap:
@@ -132,14 +145,48 @@ def extract_trajectories(video_path, pose, mdet, handedness, frames_cap, step):
             if not ok:
                 break
             proc += 1
-            H = fr.shape[0]
             mres = mdet.detect(fr)
             mdet_b = bool(mres and getattr(mres, "detected", False))
             mfill = float(getattr(mres, "fill_pct", 0) or 0) if mdet_b else float("nan")
             mbb = getattr(mres, "bbox", None) if mdet_b else None
+            rows.append([i / fps, float("nan"), float("nan"), float("nan"), mfill, int(mdet_b)])
+            mboxes.append(tuple(float(v) for v in mbb[:4])
+                          if mbb is not None and len(mbb) >= 4 else _NO_BOX)
+        i += 1
+    cap.release()
+    if not rows:
+        return None, [], 0
+
+    n = len(rows)
+    pboxes = [_NO_BOX] * n
+    t_arr = np.array([r[0] for r in rows])
+    mf = np.array([r[4] for r in rows])
+    md = np.array([r[5] for r in rows])
+    anchors, n_collapsed = find_release_anchors(t_arr, mf, md)
+
+    # sampled indices needing pose: cue windows of anchors that survive the tip-fill gate
+    needed = set()
+    for rel_idx, fill in anchors:
+        if fill < min_tip_fill:
+            continue
+        lo = rel_idx
+        while lo > 0 and t_arr[rel_idx] - t_arr[lo] < WIN_BEFORE_S + 0.15:
+            lo -= 1
+        hi = rel_idx
+        while hi < n - 1 and t_arr[hi] - t_arr[rel_idx] < JUMP_HI_S + 0.10:
+            hi += 1
+        needed.update(range(lo, hi + 1))
+
+    # ---- pass B: batched pose on needed sampled frames only ----------------------------------
+    def _flush(chunk):
+        """chunk: [(sample_idx, frame, mbb)]; batch the pose, meter-nearest player select."""
+        if not chunk:
+            return
+        results = pose.predict([c[1] for c in chunk], verbose=False, conf=0.10)
+        for (idx, fr, mbb), r in zip(chunk, results):
+            H = fr.shape[0]
             wy = hy = ay = float("nan")
             pbb = _NO_BOX
-            r = pose.predict(fr, verbose=False, conf=0.10)[0]
             if r.boxes is not None and len(r.boxes):
                 xywh = r.boxes.xywh.cpu().numpy()
                 if mbb and len(mbb) >= 4 and mbb[2] > 0:
@@ -157,25 +204,48 @@ def extract_trajectories(video_path, pose, mdet, handedness, frames_cap, step):
                 # YOLO xywh is center-based -> store top-left pixel convention
                 pbb = (float(xywh[b, 0] - xywh[b, 2] / 2), float(xywh[b, 1] - xywh[b, 3] / 2),
                        float(xywh[b, 2]), float(xywh[b, 3]))
-            rows.append((i / fps, wy, hy, ay, mfill, int(mdet_b)))
-            pboxes.append(pbb)
-            mboxes.append(tuple(float(v) for v in mbb[:4])
-                          if mbb is not None and len(mbb) >= 4 else _NO_BOX)
-        i += 1
-    cap.release()
-    if not rows:
-        return None
+            rows[idx][1:4] = [wy, hy, ay]
+            pboxes[idx] = pbb
+
+    if needed:
+        last_needed_raw = max(needed) * step
+        cap = cv2.VideoCapture(video_path)
+        chunk = []
+        i = 0
+        while i <= last_needed_raw:
+            if not cap.grab():
+                break
+            if i % step == 0 and (i // step) in needed:
+                ok, fr = cap.retrieve()
+                if not ok:
+                    break
+                si = i // step
+                mbb = mboxes[si] if not np.any(np.isnan(mboxes[si])) else None
+                chunk.append((si, fr, mbb))
+                if len(chunk) >= max(pose_batch, 1):
+                    _flush(chunk)
+                    chunk = []
+            i += 1
+        _flush(chunk)
+        cap.release()
+
     arr = {k: np.array([r[j] for r in rows]) for j, k in
            enumerate(("t", "wy", "hy", "ay", "mf", "md"))}
     arr["pbb"] = np.array(pboxes)
     arr["mbox"] = np.array(mboxes)
     arr["fps"] = fps
     arr["step"] = step
-    return arr
+    return arr, anchors, n_collapsed
 
 
 def find_release_anchors(t, mf, md):
-    """Meter-appear edges (debounced) -> (release_idx, tip_fill) at the meter-fill edge."""
+    """Meter-appear edges (debounced) -> [(release_idx, tip_fill)] at the meter-fill edge.
+
+    Returns (anchors, n_collapsed). Meter flicker inside ONE shot creates several appear
+    edges whose spans resolve to the same fill peak -- the 2026-08-09 audit found 19/78 and
+    66/251 duplicated (video, release_frame) labels. Anchors whose release times are within
+    0.2s are collapsed to the highest-fill one; the census reports the collapsed count.
+    """
     anchors = []
     prev = False
     last_t = -1e9
@@ -192,13 +262,24 @@ def find_release_anchors(t, mf, md):
                 anchors.append((rel, float(mf[rel])))
                 last_t = t[j]
         prev = cur
-    return anchors
+    # collapse same-shot duplicates: releases within 0.2s -> keep the highest-fill anchor
+    merged = []
+    for rel, fill in sorted(anchors):
+        if merged and abs(t[rel] - t[merged[-1][0]]) <= 0.2:
+            if fill > merged[-1][1]:
+                merged[-1] = (rel, fill)
+        else:
+            merged.append((rel, fill))
+    return merged, len(anchors) - len(merged)
 
 
-def label_cues_for_shot(arrs, rel_idx, dt_ms):
+def label_cues_for_shot(arrs, rel_idx, dt_ms, min_coverage=MIN_WINDOW_COVERAGE):
     """Walk backwards from the release anchor and label the other four cues.
 
-    Returns (cues dict, coverage, ordering_ok) or None if the window is unusable.
+    Returns (result, reject_reason, detail): result is (cues dict, coverage, ordering_ok)
+    on success (reason/detail None); on rejection result is None and reason is one of
+    "short_window" | "low_coverage" | "short_flick_window" with a numeric detail
+    (window frames / coverage fraction / flick-window frames) for the census.
     """
     t = arrs["t"]
     n = len(t)
@@ -206,12 +287,12 @@ def label_cues_for_shot(arrs, rel_idx, dt_ms):
     while lo > 0 and t[rel_idx] - t[lo] < WIN_BEFORE_S:
         lo -= 1
     if rel_idx - lo < 12:
-        return None
+        return None, "short_window", rel_idx - lo
 
     wy_raw = arrs["wy"][lo:rel_idx + 1]
     coverage = float(np.mean(~np.isnan(wy_raw)))
-    if coverage < MIN_WINDOW_COVERAGE:
-        return None
+    if coverage < min_coverage:
+        return None, "low_coverage", coverage
 
     wy = _ema_tau(_fill_nans(np.copy(wy_raw)), 50.0, dt_ms)
     vel = np.gradient(wy, t[lo:rel_idx + 1])          # + = downward, - = upward
@@ -222,7 +303,7 @@ def label_cues_for_shot(arrs, rel_idx, dt_ms):
     while f_lo > 0 and t[rel_idx] - t[lo + f_lo] < -FLICK_LO_S:
         f_lo -= 1
     if m - f_lo < 2:
-        return None
+        return None, "short_flick_window", m - f_lo
     flick = f_lo + int(np.argmin(vel[f_lo:m + 1]))
     flick_vel = float(vel[flick])
 
@@ -281,22 +362,26 @@ def label_cues_for_shot(arrs, rel_idx, dt_ms):
         cues["jump"] = _cue(jump, jump_conf, absolute=True)
         if jump_clamped:
             cues["jump"]["clamped_from_post_release"] = True
-    return cues, coverage, ordering_ok
+    return (cues, coverage, ordering_ok), None, None
 
 
 def summarize(shots):
+    full = [s for s in shots if s.get("tier", "AB") == "AB"]
+    n_a = len(shots) - len(full)
+    if n_a:
+        print(f"\ntiers: {len(full)} full-cue (AB) + {n_a} timing-only (A)")
     print(f"\n{'cue':<12} {'n':>5} {'median ms-before-rel':>20} {'IQR':>8}")
     print("-" * 50)
     for name in CUE_NAMES:
-        offs = [s["cues"][name]["ms_before_release"] for s in shots if name in s["cues"]]
+        offs = [s["cues"][name]["ms_before_release"] for s in full if name in s["cues"]]
         if not offs:
             print(f"{name:<12} {0:>5}")
             continue
         a = np.array(sorted(offs))
         print(f"{name:<12} {len(a):>5} {np.median(a):>19.0f} "
               f"{np.percentile(a, 75) - np.percentile(a, 25):>7.0f}")
-    ok = sum(1 for s in shots if s["ordering_ok"])
-    print(f"ordering set<=push<=flick<=release: {ok}/{len(shots)}")
+    ok = sum(1 for s in full if s["ordering_ok"])
+    print(f"ordering set<=push<=flick<=release: {ok}/{len(full)} (full-cue tier)")
 
 
 def main() -> int:
@@ -304,13 +389,21 @@ def main() -> int:
     ap.add_argument("videos", nargs="*", help="video paths (or use --videos-list)")
     ap.add_argument("--videos-list", default="", help="text file, one video path per line")
     ap.add_argument("--out", default=os.path.join("logs", "diagnostics", "release_cue_labels.json"))
-    ap.add_argument("--model", default=os.path.join("models", "orion_pose2k_n_v2.pt"))
+    # v3 default per the 2026-08-09 A/B: conversion yield is IDENTICAL to v2 (78/78 shots on
+    # the same 24 clips) but v3's wrist tracking is measurably better (4.8 vs 7.0px jitter,
+    # catches raised follow-through arms), and pose-derived cue placements differ between the
+    # models by 58-167ms median -- so use the better tracker for the trajectory-derived cues.
+    ap.add_argument("--model", default=os.path.join("models", "orion_pose2k_n_v3.pt"))
     ap.add_argument("--meter-color", default="Purple")
     ap.add_argument("--handedness", default="Right")
     ap.add_argument("--frames", type=int, default=0, help="cap sampled frames per video (0 = all)")
     ap.add_argument("--step", type=int, default=0, help="frame step (0 = auto: 2 if >80fps)")
+    ap.add_argument("--pose-batch", type=int, default=16,
+                    help="frames per batched pose call (1 = old frame-serial behavior)")
     ap.add_argument("--min-tip-fill", type=float, default=70.0,
                     help="reject shots whose meter never fills this far (weak anchor)")
+    ap.add_argument("--min-coverage", type=float, default=MIN_WINDOW_COVERAGE,
+                    help="min fraction of non-NaN wrist samples in the cue window")
     ap.add_argument("--source", default="owner", choices=["owner", "youtube"],
                     help="provenance tag; cue labels should stay owner-only (see docs)")
     args = ap.parse_args()
@@ -353,34 +446,113 @@ def main() -> int:
     mdet = MeterDetector(os.path.join(ROOT, "meter_styles"), cfg)
 
     all_shots = []
+    # Incremental progress + resume (2026-08-09): one JSON line per finished clip next to
+    # --out. A killed run loses at most the clip in flight; a rerun with the same --out
+    # skips clips already in the progress file and seeds its state from them.
+    prog_path = (args.out if os.path.isabs(args.out) else os.path.join(ROOT, args.out)) \
+        + ".progress.jsonl"
+    done_videos = set()
+    # Rejection census: every meter-detected shot that does NOT become a cue label is
+    # counted by reason (previously they vanished silently -- the 23% conversion mystery).
+    # Two-tier labels (2026-08-09): the TIMING head only needs the meter-anchored release,
+    # the CUE head needs the full wrist-derived cue set. A shot whose cue derivation fails
+    # (low coverage / short window) but whose meter anchor is clean is emitted as tier "A"
+    # (release cue only) instead of being dropped; full-cue shots are tier "AB". The trainer
+    # masks the cue-CE loss to tier-AB windows -- tier-A rows must never fabricate cue
+    # targets. The tip-fill gate stays for BOTH tiers: a low-fill anchor (median 25% in the
+    # census) is a pump-fake/tap/flicker artifact, not a trustworthy release.
+    census = {
+        "video_not_found": 0, "video_no_frames": 0, "duplicate_anchor": 0,
+        "low_tip_fill": 0, "short_window": 0, "low_coverage": 0, "short_flick_window": 0,
+        "accepted_timing_only": 0, "accepted_full": 0,
+    }
+    rej_tip_fills = []    # tip_fill of shots rejected by --min-tip-fill
+    rej_coverages = []    # coverage of shots rejected by --min-coverage
+    per_video = []        # (video, n_anchors, n_accepted) conversion table
+    if os.path.isfile(prog_path):
+        with open(prog_path, "r", encoding="utf-8") as fh:
+            for ln in fh:
+                try:
+                    rec = json.loads(ln)
+                except Exception:
+                    continue  # torn tail line from a kill mid-write
+                done_videos.add(rec["video"])
+                all_shots.extend(rec["shots"])
+                for ck, cv in rec["census"].items():
+                    census[ck] = census.get(ck, 0) + cv
+                rej_tip_fills.extend(rec.get("rej_tip_fills", []))
+                rej_coverages.extend(rec.get("rej_coverages", []))
+                if rec.get("per_video"):
+                    per_video.append(rec["per_video"])
+        if done_videos:
+            print(f"resume: {len(done_videos)} clips already in {os.path.basename(prog_path)}, "
+                  f"{len(all_shots)} shots seeded")
     for vp, handed_over in videos:
+        if os.path.basename(vp) in done_videos:
+            continue
         if not os.path.isfile(vp):
             print(f"skip (not found): {vp}")
+            census["video_not_found"] += 1
             continue
         handed = handed_over or args.handedness
         hnorm = _norm_handed(handed)
         vname = os.path.basename(vp)
         tag = f" [{hnorm} override]" if handed_over else ""
         print(f"[{vname[:40]}]{tag} extracting ...", end=" ", flush=True)
-        arrs = extract_trajectories(vp, pose, mdet, handed, args.frames, args.step)
+        c0 = dict(census)
+        s0, rt0, rc0 = len(all_shots), len(rej_tip_fills), len(rej_coverages)
+
+        def _progress_write(pv, _v=vname, _c0=c0, _s0=s0, _rt0=rt0, _rc0=rc0):
+            rec = {"video": _v, "shots": all_shots[_s0:],
+                   "census": {k: census[k] - _c0.get(k, 0) for k in census
+                              if census[k] != _c0.get(k, 0)},
+                   "rej_tip_fills": rej_tip_fills[_rt0:],
+                   "rej_coverages": rej_coverages[_rc0:],
+                   "per_video": pv}
+            with open(prog_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+
+        arrs, anchors, n_collapsed = extract_trajectories(
+            vp, pose, mdet, handed, args.frames, args.step,
+            pose_batch=args.pose_batch, min_tip_fill=args.min_tip_fill)
         if arrs is None:
             print("no frames")
+            census["video_no_frames"] += 1
+            _progress_write(None)
             continue
         step = int(arrs["step"])
         dt_ms = 1000.0 * step / max(arrs["fps"], 1.0)
-        anchors = find_release_anchors(arrs["t"], arrs["mf"], arrs["md"])
-        n_ok = 0
+        census["duplicate_anchor"] += n_collapsed
+        n_ok = n_any = 0
         for k, (rel_idx, tip_fill) in enumerate(anchors):
             if tip_fill < args.min_tip_fill:
+                census["low_tip_fill"] += 1
+                rej_tip_fills.append(round(float(tip_fill), 1))
                 continue
-            res = label_cues_for_shot(arrs, rel_idx, dt_ms)
+            res, reason, detail = label_cues_for_shot(arrs, rel_idx, dt_ms,
+                                                      min_coverage=args.min_coverage)
             if res is None:
-                continue
-            cues, coverage, ordering_ok = res
+                census[reason] += 1
+                if reason == "low_coverage":
+                    rej_coverages.append(round(float(detail), 3))
+                # tier A: timing supervision survives -- the meter anchor is clean even
+                # though the wrist-derived cues are not derivable
+                tier = "A"
+                coverage = float(detail) if reason == "low_coverage" else 0.0
+                ordering_ok = None
+                cues = {"release": {
+                    "frame": int(rel_idx), "video_frame": int(rel_idx) * step,
+                    "t": float(arrs["t"][rel_idx]), "ms_before_release": 0.0,
+                    "confidence": 1.0}}
+                census["accepted_timing_only"] += 1
+            else:
+                cues, coverage, ordering_ok = res
+                tier = "AB"
+                census["accepted_full"] += 1
             shot = {
                 "video": vname, "path": os.path.abspath(vp), "source": args.source,
                 "shot_idx": k, "fps": float(arrs["fps"]), "step": step,
-                "handedness": hnorm,
+                "handedness": hnorm, "tier": tier,
                 "release_frame": int(rel_idx),
                 "release_video_frame": int(rel_idx) * step,
                 "tip_fill": round(tip_fill, 1), "coverage": round(coverage, 3),
@@ -393,8 +565,14 @@ def main() -> int:
             if not np.any(np.isnan(mbx)):
                 shot["meter_bbox"] = [round(float(v), 1) for v in mbx]
             all_shots.append(shot)
-            n_ok += 1
-        print(f"{len(anchors)} meter shots, {n_ok} cue-labeled")
+            if tier == "AB":
+                n_ok += 1
+            n_any += 1
+        print(f"{len(anchors)} meter shots, {n_ok} cue-labeled, {n_any - n_ok} timing-only")
+        pv = {"video": vname, "meter_shots": len(anchors),
+              "cue_labeled": n_ok, "timing_only": n_any - n_ok}
+        per_video.append(pv)
+        _progress_write(pv)
 
     out = os.path.join(ROOT, args.out) if not os.path.isabs(args.out) else args.out
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -405,13 +583,31 @@ def main() -> int:
             "params": {"min_tip_fill": args.min_tip_fill, "win_before_s": WIN_BEFORE_S,
                        "push_vel_thresh": PUSH_VEL_THRESH, "flick_lo_s": FLICK_LO_S,
                        "jump_window_s": [JUMP_LO_S, JUMP_HI_S],
+                       "min_window_coverage": args.min_coverage,
+                       "pose_model": os.path.basename(mp),
                        # invocation default; per-shot "handedness" is authoritative
                        # (per-clip --videos-list overrides can differ from this)
                        "handedness": _norm_handed(args.handedness)},
             "n_shots": len(all_shots),
+            "rejection_census": census,
+            "rejected_tip_fills": sorted(rej_tip_fills),
+            "rejected_coverages": sorted(rej_coverages),
+            "per_video": per_video,
             "shots": all_shots,
         }, fh, indent=2)
     print(f"\nsaved {len(all_shots)} cue-labeled shots -> {out}")
+    total_anchors = sum(v["meter_shots"] for v in per_video)
+    print(f"rejection census (of {total_anchors} meter-detected shots):")
+    for k, v in census.items():
+        print(f"  {k:<20} {v}")
+    if rej_tip_fills:
+        a = np.array(rej_tip_fills)
+        print(f"  rejected tip_fill: median {np.median(a):.0f}  p25 {np.percentile(a, 25):.0f}  "
+              f"p75 {np.percentile(a, 75):.0f}  (gate {args.min_tip_fill})")
+    if rej_coverages:
+        a = np.array(rej_coverages)
+        print(f"  rejected coverage: median {np.median(a):.2f}  p25 {np.percentile(a, 25):.2f}  "
+              f"p75 {np.percentile(a, 75):.2f}  (gate {args.min_coverage})")
     if all_shots:
         summarize(all_shots)
     return 0 if all_shots else 1

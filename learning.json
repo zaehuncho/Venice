@@ -7,8 +7,8 @@
     "global_rise_velocity_pct_ms": 0.3610739895215379,
     "lead_rebaselined": false,
     "learned_latency_ms": 75,
-    "learned_phase_physical_ms": 263.99999999999994,
-    "measured_phase_physical_ms": 307.2014072267804,
+    "learned_phase_physical_ms": 295.99999999999994,
+    "measured_phase_physical_ms": 302.9150302870432,
     "per_level": {
         "HEAVY": {
             "nudge_pct": -0.24250000000000002

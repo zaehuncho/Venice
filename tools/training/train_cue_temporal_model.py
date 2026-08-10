@@ -24,8 +24,14 @@ Windows where > --max-arm-missing of frames have a zero-visibility shooting-arm 
 Split: owner-only validation at VIDEO granularity (the split_train_val.py invariant, fail
 closed: youtube/unknown-source shots can NEVER enter val; empty val aborts, do not relax).
 
-Loss = 0.6*timing_mse + 0.4*cue_ce. AdamW lr 3e-4, cosine schedule, early stop on the val
-green-window hit rate (|error| <= 30ms), patience 8.
+Loss = 0.6*timing_mse + 0.4*cue_ce. AdamW lr 3e-4, cosine schedule. Early stop + model
+selection on VAL TIMING MAE (2026-08-09 fix: the previous criterion -- val green-window hit
+rate -- selected a DEGENERATE CONSTANT predictor: ~1/3 of windows have offset 0, so constant
+"0 frames" scores ~25-30% hit rate by construction). A near-constant predictor (val pred std
+under max(5% of target std, 0.25 frames)) is REFUSED as best regardless of its metrics, and
+`green_hit_rate_offset2plus` (hit rate on windows with true offset >= 2 frames) is reported
+as the constant-predictor-immune view of the hit rate. Cue CE is class-weighted by inverse
+train frequency (--no-class-weights restores unweighted).
 
 Outputs in --out: cue_temporal_model.pt + cue_temporal_model_meta.json (the runtime feature
 contract). ONNX export is separate: tools/training/export_cue_temporal_onnx.py.
@@ -236,6 +242,17 @@ def _extract_video(path, tasks, pose, step):
     last_raw = max(raw_needed)
     cap = cv2.VideoCapture(path)
     dets = {}
+
+    def _flush(buf):
+        if not buf:
+            return
+        for (fi, _), r in zip(buf, pose.predict([f for _, f in buf], verbose=False, conf=0.10)):
+            if r.boxes is not None and len(r.boxes) and r.keypoints is not None:
+                dets[fi] = (r.boxes.xywh.cpu().numpy(),
+                            r.boxes.conf.cpu().numpy(),
+                            r.keypoints.data.cpu().numpy())
+
+    buf = []
     i = 0
     while i <= last_raw:
         if not cap.grab():
@@ -244,12 +261,12 @@ def _extract_video(path, tasks, pose, step):
             ok, fr = cap.retrieve()
             if not ok:
                 break
-            r = pose.predict(fr, verbose=False, conf=0.10)[0]
-            if r.boxes is not None and len(r.boxes) and r.keypoints is not None:
-                dets[i] = (r.boxes.xywh.cpu().numpy(),
-                           r.boxes.conf.cpu().numpy(),
-                           r.keypoints.data.cpu().numpy())
+            buf.append((i, fr))
+            if len(buf) >= 16:
+                _flush(buf)
+                buf = []
         i += 1
+    _flush(buf)
     cap.release()
 
     out = {}
@@ -341,15 +358,23 @@ def ensure_cache(shots, cache, span, pose_model_path, cache_file):
 # ==============================================================================================
 
 def build_dataset(shots, cache, window, per_shot, seed, handedness, cue_tol, max_arm_missing):
-    """Cut jittered windows from cached shot spans -> (X, y_frames, y_cls, mspf, vids, stats).
+    """Cut jittered windows from cached shot spans ->
+    (X, y_frames, y_cls, cue_mask, mspf, vids, stats).
 
     X (M, 51, window) float32 channels-first; y_frames = frames-until-release from the
     window's last frame; y_cls = CUE_CLASSES index at the last frame; mspf = ms-per-frame
     of the source clip (frames -> ms conversion is per-clip: 1000 * step / fps).
+
+    cue_mask (M,) bool: True where y_cls is real supervision. Two-tier labels
+    (2026-08-09): tier "A" shots carry ONLY the meter-anchored release -- their windows
+    train the timing head always, but contribute to the cue CE only when the window end
+    sits within cue_tol of the release (the one cue tier A actually knows). Everything
+    else would fabricate "none" negatives, so it is masked out of the CE. Tier "AB"
+    (and legacy label files without the field) supervise the cue head on every window.
     """
     rng = random.Random(seed)
     arm_v = [ARM_SHOULDER * 3 + 2, ARM_ELBOW * 3 + 2, ARM_WRIST * 3 + 2]
-    X, y_t, y_c, mspf, vids = [], [], [], [], []
+    X, y_t, y_c, y_m, mspf, vids = [], [], [], [], [], []
     stats = {"rejected_arm": 0, "rejected_short": 0, "shots_missing_cache": 0}
     max_j = max(window // 2, 1)
     for s in shots:
@@ -357,6 +382,7 @@ def build_dataset(shots, cache, window, per_shot, seed, handedness, cue_tol, max
         if ent is None:
             stats["shots_missing_cache"] += 1
             continue
+        tier = str(s.get("tier", "AB"))
         mirror = shot_handedness(s, handedness).strip().lower().startswith("l")
         feats = normalize_frames(ent["kpts"], mirror=mirror)
         rel_local = ent["rel"] - ent["start"]
@@ -390,29 +416,55 @@ def build_dataset(shots, cache, window, per_shot, seed, handedness, cue_tol, max
                 if d <= cue_tol and (best is None or (d, CUE_PRIORITY[name]) < best[:2]):
                     best = (d, CUE_PRIORITY[name], name)
             y_c.append(CUE_CLASSES.index(best[2]) if best else CUE_CLASSES.index("none"))
+            y_m.append(tier == "AB" or best is not None)
             X.append(w.T)
             y_t.append(float(off))
             mspf.append(ms_per_frame)
             vids.append(s["video"])
     if not X:
         return (np.zeros((0, INPUT_DIM, window), np.float32), np.zeros(0, np.float32),
-                np.zeros(0, np.int64), np.zeros(0, np.float32), [], stats)
+                np.zeros(0, np.int64), np.zeros(0, bool), np.zeros(0, np.float32), [], stats)
     return (np.stack(X).astype(np.float32), np.asarray(y_t, np.float32),
-            np.asarray(y_c, np.int64), np.asarray(mspf, np.float32), vids, stats)
+            np.asarray(y_c, np.int64), np.asarray(y_m, bool),
+            np.asarray(mspf, np.float32), vids, stats)
 
 
-def compute_metrics(pred_frames, true_frames, mspf, pred_cls, true_cls):
-    err_ms = (np.asarray(pred_frames) - np.asarray(true_frames)) * np.asarray(mspf)
+def compute_metrics(pred_frames, true_frames, mspf, pred_cls, true_cls, cue_mask=None):
+    pred_frames = np.asarray(pred_frames)
+    true_frames = np.asarray(true_frames)
+    err_ms = (pred_frames - true_frames) * np.asarray(mspf)
+    # cue metrics only where the class target is real supervision (two-tier masking)
+    if cue_mask is None:
+        cue_mask = np.ones(len(pred_cls), dtype=bool)
+    pc, tc = np.asarray(pred_cls)[cue_mask], np.asarray(true_cls)[cue_mask]
     f1 = {}
     for i, name in enumerate(CUE_CLASSES):
-        tp = int(np.sum((pred_cls == i) & (true_cls == i)))
-        fp = int(np.sum((pred_cls == i) & (true_cls != i)))
-        fn = int(np.sum((pred_cls != i) & (true_cls == i)))
+        tp = int(np.sum((pc == i) & (tc == i)))
+        fp = int(np.sum((pc == i) & (tc != i)))
+        fn = int(np.sum((pc != i) & (tc == i)))
         f1[name] = round(2 * tp / max(2 * tp + fp + fn, 1), 3)
+    # Constant-predictor-immune view: the offset-0 spike (~1/3 of windows) lets a constant
+    # "0 frames" output score ~30% raw hit rate; windows with true offset >= 2 frames cannot
+    # be hit that way, so this rate collapses to ~0 for any degenerate predictor.
+    nz = true_frames >= 2.0
+    hit_nz = float(np.mean(np.abs(err_ms[nz]) <= GREEN_WINDOW_MS)) if nz.any() else float("nan")
     return {"timing_mae_ms": round(float(np.mean(np.abs(err_ms))), 1),
             "green_hit_rate": round(float(np.mean(np.abs(err_ms) <= GREEN_WINDOW_MS)), 4),
+            "green_hit_rate_offset2plus": round(hit_nz, 4),
+            "pred_std_frames": round(float(np.std(pred_frames)), 3),
+            "target_std_frames": round(float(np.std(true_frames)), 3),
             "cue_f1": f1,
-            "cue_acc": round(float(np.mean(pred_cls == true_cls)), 4)}
+            "cue_acc": round(float(np.mean(pc == tc)), 4) if len(pc) else float("nan"),
+            "cue_windows": int(cue_mask.sum())}
+
+
+def is_degenerate(metrics):
+    """True when the timing head is a near-constant output (the 2026-08-09 artifact).
+
+    Guard: val prediction std under max(5% of target std, 0.25 frames). Such an epoch is
+    NEVER selectable as best no matter what its hit rate says.
+    """
+    return metrics["pred_std_frames"] < max(0.05 * metrics["target_std_frames"], 0.25)
 
 
 def predict_in_batches(model, torch, X, device, batch=256):
@@ -443,14 +495,16 @@ def main() -> int:
     ap.add_argument("--handedness", default="Right",
                     help="fallback when a shot record has no handedness field "
                          "(pre-2026-08-08 labels; the per-shot field wins when present)")
-    ap.add_argument("--pose-model", default=os.path.join("models", "orion_pose2k_n_v2.pt"))
+    ap.add_argument("--pose-model", default=os.path.join("models", "orion_pose2k_n_v3.pt"))
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--w-timing", type=float, default=0.6)
     ap.add_argument("--w-cue", type=float, default=0.4)
     ap.add_argument("--val-frac", type=float, default=0.2)
-    ap.add_argument("--patience", type=int, default=8, help="early-stop patience on val hit rate")
+    ap.add_argument("--patience", type=int, default=8, help="early-stop patience on val MAE")
+    ap.add_argument("--no-class-weights", action="store_true",
+                    help="disable inverse-frequency class weighting of the cue CE loss")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--debug", action="store_true",
                     help="DEBUG logging (per-shot handedness/player-lock fallback provenance)")
@@ -497,21 +551,22 @@ def main() -> int:
     cache = load_cache(cache_file)
     cache = ensure_cache(shots, cache, span, args.pose_model, cache_file)
 
-    Xtr, ttr, ctr, mtr, _vtr, st_tr = build_dataset(
+    Xtr, ttr, ctr, ktr, mtr, _vtr, st_tr = build_dataset(
         train_shots, cache, args.window, args.per_shot, args.seed,
         args.handedness, args.cue_tol, args.max_arm_missing)
-    Xva, tva, cva, mva, vva, st_va = build_dataset(
+    Xva, tva, cva, kva, mva, vva, st_va = build_dataset(
         val_shots, cache, args.window, args.per_shot, args.seed + 1,
         args.handedness, args.cue_tol, args.max_arm_missing)
     print(f"windows: {len(Xtr)} train / {len(Xva)} val  "
-          f"(rejected arm-occluded {st_tr['rejected_arm'] + st_va['rejected_arm']}, "
+          f"(cue-supervised {int(ktr.sum())} / {int(kva.sum())}; "
+          f"rejected arm-occluded {st_tr['rejected_arm'] + st_va['rejected_arm']}, "
           f"too-early {st_tr['rejected_short'] + st_va['rejected_short']}, "
           f"missing-cache shots {st_tr['shots_missing_cache'] + st_va['shots_missing_cache']})")
     if not len(Xtr) or not len(Xva):
         print("ERROR: empty train or val window set after rejection -- nothing to train on")
         return 1
-    counts = {CUE_CLASSES[i]: int(np.sum(ctr == i)) for i in range(len(CUE_CLASSES))}
-    print(f"train cue classes: {counts}")
+    counts = {CUE_CLASSES[i]: int(np.sum(ctr[ktr] == i)) for i in range(len(CUE_CLASSES))}
+    print(f"train cue classes (masked-in windows only): {counts}")
 
     # ---- model + optimization -----------------------------------------------------------------
     device = torch.device("cuda")
@@ -522,7 +577,17 @@ def main() -> int:
           f"dilations={list(DEFAULT_DILATIONS)}, dropout={DEFAULT_DROPOUT})")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    ce = tnn.CrossEntropyLoss()
+    if args.no_class_weights:
+        ce = tnn.CrossEntropyLoss()
+    else:
+        # inverse-frequency weights, normalized to mean 1 so the 0.6/0.4 loss split holds;
+        # capped at 10x mean so a near-empty class cannot dominate/destabilize the CE
+        freq = np.array([max(counts[c], 1) for c in CUE_CLASSES], dtype=np.float64)
+        w = (1.0 / freq)
+        w = np.minimum(w / w.mean(), 10.0)
+        w = w / w.mean()
+        print(f"cue class weights: {dict(zip(CUE_CLASSES, [round(float(x), 2) for x in w]))}")
+        ce = tnn.CrossEntropyLoss(weight=torch.tensor(w, dtype=torch.float32, device=device))
     mse = tnn.MSELoss()
 
     pt_path = os.path.join(out_dir, "cue_temporal_model.pt")
@@ -532,7 +597,7 @@ def main() -> int:
                   cue_tol=args.cue_tol, handedness=args.handedness,
                   max_arm_missing=args.max_arm_missing)
 
-    best = {"green_hit_rate": -1.0}
+    best = {"timing_mae_ms": float("inf"), "green_hit_rate": -1.0}
     best_epoch = -1
     stale = 0
     n = len(Xtr)
@@ -547,25 +612,32 @@ def main() -> int:
             xb = torch.from_numpy(Xtr[idx]).to(device)
             tb = torch.from_numpy(ttr[idx]).to(device)
             cb = torch.from_numpy(ctr[idx]).to(device)
+            kb = torch.from_numpy(ktr[idx]).to(device)
             pred_t, logits = model(xb)
-            # timing MSE in window-normalized units so 0.6/0.4 weighting is meaningful vs CE
-            loss = (args.w_timing * mse(pred_t / args.window, tb / args.window)
-                    + args.w_cue * ce(logits, cb))
+            # timing MSE in window-normalized units so 0.6/0.4 weighting is meaningful vs CE;
+            # cue CE only where the class target is real supervision (two-tier mask)
+            loss = args.w_timing * mse(pred_t / args.window, tb / args.window)
+            if bool(kb.any()):
+                loss = loss + args.w_cue * ce(logits[kb], cb[kb])
             opt.zero_grad()
             loss.backward()
             opt.step()
-            ep_loss += float(loss) * len(idx)
+            ep_loss += float(loss.detach()) * len(idx)
         sched.step()
 
         model.eval()
         pt, pc = predict_in_batches(model, torch, Xva, device)
-        m = compute_metrics(pt, tva, mva, pc, cva)
-        improved = m["green_hit_rate"] > best["green_hit_rate"] or (
-            m["green_hit_rate"] == best["green_hit_rate"]
-            and m["timing_mae_ms"] < best.get("timing_mae_ms", 1e9))
+        m = compute_metrics(pt, tva, mva, pc, cva, kva)
+        degen = is_degenerate(m)
+        # Selection = val timing MAE; a near-constant predictor is NEVER selectable (the
+        # 2026-08-09 artifact: hit-rate selection chose a constant "0 frames" output).
+        improved = (not degen) and m["timing_mae_ms"] < best["timing_mae_ms"]
+        hit_nz = m["green_hit_rate_offset2plus"]
         print(f"epoch {epoch + 1:3d}/{args.epochs}  loss {ep_loss / n:.4f}  "
               f"val MAE {m['timing_mae_ms']:6.1f}ms  hit {100 * m['green_hit_rate']:5.1f}%  "
-              f"cue-acc {100 * m['cue_acc']:5.1f}%  {'*' if improved else ''}")
+              f"hit(off>=2) {100 * hit_nz:5.1f}%  pred-std {m['pred_std_frames']:5.2f}f  "
+              f"cue-acc {100 * m['cue_acc']:5.1f}%  "
+              f"{'DEGENERATE' if degen else ''}{'*' if improved else ''}")
         if improved:
             best = m
             best_epoch = epoch + 1
@@ -575,8 +647,13 @@ def main() -> int:
         else:
             stale += 1
             if stale >= args.patience:
-                print(f"early stop: no val green-window improvement in {args.patience} epochs")
+                print(f"early stop: no val MAE improvement in {args.patience} epochs")
                 break
+
+    if best_epoch < 0:
+        print("\nERROR: every epoch was DEGENERATE (near-constant timing head) -- "
+              "no checkpoint saved; do not ship anything from this run")
+        return 1
 
     # ---- meta (the runtime contract) ----------------------------------------------------------
     meta = {
@@ -597,7 +674,10 @@ def main() -> int:
                      "max_arm_missing": args.max_arm_missing, "epochs_max": args.epochs,
                      "best_epoch": best_epoch, "lr": args.lr, "batch": args.batch,
                      "loss": f"{args.w_timing}*timing_mse + {args.w_cue}*cue_ce",
+                     "class_weighted_ce": not args.no_class_weights,
+                     "selection": "val timing MAE, degenerate (near-constant) epochs refused",
                      "train_windows": int(len(Xtr)), "val_windows": int(len(Xva)),
+                     "train_cue_counts": counts,
                      "wall_clock_s": round(time.time() - t0, 1)},
         "metrics_val_best": best,
     }

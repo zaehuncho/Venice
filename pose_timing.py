@@ -173,20 +173,53 @@ class PoseTimingDetector:
                  player_model_path: str = "models/orion_player_detect_v9.pt",
                  pose_conf: float = 0.10,
                  handedness: str = "Right",
-                 on_landmark: Optional[Callable[[PoseLandmark], None]] = None):
+                 on_landmark: Optional[Callable[[PoseLandmark], None]] = None,
+                 pose_backend: Optional[str] = None,
+                 pose_onnx_path: Optional[str] = None):
         self.pose_conf = pose_conf
         self.on_landmark = on_landmark
         # Shooting wrist: right-handed shooters release off the RIGHT wrist (kp 10), lefties the
         # LEFT (kp 9). We prefer that wrist's trajectory; fall back to the other only if occluded.
         self._shooting_wrist = KP_WRIST_L if str(handedness).strip().lower().startswith("l") else KP_WRIST_R
 
-        # Load pose model
+        # Load pose model (ultralytics .pt). Always loaded: it serves the full-frame
+        # fallback paths + StaminaTracker even when the ONNX ROI backend is active,
+        # and it IS the ROI path when the ONNX backend is unavailable.
         from ultralytics import YOLO
         if os.path.exists(pose_model_path):
             self.pose = YOLO(pose_model_path)
         else:
             logger.warning("Pose model %s not found, falling back to yolov8n-pose.pt", pose_model_path)
             self.pose = YOLO("yolov8n-pose.pt")
+
+        # ROI-crop pose backend: onnxruntime CUDA on the v3 export (~3 ms/call vs ~17 ms
+        # through the ultralytics wrapper). CUDA-only — pose_onnx refuses to run on CPU
+        # (fails -> we keep the ultralytics path and say so). Parity vs the .pt verified
+        # by tools/diagnostics/pose_onnx_parity.py on live framedump crops.
+        # Select with ORION_POSE_BACKEND=onnx|ultralytics (default onnx).
+        self.pose_roi = self.pose
+        backend = (pose_backend or os.environ.get("ORION_POSE_BACKEND", "onnx")).strip().lower()
+        if backend == "onnx":
+            try:
+                from pose_onnx import OnnxPoseModel
+                onnx_path = pose_onnx_path or os.environ.get("ORION_POSE_ONNX") or None
+                self.pose_roi = OnnxPoseModel(onnx_path)
+                logger.warning(
+                    "POSE BACKEND ACTIVE: %s median=%.2fms p90=%.2fms per ROI call "
+                    "(ultralytics %s stays loaded for full-frame/stamina fallbacks)",
+                    self.pose_roi.describe(), self.pose_roi.latency_ms_median,
+                    self.pose_roi.latency_ms_p90, pose_model_path)
+            except Exception as e:
+                self.pose_roi = self.pose
+                logger.warning(
+                    "POSE BACKEND ACTIVE: ultralytics %s for ALL pose calls "
+                    "(onnx backend unavailable: %s) median=%.2fms per ROI call",
+                    pose_model_path, e, self._measure_ultralytics_roi_ms())
+        else:
+            logger.warning(
+                "POSE BACKEND ACTIVE: ultralytics %s for ALL pose calls "
+                "(backend=%s requested) median=%.2fms per ROI call",
+                pose_model_path, backend, self._measure_ultralytics_roi_ms())
 
         # Load optional v9 player detection model (Player + Stamina + Basketball)
         self.player_det = None
@@ -349,6 +382,23 @@ class PoseTimingDetector:
         # Camera-anchor lock: make the under-player marker + camera-center-bottom prior dominate
         # (vs flaky ball/hint/highest-wrist). Default OFF for clean A/B; ON in the launcher + eval.
         self._camera_anchor = os.environ.get("ORION_POSE_CAMERA_ANCHOR", "0") != "0"
+
+    def _measure_ultralytics_roi_ms(self) -> float:
+        """Measure the ultralytics ROI-crop call once at init so a live session's log
+        carries the actual per-call cost of the active pose path (audit requirement)."""
+        try:
+            dummy = np.random.randint(0, 255, (300, 260, 3), dtype=np.uint8)
+            for _ in range(3):
+                self.pose.predict(dummy, verbose=False, conf=self.pose_conf)
+            times = []
+            for _ in range(7):
+                t0 = time.perf_counter()
+                self.pose.predict(dummy, verbose=False, conf=self.pose_conf)
+                times.append((time.perf_counter() - t0) * 1000.0)
+            times.sort()
+            return times[len(times) // 2]
+        except Exception:
+            return float("nan")
 
     def _append(self, wrist_y, hip_y, knee_y, frame_seq, t):
         i = self._buf_idx
@@ -990,7 +1040,7 @@ class PoseTimingDetector:
             crop = frame[py1:py2, px1:px2]
             if crop.shape[0] >= 16 and crop.shape[1] >= 16:
                 try:
-                    r = self.pose.predict(crop, verbose=False, conf=self.pose_conf)[0]
+                    r = self.pose_roi.predict(crop, verbose=False, conf=self.pose_conf)[0]
                     if r.boxes is not None and len(r.boxes) > 0:
                         if len(r.boxes) > 1:
                             areas = (r.boxes.xyxy.cpu().numpy()[:, 2] - r.boxes.xyxy.cpu().numpy()[:, 0]) * \
@@ -1018,7 +1068,7 @@ class PoseTimingDetector:
                     crop = frame[py1:py2, px1:px2]
                     if crop.shape[0] >= 16 and crop.shape[1] >= 16:
                         try:
-                            r = self.pose.predict(crop, verbose=False, conf=self.pose_conf)[0]
+                            r = self.pose_roi.predict(crop, verbose=False, conf=self.pose_conf)[0]
                             if r.boxes is not None and len(r.boxes):
                                 xyxy_crop = r.boxes.xyxy.cpu().numpy()
                                 # Pick person closest to tracker predicted center
@@ -1066,7 +1116,7 @@ class PoseTimingDetector:
                 # tracker prediction) can yield a 1px-thin slice that passes size>0 but crashes
                 # cv2.resize inside pose.predict. Skip it -> the full-frame fallback handles it.
                 if crop.shape[0] >= 16 and crop.shape[1] >= 16:
-                    r = self.pose.predict(crop, verbose=False, conf=self.pose_conf)[0]
+                    r = self.pose_roi.predict(crop, verbose=False, conf=self.pose_conf)[0]
                     if r.boxes is not None and len(r.boxes):
                         # Pick the largest person in the crop (most likely our player)
                         if len(r.boxes) > 1:
@@ -1107,7 +1157,7 @@ class PoseTimingDetector:
                 # tracker prediction) can yield a 1px-thin slice that passes size>0 but crashes
                 # cv2.resize inside pose.predict. Skip it -> the full-frame fallback handles it.
                 if crop.shape[0] >= 16 and crop.shape[1] >= 16:
-                    r = self.pose.predict(crop, verbose=False, conf=self.pose_conf)[0]
+                    r = self.pose_roi.predict(crop, verbose=False, conf=self.pose_conf)[0]
                     if r.boxes is not None and len(r.boxes):
                         if len(r.boxes) > 1:
                             areas = (r.boxes.xyxy.cpu().numpy()[:, 2] - r.boxes.xyxy.cpu().numpy()[:, 0]) * \
@@ -1667,7 +1717,7 @@ class PoseTimingDetector:
                     crop = frame[py1:py2, px1:px2]
                     if crop.shape[0] < 16 or crop.shape[1] < 16:
                         continue
-                    rp = self.pose.predict(crop, verbose=False, conf=self.pose_conf)[0]
+                    rp = self.pose_roi.predict(crop, verbose=False, conf=self.pose_conf)[0]
                     if rp.boxes is None or len(rp.boxes) == 0:
                         continue
                     # Pick largest person in crop

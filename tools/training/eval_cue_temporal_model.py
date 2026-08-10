@@ -91,7 +91,7 @@ def main() -> int:
     if not val_shots:
         print("ERROR: val split is empty")
         return 1
-    Xva, tva, cva, mva, vva, stats = build_dataset(
+    Xva, tva, cva, kva, mva, vva, stats = build_dataset(
         val_shots, cache, cfg["window"], cfg["per_shot"], cfg["seed"] + 1,
         cfg["handedness"], cfg["cue_tol"], cfg["max_arm_missing"])
     if not len(Xva):
@@ -105,27 +105,45 @@ def main() -> int:
     model.eval()
 
     pt, pc = predict_in_batches(model, torch, Xva, device, batch=args.batch)
-    m = compute_metrics(pt, tva, mva, pc, cva)
+    m = compute_metrics(pt, tva, mva, pc, cva, kva)
 
     print(f"checkpoint: {ckpt_path} (best epoch {ckpt.get('epoch', '?')})")
     print(f"val: {len(Xva)} windows from {len(set(vva))} clips / {len(val_shots)} shots  "
           f"(rejects: {stats})")
     print(f"\ntiming MAE: {m['timing_mae_ms']} ms")
     print(f"green-window hit rate (+-30ms): {100 * m['green_hit_rate']:.1f}%")
+    print(f"  offset>=2-frame windows only (constant-predictor-immune): "
+          f"{100 * m['green_hit_rate_offset2plus']:.1f}%")
+    print(f"  pred std {m['pred_std_frames']} frames vs target std {m['target_std_frames']} "
+          f"(near-zero pred std = degenerate constant output)")
     print(f"cue accuracy: {100 * m['cue_acc']:.1f}%")
     print("\ncue F1 per class:")
     for name in CUE_CLASSES:
         print(f"  {name:<10} {m['cue_f1'][name]:.3f}")
 
-    # ---- confusion matrix ---------------------------------------------------------------------
+    # ---- confusion matrix (cue-supervised windows only; tier-A rows are masked) ---------------
     ncls = len(CUE_CLASSES)
     conf = np.zeros((ncls, ncls), dtype=int)
-    for t, p in zip(cva, pc):
+    for t, p in zip(cva[kva], pc[kva]):
         conf[t, p] += 1
     hdr = " ".join(f"{n[:6]:>7}" for n in CUE_CLASSES)
     print(f"\nconfusion (rows=true, cols=pred):\n{'':<11}{hdr}")
     for i, name in enumerate(CUE_CLASSES):
         print(f"{name:<11}" + " ".join(f"{conf[i, j]:>7}" for j in range(ncls)))
+
+    # ---- horizon-stratified timing (the bot acts in the short-horizon band) -------------------
+    err_all = (pt - tva) * mva
+    true_ms = tva * mva
+    print(f"\n{'true offset band':<18} {'n':>6} {'MAE ms':>8} {'hit%':>6}")
+    print("-" * 42)
+    for lo, hi in ((0, 50), (50, 150), (150, 300), (300, 1e9)):
+        sel = (true_ms >= lo) & (true_ms < hi)
+        if not sel.any():
+            continue
+        mae_b = float(np.mean(np.abs(err_all[sel])))
+        hit_b = 100.0 * float(np.mean(np.abs(err_all[sel]) <= 30.0))
+        label = f"{int(lo)}-{'inf' if hi > 1e8 else int(hi)}ms"
+        print(f"{label:<18} {int(sel.sum()):>6} {mae_b:>8.1f} {hit_b:>6.1f}")
 
     # ---- per-clip breakdown -------------------------------------------------------------------
     err_ms = (pt - tva) * mva
@@ -136,7 +154,8 @@ def main() -> int:
         sel = vids == vid
         mae = float(np.mean(np.abs(err_ms[sel])))
         hit = 100.0 * float(np.mean(np.abs(err_ms[sel]) <= 30.0))
-        acc = 100.0 * float(np.mean(pc[sel] == cva[sel]))
+        selk = sel & kva
+        acc = 100.0 * float(np.mean(pc[selk] == cva[selk])) if selk.any() else float("nan")
         print(f"{vid[:42]:<42} {int(sel.sum()):>5} {mae:>8.1f} {hit:>6.1f} {acc:>9.1f}")
     return 0
 
