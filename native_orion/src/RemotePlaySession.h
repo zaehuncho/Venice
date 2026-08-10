@@ -461,6 +461,14 @@ private:
     // never throttled). Keeps a noisy warning from flooding orion_native.log.
     qint64 lastSidecarWarnLogMs_ = 0;
     static constexpr qint64 kSidecarWarnThrottleMs = 1000;
+    // [ORION_AUTHORITY_DEATH 2026-08-10] The raw revocation lines are precise but
+    // unreadable to a customer ("actual route is not configured DirectShow index 0").
+    // The revocation is one-way for the sidecar's life (see remote_play_orchestrator
+    // _guard_capture_latency_route: the already_revoked branch never re-tests the
+    // route, and the empty scope independently fails the authority check), so the bot
+    // is dead until a full restart and nothing else says so. Announce the consequence
+    // and the remedy in plain language, exactly once per session so it cannot flood.
+    bool authorityDeathAnnounced_ = false;
     // Last N sidecar stderr lines; dumped (bypassing the WARNING throttle) when the
     // sidecar process exits so the final traceback is never silently lost (T5).
     QStringList sidecarStderrTail_;

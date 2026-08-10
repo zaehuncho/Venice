@@ -2093,6 +2093,9 @@ void RemotePlaySession::startSidecar()
     shmFallbackRequested_ = false;
     jpegFallbackFirstFrameNumber_ = 0;
     sidecarStderrTail_.clear();
+    // [ORION_AUTHORITY_DEATH 2026-08-10] The revocation it announces is scoped to the sidecar
+    // process, so a brand-new sidecar has earned a fresh announcement.
+    authorityDeathAnnounced_ = false;
     // FIX 1: a brand-new sidecar has no promotion in flight. Bumping the generation invalidates any
     // deferred fallback/deadline timer still armed from a previous session so it cannot act here.
     ++streamPromoteGeneration_;
@@ -2669,6 +2672,18 @@ void RemotePlaySession::onSidecarStderr()
             || trimmed.contains("capture_route_mismatch");
         if (isError || isReleaseMarkerInfo || isProbeDiagnostic || isAuthorityDeath) {
             emit setupMessage(QStringLiteral("Sidecar: %1").arg(QString::fromUtf8(trimmed.left(300))));
+            // [ORION_AUTHORITY_DEATH 2026-08-10] The cause line above survives the throttle but
+            // reads as one more diagnostic. State the consequence in the customer's terms: from
+            // here on every press falls through and only a restart recovers. Emitted AFTER the
+            // cause so the log keeps "what happened" then "what it means"; once per session.
+            if (isAuthorityDeath && !authorityDeathAnnounced_) {
+                authorityDeathAnnounced_ = true;
+                emit setupMessage(QStringLiteral(
+                    "TIMING DISABLED — the capture card changed route mid-session, so shot timing "
+                    "cannot be trusted and the bot will stop firing. Close Venice and reopen it to "
+                    "recover. If it repeats, close anything else using the capture card (OBS, "
+                    "Camera, a browser tab) before reconnecting."));
+            }
         } else if (isWarning) {
             const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
             if (nowMs - lastSidecarWarnLogMs_ >= kSidecarWarnThrottleMs) {
