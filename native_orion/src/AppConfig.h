@@ -638,12 +638,31 @@ struct AppConfigData {
     // delay 0): Standstill n=19 median 657, No Dip n=3 median 446, Right Fade n=2 median 891,
     // Left Fade n=1 median 1047; Go-To unmeasured (placeholder from its long wind-up). The
     // learner overwrites these on each accepted observation (windowed median, last ~100).
+    // [ORION_PRESS_PRIOR_REFRESH 2026-08-10] Re-seeded from 128 delay-0 PRESS-TIP
+    // OBSERVATIONs in the production log (medians; applied_delay_ms==0 only, so the
+    // "delay stripped" definition above still holds). The 2026-08-08 seeds came from
+    // n=19/3/2/1 and two of them were badly wrong:
+    //
+    //   shot          n   measured median   old prior   delta
+    //   Standstill   75             662.7       660.0      +3   <- old seed was excellent
+    //   Right Fade   22             911.2       890.0     +21
+    //   Left Fade    21             870.8      1050.0    -179   <- old seed was n=1
+    //   Go-To        10            1928.4      1000.0    +928   <- old seed was a guess
+    //   No Dip        0                 -       450.0       -   <- no new data, left alone
+    //
+    // Go-To's real wind-up is nearly 2s, not 1s. Its bootstrap exclusion above is
+    // DELIBERATELY LEFT IN PLACE: n=10 is thin and un-excluding it would change shot-path
+    // behaviour in the delay-starved regime. Revisit once the learner has real weight.
+    //
+    // KEY NAMING TRAP: this map uses SPACES ("Left Fade"), while the log's shot_type field
+    // uses UNDERSCORES ("Left_Fade"). Same shot types, different convention per subsystem —
+    // any lookup built from log text must translate or it silently misses every entry.
     QMap<QString, double> pressAnchoredTipMs {
-        {QStringLiteral("Standstill"), 660.0},
-        {QStringLiteral("Left Fade"), 1050.0},
-        {QStringLiteral("Right Fade"), 890.0},
+        {QStringLiteral("Standstill"), 663.0},
+        {QStringLiteral("Left Fade"), 871.0},
+        {QStringLiteral("Right Fade"), 911.0},
         {QStringLiteral("No Dip"), 450.0},
-        {QStringLiteral("Go-To"), 1000.0},
+        {QStringLiteral("Go-To"), 1928.0},
     };
     // Per-type sigma (ms; windowed-MAD-derived, honest fusion weight). Absent type -> the
     // engine's wide factory sigma (60ms) so a young learner is weighted low, never trusted.
