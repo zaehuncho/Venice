@@ -4870,7 +4870,19 @@ class RemotePlayOrchestrator:
                                 _sy(_snap_y_plane)
                             except Exception:
                                 pass
-                        result = self._meter_detector.detect(frame, ts=_frame_wall_ms / 1000.0)
+                        # [ORION_EPOCH_TS_GUARD 2026-08-11] _frame_measurement_epoch_ms() returns a
+                        # FAIL-CLOSED 0.0 when the source epoch is missing/non-finite/<=0. Passing
+                        # that straight through is a trap: `0.0 is not None`, so the reader does NOT
+                        # fall back to perf_counter() and the literal 0.0 enters the velocity clock.
+                        # A _vel_hist window mixing 0.0 with real epoch-seconds (~1.7e9) produces a
+                        # garbage least-squares slope; an all-0.0 window pins velocity to 0. That
+                        # drives eta_ms/rise_state and gates the CV self-arm. Hand the reader None so
+                        # its own perf_counter() fallback runs. Steady-state capture-card frames
+                        # carry a real epoch, so the shipping path is byte-identical -- this only
+                        # bites at session start and on degraded frames.
+                        _detect_ts = ((_frame_wall_ms / 1000.0)
+                                      if _frame_wall_ms > 0.0 else None)
+                        result = self._meter_detector.detect(frame, ts=_detect_ts)
                         # Publish the reader's stage for the sidecar payload (coast vs fresh read).
                         try:
                             self._last_meter_stage = str((getattr(self._meter_detector, 'last_debug', None)
