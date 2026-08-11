@@ -829,7 +829,27 @@ class RemotePlayOrchestrator:
         # the first runtime-route mismatch.  Cold live learning may continue.
         self._capture_warm_cache_expected_index = 0
         self._capture_warm_cache_verified = False
+        # [ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47. These two used to be ONE flag, and
+        # conflating them bricked the bot for a whole session.
+        #
+        # `_capture_warm_cache_revoked` is POISONING: once OpenCV has been observed resolving a
+        # route other than the configured one, the PERSISTED posterior -- which is keyed by native
+        # DirectShow inventory, not by what OpenCV actually delivered -- can never be trusted again
+        # in this process. That is correctly permanent and still gates `restore_cache`.
+        #
+        # `_capture_route_currently_invalid` is "the route is wrong RIGHT NOW". It must be
+        # RETRYABLE, because a transient DSHOW->MSMF fallback is a DOCUMENTED, INTENDED recovery on
+        # the shipping HD60X (capture_card_backend.py ~:514 "on some cards (HD60X) DSHOW is the one
+        # that wedges... MSMF rides through it"). Treating that blip as permanent meant the stall
+        # recovery ARMED the brick: every consumer pinned to generation 0 for the rest of the
+        # process, so the C++ brain rejected measured latency and fell back to its ~13 ms model
+        # against 40-100 ms of real loop. Only a full restart recovered.
+        #
+        # Recovery is deliberately COLD, never warm: on return to the exact configured
+        # DSHOW/index/mode/geometry we re-key to a real scope with restore_cache=False, so the
+        # process re-earns attestation from fresh evidence and never reloads the poisoned cache.
         self._capture_warm_cache_revoked = False
+        self._capture_route_currently_invalid = False
         self._capture_latency_active_route = None
         self._capture_latency_route_lock = threading.Lock()
         # One-way for this sidecar process.  Any missing/mismatched decoder
@@ -1952,12 +1972,21 @@ class RemotePlayOrchestrator:
         with lock:
             source = str(getattr(
                 self.config, 'frame_source', '') or '').strip().lower()
-            capture_revoked = bool(getattr(
-                self, '_capture_warm_cache_revoked', False))
+            capture_poisoned = bool(
+                source in ('capture_card', 'capturecard', 'card')
+                and getattr(self, '_capture_warm_cache_revoked', False))
             decoder_revoked = bool(getattr(
                 self, '_decoder_warm_cache_revoked', False))
-            new_scope = ('' if ((source in ('capture_card', 'capturecard', 'card')
-                                 and capture_revoked)
+            # [ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47. Capture poisoning no longer blanks the
+            # scope (see _replace_latency_authority) -- blanking it would re-pin generation 0 via
+            # the `not scope` snapshot test and undo the recovery path. It must still forbid
+            # RESTORE, and that is NOT automatic here: try_load defaults restore_cache=True, so the
+            # flag has to be passed explicitly below or a poisoned route would reload the very
+            # posterior we stopped trusting.
+            capture_invalid_now = bool(
+                source in ('capture_card', 'capturecard', 'card')
+                and getattr(self, '_capture_route_currently_invalid', False))
+            new_scope = ('' if (capture_invalid_now
                                 or (source == 'decoder' and decoder_revoked))
                          else _latency_route_scope(self.config))
             old_scope = str(getattr(self, '_latency_route_scope_value', '') or '')
@@ -1972,7 +2001,9 @@ class RemotePlayOrchestrator:
             replacement = None
             try:
                 from latency_estimator import try_load as _load_latency
-                replacement = _load_latency(route_scope=new_scope)
+                replacement = _load_latency(
+                    route_scope=new_scope,
+                    restore_cache=not capture_poisoned)
             except Exception as exc:
                 logger.warning('Latency route re-key failed closed: %s', exc)
             self._latency_estimator = replacement
@@ -2005,8 +2036,11 @@ class RemotePlayOrchestrator:
             source = str(getattr(
                 self.config, 'frame_source', '') or '').strip().lower()
             capture_source = source in ('capture_card', 'capturecard', 'card')
+            # [ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47: gate on "the route is wrong NOW", not on
+            # the permanent poisoning flag. `_capture_warm_cache_verified` still fences this on a
+            # real stamped frame, so recovery cannot attest on backend properties alone.
             if (capture_source and (bool(getattr(
-                    self, '_capture_warm_cache_revoked', False)) or not bool(getattr(
+                    self, '_capture_route_currently_invalid', False)) or not bool(getattr(
                     self, '_capture_warm_cache_verified', False)))):
                 return False
             if (source == 'decoder' and bool(getattr(
@@ -2045,7 +2079,7 @@ class RemotePlayOrchestrator:
                     self.config, 'frame_source', '') or '').strip().lower()
                 capture_source = source in ('capture_card', 'capturecard', 'card')
                 if ((capture_source and (bool(getattr(
-                        self, '_capture_warm_cache_revoked', False)) or not bool(getattr(
+                        self, '_capture_route_currently_invalid', False)) or not bool(getattr(
                         self, '_capture_warm_cache_verified', False))))
                         or (source == 'decoder' and bool(getattr(
                             self, '_decoder_warm_cache_revoked', False)))):
@@ -2120,7 +2154,7 @@ class RemotePlayOrchestrator:
                 self.config, 'frame_source', '') or '').strip().lower()
             capture_source = source in ('capture_card', 'capturecard', 'card')
             if ((capture_source and (bool(getattr(
-                    self, '_capture_warm_cache_revoked', False)) or not bool(getattr(
+                    self, '_capture_route_currently_invalid', False)) or not bool(getattr(
                     self, '_capture_warm_cache_verified', False))))
                     or (source == 'decoder' and bool(getattr(
                         self, '_decoder_warm_cache_revoked', False)))):
@@ -2863,10 +2897,28 @@ class RemotePlayOrchestrator:
         config = getattr(self, 'config', None)
         source = str(getattr(
             config, 'frame_source', '') or '').strip().lower()
-        if ((source in ('capture_card', 'capturecard', 'card')
-             and bool(getattr(self, '_capture_warm_cache_revoked', False)))
-                or (source == 'decoder'
-                    and bool(getattr(self, '_decoder_warm_cache_revoked', False)))):
+        # [ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47. Capture poisoning used to blank the scope
+        # here. That is what made the fix at the guard insufficient on its own: an empty scope
+        # yields `_default_cache_path('') is None` (no persistence, no restore) AND trips the
+        # `not scope` test in latency_estimator_attestation_snapshot, which pins generation 0
+        # forever. So blanking the scope was itself a second, independent brick.
+        #
+        # Poisoning now gates only RESTORE. A scoped estimator with restore_cache=False is exactly
+        # the state we want after recovery: it has a real identity (so it can attest and later
+        # persist freshly-earned controlled evidence) but it never reloads the posterior we stopped
+        # trusting. Decoder revocation keeps its original blank-the-scope semantics untouched --
+        # that path removes restore AND persistence by design.
+        if source in ('capture_card', 'capturecard', 'card'):
+            if bool(getattr(self, '_capture_warm_cache_revoked', False)):
+                restore_cache = False
+            if bool(getattr(self, '_capture_route_currently_invalid', False)):
+                # While the route is ACTIVELY wrong, stay unscoped exactly as before: an empty
+                # scope yields no cache path, so a bad route can neither persist into nor attest
+                # against the configured route's identity. Revocation still cannot be laundered by
+                # calling a different re-key path. This lifts only once `matches` is true again.
+                effective_scope = ''
+        if (source == 'decoder'
+                and bool(getattr(self, '_decoder_warm_cache_revoked', False))):
             effective_scope = ''
         replacement = None
         try:
@@ -3068,27 +3120,36 @@ class RemotePlayOrchestrator:
                        and bool(actual_mode) and geometry_matches)
             prior_route = getattr(self, '_capture_latency_active_route', None)
             route_changed = prior_route is not None and actual_route != prior_route
-            already_revoked = bool(getattr(
+            already_poisoned = bool(getattr(
                 self, '_capture_warm_cache_revoked', False))
 
-            if already_revoked:
-                # The persisted route can never return this process.  Fresh
-                # online evidence is still unscoped, so replace all authority on
-                # every later API/index/mode transition before that route's first
-                # pixels can enter detection.
-                if route_changed or mode_changed:
-                    if mode_changed:
-                        self.config.capture_mode = actual_mode
-                    self._replace_latency_authority(
-                        '', 'capture_revoked_route_transition',
-                        fence_frames=True)
-                    logger.warning(
-                        'Capture-card timing reset for live route transition to %s index %d',
-                        actual_api or 'UNVERIFIED', actual_index)
-                self._capture_latency_active_route = actual_route
-                return False
-
+            # [ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47. There used to be an unconditional
+            # `if already_revoked: ... return False` here, so once the flag was set the `matches`
+            # test below was DEAD CODE and the only `return True` in this function was
+            # unreachable for the life of the process. A documented, intended DSHOW->MSMF stall
+            # recovery on the HD60X therefore permanently disabled measured-latency timing.
+            #
+            # Poisoning is still honoured -- it forbids reloading the persisted posterior (see
+            # _replace_latency_authority) -- but it no longer decides whether the CURRENT route is
+            # usable. That question is re-answered from `matches` on every call, so a route that
+            # comes back to the exact configured DSHOW/index/mode/geometry re-earns COLD authority
+            # in-process, with no restart.
             if matches:
+                recovered = bool(getattr(
+                    self, '_capture_route_currently_invalid', False))
+                self._capture_route_currently_invalid = False
+                if recovered and not (mode_changed or route_changed):
+                    # The route healed without tripping either transition branch below (same
+                    # api/index/mode as the last good observation). Nothing else would re-key the
+                    # authority, so do it here or the session stays pinned at generation 0.
+                    self._replace_latency_authority(
+                        _latency_route_scope(self.config),
+                        'capture_route_recovered_cold', fence_frames=True)
+                    self._capture_warm_cache_verified = False
+                    logger.warning(
+                        'Capture-card route recovered to configured DirectShow index %d; '
+                        're-earning COLD timing authority (persisted posterior stays revoked)',
+                        expected)
                 if mode_changed:
                     self.config.capture_mode = actual_mode
                     new_scope = _latency_route_scope(self.config)
@@ -3127,20 +3188,37 @@ class RemotePlayOrchestrator:
             # generation fence, even when no warm estimator happened to load.
             # Publish revocation before waiting for the latency lock so a
             # concurrent controller attestation cannot re-key back to a scope.
+            #
+            # [ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47: two flags now. Poisoning
+            # (`_capture_warm_cache_revoked`) stays one-way and permanently forbids reloading the
+            # persisted posterior. Suppression (`_capture_route_currently_invalid`) is re-evaluated
+            # from `matches` on every call, so it lifts when the card returns to the configured
+            # route. Set the suppression flag BEFORE taking the latency lock, for the same
+            # published-before-waiting reason as the line above.
+            # IDEMPOTENCE (load-bearing): this guard runs per frame. The old code relied on the
+            # unconditional early-out above to avoid re-entering here on a route that is simply
+            # STILL wrong. With the early-out gone, only an actual CHANGE may replace the authority
+            # -- otherwise a persistently bad route would swap the estimator and fence the detector
+            # on every single frame, and `test_capture_frame_msmf_fallback_revokes_warm_estimator
+            # _before_return` (which pins that the cold estimator survives a repeat call) would be
+            # right to fail.
+            newly_revoked = not already_poisoned
+            self._capture_route_currently_invalid = True
             self._capture_warm_cache_revoked = True
             self._capture_warm_cache_verified = False
             if mode_changed:
                 self.config.capture_mode = actual_mode
-            self._replace_latency_authority(
-                '', 'capture_route_mismatch', fence_frames=True)
+            if newly_revoked or route_changed or mode_changed:
+                self._replace_latency_authority(
+                    '', 'capture_route_mismatch', fence_frames=True)
+                logger.warning(
+                    'Capture-card warm timing revoked: actual route is not configured '
+                    'DirectShow index %d (actual_api=%s actual_index=%d mode=%s); '
+                    'continuing with cold live calibration',
+                    expected, actual_api or 'UNVERIFIED', actual_index,
+                    actual_mode or ('UNVERIFIED/' + geometry_reason
+                                    if geometry_reason else 'UNVERIFIED'))
             self._capture_latency_active_route = actual_route
-            logger.warning(
-                'Capture-card warm timing revoked: actual route is not configured '
-                'DirectShow index %d (actual_api=%s actual_index=%d mode=%s); '
-                'continuing with cold live calibration',
-                expected, actual_api or 'UNVERIFIED', actual_index,
-                actual_mode or ('UNVERIFIED/' + geometry_reason
-                                if geometry_reason else 'UNVERIFIED'))
             return False
 
     def latency_estimator_snapshot(self):
@@ -3199,7 +3277,7 @@ class RemotePlayOrchestrator:
                 self.config, 'frame_source', '') or '').strip().lower()
             capture_invalid = bool(
                 source in ('capture_card', 'capturecard', 'card')
-                and (bool(getattr(self, '_capture_warm_cache_revoked', False))
+                and (bool(getattr(self, '_capture_route_currently_invalid', False))
                      or not bool(getattr(
                          self, '_capture_warm_cache_verified', False))))
             decoder_invalid = bool(

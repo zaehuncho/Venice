@@ -490,6 +490,83 @@ def test_capture_revocation_cannot_be_rekeyed_or_acknowledged(monkeypatch):
     assert (generation, route) == (0, "")
 
 
+def test_capture_route_recovers_cold_after_transient_msmf_fallback(monkeypatch):
+    """[ORION_CAPTURE_ROUTE_RETRY 2026-08-11] #47 -- the ship blocker.
+
+    A DSHOW->MSMF fallback is a DOCUMENTED, INTENDED stall recovery on the shipping HD60X
+    (capture_card_backend.py ~:514). It used to latch `_capture_warm_cache_revoked` one-way, and
+    because the guard early-returned on that flag the `matches` test below it became dead code --
+    so the ONLY `return True` in the function was unreachable for the life of the process. Every
+    consumer pinned to generation 0, the C++ brain rejected measured latency and fell back to its
+    ~13 ms model against 40-100 ms of real loop, and nothing but a full restart recovered.
+
+    Poisoning must survive (never reload the persisted posterior). Suppression must not.
+    """
+    monkeypatch.setenv("ORION_MEASURE_LATENCY", "1")
+    monkeypatch.setenv("ORION_CAPTURE_CARD_INDEX", "0")
+    monkeypatch.setenv("ORION_VIDEO_DEVICE_NAMES", "Elgato HD60 X")
+    monkeypatch.setenv(
+        "ORION_VIDEO_DEVICE_IDS", "dshow-moniker-sha256-v1:" + "1" * 64)
+    orch = rpo.RemotePlayOrchestrator(rpo.OrchestratorConfig(
+        frame_source="capture_card", auto_launch_client=False,
+        virtual_controller=False,
+        console_identity="registered-host-sha256-v1:" + "a" * 64,
+        controller_route="pipe",
+        capture_mode="1920x1080@60.000|fourcc=yuy2|buffer=unreported",
+    ))
+    orch._capture_warm_cache_expected_index = 0
+
+    def sample():
+        return FrameData(
+            frame=_owned_frame(width=1920, height=1080), frame_number=1,
+            timestamp_ns=time.perf_counter_ns(), capture_api="DSHOW",
+            capture_device_index=0, capture_width=1920, capture_height=1080,
+            capture_fps=60.00024, capture_fourcc="YUY2",
+            capture_buffer_size=-1.0,
+        )
+
+    # 1) Healthy configured route attests normally.
+    assert orch._guard_capture_latency_route(frame_data=sample())
+    assert orch.attest_controller_latency_route("pipe", 7)
+    good_scope = orch._latency_route_scope_value
+    assert good_scope
+
+    # 2) Transient MSMF fallback -- suppressed AND poisoned, exactly as before.
+    msmf = sample()
+    msmf.capture_api = "MSMF"
+    assert not orch._guard_capture_latency_route(frame_data=msmf)
+    assert orch._capture_warm_cache_revoked
+    assert orch._capture_route_currently_invalid
+    assert orch._latency_route_scope_value == ""
+    assert not orch.attest_controller_latency_route("pipe", 8)
+
+    # 2b) A route that is merely STILL wrong must not churn the authority every frame (the guard
+    #     runs per frame; the removed early-out used to provide this).
+    held = orch._latency_estimator
+    assert not orch._guard_capture_latency_route(frame_data=msmf)
+    assert orch._latency_estimator is held
+
+    # 3) The card returns to the exact configured DSHOW route. THIS is what used to be impossible.
+    restore_flags = []
+    replace = orch._replace_latency_authority
+
+    def observe_replace(route_scope, reason, **kwargs):
+        restore_flags.append(bool(kwargs.get("restore_cache", False)))
+        return replace(route_scope, reason, **kwargs)
+
+    monkeypatch.setattr(orch, "_replace_latency_authority", observe_replace)
+
+    assert orch._guard_capture_latency_route(frame_data=sample())
+    assert not orch._capture_route_currently_invalid
+    assert orch._latency_route_scope_value == good_scope
+    assert orch.attest_controller_latency_route("pipe", 9)
+    assert orch.controller_latency_route_attestation_receipt("pipe", 9)
+
+    # 4) Recovery is COLD: poisoning is permanent, so the persisted posterior is never reloaded.
+    assert orch._capture_warm_cache_revoked
+    assert restore_flags and not any(restore_flags)
+
+
 def test_capture_frame_missing_negotiated_mode_revokes_warm_estimator(monkeypatch):
     fd = FrameData(
         frame=_owned_frame(), frame_number=1, timestamp_ns=time.perf_counter_ns(),
