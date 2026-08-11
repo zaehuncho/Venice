@@ -599,6 +599,12 @@ std::pair<bool, std::string> MeterDelayIntercept::start(const std::string& conso
         sink_ = [this](const Packet& pkt) { return this->winDivertSend(pkt); };
         stopFlag_.store(false);
         stopEvent_ = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stopEvent_ && log_) {
+            // Both worker loops use this handle as their ONLY sleep. They now fall back
+            // to a plain sleep (see watchdogLoop / flushLoop), so a failure here costs
+            // stop latency rather than pinning a core -- but it must not be silent.
+            log_("meter delay: CreateEventW failed; workers fall back to timed sleep");
+        }
         running_.store(true);
         captureThread_ = std::thread(&MeterDelayIntercept::captureLoop, this);
         flushThread_ = std::thread(&MeterDelayIntercept::flushLoop, this);
@@ -814,6 +820,10 @@ void MeterDelayIntercept::flushLoop()
             timer.waitUntil(target, wake);
         } else if (wake) {
             ::WaitForSingleObject(wake, static_cast<DWORD>(seconds * 1000.0 + 0.5));
+        } else {
+            // Same hazard as watchdogLoop: with neither a precise timer nor the event,
+            // waitFor was a no-op and the flush loop span. Sleep unconditionally.
+            std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
         }
     };
 
@@ -849,6 +859,12 @@ void MeterDelayIntercept::watchdogLoop()
                 == WAIT_OBJECT_0) {
                 break;
             }
+        } else {
+            // This wait is the loop's ONLY sleep. Without a fallback, a null stopEvent_
+            // turns the whole loop into a tight spin running watchdogCheck() at MHz
+            // rates inside a LocalSystem service -- one pinned core for as long as the
+            // intercept is up.
+            std::this_thread::sleep_for(std::chrono::duration<double>(kWatchdogTickS));
         }
         if (stopFlag_.load()) {
             break;

@@ -45,7 +45,16 @@ using namespace venicenet;
 // Same identity as nexus_svc.py's SVC_* so wave 3-lite is a binary swap and the
 // operator's owner_verify_meter_delay.ps1 (which queries "NexusVisionSvc") keeps
 // working. NOT a rebrand — the internal orion-*/NexusVision slug is preserved.
-const wchar_t* kSvcName = L"NexusVisionSvc";
+// [ORION_SVC_NAME 2026-08-10] installer/orion.iss registers the shipped service as
+// VeniceNetSvc and explicitly deletes the legacy NexusVisionSvc on upgrade, so
+// VeniceNetSvc is canonical. install/ creates that name; start/stop/remove try it first
+// and fall back to the legacy name so a machine still carrying an old install stays
+// controllable instead of failing with ERROR_SERVICE_DOES_NOT_EXIST and a bare exit 1.
+// Mirrors the dual-name resolution OrionAppController already does for sc start/query.
+// Safe for the dispatcher and control-handler uses below: for SERVICE_WIN32_OWN_PROCESS
+// Windows ignores the name in both SERVICE_TABLE_ENTRY and RegisterServiceCtrlHandlerW.
+const wchar_t* kSvcName = L"VeniceNetSvc";
+const wchar_t* kSvcNameLegacy = L"NexusVisionSvc";
 const wchar_t* kSvcDisplayName = L"Nexus Vision Packet Bridge";
 const wchar_t* kSvcDescription =
     L"Privileged WinDivert packet capture bridge for Nexus Vision. "
@@ -442,10 +451,28 @@ private:
 std::atomic<bool>* g_runStopFlag = nullptr; // set by SvcCtrlHandler
 HANDLE g_stopEvent = nullptr;               // waited on by runService
 
-void runService(const std::string& mode)
+// [ORION_SVC_ARGV 2026-08-10] wmain's argv[1:], stashed for svcMain.
+//
+// The distinction matters and is easy to get wrong: arguments baked into the service's
+// ImagePath (what installService writes, e.g. "--arm-meter-delay") reach the process as
+// wmain's command line. They do NOT appear in ServiceMain's argv -- that only carries
+// parameters handed to StartService() at start time. Reading svcMain's argv alone
+// therefore still misses the installed flag, which is the actual reason
+// `install --arm-meter-delay` produced a service that answered meter_delay_disarmed.
+std::vector<std::string> g_processArgs;
+
+// Returns false if the service could not actually come up (currently: the IPC port
+// could not be bound). The caller MUST surface that to the SCM as a non-NO_ERROR exit
+// code -- reporting SERVICE_STOPPED/NO_ERROR makes `sc start` and the app's start
+// attempt both look successful while nothing is listening.
+bool runService(const std::string& mode, const std::vector<std::string>& argv)
 {
     logLine("TRACE runService: entered mode=" + mode);
-    const std::vector<std::string> argv; // service mode reads arm from the environment
+    // [ORION_SVC_ARGV 2026-08-10] argv is now threaded in from the caller. It used to be
+    // a hard-coded empty vector here, which silently made `install --arm-meter-delay` a
+    // no-op: installService bakes the flag into binPath and the SCM hands it to svcMain,
+    // but it was dropped on the floor and arming could only ever come from the
+    // environment -- so every delay verb answered meter_delay_disarmed with no clue why.
     std::string envArm;
     {
         char* buf = nullptr;
@@ -519,7 +546,9 @@ void runService(const std::string& mode)
     logLine("TRACE runService: sniff.start");
     sniff.start();
     logLine("TRACE runService: server.startListening");
+    bool bound = true;
     if (!server.startListening()) {
+        bound = false;
         logLine("Cannot bind 127.0.0.1:47291 — shutting down");
     } else {
         logLine("TRACE runService: waiting on g_stopEvent");
@@ -539,6 +568,7 @@ void runService(const std::string& mode)
     // Only now, with every handle closed, can the driver actually be unloaded.
     unloadWinDivertDriver("service_shutdown");
     logLine("stopped");
+    return bound;
 }
 
 // ── SCM plumbing ──────────────────────────────────────────────────────────
@@ -580,7 +610,7 @@ void WINAPI svcCtrlHandler(DWORD ctrl)
     }
 }
 
-void WINAPI svcMain(DWORD /*argc*/, LPWSTR* /*argv*/)
+void WINAPI svcMain(DWORD argc, LPWSTR* argv)
 {
     g_svcStatusHandle = ::RegisterServiceCtrlHandlerW(kSvcName, svcCtrlHandler);
     if (!g_svcStatusHandle) {
@@ -591,13 +621,37 @@ void WINAPI svcMain(DWORD /*argc*/, LPWSTR* /*argv*/)
     g_stopEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     reportStatus(SERVICE_RUNNING, NO_ERROR, 0);
 
-    runService("service");
+    // Start from the ImagePath arguments (wmain's argv), then append anything the SCM
+    // passed to StartService(). Both are legitimate sources of the arm flag and neither
+    // alone is sufficient -- see the note on g_processArgs.
+    std::vector<std::string> args = g_processArgs;
+    for (DWORD i = 1; i < argc && argv; ++i) {
+        if (!argv[i]) continue;
+        const int n =
+            ::WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string s(static_cast<size_t>(n > 0 ? n - 1 : 0), '\0');
+        if (n > 0) {
+            ::WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, s.data(), n, nullptr, nullptr);
+        }
+        args.push_back(s);
+    }
+
+    const bool ok = runService("service", args);
 
     if (g_stopEvent) {
         ::CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
     }
-    reportStatus(SERVICE_STOPPED, NO_ERROR, 0);
+    if (ok) {
+        reportStatus(SERVICE_STOPPED, NO_ERROR, 0);
+    } else {
+        // Never report a clean stop for a service that failed to come up: `sc start`
+        // and the app's start attempt would both read as success while nothing is
+        // listening on 47291. ERROR_SERVICE_SPECIFIC_ERROR is the documented way to
+        // carry our own code, and it makes `sc query` show the failure.
+        g_svcStatus.dwServiceSpecificExitCode = 1; // 1 = IPC bind failed
+        reportStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, 0);
+    }
 }
 
 // ── install / remove / start / stop ───────────────────────────────────────
@@ -650,8 +704,24 @@ int controlService(DWORD action)
     if (!scm) {
         return 1;
     }
-    SC_HANDLE svc = ::OpenServiceW(scm, kSvcName,
-                                   SERVICE_START | SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+    // Try the canonical name, then the legacy one. A shipping machine has VeniceNetSvc;
+    // a machine carrying an old install has NexusVisionSvc. Targeting only one meant
+    // stop/remove returned ERROR_SERVICE_DOES_NOT_EXIST as a bare exit 1, so an operator
+    // would believe the bridge was stopped while it still held TCP 47291 and the
+    // WinDivert driver.
+    const DWORD access = SERVICE_START | SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS;
+    SC_HANDLE svc = ::OpenServiceW(scm, kSvcName, access);
+    const wchar_t* opened = kSvcName;
+    if (!svc) {
+        svc = ::OpenServiceW(scm, kSvcNameLegacy, access);
+        opened = kSvcNameLegacy;
+    }
+    if (!svc) {
+        std::printf("[venicenet_svc] no service named %ws or %ws (err=%lu)\n",
+                    kSvcName, kSvcNameLegacy, ::GetLastError());
+        ::CloseServiceHandle(scm);
+        return 1;
+    }
     int rc = 1;
     if (svc) {
         if (action == 0) { // start
@@ -668,7 +738,7 @@ int controlService(DWORD action)
     return rc;
 }
 
-void runDebug()
+void runDebug(const std::vector<std::string>& args)
 {
     logLine("TRACE runDebug: entered");
     std::printf("[venicenet_svc] Running in debug mode on 127.0.0.1:47291\n");
@@ -677,7 +747,7 @@ void runDebug()
     std::fflush(stdout);
     g_stopEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     logLine("TRACE runDebug: g_stopEvent created, calling runService");
-    runService("debug");
+    runService("debug", args);
     logLine("TRACE runDebug: runService returned");
     if (g_stopEvent) {
         ::CloseHandle(g_stopEvent);
@@ -710,6 +780,7 @@ int wmain(int argc, wchar_t** argv)
         }
         args.push_back(s);
     }
+    g_processArgs = args; // svcMain runs on another thread and cannot see this local
 
     // A bare invocation (arm flag aside) means the SCM launched us: run the
     // control dispatcher, not the command parser (mirrors nexus_svc's
@@ -723,7 +794,7 @@ int wmain(int argc, wchar_t** argv)
             // Not launched by the SCM (e.g. run bare from a console): fall back to
             // debug mode so a developer bare-launch still works.
             ::SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
-            runDebug();
+            runDebug(args);
         }
         return 0;
     }
@@ -743,7 +814,7 @@ int wmain(int argc, wchar_t** argv)
     }
     if (cmd == "debug") {
         ::SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
-        runDebug();
+        runDebug(args);
         return 0;
     }
     if (cmd == "install") {
