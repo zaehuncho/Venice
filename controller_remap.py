@@ -825,7 +825,19 @@ class RemapEngine:
             self._begin_warmup(ShotMode.GOTO_STICK, now)
             state.set_button(DS4Button.SQUARE, False)
         else:
-            state.set_button(DS4Button.SQUARE, False)
+            # [ORION_SQUARE_PASSTHROUGH 2026-08-10] Do NOT clear Square here.
+            #
+            # This branch is "we are IDLE and nothing is starting a shot" -- no rising
+            # edge, no warmup. It used to strip Square unconditionally anyway, which made
+            # _encode_face_buttons_selective's "pass everything through except Square while
+            # the bot owns a shot" a lie: the bot stripped Square in IDLE too, so the press
+            # never reached the console. Owner-reported symptom: cannot steal on defense and
+            # cannot use Square in menus with tempo remap on.
+            #
+            # Reaching here with Square HIGH means we returned to IDLE while the button was
+            # still held -- a warmup that cancelled under the player's thumb. The console
+            # never saw that press, so forwarding it is what the player asked for.
+            pass
 
         return state
 

@@ -1592,7 +1592,12 @@ def main() -> int:
         latency_compensation_ms=_safe_float(cfg.get("latency_compensation_ms"), 45.0),
         stable_frames_required=_safe_int(cfg.get("stable_frames_required"), 3),
         tempo_flick_hold_ms=_safe_float(cfg.get("tempo_flick_hold_ms"), 50.0),
-        input_mode="square_only",
+        # [ORION_INPUT_MODE 2026-08-10] Was hard-pinned to "square_only" here and at the
+        # update_remap handler below, so the value RemotePlaySession.cpp computes from
+        # remotePlayInputSource (square / stick / both) was serialized, sent over stdin and
+        # then thrown away -- the Remote Play input-source setting was dead config and
+        # selecting stick or both did nothing. Honour it, keeping square_only as the default.
+        input_mode=str(cfg.get("input_mode", "square_only") or "square_only"),
         no_meter_enabled=_safe_bool(cfg.get("no_meter_enabled", False), False),
         no_meter_release_point=str(cfg.get("no_meter_release_point", "push")),
         no_meter_base_offset_ms=_safe_float(cfg.get("no_meter_base_offset_ms"), 83.0),
@@ -2789,7 +2794,10 @@ def main() -> int:
                         continue
                     new_cfg = RemapConfig(
                         enabled=bool(msg.get("enabled", cur.enabled)),
-                        input_mode="square_only",
+                        # [ORION_INPUT_MODE 2026-08-10] see the note at the startup RemapConfig.
+                        # Hot-apply must honour the pushed value too, otherwise changing the
+                        # input source in the UI silently reverts on the next update_remap.
+                        input_mode=str(msg.get("input_mode", cur.input_mode) or cur.input_mode),
                         tempo_wait_ms=_safe_float(msg.get("tempo_wait_ms", cur.tempo_wait_ms), cur.tempo_wait_ms),
                         tempo_flick_hold_ms=_safe_float(msg.get("tempo_flick_hold_ms", cur.tempo_flick_hold_ms), cur.tempo_flick_hold_ms),
                         tempo_min_stick_hold_ms=_safe_float(msg.get("tempo_min_stick_hold_ms", cur.tempo_min_stick_hold_ms), cur.tempo_min_stick_hold_ms),
