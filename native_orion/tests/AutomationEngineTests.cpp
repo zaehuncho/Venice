@@ -6894,13 +6894,34 @@ void AutomationEngineTests::settleSmoothMotionRunGradesOnlyWhenFillIsFrozen()
     const QVector<AutomationEngine::MeterCalSample> graded = engine.meterSettledFrames(gliding);
     QCOMPARE(graded.size(), 10);
 
-    // 3) A MID-FLIGHT read glides identically but its fill is still RISING. The fill-tolerance
-    //    tail (halved for motion runs) is what must reject it -- this is the false-EXCELLENT case
-    //    the static rule was originally protecting against, and it must stay rejected.
+    // 3) A MID-FLIGHT read glides identically but its fill is still RISING. A STEEP rise collapses
+    //    the fill-tolerance tail in one step.
     const QVector<AutomationEngine::MeterCalSample> rising =
         build(10, /*fill0*/ 50.0, /*fillStep*/ 5.0, /*bx0*/ 900.0, /*step*/ 20.0);
     QVERIFY2(engine.meterSettledFrames(rising).isEmpty(),
              "a RISING fill on a gliding box is mid-flight, not settled -- must never grade");
+
+    // 3b) THE CASE THE ORIGINAL CLAIM GOT WRONG (adversarial review 2026-08-11). I asserted the
+    //     fill-tolerance tail was the settle-vs-mid-flight discriminator. It is not: it is
+    //     band-membership against the run's LAST fill, i.e. a fill-RATE gate. Over
+    //     meterSettleMotionMinFrames-1 = 5 intervals, anything up to
+    //     meterSettleFillTolPct*0.5 / 5 = 0.8 pp/frame threads it while climbing the entire time,
+    //     and a real 2K meter's deceleration knee crosses that band every shot. Only a STEEP rise
+    //     (case 3) was ever rejected. meterSettleMotionMaxNetDriftPct is the actual guard: a frozen
+    //     marker ends where it started. Grading this would bias the LEARNER ~6 pp low -- recording
+    //     ~93 for a shot truly landing ~99, indistinguishable from a real EARLY.
+    const QVector<AutomationEngine::MeterCalSample> slowClimb =
+        build(8, /*fill0*/ 90.0, /*fillStep*/ 0.7, /*bx0*/ 900.0, /*step*/ 20.0);
+    QVERIFY2(engine.meterSettledFrames(slowClimb).isEmpty(),
+             "a 0.7pp/frame climb threads the fill tail but is NOT settled -- net drift must reject it");
+
+    // 3c) The net-drift guard must not reject a genuine settle that merely jitters in place.
+    QVector<AutomationEngine::MeterCalSample> jitterInPlace;
+    for (int i = 0; i < 8; ++i) {
+        jitterInPlace.append(mk(96.0 + ((i % 2) ? 0.4 : -0.4), 900.0 + 20.0 * i, 480.0));
+    }
+    QVERIFY2(!engine.meterSettledFrames(jitterInPlace).isEmpty(),
+             "a frozen-but-noisy fill on a glide is a REAL settle and must still grade");
 
     // 4) Erratic motion (box jittering back and forth) fails the acceleration bound even though
     //    every individual step is under the travel ceiling.

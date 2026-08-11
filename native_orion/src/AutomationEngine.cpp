@@ -12863,7 +12863,16 @@ AutomationEngine::meterSettledFrames(const QVector<MeterCalSample>& samples) con
         while (t > i && std::abs(clean[t - 1].fillPct - lastFill) <= runFillTol) {
             --t;
         }
-        if (j - t >= runNeed) {
+        bool tailIsFrozen = true;
+        if (usedMotion && j - t >= 2) {
+            // [ORION_SETTLE_SMOOTH_MOTION fix-2] The tail above bounds TOTAL SPREAD against the
+            // last fill, which a slow steady climb satisfies while never settling (<= 0.8 pp/frame
+            // threads it -- see the header). Net drift is the property we actually want: a frozen
+            // marker ends where it started. Motion runs only; the static path is unchanged.
+            tailIsFrozen = std::abs(clean[j - 1].fillPct - clean[t].fillPct)
+                <= config_.meterSettleMotionMaxNetDriftPct;
+        }
+        if (j - t >= runNeed && tailIsFrozen) {
             best = clean.mid(t, j - t);
         }
         i = j;

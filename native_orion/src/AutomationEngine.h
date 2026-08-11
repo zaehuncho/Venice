@@ -716,6 +716,16 @@ struct RemapConfig {
     double meterSettleMaxTravelPx = 48.0;   // per-frame ceiling; beyond this it is not the same marker
     double meterSettleMaxAccelPx = 6.0;     // |step - prevStep| ceiling; half of maxMove, on purpose
     int    meterSettleMotionMinFrames = 6;  // 2x meterMinSettledFrames: motion runs must be longer
+    // [ORION_SETTLE_SMOOTH_MOTION fix-2 2026-08-11] The fill-tolerance tail is NOT a freeze test.
+    // It is band-membership against the run's LAST fill, which makes it a fill-RATE gate: over
+    // meterSettleMotionMinFrames-1 = 5 intervals, any rise up to meterSettleFillTolPct*0.5 / 5 =
+    // 0.8 pp/frame threads it while still climbing the whole way (traced counterexample:
+    // 90.0 -> 94.9 at 0.7 pp/frame reads as a 6-frame "settle"). A real 2K meter's deceleration
+    // knee passes through that band on every shot, so the original claim that the tail separates a
+    // settle from a mid-flight read was simply WRONG -- it only rejects a STEEP rise.
+    // NET DRIFT is the property actually wanted: a frozen marker ends where it started. Applied to
+    // motion runs only, so the static path keeps its existing behaviour byte-for-byte.
+    double meterSettleMotionMaxNetDriftPct = 1.5;
     // === [ORION_GRADE_V2] Phase-2 grading v2 (plan A3 + Part-0 M4/M5 gates) ==================
     // Trajectory classification of the post-release meter replaces the settled-fill rules:
     //   Case G  rise -> freeze INSIDE green                     -> EXCELLENT, err 0.
