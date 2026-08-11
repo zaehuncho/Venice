@@ -3203,12 +3203,27 @@ class RemotePlayOrchestrator:
             # _before_return` (which pins that the cold estimator survives a repeat call) would be
             # right to fail.
             newly_revoked = not already_poisoned
+            # [ORION_CAPTURE_ROUTE_RETRY fix-2 2026-08-11] `was_valid` closes a hole the FIRST cut
+            # of this commit introduced. `actual_route` is (api, index, mode) -- geometry is NOT in
+            # it -- but `matches` also requires geometry_matches. So a frame whose ndarray shape
+            # disagrees with its own stamped mode, while api/index/mode all still read configured,
+            # arrives here with route_changed AND mode_changed both False; after a poison+recovery
+            # cycle newly_revoked is False too, so the reset below was skipped. The estimator then
+            # kept the CONFIGURED scope handed to it by recovery while the route was invalid --
+            # i.e. a live _cache_path -- so a controlled label formed in that window could persist
+            # a CONTAMINATED posterior into the trusted on-disk scope, which a future process
+            # restores at startup. Pre-#47 that was impossible: a poisoned process stayed unscoped
+            # for life, so there was nothing to persist into. Re-fence on ANY valid->invalid
+            # transition, whatever caused it. Idempotence is preserved because was_valid is False
+            # while the route is merely STILL wrong.
+            was_valid = not bool(getattr(
+                self, '_capture_route_currently_invalid', False))
             self._capture_route_currently_invalid = True
             self._capture_warm_cache_revoked = True
             self._capture_warm_cache_verified = False
             if mode_changed:
                 self.config.capture_mode = actual_mode
-            if newly_revoked or route_changed or mode_changed:
+            if newly_revoked or route_changed or mode_changed or was_valid:
                 self._replace_latency_authority(
                     '', 'capture_route_mismatch', fence_frames=True)
                 logger.warning(

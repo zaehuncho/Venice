@@ -566,6 +566,24 @@ def test_capture_route_recovers_cold_after_transient_msmf_fallback(monkeypatch):
     assert orch._capture_warm_cache_revoked
     assert restore_flags and not any(restore_flags)
 
+    # 5) THE THIRD BUG (adversarial review 2026-08-11). Recovery hands the estimator the CONFIGURED
+    #    scope, which means a live cache path. `actual_route` is (api, index, mode) -- geometry is
+    #    NOT in it -- but `matches` also requires geometry_matches. So a frame whose ndarray shape
+    #    disagrees with its own stamped mode, while api/index/mode still read configured, produces
+    #    route_changed == mode_changed == False, and newly_revoked is False after the poison above.
+    #    The first cut of this commit therefore skipped the reset and left a SCOPED, un-fenced
+    #    estimator running on an invalid route -- able to persist a contaminated posterior into the
+    #    trusted on-disk scope that a FUTURE process would restore. Pre-#47 this was impossible
+    #    (a poisoned process stayed unscoped for life). Any valid->invalid transition must re-fence.
+    torn = sample()
+    torn.frame = _owned_frame(width=1280, height=720)   # 720p pixels, still stamped 1080p
+    assert not orch._guard_capture_latency_route(frame_data=torn)
+    assert orch._capture_route_currently_invalid
+    assert orch._latency_route_scope_value == "", (
+        "a geometry-only mismatch must unscope the estimator, or it can persist a contaminated "
+        "posterior into the configured route's cache")
+    assert not orch.attest_controller_latency_route("pipe", 10)
+
 
 def test_capture_frame_missing_negotiated_mode_revokes_warm_estimator(monkeypatch):
     fd = FrameData(
