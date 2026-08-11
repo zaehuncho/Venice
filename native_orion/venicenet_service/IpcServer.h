@@ -174,7 +174,22 @@ private:
     std::uintptr_t listenSock_ = ~static_cast<std::uintptr_t>(0);
     std::atomic<bool> running_{false};
     std::thread acceptThread_;
-    std::vector<std::thread> clientThreads_;
+
+    // [ORION_IPC_CLIENT_REAP 2026-08-11] A std::thread stays joinable() AFTER its function
+    // returns -- joinable() only goes false once join()/detach() is called. The old reap predicate
+    // was `!t.joinable()`, which is therefore never true for a client thread we have not joined,
+    // so it removed NOTHING: every connection permanently added a std::thread (each holding an
+    // open Win32 thread HANDLE) freed only at stop(). That accumulates at accept(), BEFORE the
+    // token check, so any unprivileged local process could grow the handle table of a LocalSystem
+    // service by connect/close looping. Pair each thread with a completion flag the reap can
+    // actually test, and cap concurrent clients (listen() backlog bounds pending, not live).
+    struct ClientThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    // The real client count is 1-2 (the app). 32 is generous headroom that is still bounded.
+    static constexpr std::size_t kMaxLiveClients = 32;
+    std::vector<ClientThread> clientThreads_;
     std::mutex clientThreadsMutex_;
 };
 

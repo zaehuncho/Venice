@@ -502,14 +502,14 @@ void IpcServer::stop()
     if (acceptThread_.joinable()) {
         acceptThread_.join();
     }
-    std::vector<std::thread> threads;
+    std::vector<ClientThread> threads;
     {
         std::lock_guard<std::mutex> lock(clientThreadsMutex_);
         threads = std::move(clientThreads_);
         clientThreads_.clear();
     }
     for (auto& t : threads) {
-        if (t.joinable()) t.join();
+        if (t.thread.joinable()) t.thread.join();
     }
 }
 
@@ -538,12 +538,35 @@ void IpcServer::acceptLoop()
             continue;
         }
         std::lock_guard<std::mutex> lock(clientThreadsMutex_);
-        // Reap finished client threads opportunistically.
-        clientThreads_.erase(std::remove_if(clientThreads_.begin(), clientThreads_.end(),
-                                            [](std::thread& t) { return !t.joinable(); }),
-                             clientThreads_.end());
-        clientThreads_.emplace_back(&IpcServer::handleClient, this,
-                                    static_cast<std::uintptr_t>(conn));
+        // [ORION_IPC_CLIENT_REAP 2026-08-11] Reap COMPLETED client threads. Test the completion
+        // flag, not joinable() -- see the ClientThread comment in the header for why the old
+        // predicate could never fire. join() here is non-blocking in practice: the flag is only
+        // set once handleClient has already returned.
+        for (auto it = clientThreads_.begin(); it != clientThreads_.end();) {
+            if (it->done && it->done->load(std::memory_order_acquire)) {
+                if (it->thread.joinable()) {
+                    it->thread.join();
+                }
+                it = clientThreads_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Bound CONCURRENT clients. Correct reaping alone still lets a local process hold N
+        // sockets open and spawn N threads inside a LocalSystem process; listen()'s backlog only
+        // bounds PENDING connections. Refuse past the cap rather than growing without limit.
+        if (clientThreads_.size() >= kMaxLiveClients) {
+            ::closesocket(conn);
+            continue;
+        }
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        const std::uintptr_t sockHandle = static_cast<std::uintptr_t>(conn);
+        clientThreads_.push_back(ClientThread{
+            std::thread([this, sockHandle, done]() {
+                handleClient(sockHandle);
+                done->store(true, std::memory_order_release);
+            }),
+            done});
     }
 }
 

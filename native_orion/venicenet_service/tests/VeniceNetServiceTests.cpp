@@ -15,9 +15,11 @@
 #include "ServiceArgs.h"
 #include "ServiceState.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace venicenet;
@@ -592,10 +594,40 @@ void testJsonParserDepthLimit()
     }
 }
 
+// [ORION_IPC_CLIENT_REAP 2026-08-11] Pin the LANGUAGE FACT the client-thread leak rested on.
+//
+// IpcServer::acceptLoop() reaped with `remove_if(..., [](std::thread& t){ return !t.joinable(); })`,
+// which reads as "drop the finished ones" and removed NOTHING: a std::thread stays joinable()
+// after its function returns -- joinable() only goes false once join()/detach() is called. Every
+// connection therefore leaked a thread object holding an open Win32 thread HANDLE inside a
+// LocalSystem process, accumulating at accept() BEFORE the token check.
+//
+// A real accept-loop test needs WSAStartup, a live listener and a token file -- an integration
+// test this Qt-free pure-logic binary deliberately does not do. So pin the PREMISE instead: if
+// this ever fails, the language changed and the reap can go back to being predicate-based. Its
+// real value is that it makes the misconception un-repeatable: anyone "simplifying" the flag-based
+// reap back to !joinable() has to delete a test that says in words why that is wrong.
+void testFinishedThreadStaysJoinableUntilJoined()
+{
+    std::atomic<bool> ran{false};
+    std::thread t([&ran]() { ran.store(true, std::memory_order_release); });
+    while (!ran.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    // The function has provably returned...
+    CHECK(ran.load(std::memory_order_acquire));
+    // ...and the thread is STILL joinable. This is exactly why `!t.joinable()` reaped nothing.
+    CHECK(t.joinable());
+    t.join();
+    // Only join() clears it.
+    CHECK(!t.joinable());
+}
+
 } // namespace
 
 int main()
 {
+    testFinishedThreadStaysJoinableUntilJoined();
     testJsonParserDepthLimit();
     testSlewCapAndTokenBucket();
     testSnapToTargetReenablesFastPath();

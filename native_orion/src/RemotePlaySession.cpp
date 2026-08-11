@@ -2419,6 +2419,14 @@ void RemotePlaySession::startSidecar()
         lastPreviewPipelineStatsMs_ = 0;
         fpsProbeState_ = QStringLiteral("stable-60");
         emit sidecarStatsChanged();
+        // [ORION_SIDECAR_PROC_LEAK 2026-08-11] The UNSOLICITED-exit path orphaned the QProcess.
+        // Both deliberate-teardown siblings delete correctly (the FailedToStart branch below at
+        // ~:2437 and stop()), so only a sidecar that died BY ITSELF leaked -- and that is exactly
+        // the path this product takes for hours: Python crash / chiaki death / capture-card loss,
+        // followed by a watchdog restart. Each cycle stranded a QProcess plus its capturing lambdas
+        // and pipe read buffers. Safe here: deleteLater() defers to the event loop, so `proc` stays
+        // valid for the rest of this handler, and a double deleteLater is a no-op in Qt.
+        proc->deleteLater();
     });
 
     connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError err) {
