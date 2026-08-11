@@ -12811,24 +12811,59 @@ AutomationEngine::meterSettledFrames(const QVector<MeterCalSample>& samples) con
     //    within meterSettleFillTolPct of the run's LAST fill — this excludes the rise/bounce that
     //    precedes the settle (e.g. a LATE shot's 100->52 bounce inside an otherwise static bbox).
     //    The latest qualifying tail wins (the frozen marker is the last thing on screen). A meter
-    //    that keeps moving (airborne fade/Go-To) yields only length-1 runs -> empty -> not graded.
+    //    that keeps moving (airborne fade/Go-To) yields only length-1 runs -> empty -> not graded,
+    //    UNLESS [ORION_SETTLE_SMOOTH_MOTION] admits it as a smoothly-translating run (see below).
     const double maxMove = config_.meterSettleMaxMovePx;
     const double fillTol = config_.meterSettleFillTolPct;
+    // [ORION_SETTLE_SMOOTH_MOTION 2026-08-11] Default OFF -> every value below collapses out and
+    // this function stays byte-for-byte the original static-run walk.
+    const bool allowMotion = config_.meterSettleAllowSmoothMotion;
+    const double maxTravel = config_.meterSettleMaxTravelPx;
+    const double maxAccel = config_.meterSettleMaxAccelPx;
     QVector<MeterCalSample> best;
     const int n = clean.size();
     int i = 0;
     while (i < n) {
         int j = i + 1;
-        while (j < n
-               && std::hypot(clean[j].bx - clean[j - 1].bx, clean[j].by - clean[j - 1].by) <= maxMove) {
+        // Whether THIS run needed the motion path even once. A run that stayed static is graded on
+        // exactly the original terms; only a run that used motion pays the stricter price.
+        bool usedMotion = false;
+        double prevDx = 0.0;
+        double prevDy = 0.0;
+        bool havePrevStep = false;
+        while (j < n) {
+            const double dx = clean[j].bx - clean[j - 1].bx;
+            const double dy = clean[j].by - clean[j - 1].by;
+            const bool isStatic = std::hypot(dx, dy) <= maxMove;
+            bool isSmooth = false;
+            if (!isStatic && allowMotion && std::hypot(dx, dy) <= maxTravel) {
+                // First step of a run has nothing to compare against, so travel alone admits it --
+                // otherwise a marker that is ALREADY moving when the run opens (every Go-To) could
+                // never seed a velocity and the motion path would be dead code on real captures.
+                isSmooth = !havePrevStep
+                    || std::hypot(dx - prevDx, dy - prevDy) <= maxAccel;
+            }
+            if (!isStatic && !isSmooth) {
+                break;
+            }
+            usedMotion = usedMotion || !isStatic;
+            prevDx = dx;
+            prevDy = dy;
+            havePrevStep = true;
             ++j;
         }
+        // A translating marker is held to a TIGHTER fill agreement and a LONGER run than a static
+        // one, so turning this on can never admit a run the static rule would already have taken.
+        const double runFillTol = usedMotion ? fillTol * 0.5 : fillTol;
+        const int runNeed = usedMotion
+            ? std::max(need, config_.meterSettleMotionMinFrames)
+            : need;
         const double lastFill = clean[j - 1].fillPct;
         int t = j;
-        while (t > i && std::abs(clean[t - 1].fillPct - lastFill) <= fillTol) {
+        while (t > i && std::abs(clean[t - 1].fillPct - lastFill) <= runFillTol) {
             --t;
         }
-        if (j - t >= need) {
+        if (j - t >= runNeed) {
             best = clean.mid(t, j - t);
         }
         i = j;

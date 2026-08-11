@@ -400,6 +400,7 @@ private slots:
     void postReleaseMovingMeterIsNotGraded();
     void postReleaseGradesSettledTailAfterMotion();
     void settleGradingRequiresBboxMotionSignal();
+    void settleSmoothMotionRunGradesOnlyWhenFillIsFrozen();
     void networkOffsetSampledAndHeldPerShot();
     void rttBaselineDeltaClampBoundsDrift();
     void wifiModeEngagesOnJitterAndTightensClamp();
@@ -6835,6 +6836,99 @@ void AutomationEngineTests::settleGradingRequiresBboxMotionSignal()
     QVERIFY2(frozenDelta > 5.0,
              qPrintable(QString("a static bbox (deflate, peak reached green) must GRADE LATE/SHORTEN once the "
                                 "bbox signal is present; got %1").arg(frozenDelta)));
+}
+
+void AutomationEngineTests::settleSmoothMotionRunGradesOnlyWhenFillIsFrozen()
+{
+    // [ORION_SETTLE_SMOOTH_MOTION 2026-08-11] A Go-To marker translates with the running player
+    // while its FILL is already frozen. The static-bbox walk cannot see that settle -- every step
+    // breaks the run -- so 5 of 8 Go-To landings on 2026-08-11 came back reason=no_settled_run with
+    // samples_n~181 and peak_fill 97-100. Ungraded also means NO PRESS-TIP observation, which is
+    // why Go-To's learner weight is pinned at 34 while Standstill caps at 100.
+    //
+    // CONFLICT, DELIBERATE AND UNRESOLVED: postReleaseMovingMeterIsNotGraded and
+    // settleGradingRequiresBboxMotionSignal both slide the bbox 40px/frame with a FROZEN fill and
+    // assert it must be SKIPPED. That is exactly what this path grades. Both still pass only
+    // because meterSettleAllowSmoothMotion defaults OFF. Anyone flipping the default MUST revisit
+    // those two: the question they encode ("is a frozen fill on a sliding box a real settle, or a
+    // mid-flight read?") is answered here by the fill-tolerance tail, not by the bbox -- but that
+    // is a judgement call about grading truth, not a refactor, and it needs the framedump A/B.
+    auto mk = [](double fill, double bx, double by) {
+        AutomationEngine::MeterCalSample s;
+        s.accepted = true;
+        s.confidence = 0.9;
+        s.fillPct = fill;
+        s.greenStartPct = 96.0;
+        s.greenEndPct = 100.0;
+        s.greenCenterPct = 98.0;
+        s.bx = bx;
+        s.by = by;
+        return s;
+    };
+    auto build = [&mk](int n, double fill0, double fillStep, double bx0, double step) {
+        QVector<AutomationEngine::MeterCalSample> v;
+        for (int i = 0; i < n; ++i) {
+            v.append(mk(fill0 + fillStep * i, bx0 + step * i, 480.0));
+        }
+        return v;
+    };
+
+    AutomationEngine engine;
+    AppConfigData config;
+    LearningData learning;
+    engine.applyConfig(config, learning);
+
+    // Constant 20px/frame translation with a dead-frozen fill: the real Go-To shape.
+    const QVector<AutomationEngine::MeterCalSample> gliding =
+        build(10, /*fill0*/ 96.0, /*fillStep*/ 0.0, /*bx0*/ 900.0, /*step*/ 20.0);
+
+    // 1) DEFAULT OFF -> byte-identical to the original static-only walk: nothing grades.
+    QVERIFY2(!engine.config_.meterSettleAllowSmoothMotion,
+             "smooth-motion settle must ship DEFAULT OFF");
+    QVERIFY2(engine.meterSettledFrames(gliding).isEmpty(),
+             "with the flag OFF a translating marker must stay ungraded, exactly as before");
+
+    engine.config_.meterSettleAllowSmoothMotion = true;
+
+    // 2) Flag ON -> the frozen-fill glide is a real settle and grades.
+    const QVector<AutomationEngine::MeterCalSample> graded = engine.meterSettledFrames(gliding);
+    QCOMPARE(graded.size(), 10);
+
+    // 3) A MID-FLIGHT read glides identically but its fill is still RISING. The fill-tolerance
+    //    tail (halved for motion runs) is what must reject it -- this is the false-EXCELLENT case
+    //    the static rule was originally protecting against, and it must stay rejected.
+    const QVector<AutomationEngine::MeterCalSample> rising =
+        build(10, /*fill0*/ 50.0, /*fillStep*/ 5.0, /*bx0*/ 900.0, /*step*/ 20.0);
+    QVERIFY2(engine.meterSettledFrames(rising).isEmpty(),
+             "a RISING fill on a gliding box is mid-flight, not settled -- must never grade");
+
+    // 4) Erratic motion (box jittering back and forth) fails the acceleration bound even though
+    //    every individual step is under the travel ceiling.
+    QVector<AutomationEngine::MeterCalSample> erratic;
+    for (int i = 0; i < 12; ++i) {
+        erratic.append(mk(96.0, 900.0 + ((i % 2) ? 30.0 : 0.0), 480.0));
+    }
+    QVERIFY2(engine.meterSettledFrames(erratic).isEmpty(),
+             "a jittering bbox is a re-acquisition, not a glide -- the accel bound must reject it");
+
+    // 5) A teleport past meterSettleMaxTravelPx is a different object, not the same marker.
+    const QVector<AutomationEngine::MeterCalSample> teleport =
+        build(10, /*fill0*/ 96.0, /*fillStep*/ 0.0, /*bx0*/ 900.0, /*step*/ 200.0);
+    QVERIFY2(engine.meterSettledFrames(teleport).isEmpty(),
+             "steps beyond the travel ceiling must break the run");
+
+    // 6) The stricter motion terms must NOT leak onto a static run: 4 frozen frames still grade on
+    //    the original meterMinSettledFrames=3, not the motion path's 6.
+    const QVector<AutomationEngine::MeterCalSample> stat =
+        build(4, /*fill0*/ 96.0, /*fillStep*/ 0.0, /*bx0*/ 900.0, /*step*/ 0.0);
+    QCOMPARE(engine.meterSettledFrames(stat).size(), 4);
+
+    // 7) A motion run SHORTER than meterSettleMotionMinFrames must not sneak through on the static
+    //    threshold -- the whole point of charging motion runs a higher price.
+    const QVector<AutomationEngine::MeterCalSample> shortGlide =
+        build(4, /*fill0*/ 96.0, /*fillStep*/ 0.0, /*bx0*/ 900.0, /*step*/ 20.0);
+    QVERIFY2(engine.meterSettledFrames(shortGlide).isEmpty(),
+             "a 4-frame glide is below meterSettleMotionMinFrames and must not grade");
 }
 
 void AutomationEngineTests::captureFrameAgeAddsToReleaseLead()

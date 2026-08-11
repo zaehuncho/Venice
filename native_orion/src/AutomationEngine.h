@@ -687,6 +687,35 @@ struct RemapConfig {
     double meterSettleMaxMovePx = 12.0;
     double meterSettleFillTolPct = 8.0;
     double meterSettlePollMs = 150.0;
+    // === [ORION_SETTLE_SMOOTH_MOTION 2026-08-11] Grade a SMOOTHLY TRANSLATING settled marker ====
+    // The static-bbox rule above is a guard against false EXCELLENT on moving shots, and it works.
+    // But it is a proxy: what actually makes a moving read untrustworthy is the box jumping
+    // (re-acquisition onto decor / another player), not the box travelling. On a Go-To the player
+    // is running, so the marker rides across the screen at near-constant velocity while its FILL is
+    // already frozen -- a genuine settle that the per-frame |step| <= meterSettleMaxMovePx test can
+    // never see, because every step breaks the run and yields length-1 runs.
+    //
+    // MEASURED 2026-08-11 (session 29, 8 Go-To shots): 5 consecutive landings came back
+    // reason=no_settled_run settled_n=0 with samples_n=180-182 and peak_fill 97-100 -- the meter was
+    // seen for the whole window and did fill; only the STATIC test failed. meter_jump on those five
+    // was 0.0104-0.0217 vs ~0.0045 on a graded Standstill. Cost is not just the missing grade:
+    // an ungraded landing emits no PRESS-TIP observation, so Go-To's learner is starved by exactly
+    // the shots it needs (its press-anchored weight is stuck at 34 while Standstill caps at 100).
+    //
+    // This path is deliberately STRICTER than the static one, so admitting it cannot be a net
+    // loosening: a run that used it needs meterSettleMotionMinFrames (more frames) and only half
+    // meterSettleFillTolPct (tighter fill agreement). A step qualifies as smooth when it is both
+    // bounded in absolute travel (rejects a teleport onto another object) and consistent with the
+    // previous step (rejects erratic/jittering boxes). The FIRST step of a run has no previous step
+    // to compare against, so it is admitted on the travel bound alone -- that is what lets a
+    // continuously-moving meter bootstrap a run at all.
+    //
+    // DEFAULT OFF: it changes which shots GRADE, and therefore what reaches the learner. Validate
+    // offline on real Go-To captures (replay framedump harness) before flipping it.
+    bool   meterSettleAllowSmoothMotion = false;
+    double meterSettleMaxTravelPx = 48.0;   // per-frame ceiling; beyond this it is not the same marker
+    double meterSettleMaxAccelPx = 6.0;     // |step - prevStep| ceiling; half of maxMove, on purpose
+    int    meterSettleMotionMinFrames = 6;  // 2x meterMinSettledFrames: motion runs must be longer
     // === [ORION_GRADE_V2] Phase-2 grading v2 (plan A3 + Part-0 M4/M5 gates) ==================
     // Trajectory classification of the post-release meter replaces the settled-fill rules:
     //   Case G  rise -> freeze INSIDE green                     -> EXCELLENT, err 0.
