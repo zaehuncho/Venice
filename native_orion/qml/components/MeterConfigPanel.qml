@@ -295,6 +295,26 @@ Item {
         Card {
             title: "Meter Delay"
             subtitle: "Adds inbound network delay so the shot meter reads cleaner"
+            // [ORION_METER_DELAY_SHELVED 2026-08-12] HIDDEN unless the feature is already on.
+            //
+            // The subtitle above is measurably FALSE, which is why this is hidden rather than
+            // merely defaulted off. Measured 2026-08-12: at D=200 the reader's green window is
+            // 13.9 pp wide against 2.8 pp at D=0, and meter bounce-back goes from 16.8% to 100%.
+            // Delay makes the meter read WORSE, not cleaner. Shipping a control whose own
+            // description is backwards is a support burden and a bad first impression.
+            //
+            // NOT deleted, and the backend is untouched. The one live hypothesis left for the
+            // feature is the owner's contested-shot theory -- the intercept is inbound-only
+            // (MeterDelayIntercept.h:7), so the console's picture of the DEFENCE is stale by D,
+            // which may win contested shots even though it costs meter legibility. That is an
+            // outcome test (make% on contested shots), not a meter-quality one, and it has not
+            // been run.
+            //
+            // Gated on meterDelayEnabled rather than a hard `false` so bringing it back needs no
+            // rebuild: set "meter_delay_enabled": true in settings.json with the app CLOSED and
+            // the card reappears, fully functional, for that test. Default is false
+            // (AppConfig.h), so a shipping install never sees it.
+            visible: orion.meterDelayEnabled
             Layout.fillWidth: true
             // 84, not the old 70: a titled+subtitled Card's real overhead is
             // 32 (margins) + ~37 (title/subtitle block) + 12 (header spacing) ≈ 81.

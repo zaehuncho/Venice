@@ -703,7 +703,21 @@ class RemotePlayClientManager:
                 return self._status
             if self._process and self._process.poll() is not None:
                 break
-            time.sleep(0.10)
+            # [ORION_CONNECT_LATENCY 2026-08-12] #89. The readiness MARKER is the console's to
+            # produce -- measured 2026-08-12, the Chiaki child launch plus PS5 stream handshake is
+            # ~2.4s of the ~3.3s connect and none of it is ours to remove here. What IS ours is how
+            # long we sit on a marker that has already landed: a 100ms poll adds up to 100ms (50ms
+            # average) of pure dead time AFTER the console is ready. 25ms cuts that to ~12ms.
+            #
+            # Cheap because the loop body is two window/log-tail probes, not I/O: at 40Hz for the
+            # ~2.4s handshake that is ~96 iterations against ~24, on a thread that is otherwise
+            # blocked doing nothing. Deliberately not lower -- past ~40Hz the probes start costing
+            # more than the latency they save, and the remaining win is bounded by 25ms anyway.
+            #
+            # This does NOT make connect near-instant. The architectural fix is pre-launching
+            # Chiaki during live preview so the handshake is already done when Connect is pressed;
+            # that is a real design change and is not attempted here.
+            time.sleep(0.025)
 
         if self._config.require_session_ready:
             detail = ("the current Chiaki session ended before becoming ready"
