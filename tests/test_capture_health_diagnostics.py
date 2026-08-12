@@ -86,14 +86,20 @@ def test_capture_health_worker_is_off_loop_bounded_latest_wins_and_drains(monkey
     assert 'tier=first' in rendered[0][1]
     assert all('tier=superseded' not in line for _, line in rendered)
     assert rendered[1][1] == (
-        "Capture health: tier=latest tiers={'latest': 3} uniqfps=60 dup%=2 "
+        "Capture health: SUSPECT cap_mode=? tier=latest tiers={'latest': 3} "
+        "uniqfps=60 dup%=2 "
         "export_fps=59 gap_fps=1 cv_fps=58 detect_ms=1.5 "
         "raw_fps=57.5 raw_gap_max_ms=24.5 raw_late=2 "
         "source_skip=7 raw_gap_frame=321 raw_gap_event_ms=1750000000125 "
         "raw_read_block_ms=16.25 raw_isolate_ms=1.75 raw_post_ms=6.50 "
-        "preview_dup_refresh=8 cap_mode=? "
-        "core_black_run=9 core_static_run=10 SUSPECT"
+        "preview_dup_refresh=8 "
+        "core_black_run=9 core_static_run=10"
     )
+    # The two fields worth paging on must survive RemotePlaySession's .left(300)
+    # forward, which leaves 244 characters for the message body.  Pin their offsets
+    # so a future field insertion cannot quietly push them back off the end again.
+    assert rendered[1][1].index('SUSPECT') < 244
+    assert rendered[1][1].index('cap_mode=') < 244
 
 
 def test_capture_health_reports_the_driver_negotiated_mode(monkeypatch):

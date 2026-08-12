@@ -2905,14 +2905,24 @@ class RemotePlayOrchestrator:
             except Exception:
                 cap_mode = '?'
 
+        # FIELD ORDER IS LOAD-BEARING. RemotePlaySession.cpp:2682/:2716 forward every sidecar line
+        # to orion_native.log as trimmed.left(300), and the Python logging prefix
+        # ("<ts> WARNING RemotePlayOrchestrator: ") eats 56 of those, leaving 244 for the message.
+        # This line renders ~360, so the last ~120 characters have ALWAYS been cut: grep the whole
+        # 8.6 MB log and "preview_dup_refresh", "core_black_run" and " SUSPECT" appear ZERO times.
+        # SUSPECT is the degraded-feed marker -- the single most important token here -- and it has
+        # never once been visible. Until the C++ cap is raised, anything worth reading must sit at
+        # the FRONT, so the suspect flag and the negotiated mode lead the line.
         logger.warning(
-            'Capture health: tier=%s tiers=%s uniqfps=%d dup%%=%.0f '
+            'Capture health:%s cap_mode=%s tier=%s tiers=%s uniqfps=%d dup%%=%.0f '
             'export_fps=%.0f gap_fps=%.0f cv_fps=%.0f detect_ms=%.1f '
             'raw_fps=%.1f raw_gap_max_ms=%.1f raw_late=%d '
             'source_skip=%d raw_gap_frame=%d raw_gap_event_ms=%.0f '
             'raw_read_block_ms=%.2f raw_isolate_ms=%.2f raw_post_ms=%.2f '
-            'preview_dup_refresh=%d cap_mode=%s '
-            'core_black_run=%d core_static_run=%d%s',
+            'preview_dup_refresh=%d '
+            'core_black_run=%d core_static_run=%d',
+            ' SUSPECT' if snapshot.suspect else '',
+            cap_mode,
             snapshot.tier, dict(snapshot.tier_counts),
             snapshot.unique_frame_fps, snapshot.duplicate_frame_pct,
             exp_fps, gap_fps, snapshot.cv_fps, snapshot.cv_detect_ms,
@@ -2925,9 +2935,8 @@ class RemotePlayOrchestrator:
             float(raw_stats.get('read_block_ms', 0.0) or 0.0),
             float(raw_stats.get('isolate_ms', 0.0) or 0.0),
             float(raw_stats.get('post_ms', 0.0) or 0.0),
-            snapshot.preview_duplicate_refreshes, cap_mode,
-            snapshot.core_black_run, snapshot.core_static_run,
-            ' SUSPECT' if snapshot.suspect else '')
+            snapshot.preview_duplicate_refreshes,
+            snapshot.core_black_run, snapshot.core_static_run)
 
     def _replace_latency_authority(self, route_scope: str, reason: str,
                                    *, fence_frames: bool,
