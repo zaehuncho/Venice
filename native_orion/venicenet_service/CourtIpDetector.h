@@ -35,6 +35,25 @@ public:
 
     static constexpr int kCourtPortMin = 30000;
     static constexpr int kCourtPortMax = 30099;
+    // [ORION_PORT_RANGE_MISMATCH 2026-08-11] This detector qualifies 30000-30099, but
+    // MeterDelayIntercept's WinDivert filter only matches 30000-30020 (MeterDelayIntercept.h
+    // kPortMax / the filter string in MeterDelayIntercept.cpp). A real court flow on 30021-30099
+    // therefore QUALIFIES here, the service reports active=true, and the filter matches ZERO
+    // packets -- meter delay silently does nothing while claiming to work. That can burn an entire
+    // tuning session, and it is invisible without reading two headers side by side.
+    //
+    // DELIBERATELY NOT "FIXED" BY MOVING EITHER BOUND. Narrowing this to 30020 would make a
+    // legitimate high-port flow undetectable (delay dies with no court at all); widening the
+    // WinDivert filter changes what a LocalSystem kernel driver captures and needs real NBA 2K26
+    // port evidence we do not have. Both silently trade one failure for another. Instead
+    // portOutsideInterceptRange() lets the caller SAY SO -- a loud, honest "detected but cannot
+    // intercept" beats a quiet lie, and it is the only version that is safe 17 days from ship.
+    // Revisit with real port evidence; see METER_DELAY_PLAN_2026-08-12.md Option 5.
+    static constexpr int kInterceptPortMax = 30020;
+    [[nodiscard]] static constexpr bool portOutsideInterceptRange(int port) noexcept
+    {
+        return port > kInterceptPortMax && port <= kCourtPortMax;
+    }
     static constexpr int kMinimumPackets = 12;
     static constexpr int kMinimumPacketsPerDirection = 3;
     static constexpr std::int64_t kMinimumObservationSpanMs = 400;

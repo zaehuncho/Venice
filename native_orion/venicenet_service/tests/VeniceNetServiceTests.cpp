@@ -625,8 +625,28 @@ void testFinishedThreadStaysJoinableUntilJoined()
 
 } // namespace
 
+// [ORION_PORT_RANGE_MISMATCH 2026-08-11] CourtIpDetector qualifies 30000-30099; the WinDivert
+// filter only matches 30000-30020. A court flow above 30020 is detected, reported active, and
+// intercepted ZERO times -- meter delay silently no-ops while claiming to work. We deliberately did
+// NOT move either bound (narrowing hides a real court, widening changes what a kernel driver
+// captures and needs port evidence we do not have); the predicate exists so the service can SAY SO.
+void testPortOutsideInterceptRange()
+{
+    CHECK(!CourtIpDetector::portOutsideInterceptRange(30000));
+    CHECK(!CourtIpDetector::portOutsideInterceptRange(CourtIpDetector::kInterceptPortMax));  // 30020
+    CHECK(CourtIpDetector::portOutsideInterceptRange(CourtIpDetector::kInterceptPortMax + 1));
+    CHECK(CourtIpDetector::portOutsideInterceptRange(CourtIpDetector::kCourtPortMax));       // 30099
+    // Outside the detector's own range entirely: not "detected but un-interceptable", just not a
+    // court -- must not warn.
+    CHECK(!CourtIpDetector::portOutsideInterceptRange(CourtIpDetector::kCourtPortMax + 1));
+    CHECK(!CourtIpDetector::portOutsideInterceptRange(0));
+    // The two ranges must actually disagree, or this whole guard is dead weight and should go.
+    CHECK(CourtIpDetector::kInterceptPortMax < CourtIpDetector::kCourtPortMax);
+}
+
 int main()
 {
+    testPortOutsideInterceptRange();
     testFinishedThreadStaysJoinableUntilJoined();
     testJsonParserDepthLimit();
     testSlewCapAndTokenBucket();

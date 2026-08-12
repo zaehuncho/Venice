@@ -384,6 +384,23 @@ private:
             const auto snap = detector_.snapshot(nowMs);
             traceCourtDecision(snap, nowMs);
             if (snap.qualified && !snap.endpointIp.empty()) {
+                // [ORION_PORT_RANGE_MISMATCH 2026-08-11] Say it out loud when we have qualified a
+                // court we can never actually intercept. This detector accepts 30000-30099 while
+                // the WinDivert filter only matches 30000-30020, so a flow above 30020 makes the
+                // service report active=true and hold ZERO packets -- meter delay quietly does
+                // nothing while claiming to work, which can burn a whole tuning session. Warn
+                // ONCE per endpoint rather than per packet; the flow is steady-state so an
+                // unthrottled warning here would flood the log at game rate.
+                if (CourtIpDetector::portOutsideInterceptRange(snap.endpointPort)
+                    && snap.endpointPort != lastOutOfRangePortWarned_) {
+                    lastOutOfRangePortWarned_ = snap.endpointPort;
+                    logLine(std::string(
+                        "WARNING court endpoint qualified on port ")
+                        + std::to_string(snap.endpointPort)
+                        + " which is OUTSIDE the intercept filter range 30000-"
+                        + std::to_string(CourtIpDetector::kInterceptPortMax)
+                        + " -- meter delay will report active but hold NO packets");
+                }
                 // Feed the intercept's court IP only if the client hasn't pinned
                 // one (setDetectedCourtIp is a no-op once a client set wins).
                 server_->setDetectedCourtIp(snap.endpointIp);
@@ -435,6 +452,9 @@ private:
     WinDivertLibrary* lib_ = nullptr;
     IpcServer* server_ = nullptr;
     CourtIpDetector detector_;
+    // [ORION_PORT_RANGE_MISMATCH 2026-08-11] Last endpoint port we warned about being outside the
+    // WinDivert filter range, so the warning fires once per endpoint instead of once per packet.
+    int lastOutOfRangePortWarned_ = 0;
     // Court tracer state — only touched on the sniff thread inside dispatch().
     bool traceQualified_ = false;
     std::string traceEndpoint_ = "<none>";
