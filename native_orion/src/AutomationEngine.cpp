@@ -3334,6 +3334,10 @@ void AutomationEngine::reset()
     meterLockMaxJumpNorm_ = -1.0;
     meterCapNormXAtRel_ = -1.0;
     meterCapNormYAtRel_ = -1.0;
+    // [ORION_LANDING_FEATURES 2026-08-12] Cleared with the rest of the at-release snapshot so a
+    // stale value from the previous shot can never be attributed to this one.
+    meterCapFrameAgeAtRelMs_ = -1.0;
+    meterCapNetworkOffsetAtRelMs_ = -1.0;
 }
 
 void AutomationEngine::beginSidecarProcessGeneration()
@@ -12970,6 +12974,12 @@ void AutomationEngine::startPostReleaseMeterCapture(double now)
     // a grade-time read would attribute the shot to the wrong spot on the floor.
     meterCapNormXAtRel_ = lastMeterNormX_;
     meterCapNormYAtRel_ = lastMeterNormY_;
+    // [ORION_LANDING_FEATURES 2026-08-12] Same sample-and-hold, same instant: the two pipeline-state
+    // numbers that were computed for every shot and reached disk for none. Sampled here rather than
+    // at grade time because both keep moving through the post-release capture window.
+    meterCapFrameAgeAtRelMs_ = std::isfinite(shot_.frameAgeMs) ? shot_.frameAgeMs : -1.0;
+    meterCapNetworkOffsetAtRelMs_ =
+        std::isfinite(shot_.networkOffsetMs) ? shot_.networkOffsetMs : -1.0;
     meterCapSamples_.clear();
 }
 
@@ -14267,7 +14277,21 @@ void AutomationEngine::evaluatePostReleaseMeter()
         // green_start/green_end above are the Release Threshold slider, NOT a measurement --
         // which was true of 72.3% of landings before this line existed.
         "green_obs_n=%10 green_obs_start=%11 green_obs_width=%12 "
-        "meter_x=%13 meter_y=%14 meter_jump=%15 shot=%16")
+        // [ORION_LANDING_FEATURES 2026-08-12] APPEND-ONLY, before shot= (space-bearing label, must
+        // stay last). The pipeline state AT THE FIRE INSTANT, so a graded landing can finally be
+        // regressed against the conditions that produced it.
+        //   vel_at_rel   - meter rise velocity (pp/ms) at release-command submit
+        //   frame_age_ms - how OLD the deciding capture sample was
+        //   rtt_ms       - network offset latched for this shot
+        // -1 = unavailable. WHAT IT WOULD PROVE: whether the per-shot-type residual (Fades and
+        // Go-To show corr(fill_at_rel, peak) ~ +0.5 while Standstill is ~0.0) tracks RTT, tracks
+        // velocity, or is random -- which decides whether a lead controller should be feed-forward
+        // or purely feedback. Before this line those three were computed on every shot and written
+        // on none, and the rich at-fire dump (TIP DEADLINE DECISION) fires only on MISSES, so the
+        // graded shots carried no record of their own conditions.
+        // Nothing consumes these back into timing.
+        "vel_at_rel=%13 frame_age_ms=%14 rtt_ms=%15 "
+        "meter_x=%16 meter_y=%17 meter_jump=%18 shot=%19")
                               .arg(seq)
                               .arg(peak, 0, 'f', 2)
                               .arg(fill, 0, 'f', 2)
@@ -14280,6 +14304,9 @@ void AutomationEngine::evaluatePostReleaseMeter()
                               .arg(greenObsN)
                               .arg(greenObsN > 0 ? obsGs : -1.0, 0, 'f', 2)
                               .arg(greenObsN > 0 ? obsWidth : -1.0, 0, 'f', 2)
+                              .arg(meterCapRiseVelocityPctPerMs_, 0, 'f', 5)
+                              .arg(meterCapFrameAgeAtRelMs_, 0, 'f', 2)
+                              .arg(meterCapNetworkOffsetAtRelMs_, 0, 'f', 2)
                               .arg(meterCapNormXAtRel_, 0, 'f', 4)
                               .arg(meterCapNormYAtRel_, 0, 'f', 4)
                               .arg(landingMeterJump, 0, 'f', 4)

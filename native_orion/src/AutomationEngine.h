@@ -4068,6 +4068,24 @@ private:
     double meterLockMaxJumpNorm_ = -1.0;
     double meterCapNormXAtRel_ = -1.0;    // court position snapshotted at release-command submit
     double meterCapNormYAtRel_ = -1.0;
+    // [ORION_LANDING_FEATURES 2026-08-12] Pipeline state AT THE FIRE INSTANT, sample-and-held for
+    // the same reason meterCapNormXAtRel_ is: the capture window runs hundreds of ms past the
+    // command, so a grade-time read describes a different world than the one the shot was fired in.
+    //
+    // WHY THIS EXISTS. The rich at-fire dump ("TIP DEADLINE DECISION") is emitted only on MISSES,
+    // and RTT-at-fire is latched into shot_.networkOffsetMs and then never logged anywhere. So the
+    // shots that actually matter -- the graded ones -- carry no record of the pipeline state that
+    // produced them, and "is the Fade residual RTT-driven, velocity-driven, or random?" is
+    // unanswerable from the log. Every one of these is already computed; none was reaching disk.
+    //
+    // Deliberately only TWO members: armed_sigma_ms and command_eta_ms already reach the log on
+    // the "Outcome identity" line (lastReleaseArmedSigmaMs_ / lastReleaseArmedCommandEtaMs_), and
+    // the rise velocity is already latched as meterCapRiseVelocityPctPerMs_. Duplicating them here
+    // would create a second source of truth for the same numbers. These two had no path to disk.
+    //
+    // OBSERVABILITY ONLY. Nothing reads these back into timing. -1 = not available for this shot.
+    double meterCapFrameAgeAtRelMs_ = -1.0;       // capture staleness of the deciding sample
+    double meterCapNetworkOffsetAtRelMs_ = -1.0;  // RTT/network offset latched for this shot
     QVector<MeterCalSample> meterCapSamples_;
     // === [ORION_TIP_PHASE] per-landing observation of the animation constant ===========
     // The anchor is snapshotted at release-command submit (the same sample-and-hold shape

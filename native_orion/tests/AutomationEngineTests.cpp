@@ -29304,6 +29304,12 @@ void AutomationEngineTests::courtPositionIsStampedOnAbortAndLandingLines()
         // release-command submit, which is the instant whose court position the shot belongs to.
         engine.meterCapNormXAtRel_ = 0.75;
         engine.meterCapNormYAtRel_ = 0.50;
+        // [ORION_LANDING_FEATURES 2026-08-12] The pipeline state at the fire instant. These were
+        // computed on every shot and written on none, so a graded landing could not be regressed
+        // against the conditions that produced it.
+        engine.meterCapRiseVelocityPctPerMs_ = 0.16840;
+        engine.meterCapFrameAgeAtRelMs_ = 9.40;
+        engine.meterCapNetworkOffsetAtRelMs_ = 23.50;
         engine.meterCapSamples_.clear();
         for (int i = 0; i < 4; ++i) {
             AutomationEngine::MeterCalSample s;
@@ -29339,6 +29345,13 @@ void AutomationEngineTests::courtPositionIsStampedOnAbortAndLandingLines()
         QVERIFY(!diagField(landing, "settled_fill").isNull());
         QVERIFY(!diagField(landing, "green_start").isNull());
         QVERIFY(!diagField(landing, "settled_n").isNull());
+        // [ORION_LANDING_FEATURES 2026-08-12] The three at-fire features must reach the line with
+        // the values latched at submit. Pinned because this exact class of diagnostic has been
+        // lost twice: the capture-health tail was truncated for its entire life, and the courtwide
+        // steal's veto reason is nulled before its own log statement reads it.
+        QCOMPARE(diagField(landing, "vel_at_rel"), QStringLiteral("0.16840"));
+        QCOMPARE(diagField(landing, "frame_age_ms"), QStringLiteral("9.40"));
+        QCOMPARE(diagField(landing, "rtt_ms"), QStringLiteral("23.50"));
         // shot= must remain the LAST field. Its value legitimately contains a space, so it can
         // only be parsed as the rest of the line; appending after it would silently corrupt
         // every reader of the shot type.
