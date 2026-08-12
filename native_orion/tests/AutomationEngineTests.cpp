@@ -1918,6 +1918,17 @@ void AutomationEngineTests::squarePassthroughGivesSquareASecondHomeUnderTempo()
     output = engine.process(physical);
     QVERIFY(output.square());                  // passthrough wins on the FINAL output
     QCOMPARE(output.rightStickY, 127);         // without disturbing the tempo gesture
+    // ...and it must SAY it injected, so the release-ownership trace can subtract a steal instead
+    // of recording out_cleared_all=0 -- a signature whose own comment reads "a real engine
+    // override bug". Without this the passthrough fabricates the exact defect that trace hunts.
+    QVERIFY(engine.squarePassthroughInjectedLastTick());
+
+    // The latch must not outlive the click, or an ordinary shot's output gets marked as injected
+    // and a genuine override would be silently subtracted away.
+    physical.buttons = XINPUT_GAMEPAD_X;
+    output = engine.process(physical);
+    QVERIFY(!engine.squarePassthroughInjectedLastTick());
+    QVERIFY(!output.square());
 }
 
 void AutomationEngineTests::squarePassthroughIsInertWithoutTempoOrWhenDisabled()

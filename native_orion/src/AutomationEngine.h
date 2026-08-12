@@ -2472,7 +2472,20 @@ public:
     ControllerState processInternal(const ControllerState& physical);
     [[nodiscard]] uint16_t squarePassthroughBit() const noexcept;
     void applySquarePassthrough(ControllerState& output,
-                                const ControllerState& physical) const noexcept;
+                                const ControllerState& physical) noexcept;
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] True when the LAST process() injected Square from the
+    // stick click rather than the shot path producing it.
+    //
+    // updateReleaseOwnershipTrace() reads output.square() to prove Orion held the output Square at
+    // 0 for a whole pulse+cooldown, and its own comment calls any 0 there "a real engine override
+    // bug". A steal pressed during a live shot's Releasing window sets that bit and manufactures
+    // exactly the signature that branch exists to hunt -- poisoning the diagnostic we tune shot
+    // timing with. The trace subtracts THIS rather than recomputing the gate condition, so the two
+    // can never drift apart.
+    [[nodiscard]] bool squarePassthroughInjectedLastTick() const noexcept
+    {
+        return squarePassthroughInjected_;
+    }
     // Tempo's left-stick intent is committed as its own ordered controller
     // packet before any generated RS-down gather may be emitted. The controller
     // uses these read-only transaction facts to protect that packet from defense
@@ -4086,6 +4099,12 @@ private:
     // OBSERVABILITY ONLY. Nothing reads these back into timing. -1 = not available for this shot.
     double meterCapFrameAgeAtRelMs_ = -1.0;       // capture staleness of the deciding sample
     double meterCapNetworkOffsetAtRelMs_ = -1.0;  // RTT/network offset latched for this shot
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] Set by applySquarePassthrough on every process() tick;
+    // read by the release-ownership trace so a steal is never mistaken for an engine override.
+    bool squarePassthroughInjected_ = false;
+    // [ORION_LEAD_CEILING_WARN 2026-08-12] De-dup key for the load-time over-ceiling advisory,
+    // encoding the (base lead, offset) pair it was last emitted for. NaN = never emitted.
+    double leadCeilingWarnKey_ = std::numeric_limits<double>::quiet_NaN();
     QVector<MeterCalSample> meterCapSamples_;
     // === [ORION_TIP_PHASE] per-landing observation of the animation constant ===========
     // The anchor is snapshotted at release-command submit (the same sample-and-hold shape

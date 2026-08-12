@@ -1625,6 +1625,42 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // just set the offset, and the next engage must be judged against the NEW value.
     config_.meterDelayLeadOffsetMs = settings.meterDelayLeadOffsetMs;
     meterDelayLeadUncalibratedWarnedMs_ = -1.0;
+    // [ORION_LEAD_CEILING_WARN 2026-08-12] Say it AT LOAD when the delayed-condition lead cannot be
+    // scheduled, instead of waiting for the operator to turn delay on and lose a session.
+    //
+    // THE BUG THIS ENDS. On 2026-08-12 the offset sat at 155 against a 96 ms headroom: base 290 +
+    // 155 = 445 vs a 386 ceiling. Every delayed shot died SHOT LEAD CONFLICT -- 151 aborts, 0
+    // releases -- and nothing said so until someone read two headers side by side. Worse, the band
+    // in AppConfig (kMeterDelayLeadOffsetMaxMs = 400) is ITSELF above the ceiling, and cleanDouble
+    // clamps silently, so the config layer can hand the engine a value it can never honour and
+    // report nothing. Then the lead LEARNS: 290 drifted to 297 the same afternoon, which quietly
+    // pushed a hand-picked "safe" 90 to 387 -- 0.7 ms over. Any fixed offset eventually crosses.
+    //
+    // Advisory only. It changes no timing and suppresses no shot -- the runtime fail-closed path is
+    // unchanged. It fires regardless of whether delay is currently applied, because the whole point
+    // is to be heard BEFORE the delayed session starts. De-duplicated on the (lead, offset) pair so
+    // an apply storm cannot spam the Activity log.
+    if (config_.meterDelayLeadOffsetMs > 0.0) {
+        const double base = measuredLeadForActuationMs();
+        const double ceiling = maxSchedulableTipLeadMs();
+        const double total = base + config_.meterDelayLeadOffsetMs;
+        if (std::isfinite(base) && std::isfinite(ceiling) && ceiling > 0.0 && total > ceiling) {
+            const double key = base * 100000.0 + config_.meterDelayLeadOffsetMs;
+            if (!qFuzzyCompare(leadCeilingWarnKey_, key)) {
+                leadCeilingWarnKey_ = key;
+                emit engineDiagnostic(
+                    QStringLiteral("SHOT LEAD CONFLICT: Shot Lead %1ms + delayed-condition offset "
+                                   "%2ms = %3ms exceeds the schedulable ceiling %4ms. Meter delay "
+                                   "will abort EVERY shot while this holds; lower the offset to "
+                                   "%5ms or less.")
+                        .arg(base, 0, 'f', 0)
+                        .arg(config_.meterDelayLeadOffsetMs, 0, 'f', 0)
+                        .arg(total, 0, 'f', 0)
+                        .arg(ceiling, 0, 'f', 0)
+                        .arg(std::max(0.0, std::floor(ceiling - base)), 0, 'f', 0));
+            }
+        }
+    }
     // [ORION_GREEN_CENTER] Aim inside the green window instead of on its late edge. AppConfig has
     // already banded these; copy verbatim so a settings sweep needs no rebuild. Env override
     // ORION_GREEN_CENTER_FRAC exists for the same reason the lead knobs have one -- so a live A/B
@@ -3051,8 +3087,11 @@ uint16_t AutomationEngine::squarePassthroughBit() const noexcept
 }
 
 void AutomationEngine::applySquarePassthrough(ControllerState& output,
-                                              const ControllerState& physical) const noexcept
+                                              const ControllerState& physical) noexcept
 {
+    // Cleared every tick BEFORE the gates, so a stale true can never outlive the click that set it
+    // and mark an ordinary shot's output as passthrough-injected.
+    squarePassthroughInjected_ = false;
     // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88 -- see RemapConfig::squarePassthroughEnabled.
     //
     // Gated on tempoRemapEnabled because that is the ONLY condition under which Square is
@@ -3069,6 +3108,7 @@ void AutomationEngine::applySquarePassthrough(ControllerState& output,
     // Consume the click. It is now a dedicated Square button, so forwarding it as well would
     // double-input anything the game binds to that stick press.
     output.buttons = static_cast<uint16_t>(output.buttons & ~bit);
+    squarePassthroughInjected_ = true;
 }
 
 ControllerState AutomationEngine::process(const ControllerState& physical)

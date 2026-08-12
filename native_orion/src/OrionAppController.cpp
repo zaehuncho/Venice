@@ -9797,7 +9797,14 @@ void OrionAppController::updateReleaseOwnershipTrace(const ControllerState& phys
 
     const int seq = shot_.releaseSeq;
     const bool physSq = physical.square();
-    const bool outSq = output.square();
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] Subtract a stick-click steal from the ownership trace.
+    // out_cleared_all=1 below is asserted to prove Orion held the output Square at 0 for the whole
+    // pulse+cooldown, and the comment at flushReleaseOwnershipTrace calls any 0 there "a real
+    // engine override bug". Square passthrough deliberately puts X on the output when R3 is held,
+    // so a steal during a live shot's Releasing window would fabricate precisely that signature and
+    // send us hunting an engine bug that does not exist. Read the engine's own injection latch
+    // rather than re-deriving the gate here, so the two cannot disagree.
+    const bool outSq = output.square() && !automation_.squarePassthroughInjectedLastTick();
     const QString backend = directPipeOwnsInput_
         ? QStringLiteral("PIPE")
         : (controller_.isDs4Backend() ? QStringLiteral("DS4")
