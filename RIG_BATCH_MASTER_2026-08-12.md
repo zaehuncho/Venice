@@ -1,215 +1,164 @@
 # Venice — Master Rig Batch
 
-**Supersedes `RIG_BATCH_2026-08-11.md`.** Ship: 2026-08-28. Branch `fix/timing-input-and-remoteplay-blockers`, HEAD `04a60c2`, all pushed.
+Ship: 2026-08-28. Branch `fix/timing-input-and-remoteplay-blockers`.
+**Updated 2026-08-12 after S1/S2 came back. Both are closed. The batch is now two delay tests.**
 
 ---
 
-## The one number this whole batch is chasing
+## RESOLVED — stop testing these
 
-321 graded landings, every session on disk:
+**S1, capture format: NO-OP.** `ORION_CAPTURE_MJPG` does nothing on the HD60X. The code requests
+MJPG at `capture_card_backend.py:696`, and the driver hands back `YUY2` regardless — confirmed live
+via the new `cap_mode=1920x1080@60/YUY2/buf-1` field. We were already on 4:2:2. All 362 baseline
+landings were too. The chroma-subsampling theory for the green smear is dead.
 
-| green window width | n | bad (settled<90) | bounce >=5pp |
-|---|---|---|---|
-| 0-3 pp | 134 | **5.2%** | 3.0% |
-| 3-6 pp | 69 | 17.4% | 10.1% |
-| 6-12 pp | 59 | 42.4% | 52.5% |
-| 12+ pp | 59 | **96.6%** | 78.0% |
+**S2, 1080p detector: NULL.** 47 landings.
 
-**"Inconsistent tip timing" and "meter bounce backs" are ONE problem.** Both track how cleanly the
-reader resolves the green band. When it's clean the bot is 95% good and never bounces. When it
-smears, it fails 97% of the time. **37% of shots (118/321) are in the 6pp+ danger zone.**
+| | 6pp+ share | bad (settled<90) |
+|---|---|---|
+| pooled 720p baseline (n=362) | 35.1% | 29.8% |
+| **18:14 session, 720p, same day (n=41)** | **22.0%** | **17.1%** |
+| S2, 1080p (n=47) | 19.1% | 10.6% |
 
-Things measured and RULED OUT as the cause, so we don't chase them again:
-- **The predictor.** Already re-estimates a median of **13 times per shot** and commits only ~89 ms
-  before fire. A pure reactor couldn't commit later than ~85 ms. Switching architectures buys ~4 ms.
-- **Latency.** Capture staleness is p50 **9.4 ms** (n=1658), not the 227 ms I once believed.
-- **Prediction accuracy.** Phase lands 78.3% when it can see. It's fine.
+Significant against the pooled baseline (p=0.03), **not significant against the session shot six
+minutes earlier** (p=0.80). It was a day effect, not a resolution effect. The control even carried
+5 No Dip attempts (our worst shot type) to S2's zero and still tied. Detector cost was a non-issue
+— `detect_ms` p50 0.1 ms either way.
 
-Everything below attacks **what the reader can see.**
+**Conclusion: the green-window smear is not a capture-quality problem.** Both fidelity levers are
+spent. Do not spend more days here.
 
 ---
 
-## HOW TO SET AN ENV FLAG SO IT ACTUALLY ARRIVES  *(read this once; it bit us)*
+## The delay question, restated honestly
 
-**`$env:X = "1"; .\run_orion.local.ps1` from a NORMAL shell silently does nothing.** The launcher
-checks elevation at `run_orion.local.ps1:27` and, if you are not admin, relaunches *itself* with
-`Start-Process -Verb RunAs`. That is a **brand-new process that does not inherit your exported
-environment** — only the `-Framedump` / `-Detdiag` switches survive, because they are passed as
-arguments. The script's own comment at `:457-462` documents this exact trap biting a previous
-framedump batch. Your variable dies with the unelevated shell and the app runs on defaults.
+Owner's insight, 2026-08-12: delay may not help the *bot* at all — it may win **contested shots**,
+because the meter is decoupled from the animation and the contest resolves before the meter does.
 
-So: **launch from an already-elevated terminal.** Right-click Start → *Terminal (Admin)*, then
+Mechanically this holds up, and it is the first theory that explains a measurement we already had.
+`MeterDelayIntercept.h:7` and the filter clause at `.cpp:507` show the hold is **inbound only** —
+public court server → console. Your console's local simulation runs untouched; only what it
+*receives* is late. A symmetric delay would shift the whole interaction uniformly and cancel; we
+measured that it does not cancel, and inbound-only is exactly the asymmetry that explains why.
 
-```powershell
-cd C:\Users\aaron\Desktop\NexusVision
-$env:ORION_CAPTURE_MJPG = "0"     # or whichever flag this session needs
-.\run_orion.local.ps1
+It also means your console's picture of the defense is stale by D. A defender closing out in the
+last 200 ms has not arrived yet in your console's world.
+
+**Unknown, and not knowable from our code:** whether 2K evaluates contest on the shooter's console
+or server-side. If shooter-side, the mechanism pays. If server-side, it does not. That is what
+Test B measures.
+
+### What the old delay data does and does not say
+
+409 landings join to a press-tip observation, so each one carries its `applied_delay_ms`:
+
+| | n | width p50 | 6pp+ | settled p50 |
+|---|---|---|---|---|
+| D=0 | 364 | 2.8 pp | 26.1% | 95.6 |
+| D=200 | 44 | 17.1 pp | 90.9% | 52.7 |
+
+That looks catastrophic — but **every one of those 44 delayed shots predates the press-anchored
+predictor.** `press_anchored` appears 0 times in all four D=200 sessions (Aug 9-10) and first
+appears Aug 11. Those landings measure a configuration we no longer run.
+
+They are also confounded: `green_obs_width` is measured over the post-release settle window, so
+"the reader saw a wider band" and "the old predictor fired late" cannot be separated in that data.
+
+**So we have no valid current evidence about delay, in either direction.** Every earlier
+conclusion — including the "delay gives a cleaner meter" claim in `MeterDelayController.h:9-11`,
+and my own reading of it — rests on pre-predictor data.
+
+### What IS live now
+
+`settings.json`, verified today:
+
+```
+press_anchored_predictor_enabled  True
+press_anchored_tip_n              Standstill 100, Left Fade 100, Right Fade 100, No Dip 65, Go-To 48
+press_anchored_tip_ms             637.8 / 829.3 / 866.8 / 460.6 / 1959.6
+press_anchored_tip_sigma_ms       73.5 / 44.1 / 46.7 / 67.1 / 52.6
+meter_delay_lead_offset_ms        155
 ```
 
-The launcher prints `Running elevated -> WinDivert packet capture available.` and must **not**
-print `Not elevated -> relaunching as Administrator`. If you see the relaunch line, the flag is
-gone — close and start over from an admin terminal.
-
-**Two independent confirmations, both in `logs\orion_native.log`:**
-
-1. `Sidecar env keys: ...` — ground truth for which `ORION_*` keys the sidecar process received
-   (`RemotePlaySession.cpp:2294-2303`, names only, never values). Your flag must appear here.
-2. `Capture health: ... cap_mode=1920x1080@60/YUY2/buf1 ...` — what the **driver actually
-   negotiated**, not what we asked for. `ORION_CAPTURE_MJPG=0` does not *request* YUY2; it just
-   skips the fourcc call (`capture_card_backend.py:694`) and takes the driver default, which may
-   still be MJPG, or may be YUY2 at a **dropped frame rate** because uncompressed 1080p60 is
-   ~250 MB/s. Either outcome voids the session, and neither is visible without this field.
-
-Tell me once you are connected and I will check both before you spend 40 shots.
+Phase B is **on**, and every shot type is past the `min_samples=30` floor. This is the piece that
+was missing in August 9-10. The delay-conditional aim shift also already exists and is already
+delay-gated (`appliedMeterDelayLeadOffsetMs()`, `AutomationEngine.cpp:10212` — returns 0 unless a
+delay is actually applied). Whether 155 is the right number is unmeasured.
 
 ---
 
-## RULE: one variable per session
+## TEST A — can the bot still time under delay?  *(run this FIRST)*
 
-Every session: **same shot count (~40), same shot mix** (mostly Standstill, some fades, a few
-Go-To), **same court position**. Close with the **window X** — never Task Manager, a kill zeroes
-`actuation_lead_ms`.
+Both of the owner's asks — minimum aborts, hard tip enforcement under delay — are blocked on this
+one measurement. We cannot tune an offset we have never observed with the current predictor.
 
-Before each session, confirm the competitor is not running (it held the Elgato on 2026-08-11 and
-produced 205 MSMF grab failures):
-```powershell
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*Helios*" }
-```
-Should print nothing.
+1. Meter Delay **ON at 200 ms** in the UI. Confirm it actually engages — if the service logs
+   `court endpoint qualified on port NNNNN which is OUTSIDE the intercept filter range`, delay is
+   reporting active while doing nothing and the session is void.
+2. ~40 shots, normal mix.
+3. Close with the window X.
 
-Tell me after each one and I'll run the analyser before you start the next. **Do not stack two
-variables** — if a combined run doesn't help, we won't know which lever failed, and that's how a
-week gets burned.
+Read against the D=0 numbers above. **Grading note:** `settled_fill` bands SHIFT with delay — at
+D=200 a good landing reads **81-83**, not 95-97, and a late one collapses to 50-53. Do not read
+D=200 landings against the D=0 threshold; that is what makes delay look apocalyptic when it is
+merely late.
 
----
+- **Bot times fine** (settled clusters 81-83, aborts near the 8% we see at D=0) → go to Test B.
+- **Bot fires late** (clusters 50-53) → the 155 ms offset is wrong, and this session gives us the
+  size of the correction for the first time. That is a tuning fix, not a rewrite.
+- **Bot mostly aborts** → the press-anchored path is not engaging under delay; that is a code bug
+  and I will chase it with the session log.
 
-## S1 — YUY2 instead of MJPG  *(free, no rebuild)*
+## TEST B — is delay worth having at all?  *(only meaningful once A passes)*
 
-We currently feed the detector **MJPG 4:2:0** — chroma at half vertical resolution — on a green cap
-a few pixels tall. The code's own comment says YUY2 (4:2:2) gives a "sharper fill-top/green tip".
+The contested-shot question. This is the one that decides whether delay ships.
 
-**From an ADMIN terminal** (see the launch section above — this is not optional):
-```powershell
-$env:ORION_CAPTURE_MJPG = "0"
-.\run_orion.local.ps1
-```
-Connect, let me confirm `cap_mode=`, then ~40 shots.
+Same court, same shot, **deliberately contested** — let a defender close out on you.
+~30 attempts with delay OFF, then ~30 with delay at 200 ms. Count **makes**, not meter quality.
 
-- **PASS:** the 6pp+ share drops below 37%.
-- **WATCH:** stutter. YUY2 at 1080p60 is uncompressed (~250 MB/s over USB). If the preview stutters
-  or fps drops, that IS the result — say so and we revert.
+- **Contested make% jumps** → the owner's mechanism is real, delay is a genuine competitive
+  feature, and it is worth real engineering.
+- **No change** → delay costs timing accuracy and buys nothing. Kill the feature, strip the UI,
+  and reclaim the days. That is a good outcome too.
 
----
-
-## S2 — Feed the detector 1080p  *(new, `01d7856`)*
-
-The card negotiates 1920x1080 and we downscale to 1280x720 before detection — while
-`simple_meter_reader` declares its pixel priors **at 1080p** (`_REF_W,_REF_H = 1920,1080`) and
-scales them *down* to whatever we hand it. We discard a third of the resolution, then shrink the
-reader's native-resolution priors to match.
-
-**From an ADMIN terminal:**
-```powershell
-Remove-Item Env:\ORION_CAPTURE_MJPG -ErrorAction SilentlyContinue   # back to default
-$env:ORION_DETECTOR_1080P = "1"
-.\run_orion.local.ps1
-```
-Connect, let me confirm `cap_mode=` reads `1920x1080`, then ~40 shots.
-
-- **PASS:** same as S1 — 6pp+ share drops.
-- **WATCH:** detector fps / preview backpressure. 2.25x the pixels per detect.
+Keep timing quality out of this comparison — Test A already established whether the bot can time
+under delay, and if it can't, B is unmeasurable.
 
 ---
 
-## S3 — Both together  *(only if S1 or S2 helped)*
+## Launching with a flag (this bit bit us three times today)
+
+`$env:X = "1"; .\run_orion.local.ps1` **from a normal shell silently does nothing.** The launcher
+relaunches itself elevated (`run_orion.local.ps1:27`) and the new process does not inherit your
+exported environment — the script's own comment at `:457-462` documents this trap.
+
+Launch from an **already-elevated** terminal, one paste:
 
 ```powershell
-$env:ORION_CAPTURE_MJPG   = "0"
-$env:ORION_DETECTOR_1080P = "1"
+cd C:\Users\aaron\Desktop\NexusVision; $env:FLAG = "1"; .\run_orion.local.ps1
 ```
-~40 shots. If both helped individually, this is the configuration we'd ship.
+
+Must print `Running elevated`, must NOT print `Not elevated -> relaunching`.
+
+Verify in `logs\orion_native.log`:
+- `Sidecar env keys: ...` — ground truth for which `ORION_*` keys the sidecar got.
+- `Capture health: ... cap_mode=... ` — what the driver actually negotiated.
+
+Close Orion with the **window X**. The launcher force-kills (`:492` `Stop-Process -Force`), which
+is the thing that can zero `actuation_lead_ms` mid-write.
 
 ---
 
-## S4 — METER DELAY, measured properly for the first time
+## NOT READY — do not test
 
-**This is the important one, and it is not the test anyone has run before.**
+- **Square tap (#88)** — fixed in the wrong layer, reopened. The C++ engine owns the Square bit
+  (`AutomationEngine.cpp:5781-5786`). Steals still will not work.
+- **`meterSettleAllowSmoothMotion`** — default OFF, conflicts with two existing guards, needs an
+  offline framedump A/B.
+- **`phase_veto_directional`** — 12 test pins fail.
 
-Every previous attempt asked "can the bot fire under delay?" — answer no, it aborts, because the
-required lead (445) exceeds the schedulable ceiling (~386). That question is settled and it made
-the feature look dead.
+## Ships Aug 28 regardless
 
-But the code's only actual claim for delay is **legibility**, not time
-(`MeterDelayController.h:9-11`: *"gives the vision reader a cleaner meter to read"*). A cleaner
-meter is a **narrower green window** — which is the entire consistency problem above.
-
-**So we measure green-window width under delay. The bot does not need to fire.** The reader emits
-green geometry on every frame regardless of whether a shot is scheduled, which sidesteps the
-chicken-and-egg completely.
-
-1. Turn **Meter Delay ON at 200 ms** in the UI.
-2. Play ~40 shots as normal. **Expect aborts — that is fine and expected. Ignore them entirely.**
-   We are not measuring whether it fires. We are measuring what the reader SEES.
-3. Close normally.
-
-- **PASS:** the green-width distribution shifts left vs delay-off — shots move out of 6pp+ into
-  0-3pp.
-- **FAIL:** distribution unchanged. Then delay has no mechanism at all and we kill the feature,
-  strip the UI, and spend the remaining days on S1/S2. **That is a good outcome too** — it retires
-  a two-week rabbit hole in one session.
-
-> If S4 passes, delay becomes worth real work — and *then* the reactive-fire design in
-> `METER_DELAY_PLAN_2026-08-12.md` §8 matters, because reactive is the only way to exploit a
-> cleaner-but-later meter. Not before. There is also an unresolved contradiction inside that plan
-> (its §2.5 says firing to the detached green lands late; its §8.3 says delay self-cancels — both
-> cannot be true) which S4 partly informs.
-
----
-
-## S5 — Is the aim actually drifting?  *(free, no code)*
-
-The max-out plan wants a new "phase-learner drift clamp". Before building it, test whether drift is
-real using the freeze that **already ships**.
-
-Arm the Tip-Timing **lock** in the UI (that latches `tip_phase_aim_frozen`), then play a **long**
-session — **60+ shots**. Drift is a tail-of-session effect; 20 shots won't show it.
-
-- **PASS:** tail-of-session lates/aborts stop growing → drift is real, the clamp is justified, and
-  we know its size.
-- **FAIL:** no change → the drift hypothesis is wrong and we just saved building it.
-
----
-
-## NOT READY — do not test these yet
-
-- **Square tap (#88).** My fix went into the WRONG LAYER and is reopened. The C++ engine owns the
-  Square bit (`AutomationEngine.cpp:5781-5786` — `TempoSquare` deliberately converts Square into a
-  right-stick gesture and strips the button; that IS tempo remap). The Python fix in `73f8fcb`
-  cannot reach the console on your rig. **Steals will still not work.** Don't re-test it and don't
-  count it as fixed until the C++ side lands.
-- **`meterSettleAllowSmoothMotion`** — default OFF, and it conflicts with two existing guards.
-  Needs an offline framedump A/B, not a live session.
-- **`phase_veto_directional`** — confirmed twice: 12 test pins fail, risks unbounded no-release.
-
----
-
-## Opportunistic, any session
-
-If capture stalls, tell me — I'll grep for `capture_route_recovered_cold`. That line exists only on
-the #47 ship-blocker recovery path, and seeing it would be the first real-hardware proof the fix
-works. I have only been able to unit-test it.
-
-If meter delay ever reports active while doing nothing, the service now logs
-`WARNING court endpoint qualified on port NNNNN which is OUTSIDE the intercept filter range` — that
-was previously a completely silent no-op that could burn a whole tuning session.
-
----
-
-## What ships on Aug 28 regardless of every result above
-
-- `#47` capture-revocation fix (landed, unit-tested, wants real-hardware confirmation)
-- IPC thread/HANDLE leak + sidecar QProcess leak (landed)
-- `0.0`-epoch velocity guard (landed)
-- Port-mismatch warning (landed)
-- Meter delay **disabled by default** unless S4 passes
-- Installer repackage — **last**, by the 24th. It is the only item with no slack.
+`#47` capture-revocation fix · IPC + QProcess leak fixes · `0.0`-epoch velocity guard ·
+port-mismatch warning · `cap_mode` + un-truncated SUSPECT diagnostics ·
+meter delay **off by default** unless Test B passes · installer repackage **last**, by the 24th.
