@@ -1,141 +1,122 @@
 # Venice — Master Rig Batch
 
-Ship 2026-08-28. Branch `fix/timing-input-and-remoteplay-blockers` @ `021f6af`, pushed.
-**This is ONE session, ~15 minutes.** Meter delay is shelved. Everything below is delay-OFF.
+Ship 2026-08-28. Branch `fix/timing-input-and-remoteplay-blockers` @ `70f980d`, pushed.
+**Relaunch before testing — five commits landed since the build you last ran.**
 
 ---
 
-## Before you start
+## FIRST: a number I got wrong
 
-**Relaunch.** The running app predates `021f6af`, so R3 does nothing yet.
+I told you we were "done bot-wise" off a **3.7% under-timed** figure. That used `peak < 95` as the
+miss threshold — a bar I invented. Your green window starts at **98.0**. Scored against the real
+window, the same session was:
 
-```powershell
-cd C:\Users\aaron\Desktop\NexusVision; .\run_orion.local.ps1
+```
+peak < 95          (my bar)            3.7%
+peak < green_start (the real bar)     25.9%     <- one in four
+peak > green_end                       0.0%
+in green                              74.1%
 ```
 
-Meter Delay **OFF**. No env flags — the shipping default config is what we are measuring.
-Close with the **window X** when done (the launcher force-kills, and that can zero
-`actuation_lead_ms` mid-write).
+**We are not done bot-wise.** One shot in four misses green, always low — over-timing does not
+exist at all (0.0% across every shot type, all 528 delay-off landings). It is a *spread* problem:
+the window is ~2 pp wide and peak spread is 3.3 pp (Standstill) to 8.4 pp (Right Fade).
 
-Two settings I changed with the app closed, both already saved:
-
-| | was | now | why |
-|---|---|---|---|
-| `press_anchored_predictor_enabled` | true | **false** | it was hijacking shots and firing at fill 18 |
-| `meter_delay_lead_offset_ms` | 155 | 90 | only matters with delay on; 155 exceeded the 96 ceiling |
+That also kills "aim higher" permanently. The optimal constant aim offset is **+0.0** for every
+shot type — a shift just trades under-misses for over-misses. Only narrowing the distribution helps.
 
 ---
 
-## The session — four things, one sitting
+## What changed since your last run
 
-**A. ~40 normal shots**, your usual mix, MyCourt or a game. This is the consistency number.
-
-**B. ~10 Go-To from beyond half court**, nothing else mixed in. Take them in a block so I can
-find them in the log by timestamp.
-
-**C. Press R3 a few times on defense** — that is the new steal button.
-
-**D. Tell me anything that felt wrong.** Your read has been right every time today: "76 aborts,
-you sure?", "square passthrough not working", "sometimes it only times the meter halfway". All
-three were real and all three were things the numbers alone had not shown me.
-
----
-
-## What each one is checking
-
-### A — consistency (the "are we done" number)
-
-Delay-off baseline, phase-armed, n=421:
-
-| | share |
+| commit | what |
 |---|---|
-| UNDER-timed (peak_fill < 95 — fired before the tip) | 10.7% |
-| OVER-timed (reached the tip, then settled < 90) | 6.9% |
-| clean (peak ≥ 95 **and** settled ≥ 95) | 64.6% |
+| `26261bf` | **A7** — every graded landing now carries `vel_at_rel`, `frame_age_ms`, `rtt_ms` |
+| `1fc8f6a` | steal no longer poisons the ownership trace; load-time warning if the lead can't be scheduled |
+| `70f980d` | Meter Delay card hidden; connect readiness poll 100 ms → 25 ms |
+| `021f6af` | **R3 = Square** (the steal), earlier today |
+| settings | `press_anchored_predictor_enabled` **false**, `meter_delay_lead_offset_ms` **90 → 80** |
 
-**PASS: under-timed drops well below 10.7%.** The press-anchored predictor accounted for a chunk
-of it — every shot it armed failed to top out — and it is now off. First post-fix sample was 14/14
-topping out, which is promising and far too small to trust.
-
-`peak_fill` is the honest instrument here and you can read it yourself in the Activity log:
-`peak = fill_at_rel + travel_pp`, and the meter stops where the release registers. **Near 100 means
-it released at the tip; anything in the 80s means it fired early.** Only valid with delay off.
-
-### B — Go-To beyond half court
-
-`ORION_READER_STEAL_COURTWIDE` already defaults ON, so the fix we shipped for this is active and
-you are still seeing it fail. The courtwide steal has only ever seated **19 times**.
-
-The candidate it finds gets nulled by one of two vetoes before anything is logged
-(`simple_meter_reader.py:5678-5681` — B8 clipped-sliver, B7 prior-presence), and for a
-beyond-half-court meter at `h=4-9 px` both are plausible. A clean block of 10 lets me tell
-"never found a candidate" from "found one and threw it away". Those are different fixes.
-
-### C — Square / steals (#88, `021f6af`)
-
-Tempo remap consumes Square at 21 sites across 12 functions, which is also why the steal died.
-**R3 now emits a real Square** that the remap never touches — including mid-shot, while Square is
-held and the stick is being driven. The click is consumed so the game does not also see a stick
-press.
-
-L3 is deliberately not the default: it is turbo in 2K, so Square there would steal on every sprint.
-Change with `square_passthrough_button` (`r3` / `l3` / `none`).
-
-My previous attempt at this (`73f8fcb`) tried to tell a tap from a hold and replay it, in the
-Python layer, which cannot reach the console on a capture-card rig. This one cannot guess wrong.
+The offset move matters: your lead **learned from 290 to 297 during today's sessions**, which
+silently pushed my "safe" 90 to 387 against a 386.3 ceiling — 0.7 ms over, i.e. delay would have
+aborted every shot again. 80 leaves 9.3 ms of margin, and the new warning now catches it at load
+instead of costing you a session.
 
 ---
 
-## Where "strictly enforced tip timing" actually stands
+## The session — one sitting, ~15 minutes
 
-Worth reading before deciding we are done, because the remaining error is not where we assumed.
+Relaunch, delay off (the card is hidden now), then:
 
-```
-                 fill_at_rel      travel_pp
-under-timed         39.0            52.4
-reached the tip     39.4            59.4
-```
+1. **~40 normal shots**, usual mix.
+2. **~10 Go-To from beyond half court**, in one block so I can find them by timestamp.
+3. **R3 on defense** — the steal. Tell me whether it works; the log can't tell me.
+4. **Anything that felt wrong.** You've been right three times today when the numbers weren't.
 
-**The bot commands the release at the identical moment on both.** Command-point spread is 6.4 pp
-(~35 ms); travel spread is 9.7 pp (~53 ms). The larger variance is *downstream of the press* — how
-far the meter moves before the release registers.
+### What I'll read
 
-So the residual is **not** fixable by a better predictor, a better reader, or sub-pixel work:
+**Consistency:** `peak < green_start`, against the **25.9%** baseline. Not my old 95 bar.
 
-- Sub-pixel already exists (`ORION_READER_SUBPIX_EDGE`) and is off on purpose — measured at
-  **0.23 ms** of noise removed against a **1.88 ms** bias introduced.
-- 1080p detection: tested, null against a same-day control.
-- Capture format: `ORION_CAPTURE_MJPG` is a no-op, the HD60X gives YUY2 regardless.
+**A7's payoff:** with `vel_at_rel` / `frame_age_ms` / `rtt_ms` now on every landing, I can finally
+regress the residual against pipeline state and answer the question that decides the next build —
+is the Fade miss rate RTT-driven, velocity-driven, or random? That determines whether a lead
+controller should be feed-forward or pure feedback. One session of data is enough.
 
-What would address it is aiming through the meter's own rate — fire when
-`fill + velocity x latency >= 100` rather than at a fixed predicted moment. The engine already
-computes exactly that quantity (`expectedRisePct = velocityPctPerMs * effectiveLatency`,
-`AutomationEngine.cpp:8419`) — but only the vision-crossing release path consumes it, and your
-shots fire on the **phase** path (`targetMode=meter_tip_phase`), which is rate-blind. The bounded
-±18 ms vision nudge is gated on green-confirmation, and these shots log `greenConfirmed=0`.
-
-**That is the one real bot-side change left.** It is a shot-path edit, which is the riskiest kind,
-so I want session A's number first — if under-timing is already near zero with the predictor off,
-it is not worth the risk this close to ship.
+**Go-To:** the courtwide steal has seated **19 times ever**. A clean block tells me whether the
+ladder never finds a candidate or finds one and a veto discards it — different fixes.
 
 ---
 
-## Not in this batch
+## Why the residual is not what I said (corrected)
 
-- **Meter delay** — shelved. Revives only if the contested-shot A/B says the netcode advantage is
-  real. Inbound-only hold is confirmed (`MeterDelayIntercept.h:7`), and the "cleaner meter" claim
-  is refuted: green width was 13.9 pp at D=200 vs 2.8 pp at D=0.
-- **`meter_x` right-side effect** — real and reproducible (7/7 sessions, 16% vs 38%) but a second
-  independent instrument disagrees about direction, so the metric itself is suspect. Needs a
-  framedump, not more log archaeology.
-- **Stick-value randomisation** — the reference GPC jitters every injected flick by ±7; we emit
-  exactly `(0, ±127)` every time, a perfectly repeatable fingerprint. No evidence 2K looks. Your
-  call, not mine to change unilaterally.
-- `meterSettleAllowSmoothMotion`, `phase_veto_directional` — still not ready.
+I claimed it was "downstream of the press" and that no predictor or reader work could help.
+**That was circular** — `travel_pp` is `peak_fill − fill_at_rel` by definition (652/652 rows), and
+peak was my grouping variable, so "they differ in travel" was the same sentence as "they differ in
+peak".
+
+The real structure splits by shot type, and it reproduces independently:
+
+```
+shot           n    corr(fill_at_rel, peak)   peak_sd   under-miss
+Standstill   227           -0.00               3.34       15.0%
+No_Dip        45           +0.01               3.91        6.7%
+Right_Fade   104           +0.62               8.42       14.4%
+Left_Fade     97           +0.56               4.68       22.7%
+Go-To         55           +0.50               2.42       18.2%
+```
+
+**Standstill / No Dip** self-correct — fire early, the meter travels further, peak lands the same.
+Nothing upstream helps there.
+**Fades / Go-To** leak fire jitter straight into peak. A tighter fire *does* tighten the outcome —
+and they are the worst offenders. My blanket "no predictor work helps" was wrong for exactly the
+shots that need it most.
+
+---
+
+## Still confirmed dead — do not revisit
+
+- **Aim higher / per-type aim offset** — optimal constant offset is +0.0. Proven, not argued.
+- **Sub-pixel reading** — `ORION_READER_SUBPIX_EDGE` exists and is off on purpose: removes 0.23 ms
+  of noise, introduces 1.88 ms of bias.
+- **1080p detection** — null against a same-day control (p=0.80).
+- **Capture format** — `ORION_CAPTURE_MJPG` is a no-op; the HD60X returns YUY2 regardless.
+- **Meter delay as a meter-quality feature** — green width 13.9 pp at D=200 vs 2.8 pp at D=0, and
+  bounce-back 100% vs 16.8%. It makes the read *worse*. Card is now hidden.
+
+## Next, once the session lands
+
+1. **A5 tick probe** — both consumers are already written and gated; only the phase probe is
+   missing. Verified: **zero `tick_phase` entries in the entire log**, and the code says so at
+   `AutomationEngine.cpp:11719` — *"not one probe label has ever been accepted on this install."*
+   Kills the ±8.3 ms send-vs-poll beat, which is 1.5 pp of a 2 pp window. **Not attempted today** —
+   it is real new measurement code, and I would rather build it against A7's data than rush it.
+2. **A2 bounded lead controller**, fed by A7's regression.
+3. **A6 sub-frame peak** — the graded peak is a discrete frame max quantised to ~3.7 pp, which is
+   *larger than the entire green window*. We are grading with a ruler coarser than the target.
 
 ## Ships Aug 28 regardless
 
 `#47` capture-revocation fix · IPC + QProcess leak fixes · `0.0`-epoch velocity guard ·
-port-mismatch warning · `cap_mode` + un-truncated SUSPECT diagnostics · press-anchored predictor
-off · R3 Square passthrough · meter delay off by default · **installer repackage LAST, by the 24th
-— the only item with no slack.**
+port-mismatch warning · `cap_mode` + SUSPECT diagnostics · A7 landing features · press-anchored
+predictor off · R3 Square passthrough · lead-ceiling warning · Meter Delay hidden ·
+**installer repackage LAST, by the 24th — the only item with no slack.**
