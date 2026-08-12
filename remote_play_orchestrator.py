@@ -2890,13 +2890,28 @@ class RemotePlayOrchestrator:
             except Exception:
                 raw_stats = {}
 
+        # What the DRIVER actually gave us, not what we asked for. capture_card_backend logs this
+        # once at open time (logger.info "Capture-card negotiated"), but sidecar INFO is only
+        # forwarded to orion_native.log in the shutdown tail -- so the one line that says whether
+        # ORION_CAPTURE_MJPG=0 / ORION_DETECTOR_1080P=1 actually TOOK has never been visible during
+        # a session. Every capture-format A/B until now was faith-based. This warning IS forwarded,
+        # so restate the negotiated mode here, cheaply, on every health tick.
+        cap_mode = '?'
+        negotiated_mode = getattr(backend, 'negotiated_mode', None) if backend is not None else None
+        if callable(negotiated_mode):
+            try:
+                _nw, _nh, _nfps, _ncc, _nbuf = negotiated_mode()
+                cap_mode = '%dx%d@%.0f/%s/buf%.0f' % (_nw, _nh, _nfps, _ncc or '?', _nbuf)
+            except Exception:
+                cap_mode = '?'
+
         logger.warning(
             'Capture health: tier=%s tiers=%s uniqfps=%d dup%%=%.0f '
             'export_fps=%.0f gap_fps=%.0f cv_fps=%.0f detect_ms=%.1f '
             'raw_fps=%.1f raw_gap_max_ms=%.1f raw_late=%d '
             'source_skip=%d raw_gap_frame=%d raw_gap_event_ms=%.0f '
             'raw_read_block_ms=%.2f raw_isolate_ms=%.2f raw_post_ms=%.2f '
-            'preview_dup_refresh=%d '
+            'preview_dup_refresh=%d cap_mode=%s '
             'core_black_run=%d core_static_run=%d%s',
             snapshot.tier, dict(snapshot.tier_counts),
             snapshot.unique_frame_fps, snapshot.duplicate_frame_pct,
@@ -2910,7 +2925,7 @@ class RemotePlayOrchestrator:
             float(raw_stats.get('read_block_ms', 0.0) or 0.0),
             float(raw_stats.get('isolate_ms', 0.0) or 0.0),
             float(raw_stats.get('post_ms', 0.0) or 0.0),
-            snapshot.preview_duplicate_refreshes,
+            snapshot.preview_duplicate_refreshes, cap_mode,
             snapshot.core_black_run, snapshot.core_static_run,
             ' SUSPECT' if snapshot.suspect else '')
 

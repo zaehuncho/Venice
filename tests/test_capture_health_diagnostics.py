@@ -91,9 +91,61 @@ def test_capture_health_worker_is_off_loop_bounded_latest_wins_and_drains(monkey
         "raw_fps=57.5 raw_gap_max_ms=24.5 raw_late=2 "
         "source_skip=7 raw_gap_frame=321 raw_gap_event_ms=1750000000125 "
         "raw_read_block_ms=16.25 raw_isolate_ms=1.75 raw_post_ms=6.50 "
-        "preview_dup_refresh=8 "
+        "preview_dup_refresh=8 cap_mode=? "
         "core_black_run=9 core_static_run=10 SUSPECT"
     )
+
+
+def test_capture_health_reports_the_driver_negotiated_mode(monkeypatch):
+    """cap_mode must restate what the DRIVER gave us, not what we requested.
+
+    capture_card_backend logs the negotiated mode once at open time via logger.info,
+    but sidecar INFO only reaches orion_native.log in the shutdown tail -- so a live
+    session could never confirm that ORION_CAPTURE_MJPG=0 / ORION_DETECTOR_1080P=1
+    actually took.  Every capture-format A/B was faith-based until this field existed.
+    """
+    class Backend:
+        def export_stats(self):
+            return 59.0, 1.0
+
+        def cadence_stats(self, window_s):
+            return {'fps': 57.5}
+
+        def negotiated_mode(self):
+            return (1920, 1080, 60.0, 'YUY2', 1.0)
+
+    rendered = []
+    monkeypatch.setattr(rpo.logger, 'warning', lambda fmt, *a: rendered.append(fmt % a))
+    rpo.RemotePlayOrchestrator._emit_capture_health_diagnostic(
+        _snapshot(Backend(), 'latest'))
+
+    assert len(rendered) == 1
+    assert 'cap_mode=1920x1080@60/YUY2/buf1' in rendered[0]
+
+
+def test_capture_health_never_lets_a_mode_probe_break_the_health_line(monkeypatch):
+    """A backend without the accessor, or one that throws, must degrade to '?'.
+
+    Diagnostics are observational: losing cap_mode is acceptable, losing the whole
+    capture-health line (the tier/dup/fps evidence used to diagnose a degraded feed)
+    is not.
+    """
+    class NoAccessor:
+        def export_stats(self):
+            return 0.0, 0.0
+
+    class Throws(NoAccessor):
+        def negotiated_mode(self):
+            raise RuntimeError('driver went away mid-teardown')
+
+    for backend in (NoAccessor(), Throws(), None):
+        rendered = []
+        monkeypatch.setattr(rpo.logger, 'warning', lambda fmt, *a: rendered.append(fmt % a))
+        rpo.RemotePlayOrchestrator._emit_capture_health_diagnostic(
+            _snapshot(backend, 'latest'))
+        assert len(rendered) == 1
+        assert 'cap_mode=? ' in rendered[0]
+        assert 'core_black_run=9' in rendered[0]
 
 
 def test_capture_loop_handoff_only_snapshots_primitives_and_never_queries_backend():
