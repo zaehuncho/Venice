@@ -473,6 +473,12 @@ class GreenWindowTracker:
 
 class RemapEngine:
 
+    # [ORION_SQUARE_TAP_FORWARD 2026-08-11] #88. Frames of synthetic Square emitted after a WARMUP
+    # cancels on release, to replay the tap the bot swallowed. 4 frames at the 60 Hz input rate is
+    # ~66 ms -- comfortably long enough for the console to register a press, and still shorter than
+    # min_press_hold_ms (~75 ms) so a replayed tap can never itself look like a shot hold.
+    SQUARE_TAP_FORWARD_FRAMES = 4
+
     def __init__(self, config=None):
         self._config = config or RemapConfig()
         self._config.input_mode = _normalize_input_mode(self._config.input_mode, 'both')
@@ -493,6 +499,9 @@ class RemapEngine:
         self._stick_down_latched = False
         self._stick_up_latched = False
         self._stick_up_frames = 0
+        # [ORION_SQUARE_TAP_FORWARD 2026-08-11] Countdown of synthetic Square-down frames owed to
+        # the console for a tap the bot swallowed during a cancelled WARMUP. See #88.
+        self._pending_square_forward = 0
         self._stats = {'shots_attempted': 0, 'shots_released': 0, 'shots_aborted': 0, 'avg_hold_ms': 0.0, 'last_release_fill_pct': 0.0, 'greens_hit': 0}
         self._hold_times = deque(maxlen=50)
         # Rolling window of recent timing errors (ms, signed). Used to drive a
@@ -676,6 +685,25 @@ class RemapEngine:
                 output = self._process_releasing(output, now)
             elif hs == HoldState.COOLDOWN:
                 output = self._process_cooldown(output, now)
+
+            # [ORION_SQUARE_TAP_FORWARD 2026-08-11] #88. Replay a swallowed tap.
+            #
+            # Placed AFTER the dispatch so it is the last word on the output byte -- every
+            # _process_* branch above may strip Square, and this must survive that. Gated on IDLE
+            # so it can never fight a live shot, and cleared the moment a new warmup arms (below),
+            # so a tap immediately followed by a real held shot does not inject into it.
+            #
+            # The physical button is already RELEASED here, so this is synthetic input. That is the
+            # point: the player did press it, we ate it, and a sub-threshold tap is definitionally
+            # not a shot.
+            # Gate on `hs` -- the state at the START of this frame -- not the post-dispatch state.
+            # On the cancelling frame itself hs is WARMUP, so the replay begins on the FOLLOWING
+            # frame: the physical button has only just gone up and re-asserting it in the same
+            # packet is indistinguishable from never releasing. _begin_warmup() clears the counter,
+            # so a new real press always wins over an owed replay.
+            if self._pending_square_forward > 0 and hs == HoldState.IDLE:
+                output.set_button(DS4Button.SQUARE, True)
+                self._pending_square_forward -= 1
             return output
     
     def _encode_face_buttons_selective(self, original_button_byte, shot, hold_state):
@@ -854,6 +882,9 @@ class RemapEngine:
         )
         self._sampler.reset()
         self._green_tracker.reset()
+        # [ORION_SQUARE_TAP_FORWARD 2026-08-11] A new warmup supersedes any owed tap replay: the
+        # player has moved on to a real press, and injecting into it would corrupt the shot.
+        self._pending_square_forward = 0
         logger.debug('Shot WARMUP mode=%s', mode.name)
 
     def _process_warmup(self, state, input_active, now):
@@ -866,6 +897,19 @@ class RemapEngine:
                 rtt_offset_ms=shot.rtt_offset_ms,
                 dynamic_offset_ms=shot.dynamic_offset_ms,
             )
+            # [ORION_SQUARE_TAP_FORWARD 2026-08-11] #88. Every WARMUP frame stripped Square from
+            # the output, so a tap shorter than min_press_hold_ms (~75ms) reached the console as
+            # NOTHING: pressed, swallowed, cancelled, never forwarded. Owner symptom -- cannot
+            # steal on defence, cannot press Square in a menu, with tempo remap on.
+            #
+            # A tap below the hold threshold is BY DEFINITION not a shot (a shot must be held), so
+            # it was always the player's other intent and forwarding it is correct. Re-emit it as a
+            # synthetic press over the next few frames; the action lands ~1-2 frames late instead
+            # of never. Only on the RELEASE cancel -- a movement-cancel (below) means the player
+            # drove out of it while still holding, and the still-held physical button flows through
+            # on its own once we are back in IDLE.
+            if shot.mode == ShotMode.BUTTON_SHOT:
+                self._pending_square_forward = self.SQUARE_TAP_FORWARD_FRAMES
             logger.debug('Shot WARMUP cancelled: input released')
             return state
 

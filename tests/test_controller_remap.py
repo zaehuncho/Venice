@@ -449,6 +449,67 @@ def test_button_mode_tap_is_fully_suppressed_from_first_frame():
     out = engine.process(_square_state(False))  # released before threshold
     assert engine.current_state == HoldState.IDLE
     assert not out.is_button_pressed(DS4Button.SQUARE)
+    # NOTE (#88, 2026-08-11): "fully suppressed" now means suppressed DURING the warmup and on the
+    # cancelling frame -- which is all this test ever asserted, and all that the original
+    # "tapping shoots" bug required. The tap is replayed on the FOLLOWING frames; see
+    # test_cancelled_warmup_replays_the_swallowed_square_tap.
+
+
+def test_cancelled_warmup_replays_the_swallowed_square_tap():
+    """#88 -- a sub-threshold Square tap must still REACH the console.
+
+    Every WARMUP frame strips Square, so a tap released before min_press_hold_ms used to reach the
+    console as nothing at all: pressed, swallowed, cancelled, never forwarded. Owner symptom --
+    cannot steal on defence, cannot press Square in a menu, with tempo remap on.
+
+    A tap below the hold threshold is by definition not a shot (a shot must be HELD), so it was
+    always the player's other intent. Replay it.
+    """
+    cfg = RemapConfig(stable_frames_required=1, confidence_gate=0.10,
+                      gpc_flick_chain_ms=0.0, min_press_hold_ms=80.0)
+    engine = RemapEngine(cfg)
+
+    out = engine.process(_square_state(True))        # IDLE -> WARMUP
+    assert engine.current_state == HoldState.WARMUP
+    assert not out.is_button_pressed(DS4Button.SQUARE)
+
+    out = engine.process(_square_state(False))       # released before threshold -> cancel
+    assert engine.current_state == HoldState.IDLE
+    assert not out.is_button_pressed(DS4Button.SQUARE), (
+        "the cancelling frame must stay clean -- re-asserting in the same packet the button went "
+        "up in is indistinguishable from never releasing")
+
+    # The replay: Square is now emitted even though the physical button is released.
+    forwarded = 0
+    for _ in range(RemapEngine.SQUARE_TAP_FORWARD_FRAMES):
+        out = engine.process(_square_state(False))
+        if out.is_button_pressed(DS4Button.SQUARE):
+            forwarded += 1
+    # The >= 1 is load-bearing: `forwarded == SQUARE_TAP_FORWARD_FRAMES` alone would pass
+    # vacuously if the constant were ever zeroed, since the loop would not run.
+    assert forwarded >= 1, "the swallowed tap must be replayed to the console"
+    assert forwarded == RemapEngine.SQUARE_TAP_FORWARD_FRAMES
+
+    # ...and then it stops. A replay that never ends would read as a held shot.
+    out = engine.process(_square_state(False))
+    assert not out.is_button_pressed(DS4Button.SQUARE)
+    assert engine.current_state == HoldState.IDLE
+
+
+def test_replay_is_abandoned_when_a_real_press_arrives():
+    """A tap immediately followed by a genuine held shot must not inject into that shot."""
+    cfg = RemapConfig(stable_frames_required=1, confidence_gate=0.10,
+                      gpc_flick_chain_ms=0.0, min_press_hold_ms=80.0)
+    engine = RemapEngine(cfg)
+
+    engine.process(_square_state(True))              # WARMUP
+    engine.process(_square_state(False))             # cancel -> replay owed
+    assert engine._pending_square_forward > 0
+
+    out = engine.process(_square_state(True))        # a REAL new press arms a warmup
+    assert engine.current_state == HoldState.WARMUP
+    assert engine._pending_square_forward == 0, "a new warmup must supersede an owed replay"
+    assert not out.is_button_pressed(DS4Button.SQUARE)
 
 
 def test_button_mode_hold_outputs_real_square_then_autogreen_releases():
