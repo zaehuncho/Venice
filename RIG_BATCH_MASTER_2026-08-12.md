@@ -1,164 +1,141 @@
 # Venice — Master Rig Batch
 
-Ship: 2026-08-28. Branch `fix/timing-input-and-remoteplay-blockers`.
-**Updated 2026-08-12 after S1/S2 came back. Both are closed. The batch is now two delay tests.**
+Ship 2026-08-28. Branch `fix/timing-input-and-remoteplay-blockers` @ `021f6af`, pushed.
+**This is ONE session, ~15 minutes.** Meter delay is shelved. Everything below is delay-OFF.
 
 ---
 
-## RESOLVED — stop testing these
+## Before you start
 
-**S1, capture format: NO-OP.** `ORION_CAPTURE_MJPG` does nothing on the HD60X. The code requests
-MJPG at `capture_card_backend.py:696`, and the driver hands back `YUY2` regardless — confirmed live
-via the new `cap_mode=1920x1080@60/YUY2/buf-1` field. We were already on 4:2:2. All 362 baseline
-landings were too. The chroma-subsampling theory for the green smear is dead.
-
-**S2, 1080p detector: NULL.** 47 landings.
-
-| | 6pp+ share | bad (settled<90) |
-|---|---|---|
-| pooled 720p baseline (n=362) | 35.1% | 29.8% |
-| **18:14 session, 720p, same day (n=41)** | **22.0%** | **17.1%** |
-| S2, 1080p (n=47) | 19.1% | 10.6% |
-
-Significant against the pooled baseline (p=0.03), **not significant against the session shot six
-minutes earlier** (p=0.80). It was a day effect, not a resolution effect. The control even carried
-5 No Dip attempts (our worst shot type) to S2's zero and still tied. Detector cost was a non-issue
-— `detect_ms` p50 0.1 ms either way.
-
-**Conclusion: the green-window smear is not a capture-quality problem.** Both fidelity levers are
-spent. Do not spend more days here.
-
----
-
-## The delay question, restated honestly
-
-Owner's insight, 2026-08-12: delay may not help the *bot* at all — it may win **contested shots**,
-because the meter is decoupled from the animation and the contest resolves before the meter does.
-
-Mechanically this holds up, and it is the first theory that explains a measurement we already had.
-`MeterDelayIntercept.h:7` and the filter clause at `.cpp:507` show the hold is **inbound only** —
-public court server → console. Your console's local simulation runs untouched; only what it
-*receives* is late. A symmetric delay would shift the whole interaction uniformly and cancel; we
-measured that it does not cancel, and inbound-only is exactly the asymmetry that explains why.
-
-It also means your console's picture of the defense is stale by D. A defender closing out in the
-last 200 ms has not arrived yet in your console's world.
-
-**Unknown, and not knowable from our code:** whether 2K evaluates contest on the shooter's console
-or server-side. If shooter-side, the mechanism pays. If server-side, it does not. That is what
-Test B measures.
-
-### What the old delay data does and does not say
-
-409 landings join to a press-tip observation, so each one carries its `applied_delay_ms`:
-
-| | n | width p50 | 6pp+ | settled p50 |
-|---|---|---|---|---|
-| D=0 | 364 | 2.8 pp | 26.1% | 95.6 |
-| D=200 | 44 | 17.1 pp | 90.9% | 52.7 |
-
-That looks catastrophic — but **every one of those 44 delayed shots predates the press-anchored
-predictor.** `press_anchored` appears 0 times in all four D=200 sessions (Aug 9-10) and first
-appears Aug 11. Those landings measure a configuration we no longer run.
-
-They are also confounded: `green_obs_width` is measured over the post-release settle window, so
-"the reader saw a wider band" and "the old predictor fired late" cannot be separated in that data.
-
-**So we have no valid current evidence about delay, in either direction.** Every earlier
-conclusion — including the "delay gives a cleaner meter" claim in `MeterDelayController.h:9-11`,
-and my own reading of it — rests on pre-predictor data.
-
-### What IS live now
-
-`settings.json`, verified today:
-
-```
-press_anchored_predictor_enabled  True
-press_anchored_tip_n              Standstill 100, Left Fade 100, Right Fade 100, No Dip 65, Go-To 48
-press_anchored_tip_ms             637.8 / 829.3 / 866.8 / 460.6 / 1959.6
-press_anchored_tip_sigma_ms       73.5 / 44.1 / 46.7 / 67.1 / 52.6
-meter_delay_lead_offset_ms        155
-```
-
-Phase B is **on**, and every shot type is past the `min_samples=30` floor. This is the piece that
-was missing in August 9-10. The delay-conditional aim shift also already exists and is already
-delay-gated (`appliedMeterDelayLeadOffsetMs()`, `AutomationEngine.cpp:10212` — returns 0 unless a
-delay is actually applied). Whether 155 is the right number is unmeasured.
-
----
-
-## TEST A — can the bot still time under delay?  *(run this FIRST)*
-
-Both of the owner's asks — minimum aborts, hard tip enforcement under delay — are blocked on this
-one measurement. We cannot tune an offset we have never observed with the current predictor.
-
-1. Meter Delay **ON at 200 ms** in the UI. Confirm it actually engages — if the service logs
-   `court endpoint qualified on port NNNNN which is OUTSIDE the intercept filter range`, delay is
-   reporting active while doing nothing and the session is void.
-2. ~40 shots, normal mix.
-3. Close with the window X.
-
-Read against the D=0 numbers above. **Grading note:** `settled_fill` bands SHIFT with delay — at
-D=200 a good landing reads **81-83**, not 95-97, and a late one collapses to 50-53. Do not read
-D=200 landings against the D=0 threshold; that is what makes delay look apocalyptic when it is
-merely late.
-
-- **Bot times fine** (settled clusters 81-83, aborts near the 8% we see at D=0) → go to Test B.
-- **Bot fires late** (clusters 50-53) → the 155 ms offset is wrong, and this session gives us the
-  size of the correction for the first time. That is a tuning fix, not a rewrite.
-- **Bot mostly aborts** → the press-anchored path is not engaging under delay; that is a code bug
-  and I will chase it with the session log.
-
-## TEST B — is delay worth having at all?  *(only meaningful once A passes)*
-
-The contested-shot question. This is the one that decides whether delay ships.
-
-Same court, same shot, **deliberately contested** — let a defender close out on you.
-~30 attempts with delay OFF, then ~30 with delay at 200 ms. Count **makes**, not meter quality.
-
-- **Contested make% jumps** → the owner's mechanism is real, delay is a genuine competitive
-  feature, and it is worth real engineering.
-- **No change** → delay costs timing accuracy and buys nothing. Kill the feature, strip the UI,
-  and reclaim the days. That is a good outcome too.
-
-Keep timing quality out of this comparison — Test A already established whether the bot can time
-under delay, and if it can't, B is unmeasurable.
-
----
-
-## Launching with a flag (this bit bit us three times today)
-
-`$env:X = "1"; .\run_orion.local.ps1` **from a normal shell silently does nothing.** The launcher
-relaunches itself elevated (`run_orion.local.ps1:27`) and the new process does not inherit your
-exported environment — the script's own comment at `:457-462` documents this trap.
-
-Launch from an **already-elevated** terminal, one paste:
+**Relaunch.** The running app predates `021f6af`, so R3 does nothing yet.
 
 ```powershell
-cd C:\Users\aaron\Desktop\NexusVision; $env:FLAG = "1"; .\run_orion.local.ps1
+cd C:\Users\aaron\Desktop\NexusVision; .\run_orion.local.ps1
 ```
 
-Must print `Running elevated`, must NOT print `Not elevated -> relaunching`.
+Meter Delay **OFF**. No env flags — the shipping default config is what we are measuring.
+Close with the **window X** when done (the launcher force-kills, and that can zero
+`actuation_lead_ms` mid-write).
 
-Verify in `logs\orion_native.log`:
-- `Sidecar env keys: ...` — ground truth for which `ORION_*` keys the sidecar got.
-- `Capture health: ... cap_mode=... ` — what the driver actually negotiated.
+Two settings I changed with the app closed, both already saved:
 
-Close Orion with the **window X**. The launcher force-kills (`:492` `Stop-Process -Force`), which
-is the thing that can zero `actuation_lead_ms` mid-write.
+| | was | now | why |
+|---|---|---|---|
+| `press_anchored_predictor_enabled` | true | **false** | it was hijacking shots and firing at fill 18 |
+| `meter_delay_lead_offset_ms` | 155 | 90 | only matters with delay on; 155 exceeded the 96 ceiling |
 
 ---
 
-## NOT READY — do not test
+## The session — four things, one sitting
 
-- **Square tap (#88)** — fixed in the wrong layer, reopened. The C++ engine owns the Square bit
-  (`AutomationEngine.cpp:5781-5786`). Steals still will not work.
-- **`meterSettleAllowSmoothMotion`** — default OFF, conflicts with two existing guards, needs an
-  offline framedump A/B.
-- **`phase_veto_directional`** — 12 test pins fail.
+**A. ~40 normal shots**, your usual mix, MyCourt or a game. This is the consistency number.
+
+**B. ~10 Go-To from beyond half court**, nothing else mixed in. Take them in a block so I can
+find them in the log by timestamp.
+
+**C. Press R3 a few times on defense** — that is the new steal button.
+
+**D. Tell me anything that felt wrong.** Your read has been right every time today: "76 aborts,
+you sure?", "square passthrough not working", "sometimes it only times the meter halfway". All
+three were real and all three were things the numbers alone had not shown me.
+
+---
+
+## What each one is checking
+
+### A — consistency (the "are we done" number)
+
+Delay-off baseline, phase-armed, n=421:
+
+| | share |
+|---|---|
+| UNDER-timed (peak_fill < 95 — fired before the tip) | 10.7% |
+| OVER-timed (reached the tip, then settled < 90) | 6.9% |
+| clean (peak ≥ 95 **and** settled ≥ 95) | 64.6% |
+
+**PASS: under-timed drops well below 10.7%.** The press-anchored predictor accounted for a chunk
+of it — every shot it armed failed to top out — and it is now off. First post-fix sample was 14/14
+topping out, which is promising and far too small to trust.
+
+`peak_fill` is the honest instrument here and you can read it yourself in the Activity log:
+`peak = fill_at_rel + travel_pp`, and the meter stops where the release registers. **Near 100 means
+it released at the tip; anything in the 80s means it fired early.** Only valid with delay off.
+
+### B — Go-To beyond half court
+
+`ORION_READER_STEAL_COURTWIDE` already defaults ON, so the fix we shipped for this is active and
+you are still seeing it fail. The courtwide steal has only ever seated **19 times**.
+
+The candidate it finds gets nulled by one of two vetoes before anything is logged
+(`simple_meter_reader.py:5678-5681` — B8 clipped-sliver, B7 prior-presence), and for a
+beyond-half-court meter at `h=4-9 px` both are plausible. A clean block of 10 lets me tell
+"never found a candidate" from "found one and threw it away". Those are different fixes.
+
+### C — Square / steals (#88, `021f6af`)
+
+Tempo remap consumes Square at 21 sites across 12 functions, which is also why the steal died.
+**R3 now emits a real Square** that the remap never touches — including mid-shot, while Square is
+held and the stick is being driven. The click is consumed so the game does not also see a stick
+press.
+
+L3 is deliberately not the default: it is turbo in 2K, so Square there would steal on every sprint.
+Change with `square_passthrough_button` (`r3` / `l3` / `none`).
+
+My previous attempt at this (`73f8fcb`) tried to tell a tap from a hold and replay it, in the
+Python layer, which cannot reach the console on a capture-card rig. This one cannot guess wrong.
+
+---
+
+## Where "strictly enforced tip timing" actually stands
+
+Worth reading before deciding we are done, because the remaining error is not where we assumed.
+
+```
+                 fill_at_rel      travel_pp
+under-timed         39.0            52.4
+reached the tip     39.4            59.4
+```
+
+**The bot commands the release at the identical moment on both.** Command-point spread is 6.4 pp
+(~35 ms); travel spread is 9.7 pp (~53 ms). The larger variance is *downstream of the press* — how
+far the meter moves before the release registers.
+
+So the residual is **not** fixable by a better predictor, a better reader, or sub-pixel work:
+
+- Sub-pixel already exists (`ORION_READER_SUBPIX_EDGE`) and is off on purpose — measured at
+  **0.23 ms** of noise removed against a **1.88 ms** bias introduced.
+- 1080p detection: tested, null against a same-day control.
+- Capture format: `ORION_CAPTURE_MJPG` is a no-op, the HD60X gives YUY2 regardless.
+
+What would address it is aiming through the meter's own rate — fire when
+`fill + velocity x latency >= 100` rather than at a fixed predicted moment. The engine already
+computes exactly that quantity (`expectedRisePct = velocityPctPerMs * effectiveLatency`,
+`AutomationEngine.cpp:8419`) — but only the vision-crossing release path consumes it, and your
+shots fire on the **phase** path (`targetMode=meter_tip_phase`), which is rate-blind. The bounded
+±18 ms vision nudge is gated on green-confirmation, and these shots log `greenConfirmed=0`.
+
+**That is the one real bot-side change left.** It is a shot-path edit, which is the riskiest kind,
+so I want session A's number first — if under-timing is already near zero with the predictor off,
+it is not worth the risk this close to ship.
+
+---
+
+## Not in this batch
+
+- **Meter delay** — shelved. Revives only if the contested-shot A/B says the netcode advantage is
+  real. Inbound-only hold is confirmed (`MeterDelayIntercept.h:7`), and the "cleaner meter" claim
+  is refuted: green width was 13.9 pp at D=200 vs 2.8 pp at D=0.
+- **`meter_x` right-side effect** — real and reproducible (7/7 sessions, 16% vs 38%) but a second
+  independent instrument disagrees about direction, so the metric itself is suspect. Needs a
+  framedump, not more log archaeology.
+- **Stick-value randomisation** — the reference GPC jitters every injected flick by ±7; we emit
+  exactly `(0, ±127)` every time, a perfectly repeatable fingerprint. No evidence 2K looks. Your
+  call, not mine to change unilaterally.
+- `meterSettleAllowSmoothMotion`, `phase_veto_directional` — still not ready.
 
 ## Ships Aug 28 regardless
 
 `#47` capture-revocation fix · IPC + QProcess leak fixes · `0.0`-epoch velocity guard ·
-port-mismatch warning · `cap_mode` + un-truncated SUSPECT diagnostics ·
-meter delay **off by default** unless Test B passes · installer repackage **last**, by the 24th.
+port-mismatch warning · `cap_mode` + un-truncated SUSPECT diagnostics · press-anchored predictor
+off · R3 Square passthrough · meter delay off by default · **installer repackage LAST, by the 24th
+— the only item with no slack.**
