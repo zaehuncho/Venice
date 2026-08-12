@@ -1304,6 +1304,9 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     }
     config_.tempoRemapEnabled = settings.tempoRemapEnabled;
     config_.tempoRemapType = settings.tempoRemapType;
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88
+    config_.squarePassthroughEnabled = settings.squarePassthroughEnabled;
+    config_.squarePassthroughButton = settings.squarePassthroughButton;
     // Built-in default-ON (user directive): no-dip is the default shot, so the engine forces the
     // mode on regardless of the (signed) settings value. noDipLeadMs stays live-tuned (default 0 =
     // behaviour-neutral until dialled). Was: config_.noDipEnabled = settings.noDipEnabled;
@@ -3039,7 +3042,43 @@ void AutomationEngine::updateNetworkQuality(double offsetMs, double jitterMs)
     updateNetworkOffset(offsetMs);
 }
 
+uint16_t AutomationEngine::squarePassthroughBit() const noexcept
+{
+    const QString button = config_.squarePassthroughButton.trimmed().toLower();
+    if (button == QLatin1String("r3")) return XINPUT_GAMEPAD_RIGHT_THUMB;
+    if (button == QLatin1String("l3")) return XINPUT_GAMEPAD_LEFT_THUMB;
+    return 0;   // "none" and every unrecognised value: inert, never a crash
+}
+
+void AutomationEngine::applySquarePassthrough(ControllerState& output,
+                                              const ControllerState& physical) const noexcept
+{
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88 -- see RemapConfig::squarePassthroughEnabled.
+    //
+    // Gated on tempoRemapEnabled because that is the ONLY condition under which Square is
+    // unreachable. With Tempo off the physical button already passes through, and a second
+    // binding would be a surprise (a stick click silently shooting) rather than a fix.
+    if (!config_.squarePassthroughEnabled || !config_.tempoRemapEnabled) {
+        return;
+    }
+    const uint16_t bit = squarePassthroughBit();
+    if (bit == 0 || (physical.buttons & bit) == 0) {
+        return;
+    }
+    output.buttons |= XINPUT_GAMEPAD_X;
+    // Consume the click. It is now a dedicated Square button, so forwarding it as well would
+    // double-input anything the game binds to that stick press.
+    output.buttons = static_cast<uint16_t>(output.buttons & ~bit);
+}
+
 ControllerState AutomationEngine::process(const ControllerState& physical)
+{
+    ControllerState output = processInternal(physical);
+    applySquarePassthrough(output, physical);
+    return output;
+}
+
+ControllerState AutomationEngine::processInternal(const ControllerState& physical)
 {
     const double now = nowMs();
     lastPhysical_ = physical;

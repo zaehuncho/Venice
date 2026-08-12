@@ -128,6 +128,25 @@ struct RemapConfig {
     // Legacy persisted compatibility. Runtime Tempo behavior is controlled by
     // tempoRemapEnabled and always remaps the Square-owned shot to gather/flick.
     QString tempoRemapType = QStringLiteral("button");
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88. Tempo remap CONSUMES Square: every owned path
+    // clears XINPUT_GAMEPAD_X and drives the right stick instead (21 clear sites across 12
+    // functions). That is the remap working as designed, but it also means Square's OTHER job --
+    // the steal -- becomes unreachable while Tempo is on.
+    //
+    // The 2026-08-11 attempt (73f8fcb) tried to tell a "tap" from a "hold" and replay the tap the
+    // remap had swallowed. That has to GUESS, and it guessed in the Python remap layer, which
+    // cannot reach the console on a capture-card rig at all. Reopened.
+    //
+    // Give Square a SECOND HOME instead: a stick click emits a real Square and is exempt from the
+    // remap. No timing heuristic, no replay window, nothing to race. Applied once on the FINAL
+    // output in process(), so it cannot be undone by a later clear site.
+    //
+    // R3 is the default and L3 is deliberately NOT: L3 is turbo in NBA 2K, so binding Square there
+    // fires a steal every time the player sprints. R3 is unused by this engine (grep
+    // XINPUT_GAMEPAD_RIGHT_THUMB -- read in WinMmButtonMapping/OrionAppController, never acted on).
+    bool squarePassthroughEnabled = true;
+    // "r3" | "l3" | "none". Unrecognised values behave as "none" (feature inert, never a crash).
+    QString squarePassthroughButton = QStringLiteral("r3");
     // No-Dip shot mode: a no-dip jumpshot skips the gather/dip, so it releases earlier. When on,
     // add noDipLeadMs to the release lead (live-tuned; default 0 = inert).
     bool noDipEnabled = false;
@@ -2446,6 +2465,14 @@ public:
     // doesn't match the active capture (a later shot already opened its own).
     void cancelPostReleaseGrade(int releaseSeq);
     ControllerState process(const ControllerState& physical);
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] process() is now a thin wrapper: it runs the state
+    // machine (processInternal) and then applies the passthrough to the FINAL output. Deliberately
+    // NOT folded into the state machine -- processInternal has FIVE return points and the remap
+    // clears Square at 21 sites, so any earlier placement can be silently undone downstream.
+    ControllerState processInternal(const ControllerState& physical);
+    [[nodiscard]] uint16_t squarePassthroughBit() const noexcept;
+    void applySquarePassthrough(ControllerState& output,
+                                const ControllerState& physical) const noexcept;
     // Tempo's left-stick intent is committed as its own ordered controller
     // packet before any generated RS-down gather may be emitted. The controller
     // uses these read-only transaction facts to protect that packet from defense

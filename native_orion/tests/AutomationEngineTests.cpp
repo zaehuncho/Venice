@@ -77,6 +77,8 @@ private slots:
     void squareHoldUsesOnlyVirtualSquare();
     void winMmSonyButtonMappingAndPov();
     void tempoRemapDrivesStickDownThenFlicksUp();
+    void squarePassthroughGivesSquareASecondHomeUnderTempo();
+    void squarePassthroughIsInertWithoutTempoOrWhenDisabled();
     void tempoMovementCommitPrecedesSquareGather();
     void tempoMovementCommitPreservesFadeThroughFlickAndDrain();
     void tempoMovementCommitFailureFallsBackBeforeSyntheticRs();
@@ -1870,6 +1872,82 @@ void AutomationEngineTests::tempoRemapDrivesStickDownThenFlicksUp()
     }
     QVERIFY(sawUpFlick);                  // tempo shot fired as an UP flick
     QVERIFY(squareStayedSuppressed);     // never a Square button shot
+}
+
+void AutomationEngineTests::squarePassthroughGivesSquareASecondHomeUnderTempo()
+{
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88. Tempo remap consumes Square at 21 sites, which
+    // also kills the steal. R3 must emit a REAL Square that survives to the final output, and the
+    // click itself must be consumed so the game does not also see a stick press.
+    AutomationEngine engine;
+    AppConfigData config;
+    config.remotePlayInputSource = QStringLiteral("square");
+    config.tempoRemapEnabled = true;
+    config.meterEnabled = true;
+    config.minimumHoldMs = 0.0;
+    config.fixedHoldMs = 650.0;
+    LearningData learning;
+    engine.applyConfig(config, learning);
+
+    // Idle, nothing else held: R3 alone is a Square.
+    ControllerState physical;
+    physical.buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    ControllerState output = engine.process(physical);
+    QVERIFY(output.square());
+    QVERIFY((output.buttons & XINPUT_GAMEPAD_RIGHT_THUMB) == 0);   // click consumed
+    // A stick click is NOT a shot gesture: the engine keys shot intent off the physical Square
+    // edge, so this must never arm the bot.
+    QCOMPARE(engine.shotsAttempted(), 0);
+
+    // Released -> no Square.
+    physical.buttons = 0;
+    output = engine.process(physical);
+    QVERIFY(!output.square());
+
+    // The load-bearing case: MID-SHOT. Square is held (so the remap owns it and is driving the
+    // right stick), and R3 must still reach the console for a steal.
+    physical.buttons = XINPUT_GAMEPAD_X;
+    output = engine.process(physical);
+    engine.advanceTestClock(220);
+    output = engine.process(physical);
+    QCOMPARE(engine.context().mode, ShotMode::TempoSquare);
+    QVERIFY(!output.square());                 // remap still suppresses the physical Square
+    QCOMPARE(output.rightStickY, 127);         // ...and still drives the gather
+
+    physical.buttons = XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_RIGHT_THUMB;
+    output = engine.process(physical);
+    QVERIFY(output.square());                  // passthrough wins on the FINAL output
+    QCOMPARE(output.rightStickY, 127);         // without disturbing the tempo gesture
+}
+
+void AutomationEngineTests::squarePassthroughIsInertWithoutTempoOrWhenDisabled()
+{
+    // Three inert paths. Tempo OFF is the important one: Square already passes through on its own
+    // there, so a second binding would be a surprise (a stick click silently shooting), not a fix.
+    const struct { bool tempo; bool enabled; QString button; const char* why; } cases[] = {
+        { false, true,  QStringLiteral("r3"),   "tempo off -> physical Square already works" },
+        { true,  false, QStringLiteral("r3"),   "feature disabled" },
+        { true,  true,  QStringLiteral("none"), "no button bound" },
+        { true,  true,  QStringLiteral("xyz"),  "unrecognised button must not fall back to a bind" },
+    };
+    for (const auto& c : cases) {
+        AutomationEngine engine;
+        AppConfigData config;
+        config.remotePlayInputSource = QStringLiteral("square");
+        config.tempoRemapEnabled = c.tempo;
+        config.meterEnabled = true;
+        config.squarePassthroughEnabled = c.enabled;
+        config.squarePassthroughButton = c.button;
+        LearningData learning;
+        engine.applyConfig(config, learning);
+
+        ControllerState physical;
+        physical.buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+        const ControllerState output = engine.process(physical);
+        QVERIFY2(!output.square(), c.why);
+        // Inert means untouched: the click still reaches the game as a click.
+        QVERIFY2((output.buttons & XINPUT_GAMEPAD_RIGHT_THUMB) != 0, c.why);
+    }
 }
 
 void AutomationEngineTests::tempoMovementCommitPrecedesSquareGather()
@@ -8688,6 +8766,12 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // Appears at its compiled default of 0.0, which is exactly the pre-keying behaviour,
         // so an owner's file gaining this key changes nothing about how their install fires.
         QStringLiteral("meter_delay_lead_offset_ms"),
+        // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88. Both appear at compiled defaults
+        // (enabled=true, button="r3"). Safe for an existing install: the passthrough is gated on
+        // tempoRemapEnabled, so an owner who never turned Tempo on sees no behaviour change at
+        // all, and one who did gains a Square they previously could not reach.
+        QStringLiteral("square_passthrough_enabled"),
+        QStringLiteral("square_passthrough_button"),
     };
     QStringList newKeys;
     const QStringList persistedKeys = persisted.keys();

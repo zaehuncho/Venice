@@ -473,6 +473,9 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("tempo_remap_enabled"), data.tempoRemapEnabled);
     obj.insert(QStringLiteral("tempo_flick_enabled"), data.tempoFlickEnabled);
     obj.insert(QStringLiteral("tempo_remap_type"), data.tempoRemapType);
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88
+    obj.insert(QStringLiteral("square_passthrough_enabled"), data.squarePassthroughEnabled);
+    obj.insert(QStringLiteral("square_passthrough_button"), data.squarePassthroughButton);
     obj.insert(QStringLiteral("no_dip_enabled"), data.noDipEnabled);
     obj.insert(QStringLiteral("no_dip_lead_ms"), data.noDipLeadMs);
     // [ORION_USER_LEAD] the user-facing Shot Lead + whether the USER (not the measurement) set it.
@@ -1102,6 +1105,13 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     data_.tempoRemapEnabled = cleanBool(obj, "tempo_remap_enabled", data_.tempoRemapEnabled);
     data_.tempoFlickEnabled = cleanBool(obj, "tempo_flick_enabled", data_.tempoFlickEnabled);
     data_.tempoRemapType = cleanText(obj, "tempo_remap_type", data_.tempoRemapType, 16);
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88. An unrecognised button string leaves the feature
+    // inert rather than defaulting to a binding the user did not ask for; squarePassthroughBit()
+    // maps anything outside {r3,l3} to 0.
+    data_.squarePassthroughEnabled =
+        cleanBool(obj, "square_passthrough_enabled", data_.squarePassthroughEnabled);
+    data_.squarePassthroughButton =
+        cleanText(obj, "square_passthrough_button", data_.squarePassthroughButton, 8);
     data_.noDipEnabled = cleanBool(obj, "no_dip_enabled", data_.noDipEnabled);
     data_.noDipLeadMs = cleanDouble(obj, "no_dip_lead_ms", data_.noDipLeadMs, -150.0, 150.0);
     // [ORION_USER_LEAD] accepted set is {0} u [150, 800]: 0 means "not configured yet" (the

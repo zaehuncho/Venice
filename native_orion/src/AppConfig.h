@@ -422,6 +422,12 @@ struct AppConfigData {
     // gather -> flick at the meter tip; best for Go-To). Stage-3 scaffold: UI + plumbing in
     // place; the engine stick-flick timing is tuned from a live batch before it drives output.
     QString tempoRemapType = QStringLiteral("button");
+    // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88. Tempo remap consumes Square, which also disables
+    // the steal. A stick click becomes a real Square that the remap never touches. Default R3:
+    // L3 is turbo in NBA 2K, so binding Square there would steal on every sprint. See
+    // RemapConfig::squarePassthroughEnabled for the full rationale.
+    bool squarePassthroughEnabled = true;
+    QString squarePassthroughButton = QStringLiteral("r3");   // "r3" | "l3" | "none"
     // Per-type shot-mode override: type -> "auto"|"normal"|"tempo" (auto/absent = global tempo).
     // Lets Standstill stay a normal Square while fades use the tempo gesture, etc.
     QMap<QString, QString> shotTypeModeOverride;
