@@ -137,6 +137,38 @@ def _isolate_detector_frame(frame, trusted_isolated: bool = False):
         return None, "isolation"
 
 
+def _detector_contract_size():
+    """[ORION_DETECTOR_1080P 2026-08-11] Resolve the detector's geometry contract.
+
+    DEFAULT IS UNCHANGED (1280x720) -- set ORION_DETECTOR_1080P=1 to feed the detector the card's
+    full 1920x1080 instead. A/B-able without a rebuild, same convention as ORION_CAPTURE_MJPG.
+
+    WHY IT MIGHT WIN. The capture card already negotiates 1920x1080; we then downscale to 720p
+    before detection. Meanwhile simple_meter_reader's own pixel priors are declared AT 1080p
+    (`_REF_W, _REF_H = 1920.0, 1080.0  # priors are px @1080p; scaled to the live capture size`)
+    and are scaled DOWN to whatever we hand it. So today we throw away a third of the resolution
+    and then shrink the reader's native-resolution priors to match the smaller frame.
+
+    That matters because of what the loss actually costs. Across 321 graded landings the green
+    window width predicts almost everything: under 3pp only 5.2% of shots land badly and 3% bounce;
+    over 12pp it is 96.6% bad and 78% bounce. 37% of shots sit in the 6pp+ danger zone. A green cap
+    a few pixels tall, carried in MJPG 4:2:0 chroma (half vertical resolution) and then scaled by
+    0.667, is exactly how a crisp band turns into a smeared one.
+
+    NOT DEFAULT-ON: this is a real behaviour change (more pixels per detect, different rounding in
+    every derived box) and it deserves a framedump A/B or a counted live batch first. The
+    source-independence contract the caller documents is PRESERVED either way -- every source is
+    still normalised to ONE size, just a different one.
+    """
+    raw = str(os.environ.get('ORION_DETECTOR_1080P', '') or '').strip().lower()
+    if raw in ('1', 'true', 'yes', 'on'):
+        return 1920, 1080
+    return 1280, 720
+
+
+_DETECTOR_CONTRACT_W, _DETECTOR_CONTRACT_H = _detector_contract_size()
+
+
 def _normalize_detector_frame(frame, width: int = 1280, height: int = 720):
     """Aspect-preserving normalization to the detector's exact 1280x720 contract.
 
@@ -3667,7 +3699,10 @@ class RemotePlayOrchestrator:
         # source negotiated 720p or 1080p.  This is a uniform scale (plus at most a
         # centered aspect crop), never the independent-axis stretch that made meter
         # width/height and court position source-dependent.
-        return _normalize_detector_frame(owned, width=1280, height=720)
+        # [ORION_DETECTOR_1080P 2026-08-11] The contract SIZE is now selectable (default 1280x720,
+        # unchanged); the one-size-for-every-source property this comment protects is untouched.
+        return _normalize_detector_frame(
+            owned, width=_DETECTOR_CONTRACT_W, height=_DETECTOR_CONTRACT_H)
 
     def _source_frame_reason(self, frame, source_identity: int, frame_number: int,
                              timestamp_ns: int, now_s: float) -> str:
