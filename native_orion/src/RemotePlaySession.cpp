@@ -1933,26 +1933,36 @@ void RemotePlaySession::promoteWarmPreviewToStream()
     // values a fresh --config-json launch would have baked in).
     pushRemapUpdate();
 
-    // Protocol grace only. A legacy sidecar that never acknowledges current-session
-    // readiness is not allowed to inherit the old unconditional Running fallback.
-    // Missing evidence must fail closed just like an explicit false verdict.
+    // Progress note only -- NOT a verdict.
+    //
+    // This used to fail the promotion CLOSED when the sidecar's `begin` ack had not arrived within
+    // kStreamPromoteFallbackMs, on the theory that only a legacy sidecar stays silent that long.
+    // Measured 2026-08-12 that theory is false. One preview sidecar (pid 8580) served four Connect
+    // presses; this timer rejected the first two at 2.54s and the third and fourth promoted fine --
+    // the SAME process, so it cannot have "learned" the protocol in between. What the timer actually
+    // measured was ack LATENCY, not ack CAPABILITY.
+    //
+    // The latency is structural and self-documented: the ack goes out through _emit(), whose own
+    // comment records the preview/telemetry writers monopolising `_emit_lock` with "p50=1538 ms
+    // measured" queueing (n=447). A live, compliant sidecar therefore misses a 2.5s grace routinely,
+    // and the user eats an Error plus a preview teardown/restore for a promotion that was working.
+    //
+    // Fail-closed is preserved intact, and does not depend on this timer:
+    //   * `started` can only reach Running through sidecarStartedHasInputAuthority(), which demands
+    //     an explicit input_ready -- a legacy sidecar's bare `started` is still rejected there.
+    //   * an ack (or verdict) that never arrives at ALL is still caught by the
+    //     kStreamPromoteDeadlineMs deadline below, which errors with an honest message.
+    // So dropping the fatality here removes a false negative without opening a false positive.
     QTimer::singleShot(kStreamPromoteFallbackMs, this, [this, generation]() {
-        if (generation != streamPromoteGeneration_ || state_ != RemotePlayState::Connecting) {
+        if (generation != streamPromoteGeneration_ || !streamPromotePending_
+                || state_ != RemotePlayState::Connecting) {
             return;   // superseded by a newer connect, or the verdict already moved us
         }
-        if (streamPromoteAcked_) {
-            // The sidecar told us it is working on it; wait for the real result rather than
-            // claiming a running bot we cannot vouch for.
-            setState(RemotePlayState::Connecting,
-                     QStringLiteral("Starting Chiaki input link..."));
-            return;
-        }
-        streamPromotePending_ = false;
-        rejectLateSidecarStarted_ = true;
-        setState(RemotePlayState::Error,
-                 QStringLiteral("Stream sidecar did not acknowledge current console-session "
-                                "readiness; automation remains disabled."));
-        restoreWarmPreviewAfterPromotionFailure();
+        setState(RemotePlayState::Connecting,
+                 streamPromoteAcked_
+                     ? QStringLiteral("Starting Chiaki input link...")
+                     : QStringLiteral("Waiting for the detection sidecar to pick up the stream "
+                                      "request..."));
     });
 
     // Hard deadline for an ACKed promotion that never reported started/error (sidecar wedged inside

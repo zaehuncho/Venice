@@ -67,6 +67,27 @@ _LAST_BUSY_DIAG_NS = 0   # rate-limit the "device busy" explainer to once per 30
 _ABANDONED_CAPS: List = []
 _ABANDONED_LOCK = threading.Lock()
 
+# Serialises MSMF/DSHOW device-GRAPH transitions (build = cv2.VideoCapture(), teardown =
+# cap.release()) across every thread in this process.
+#
+# Bughunt #7 established that release must happen on the READER thread, because releasing under a
+# blocked read() access-violates. That is still true, but it left the mirror-image race open and it
+# killed a live session on 2026-08-12 (sidecar pid 25792, `Windows fatal exception: code 0xc0000374`
+# = STATUS_HEAP_CORRUPTION). The faulthandler dump names both halves at once:
+#
+#     Current thread ... capture_card_backend.py, line 1127 in _run     <- abandoned reader RELEASING
+#     Thread ...        capture_card_backend.py, line  693 in _open     <- recovery thread OPENING
+#
+# i.e. the in-process re-open ("Capture-card reader died; detaching for in-process re-open") builds a
+# new graph on the SAME physical device while the abandoned reader's read() finally returns 2.7s
+# later and tears the old one down. Both mutate the driver's shared allocator; the heap does not
+# survive it. The log shows exactly that spacing: abandon 18:17:09.890 -> crash 18:17:12.582.
+#
+# Only the two graph transitions are serialised. Frame reads are deliberately NOT held here: a wedged
+# read() would then block every future open forever, which is the failure this backend exists to
+# recover from.
+_DEVICE_GRAPH_LOCK = threading.Lock()
+
 
 def _park_abandoned_cap(cap) -> None:
     """Keep a wedged handle alive at module scope (see _ABANDONED_CAPS)."""
@@ -681,10 +702,14 @@ class CaptureCardBackend:
         for api, name in self._api_order():
             cap = None
             try:
-                cap = cv2.VideoCapture(idx, api)
-                if not cap or not cap.isOpened():
-                    if cap is not None:
+                # Graph BUILD. Serialised against every teardown in this process, including an
+                # abandoned reader's late release of this same device (see _DEVICE_GRAPH_LOCK).
+                with _DEVICE_GRAPH_LOCK:
+                    cap = cv2.VideoCapture(idx, api)
+                    opened = bool(cap) and cap.isOpened()
+                    if not opened and cap is not None:
                         cap.release()
+                if not opened:
                     continue
                 opened_any = True
                 # Best-effort device config. MJPG lets most USB cards do 1080p60
@@ -706,7 +731,8 @@ class CaptureCardBackend:
                     pass
                 ok, frame = cap.read()
                 if not ok or frame is None or getattr(frame, "size", 0) == 0:
-                    cap.release()
+                    with _DEVICE_GRAPH_LOCK:
+                        cap.release()
                     continue
                 invalid_reason = self._contract_reason(frame)
                 if invalid_reason:
@@ -715,7 +741,8 @@ class CaptureCardBackend:
                         "(%s, shape=%s); refusing it instead of resizing/stretching",
                         name, idx, invalid_reason, getattr(frame, "shape", None),
                     )
-                    cap.release()
+                    with _DEVICE_GRAPH_LOCK:
+                        cap.release()
                     continue
                 # Log what the driver ACTUALLY negotiated (advisory set() calls are often overridden) so
                 # we can confirm 1080p60 + MJPG + a shallow buffer really took, per the latency audit.
@@ -744,7 +771,8 @@ class CaptureCardBackend:
                 logger.debug("CaptureCard open via %s failed: %s", name, exc)
                 if cap is not None:
                     try:
-                        cap.release()
+                        with _DEVICE_GRAPH_LOCK:
+                            cap.release()
                     except Exception:
                         pass
         self._open_diag = ("invalid:" + invalid_reason) if invalid_reason else (
@@ -1124,7 +1152,12 @@ class CaptureCardBackend:
                 self._cap = None
             if cap is not None:
                 try:
-                    cap.release()
+                    # Graph TEARDOWN. This is the exact line the 2026-08-12 heap-corruption dump
+                    # caught racing a concurrent _open() of the same device after stop() abandoned
+                    # this reader. The lock makes the recovery re-open wait for this release (or
+                    # vice versa) instead of interleaving driver-side graph mutations.
+                    with _DEVICE_GRAPH_LOCK:
+                        cap.release()
                 except Exception as exc:
                     logger.debug("Capture-card reader release failed: %s", exc)
                 # Released on the OWNING thread => the finalizer is now a no-op, so the
@@ -1321,7 +1354,8 @@ class CaptureCardBackend:
         cap, self._cap = self._cap, None
         if cap is not None:
             try:
-                cap.release()
+                with _DEVICE_GRAPH_LOCK:
+                    cap.release()
             except Exception:
                 pass
         logger.info("Capture-card capture stopped")

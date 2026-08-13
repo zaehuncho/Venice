@@ -415,8 +415,10 @@ private:
     // A compliant sidecar brackets the promotion: {"event":"stream_promote","state":"begin"} on
     // receipt, then either {"event":"started"} (Chiaki/input up) or {"event":"error"} (it is NOT,
     // so no input can reach the console). streamPromoteAcked_ records that the RUNNING sidecar
-    // speaks this protocol. An older sidecar never sends `begin` and is rejected after the short
-    // protocol grace; legacy process-liveness may never promote to Running.
+    // speaks this protocol. It is a PROGRESS signal, not the safety gate: a missing `begin` is no
+    // longer fatal (it was, and it false-failed live sidecars -- see the note at the
+    // kStreamPromoteFallbackMs timer). Legacy process-liveness still may never promote to Running,
+    // because sidecarStartedHasInputAuthority() requires an explicit input_ready on `started`.
     bool streamPromotePending_ = false;
     bool streamPromoteAcked_ = false;
     // True only while Connect is upgrading an already-live capture-card preview. A failed verdict
@@ -429,9 +431,10 @@ private:
     // Bumped per promotion so a deferred fallback/deadline timer from an earlier connect can never
     // act on a later session (the same hazard the sidecarRestartPending_ guard exists for).
     quint64 streamPromoteGeneration_ = 0;
-    // Protocol-ack grace and hard verdict deadline. Python's streaminfo proof has a 15 s budget;
-    // the native deadline leaves five seconds for cleanup + the final JSON verdict and remains the
-    // independent bound if the sidecar thread/stdout wedges.
+    // Progress-note beat and hard verdict deadline. Python's streaminfo proof has a 15 s budget;
+    // the native deadline leaves five seconds for cleanup + the final JSON verdict and is the ONLY
+    // fatal bound if the sidecar thread/stdout wedges. The 2.5 s beat merely refreshes the
+    // Connecting message -- it must never adjudicate, because ack latency is not ack absence.
     static constexpr int kStreamPromoteFallbackMs = 2500;
     static constexpr int kStreamPromoteDeadlineMs = 20000;
     // Input-only recovery has its own generation and native deadline. Without this, a blocked
