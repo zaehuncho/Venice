@@ -349,9 +349,10 @@ Card {
             visible: orion.shotLeadMaxUsableMs > 0
                      && orion.shotLeadMaxUsableMs < orion.actuationLeadMaxMs
             Layout.fillWidth: true
-            text: "Tip Timing " + orion.tipTimingMs.toFixed(0) + " ms caps usable lead at "
-                  + orion.shotLeadMaxUsableMs.toFixed(0) + " ms (the mark on the slider) — "
-                  + "higher leads abort live tip shots."
+            // [ORION_CARD_TRIM 2026-08-13] One line, not three. The mark on the slider already
+            // shows WHERE; this only has to say what crossing it costs.
+            text: "Above " + orion.shotLeadMaxUsableMs.toFixed(0) + " ms (the slider mark), "
+                  + "live tip shots abort."
             color: Theme.textFaint
             font.family: Theme.fontUi
             font.pixelSize: 11
@@ -363,9 +364,9 @@ Card {
         Text {
             objectName: "shotLeadGuidance"
             Layout.fillWidth: true
-            text: "Watch the game's TIMING banner after each shot. "
-                  + "Shots landing LATE? Raise this. Landing EARLY? Lower it. "
-                  + "Move it a few ms at a time."
+            // [ORION_CARD_TRIM 2026-08-13] Two lines instead of three. The direction is the whole
+            // point of this sentence, so it stays; "a few ms at a time" is implied by ±1 buttons.
+            text: "Watch the game's TIMING banner: landing LATE? Raise this. EARLY? Lower it."
             color: Theme.textSecondary
             font.family: Theme.fontUi
             font.pixelSize: 12
@@ -383,16 +384,14 @@ Card {
         Text {
             objectName: "shotLeadMeasurement"
             Layout.fillWidth: true
+            // [ORION_CARD_TRIM 2026-08-13] Same three states, one line each.
             text: root.measured
-                  ? ("Venice measured " + orion.actuationLeadMeasuredMs.toFixed(0)
-                     + " ms on your setup, from the last " + orion.actuationLeadMeasuredSamples
-                     + " shots"
-                     + (orion.actuationLeadUserSet ? " — your setting is being used instead." : "."))
+                  ? ("Measured " + orion.actuationLeadMeasuredMs.toFixed(0) + " ms over "
+                     + orion.actuationLeadMeasuredSamples + " shots"
+                     + (orion.actuationLeadUserSet ? " — yours is used instead." : "."))
                   : (orion.latencyCalibrationReady
-                     ? "Venice measures this from the bot's own shots — it fills in "
-                       + "after about a dozen."
-                     : "Timing is still warming up (see Timing above) — until it reads "
-                       + "Ready, set the lead yourself using the banner rule.")
+                     ? "Venice fills this in after about a dozen bot shots."
+                     : "Timing still warming up — set this by hand for now.")
             color: Theme.textFaint
             font.family: Theme.fontUi
             font.pixelSize: 11

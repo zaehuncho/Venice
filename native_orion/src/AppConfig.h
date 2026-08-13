@@ -428,6 +428,18 @@ struct AppConfigData {
     // RemapConfig::squarePassthroughEnabled for the full rationale.
     bool squarePassthroughEnabled = true;
     QString squarePassthroughButton = QStringLiteral("r3");   // "r3" | "l3" | "none"
+    // [ORION_SETTLE_SMOOTH_MOTION 2026-08-13] Grade a smoothly-TRANSLATING settled marker. Shipped
+    // 2026-08-11 as a compile-time constant with a commit message claiming it was live-A/B-able
+    // ("ORION_SETTLE_SMOOTH_MOTION=1"); it never was -- there was no env read, no settings key and
+    // no applyConfig line, so enabling it meant editing source and rebuilding. Second-opinion
+    // review 2026-08-13 caught the discrepancy. Wired here so the Go-To A/B can actually be run.
+    //
+    // STILL DEFAULT OFF, and that is not timidity: with the bbox gate relaxed, fill-freeze becomes
+    // the sole discriminator, and AutomationEngineTests::settleGradingRequiresBboxMotionSignal
+    // guards a false-EXCELLENT bug that ALREADY SHIPPED once (DetectionResult built with no x/y/w/h
+    // -> all bbox motion read as 0 -> sliding fades looked settled). Turning this on trades a known
+    // measurement gap for a known correctness risk; it is a diagnostic session flag, not a default.
+    bool meterSettleAllowSmoothMotion = false;
     // Per-type shot-mode override: type -> "auto"|"normal"|"tempo" (auto/absent = global tempo).
     // Lets Standstill stay a normal Square while fades use the tempo gesture, etc.
     QMap<QString, QString> shotTypeModeOverride;

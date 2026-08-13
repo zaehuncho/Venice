@@ -475,6 +475,7 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("tempo_remap_type"), data.tempoRemapType);
     // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88
     obj.insert(QStringLiteral("square_passthrough_enabled"), data.squarePassthroughEnabled);
+    obj.insert(QStringLiteral("meter_settle_allow_smooth_motion"), data.meterSettleAllowSmoothMotion);
     obj.insert(QStringLiteral("square_passthrough_button"), data.squarePassthroughButton);
     obj.insert(QStringLiteral("no_dip_enabled"), data.noDipEnabled);
     obj.insert(QStringLiteral("no_dip_lead_ms"), data.noDipLeadMs);
@@ -1110,6 +1111,8 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     // maps anything outside {r3,l3} to 0.
     data_.squarePassthroughEnabled =
         cleanBool(obj, "square_passthrough_enabled", data_.squarePassthroughEnabled);
+    data_.meterSettleAllowSmoothMotion =
+        cleanBool(obj, "meter_settle_allow_smooth_motion", data_.meterSettleAllowSmoothMotion);
     data_.squarePassthroughButton =
         cleanText(obj, "square_passthrough_button", data_.squarePassthroughButton, 8);
     data_.noDipEnabled = cleanBool(obj, "no_dip_enabled", data_.noDipEnabled);

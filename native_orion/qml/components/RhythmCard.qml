@@ -74,13 +74,12 @@ Card {
             color: Theme.textMuted
             font.family: Theme.fontUi
             font.pixelSize: 11
+            // [ORION_CARD_TRIM 2026-08-13] One line per state. The 50 ms floor's full rationale
+            // (a sub-frame edge can fall between console polls) lives in the file header and in
+            // AppConfig, where someone changing it will actually be looking.
             text: root.flickActive
-                  ? "A shorter flick is a snappier push; a longer one is more deliberate. 50 ms is "
-                    + "the floor — the console samples the pad on its own cadence, and an edge much "
-                    + "under one 60 Hz frame (16.7 ms) can be missed entirely, which shows up as a "
-                    + "rare shot that releases late for no visible reason."
-                  : "Inactive: Tempo is off, so the shot is released as a button press and no stick "
-                    + "flick is generated. Turn Tempo on in Tempo Remap to use this."
+                  ? "Shorter is snappier, longer more deliberate. 50 ms is the floor."
+                  : "Inactive — Tempo is off, so no stick flick is generated."
         }
     }
 }

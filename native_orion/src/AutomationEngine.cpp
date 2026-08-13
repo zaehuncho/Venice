@@ -1306,6 +1306,8 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     config_.tempoRemapType = settings.tempoRemapType;
     // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88
     config_.squarePassthroughEnabled = settings.squarePassthroughEnabled;
+    // [ORION_SETTLE_SMOOTH_MOTION 2026-08-13] was compile-time only; see AppConfigData.
+    config_.meterSettleAllowSmoothMotion = settings.meterSettleAllowSmoothMotion;
     config_.squarePassthroughButton = settings.squarePassthroughButton;
     // Built-in default-ON (user directive): no-dip is the default shot, so the engine forces the
     // mode on regardless of the (signed) settings value. noDipLeadMs stays live-tuned (default 0 =

@@ -264,8 +264,9 @@ Card {
             Text {
                 objectName: "tipTimingGuidance"
                 Layout.fillWidth: true
-                text: "Watch the game's TIMING banner.\n"
-                      + "EARLY → press Later.  LATE → press Earlier."
+                // [ORION_CARD_TRIM 2026-08-13] Was a forced two-liner via \n; the sentence fits
+                // one row and the card is tall enough already.
+                text: "Watch the TIMING banner: EARLY → Later, LATE → Earlier."
                 color: Theme.textSecondary
                 font.family: Theme.fontUi
                 font.pixelSize: 12

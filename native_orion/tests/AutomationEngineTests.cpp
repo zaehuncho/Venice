@@ -1986,6 +1986,9 @@ void AutomationEngineTests::squarePassthroughIsSuppressedAcrossTheReleaseEdge()
         QVERIFY2(gated.square() == c.expectSquare, c.why);
         QVERIFY2(engine.squarePassthroughInjectedLastTick() == c.expectSquare, c.why);
     }
+    // Hand the engine back at rest. The loop pokes shot_.state directly, bypassing the transitions
+    // that normally unwind a shot, so leaving it in Cooldown means the destructor runs mid-shot.
+    engine.shot_.state = HoldState::Idle;
 }
 
 void AutomationEngineTests::squarePassthroughIsInertWithoutTempoOrWhenDisabled()
@@ -8840,6 +8843,11 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // all, and one who did gains a Square they previously could not reach.
         QStringLiteral("square_passthrough_enabled"),
         QStringLiteral("square_passthrough_button"),
+        // [ORION_SETTLE_SMOOTH_MOTION 2026-08-13] Persists at the compiled default (false), which
+        // is byte-identical to the compile-time constant it replaces -- an existing install grades
+        // exactly as before. It is written so the Go-To A/B can be run without a rebuild, which is
+        // what the 2026-08-11 commit claimed and never delivered.
+        QStringLiteral("meter_settle_allow_smooth_motion"),
     };
     QStringList newKeys;
     const QStringList persistedKeys = persisted.keys();
