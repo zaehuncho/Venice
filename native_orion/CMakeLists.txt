@@ -481,6 +481,7 @@ qt_add_qml_module(OrionNative
         qml/components/MeterConfigPanel.qml
         qml/components/MeterTelemetryHud.qml
         qml/components/ShotLeadCard.qml
+        qml/components/RhythmCard.qml
         qml/components/ShotLeadUsableMaxIndicator.qml
         qml/components/TipTimingCard.qml
         qml/components/ColorSwatchRow.qml

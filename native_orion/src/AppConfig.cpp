@@ -1225,7 +1225,13 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     data_.fixedHoldMs = cleanDouble(obj, "fixed_hold_time_ms", data_.fixedHoldMs, 100.0, 2000.0);
     data_.earlyLateOffsetMs = cleanDouble(obj, "early_late_offset_ms", data_.earlyLateOffsetMs, -100.0, 100.0);
     data_.tempoWaitMs = cleanDouble(obj, "tempo_wait_ms", data_.tempoWaitMs, 0.0, 250.0);
-    data_.tempoFlickHoldMs = cleanDouble(obj, "tempo_flick_hold_ms", data_.tempoFlickHoldMs, 10.0, 500.0);
+    // [ORION_FLICK_FLOOR 2026-08-13] Lower bound is 50, not 10, because AutomationEngine applies
+    // `std::max(flickHold, releasePulseMs)` and releasePulseMs is a fixed 50.0 (engine-only, never
+    // configurable). Everything under 50 therefore ran as 50: this owner's stored 16 had been
+    // silently executing as 50 for the whole life of the setting, and the slider's bottom 40 ms was
+    // dead travel with no indication. Clamping here makes stored == displayed == effective, and
+    // migrates an existing sub-floor value up on the next load.
+    data_.tempoFlickHoldMs = cleanDouble(obj, "tempo_flick_hold_ms", data_.tempoFlickHoldMs, 50.0, 500.0);
     data_.tempoMinStickHoldMs = cleanDouble(obj, "tempo_min_stick_hold_ms", data_.tempoMinStickHoldMs, 0.0, 500.0);
     data_.tempoFallbackTimeoutMs = cleanDouble(obj, "tempo_fallback_timeout_ms", data_.tempoFallbackTimeoutMs, 100.0, 3000.0);
     data_.minimumHoldMs = cleanDouble(obj, "minimum_hold_time_ms", data_.minimumHoldMs, 0.0, 3000.0);
@@ -1254,7 +1260,8 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
                 data_.remotePlayInputSource);
         }
         data_.tempoWaitMs = cleanDouble(tempo, "wait_ms", data_.tempoWaitMs, 0.0, 250.0);
-        data_.tempoFlickHoldMs = cleanDouble(tempo, "flick_hold_ms", data_.tempoFlickHoldMs, 10.0, 500.0);
+        // Same 50 ms engine floor as the flat tempo_flick_hold_ms key above.
+        data_.tempoFlickHoldMs = cleanDouble(tempo, "flick_hold_ms", data_.tempoFlickHoldMs, 50.0, 500.0);
         data_.tempoMinStickHoldMs = cleanDouble(tempo, "min_stick_hold_ms", data_.tempoMinStickHoldMs, 0.0, 500.0);
         data_.tempoFallbackTimeoutMs = cleanDouble(tempo, "fallback_timeout_ms", data_.tempoFallbackTimeoutMs, 100.0, 3000.0);
     }

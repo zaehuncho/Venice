@@ -1577,6 +1577,14 @@ Item {
                     Layout.fillWidth: true
                 }
 
+                // [ORION_RHYTHM 2026-08-13] Directly under Shot Lead by request: Shot Lead sets
+                // WHEN the release flick starts, Rhythm sets how long the stick is held up for
+                // it. Previously buried in Tempo Remap's Tuning expander. See RhythmCard.qml.
+                RhythmCard {
+                    objectName: "rhythmCard"
+                    Layout.fillWidth: true
+                }
+
                 // [ORION_USER_TIP] The OTHER user-facing timing quantity — the
                 // jumpshot's animation length (the aim), as distinct from the
                 // rig's latency (the lead, above). See TipTimingCard.qml.

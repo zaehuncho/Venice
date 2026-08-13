@@ -3378,6 +3378,10 @@ void AutomationEngine::reset()
     // stale value from the previous shot can never be attributed to this one.
     meterCapFrameAgeAtRelMs_ = -1.0;
     meterCapNetworkOffsetAtRelMs_ = -1.0;
+    // [ORION_FLICK_OBS 2026-08-13] Same reason: a ButtonShot following a TempoSquare must not
+    // inherit the previous shot's flick numbers.
+    flickActualAtRelMs_ = -1.0;
+    flickHoldUsedMs_ = -1.0;
 }
 
 void AutomationEngine::beginSidecarProcessGeneration()
@@ -8879,12 +8883,18 @@ void AutomationEngine::processReleasing(ControllerState& output, double now)
             flickHold = config_.shotTypeFlickHoldMs.value(shot_.shotType);
         }
         const double flickMs = std::max(flickHold, config_.releasePulseMs);
+        // [ORION_FLICK_OBS 2026-08-13] Latch the EFFECTIVE hold, not the configured one. These
+        // differ whenever the slider sits below releasePulseMs, and that gap was invisible: a
+        // tempo_flick_hold_ms of 16 silently ran as 50. Logging flickMs (not flickHold) is what
+        // makes the slider's real behaviour checkable from a session log.
+        flickHoldUsedMs_ = flickMs;
         if (elapsed < flickMs) {
             if (shot_.actualFlickMs < 0.0) {
                 // Anchor-relative (matches plannedFlickMs): when the flick actually started.
                 shot_.actualFlickMs = shot_.firstMeterSeenMs >= 0.0
                     ? now - shot_.firstMeterSeenMs
                     : (shot_.holdStartMs > 0.0 ? now - shot_.holdStartMs : 0.0);
+                flickActualAtRelMs_ = shot_.actualFlickMs;
             }
         } else {
             output.rightStickY = 0;
@@ -14330,8 +14340,12 @@ void AutomationEngine::evaluatePostReleaseMeter()
         // on none, and the rich at-fire dump (TIP DEADLINE DECISION) fires only on MISSES, so the
         // graded shots carried no record of their own conditions.
         // Nothing consumes these back into timing.
-        "vel_at_rel=%13 frame_age_ms=%14 rtt_ms=%15 "
-        "meter_x=%16 meter_y=%17 meter_jump=%18 shot=%19")
+        // [ORION_FLICK_OBS 2026-08-13] flick_ms   - anchor-relative ms the RS-up flick began
+        //                              flick_hold - EFFECTIVE hold used, after the releasePulseMs
+        //                                           floor (so a 16ms slider reading 50 is visible)
+        // -1 on both = no tempo flick this shot (ButtonShot / GoToStick).
+        "vel_at_rel=%13 frame_age_ms=%14 rtt_ms=%15 flick_ms=%16 flick_hold=%17 "
+        "meter_x=%18 meter_y=%19 meter_jump=%20 shot=%21")
                               .arg(seq)
                               .arg(peak, 0, 'f', 2)
                               .arg(fill, 0, 'f', 2)
@@ -14347,6 +14361,8 @@ void AutomationEngine::evaluatePostReleaseMeter()
                               .arg(meterCapRiseVelocityPctPerMs_, 0, 'f', 5)
                               .arg(meterCapFrameAgeAtRelMs_, 0, 'f', 2)
                               .arg(meterCapNetworkOffsetAtRelMs_, 0, 'f', 2)
+                              .arg(flickActualAtRelMs_, 0, 'f', 1)
+                              .arg(flickHoldUsedMs_, 0, 'f', 1)
                               .arg(meterCapNormXAtRel_, 0, 'f', 4)
                               .arg(meterCapNormYAtRel_, 0, 'f', 4)
                               .arg(landingMeterJump, 0, 'f', 4)

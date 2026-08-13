@@ -256,22 +256,13 @@ Item {
                     InfoTip { text: "Auto learns from the live meter each shot. Manual freezes the values below." }
                 }
 
-                RowLayout {
-                    visible: tempoCard.tuningExpanded && orion.tempoEnabled && !orion.autoTune
-                    Layout.fillWidth: true
-                    spacing: 10
-                    Text { text: "Tempo"; color: Theme.textMuted; font.family: Theme.fontUi; font.pixelSize: 12; Layout.preferredWidth: 70 }
-                    ThemedSlider {
-                        id: tempoSlider
-                        Layout.fillWidth: true
-                        from: 16
-                        to: 250
-                        value: orion.tempoFlickHoldMs
-                        onMoved: if (!pressed) orion.tempoFlickHoldMs = value
-                        onPressedChanged: if (!pressed) orion.tempoFlickHoldMs = value
-                    }
-                    Text { text: (tempoSlider.pressed ? tempoSlider.value : orion.tempoFlickHoldMs).toFixed(0) + " ms"; color: Theme.textPrimary; font.family: Theme.fontMono; font.pixelSize: 12; Layout.preferredWidth: 52; horizontalAlignment: Text.AlignRight }
-                }
+                // [ORION_RHYTHM 2026-08-13] The tempoFlickHoldMs slider MOVED OUT of this expander
+                // to the top-level Rhythm card, directly under Shot Lead (RhythmCard.qml). Deleted
+                // rather than duplicated so there is exactly one control for the setting.
+                //
+                // It also had `from: 16`, which is where this owner's stored 16 came from: the
+                // engine floors the flick at releasePulseMs (50), so the slider's entire 16..49
+                // band was dead travel that silently executed as 50. The new card starts at 50.
 
                 RowLayout {
                     visible: tempoCard.tuningExpanded && orion.tempoEnabled && !orion.autoTune

@@ -152,7 +152,11 @@ struct RemapConfig {
     bool noDipEnabled = false;
     double noDipLeadMs = 0.0;
     double tempoWaitMs = 0.0;
-    double tempoFlickHoldMs = 50.0;
+    // [ORION_FLICK_FLOOR 2026-08-13] 66.0 to agree with AppConfig::Data (was 50.0 here). AppConfig
+    // always overwrites this via applyConfig, so 66 is what every real session has actually run --
+    // the 50 only ever applied to a default-constructed engine in tests, which made the two files
+    // disagree about "the default" with no way to tell which was authoritative.
+    double tempoFlickHoldMs = 66.0;
     double tempoFallbackTimeoutMs = 650.0;
     double tempoMinStickHoldMs = 0.0;
     double minHoldMs = 90.0;
@@ -4099,6 +4103,15 @@ private:
     // OBSERVABILITY ONLY. Nothing reads these back into timing. -1 = not available for this shot.
     double meterCapFrameAgeAtRelMs_ = -1.0;       // capture staleness of the deciding sample
     double meterCapNetworkOffsetAtRelMs_ = -1.0;  // RTT/network offset latched for this shot
+    // [ORION_FLICK_OBS 2026-08-13] Rhythm-shooting flick, latched off shot_ before it is recycled.
+    // shot_.actualFlickMs was computed on every tempo release since the gesture shipped and emitted
+    // NOWHERE -- the "Release tempo" line carries only plannedFlickMs, which is -1 by design on the
+    // vision path (see OrionAppController.cpp), so a live_meter_tip session logged no flick data at
+    // all. Without these two the flick-hold slider is untunable: you cannot see when the up-flick
+    // started, nor what hold the engine actually used after the releasePulseMs floor is applied.
+    // -1 = this shot generated no tempo flick (ButtonShot / GoToStick).
+    double flickActualAtRelMs_ = -1.0;   // anchor-relative ms at which the RS-up flick began
+    double flickHoldUsedMs_ = -1.0;      // EFFECTIVE hold after max(per-type|global, releasePulse)
     // [ORION_SQUARE_PASSTHROUGH 2026-08-12] Set by applySquarePassthrough on every process() tick;
     // read by the release-ownership trace so a steal is never mistaken for an engine override.
     bool squarePassthroughInjected_ = false;
