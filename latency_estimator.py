@@ -1023,8 +1023,50 @@ class LatencyEstimator:
                 # fixed_ms/sd_ms above stay the LIVE learning posterior; reopen_guard=1 says the
                 # PUBLISHED authority is the retained pre-reopen tuple (see l_fixed_ms).
                 int(bool(self._reopen_guard_publishable())))
+            self._warn_if_learning_starved(bool(accepted))
         except Exception:
             pass
+
+    # Starvation watch: how many consecutive rejections before we say so out loud, and how often
+    # to repeat once we have. 40 is ~one shooting drill -- long enough that an ordinary cold start
+    # or a run of scrappy shots never trips it, short enough to be seen inside one session.
+    _STARVE_WARN_AFTER = 40
+    _STARVE_WARN_EVERY = 40
+
+    def _warn_if_learning_starved(self, accepted: bool) -> None:
+        """Say it out loud when ordinary play is teaching this estimator nothing.
+
+        Measured 2026-08-12 on the owner's rig: 101 observations, 5 accepted (all `warming`), and
+        every one of 499 release decisions logged `lead_kind=factory` -- the lead had been the
+        factory prior all session and nothing in the logs said so. It has to be inferred from an
+        unchanging `n=` across a hundred INFO lines, which is exactly the kind of silent stall this
+        project keeps getting bitten by.
+
+        The cause is structural, not a bug in the gates: `rise_ok` needs `peak < 97.0` and
+        `f_stop <= f_stop_max` (95.0), because above the cap the freeze point saturates and encodes
+        overtime rather than view latency. But the bot aims at the TIP -- mean peak 98.4 -- so only
+        ~8% of shots can ever clear that gate, and those are the mistimed ones. The better the bot
+        gets, the less its own latency estimator is allowed to learn.
+
+        This does NOT relax any gate (that would feed the most load-bearing constant in the system
+        a biased diet of undertimed shots). It only makes the stall visible, so the lead being
+        frozen is a thing you read rather than a thing you deduce.
+        """
+        if accepted:
+            self._starve_streak = 0
+            return
+        streak = int(getattr(self, "_starve_streak", 0)) + 1
+        self._starve_streak = streak
+        if streak < self._STARVE_WARN_AFTER:
+            return
+        if (streak - self._STARVE_WARN_AFTER) % self._STARVE_WARN_EVERY != 0:
+            return
+        logger.warning(
+            "LATENCY LEARNING STALLED: %d consecutive observations rejected (last=%s); the shot "
+            "lead is still the factory prior and is not adapting to this rig. Usually structural, "
+            "not a fault: the accept gate needs peak<97.0 / f_stop<=%.1f, but a tip-aimed bot "
+            "peaks at ~98-100, so ordinary good shots can never qualify.",
+            streak, str(self._last_rejection or "unknown"), float(self._f_stop_max))
 
     @_estimator_locked
     def _expire_pending_release(self, wall_ms: float) -> None:
