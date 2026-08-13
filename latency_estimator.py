@@ -1062,10 +1062,12 @@ class LatencyEstimator:
         if (streak - self._STARVE_WARN_AFTER) % self._STARVE_WARN_EVERY != 0:
             return
         logger.warning(
-            "LATENCY LEARNING STALLED: %d consecutive observations rejected (last=%s); the shot "
-            "lead is still the factory prior and is not adapting to this rig. Usually structural, "
-            "not a fault: the accept gate needs peak<97.0 / f_stop<=%.1f, but a tip-aimed bot "
-            "peaks at ~98-100, so ordinary good shots can never qualify.",
+            "LATENCY LEARNING STALLED: %d consecutive observations rejected (last=%s). Structural, "
+            "not a fault: the accept gate needs peak<97.0 / f_stop<=%.1f, but a tip-aimed bot peaks "
+            "at ~98-100, so ordinary good shots can never qualify. NOTE this does NOT mean the bot "
+            "is mistimed -- an in-band Shot Lead REPLACES this posterior as the actuation lead "
+            "(AutomationEngine.cpp measuredLeadForActuationMs), so a stalled estimator changes "
+            "nothing about when shots fire. Informational only.",
             streak, str(self._last_rejection or "unknown"), float(self._f_stop_max))
 
     @_estimator_locked
