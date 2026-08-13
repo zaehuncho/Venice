@@ -3100,6 +3100,28 @@ void AutomationEngine::applySquarePassthrough(ControllerState& output,
     if (!config_.squarePassthroughEnabled || !config_.tempoRemapEnabled) {
         return;
     }
+    // [ORION_SQUARE_PASSTHROUGH fix-2 2026-08-13] Suppress across the RELEASE EDGE only.
+    //
+    // Second-opinion review found the residual: applyShotReleaseEdge clears X for
+    // ButtonShot/TempoSquare but NOT for TempoStick/GoToStick (ShotReleasePolicy.h), so holding R3
+    // through one of those shots delivers the injected Square to the console at the release
+    // instant. Reachable in this owner's config -- Go-To shots run as GoToStick. Not engine-state
+    // corruption (the release handlers read neither `output` nor `physical`, and the app's own
+    // virtual pad is excluded from device selection), but it is a real button the game acts on.
+    //
+    // The review's suggested one-liner was `shot_.state == Idle`. That is WRONG and the existing
+    // test caught it: squarePassthroughGivesSquareASecondHomeUnderTempo fails its FIRST assertion
+    // under that gate -- the plain "R3 alone, nothing else held" case -- because the engine does
+    // not sit in Idle during ordinary play. Idle-gating would have silently killed the whole
+    // feature, which is exactly the #88 complaint it was built to fix.
+    //
+    // Releasing/Cooldown is the precise window: it is where the un-cleared X can escape, and it is
+    // the only place the engine is authoring X itself. Everywhere else (Idle/Armed/Holding/
+    // GreenWindow/PumpFake) the engine is either not touching X or actively suppressing it, and an
+    // R3 press there is an unambiguous user steal.
+    if (shot_.state == HoldState::Releasing || shot_.state == HoldState::Cooldown) {
+        return;
+    }
     const uint16_t bit = squarePassthroughBit();
     if (bit == 0 || (physical.buttons & bit) == 0) {
         return;

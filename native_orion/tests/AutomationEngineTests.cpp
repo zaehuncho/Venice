@@ -78,6 +78,7 @@ private slots:
     void winMmSonyButtonMappingAndPov();
     void tempoRemapDrivesStickDownThenFlicksUp();
     void squarePassthroughGivesSquareASecondHomeUnderTempo();
+    void squarePassthroughIsSuppressedAcrossTheReleaseEdge();
     void squarePassthroughIsInertWithoutTempoOrWhenDisabled();
     void tempoMovementCommitPrecedesSquareGather();
     void tempoMovementCommitPreservesFadeThroughFlickAndDrain();
@@ -1929,6 +1930,62 @@ void AutomationEngineTests::squarePassthroughGivesSquareASecondHomeUnderTempo()
     output = engine.process(physical);
     QVERIFY(!engine.squarePassthroughInjectedLastTick());
     QVERIFY(!output.square());
+}
+
+void AutomationEngineTests::squarePassthroughIsSuppressedAcrossTheReleaseEdge()
+{
+    // [ORION_SQUARE_PASSTHROUGH fix-2 2026-08-13] The steal must NOT ride out on the release edge.
+    //
+    // applyShotReleaseEdge clears X for ButtonShot/TempoSquare but not for TempoStick/GoToStick,
+    // so without this gate a held R3 delivers a real Square to the console at the exact instant
+    // the engine releases the shot. Go-To runs as GoToStick, so this is reachable in the shipped
+    // config, and the game acts on the extra button.
+    //
+    // Deliberately NOT gated on HoldState::Idle (the obvious one-liner, and what the 2026-08-13
+    // second-opinion review proposed): the engine does not sit in Idle during ordinary play, so
+    // that gate makes the whole feature inert -- which is the #88 complaint it exists to fix. The
+    // sibling test squarePassthroughGivesSquareASecondHomeUnderTempo fails on its FIRST assertion
+    // under an Idle gate, and is the reason this narrower window was chosen. Releasing/Cooldown is
+    // the only span where the engine authors X itself.
+    AutomationEngine engine;
+    AppConfigData config;
+    config.remotePlayInputSource = QStringLiteral("square");
+    config.tempoRemapEnabled = true;
+    config.meterEnabled = true;
+    config.minimumHoldMs = 0.0;
+    config.fixedHoldMs = 120.0;      // short, so the fixed-hold release lands inside this test
+    LearningData learning;
+    engine.applyConfig(config, learning);
+
+    // R3 alone, no Square: the ordinary defense steal. Baseline -- this MUST pass through, and is
+    // the assertion an Idle gate breaks.
+    ControllerState physical;
+    physical.buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    ControllerState output = engine.process(physical);
+    QVERIFY2(output.square(), "baseline: R3 must still be a Square outside the release edge");
+    QVERIFY(engine.squarePassthroughInjectedLastTick());
+
+    // Now pin the gate directly at each state, rather than re-testing the whole release machinery
+    // (which needs meter telemetry and would make this a fragile integration test). The states the
+    // engine authors X in are the ones that must swallow the injection.
+    const struct { HoldState state; bool expectSquare; const char* why; } cases[] = {
+        { HoldState::Armed,       true,  "armed is not a release edge - steal must work" },
+        { HoldState::Holding,     true,  "holding: engine suppresses X itself, R3 is unambiguous" },
+        { HoldState::GreenWindow, true,  "green window is still pre-release" },
+        { HoldState::Releasing,   false, "RELEASE EDGE: un-cleared X would reach the console" },
+        { HoldState::Cooldown,    false, "post-release drain: the edge may still be in flight" },
+    };
+    // Call the gate DIRECTLY rather than through process(): process() re-runs processInternal
+    // first, which transitions the state (a Cooldown with no Square held is gone again before the
+    // gate ever reads it), so a state set on the engine cannot be observed end-to-end. Testing the
+    // gate in isolation is what actually pins the contract.
+    for (const auto& c : cases) {
+        engine.shot_.state = c.state;
+        ControllerState gated;              // fresh, as process() hands it the engine's output
+        engine.applySquarePassthrough(gated, physical);
+        QVERIFY2(gated.square() == c.expectSquare, c.why);
+        QVERIFY2(engine.squarePassthroughInjectedLastTick() == c.expectSquare, c.why);
+    }
 }
 
 void AutomationEngineTests::squarePassthroughIsInertWithoutTempoOrWhenDisabled()
