@@ -5,8 +5,8 @@ import OrionNative
 
 // Customer controls beside the live feed. Detection and latency learning are
 // autonomous; users only identify the visual meter profile and optionally enable
-// Tempo remapping. Square remains the safe default; Stick and Both are explicit
-// choices because they also authorize qualified raw right-stick shot gestures.
+// Tempo remapping. Square remains the safe default; Stick is the explicit
+// alternative, and it authorizes qualified raw right-stick shot gestures.
 Item {
     id: meterPanel
     property bool streamLive: false
@@ -165,37 +165,38 @@ Item {
                     Layout.fillWidth: true
                     spacing: 8
                     Text { text: "Input"; color: Theme.textMuted; font.family: Theme.fontUi; font.pixelSize: 12; Layout.preferredWidth: 62 }
-                    RowLayout {
+
+                    // [ORION_TEMPO_INPUT_DROPDOWN 2026-08-13] Square / Stick as a dropdown
+                    // (owner request), replacing the three-segment pill row.
+                    //
+                    // "Both" is GONE from the choices. It was never the thing its own InfoTip
+                    // claimed: Go-To arms on config_.gotoEnabled + a strict RS-up, NOT on
+                    // stickInputAllowed() (AutomationEngine.cpp:5132), so Go-To already works
+                    // on plain Square — verified live 2026-08-13 (epoch 99 fired mode=GoToStick
+                    // with remote_play_input_source=square). The only thing "both" actually
+                    // added was the RS-DOWN TempoStick gesture on top of Square, which is a
+                    // third shot source nobody here shoots with.
+                    //
+                    // The BACKEND still understands "both" (AppConfig normalization,
+                    // RemotePlaySession, AutomationEngine input_mode) and is untouched, so a
+                    // settings.json carrying it keeps working. It is surfaced in the list only
+                    // while it is the live value, so an existing "both" install can see what it
+                    // is on and choose its way out instead of the combo silently showing
+                    // "Square" over a stored "both".
+                    DashboardCombo {
+                        objectName: "tempoInputSourceCombo"
                         Layout.fillWidth: true
-                        spacing: 6
-                        Repeater {
-                            model: [
-                                { l: "Square", v: "square" },
-                                { l: "Stick", v: "stick" },
-                                { l: "Both", v: "both" }
-                            ]
-                            delegate: Rectangle {
-                                required property var modelData
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 28
-                                radius: 8
-                                color: orion.tempoInputSource === modelData.v ? Theme.accentSoft : Theme.bgField
-                                border.color: orion.tempoInputSource === modelData.v ? Theme.accent : Theme.borderSoft
-                                border.width: 1
-                                Behavior on color { ColorAnimation { duration: Theme.motionFast } }
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: modelData.l
-                                    color: orion.tempoInputSource === modelData.v ? Theme.textPrimary : Theme.textMuted
-                                    font.family: Theme.fontUi
-                                    font.pixelSize: 12
-                                    font.weight: orion.tempoInputSource === modelData.v ? Font.DemiBold : Font.Normal
-                                }
-                                MouseArea { anchors.fill: parent; onClicked: orion.tempoInputSource = modelData.v }
-                            }
-                        }
+                        implicitHeight: 28
+                        model: orion.tempoInputSource === "both"
+                               ? ["Square", "Stick", "Both"]
+                               : ["Square", "Stick"]
+                        value: orion.tempoInputSource === "stick" ? "Stick"
+                               : orion.tempoInputSource === "both" ? "Both"
+                               : "Square"
+                        onValueChanged: orion.tempoInputSource = value.toLowerCase()
                     }
-                    InfoTip { text: "Both keeps Square remapped and adds Stick and Go-To shot gestures." }
+
+                    InfoTip { text: "Square remaps the Square shot button. Stick shoots off the right stick instead. Go-To works either way." }
                 }
 
                 // Tuning expander header: always present so the active mode stays

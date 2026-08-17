@@ -78,10 +78,20 @@ def test_meter_controls_are_autonomous_not_a_setup_batch() -> None:
     assert 'text: "Color"' in meter
     assert 'text: "Tempo Remap"' in meter
     assert 'text: "Input"' in meter
-    assert '{ l: "Square", v: "square" }' in meter
-    assert '{ l: "Stick", v: "stick" }' in meter
-    assert '{ l: "Both", v: "both" }' in meter
-    assert "orion.tempoInputSource = modelData.v" in meter
+    # [ORION_TEMPO_INPUT_DROPDOWN 2026-08-13] The three-segment pill row (Square / Stick / Both)
+    # is now a two-option dropdown. "Both" is no longer offerable: it was documented as adding
+    # "Stick and Go-To shot gestures", but Go-To arms on gotoEnabled plus a strict RS-up and
+    # never consults stickInputAllowed() -- verified live, a Go-To fired with input_source=square.
+    # All it really added was the RS-DOWN TempoStick gesture layered on Square.
+    assert "DashboardCombo" in meter
+    assert 'objectName: "tempoInputSourceCombo"' in meter
+    assert '["Square", "Stick"]' in meter
+    assert "orion.tempoInputSource = value.toLowerCase()" in meter
+    # The BACKEND still understands "both" (AppConfig normalization, RemotePlaySession,
+    # AutomationEngine input_mode), so a settings.json carrying it keeps working -- and the combo
+    # must still SHOW it while it is the live value, or such an install would silently read
+    # "Square" over a stored "both".
+    assert 'orion.tempoInputSource === "both"' in meter
     assert "Calibrate Meter" not in meter
     assert "trainRequested" not in meter
     assert "meterCalibration" not in meter

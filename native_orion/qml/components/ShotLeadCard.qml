@@ -54,7 +54,10 @@ Card {
     ColumnLayout {
         id: col
         anchors.fill: parent
-        spacing: 10
+        // [ORION_CARD_TRIM 2026-08-13 pass 2] 10 -> 8. Six visible gaps on this card, so this is
+        // ~12px off the resting height on its own. Safe because Layout.preferredHeight tracks
+        // col.implicitHeight — the card shrinks with its content rather than leaving dead space.
+        spacing: 8
 
         // [ORION_LEAD_CONFLICT 2026-08-08] Honesty banner (idiom shared with MeterConfigPanel's
         // Meter Delay card). This is the warning whose absence cost a whole play session: with
@@ -341,31 +344,19 @@ Card {
             leadMs: leadSlider.pressed ? leadSlider.value : root.shownLead
         }
 
-        // [ORION_LEAD_CONFLICT 2026-08-08] Names the tick above. Shown only while the boundary
-        // actually cuts the slider's range (a Tip Timing long enough to schedule every lead has
-        // no trap to mark).
-        Text {
-            objectName: "shotLeadMaxUsableCaption"
-            visible: orion.shotLeadMaxUsableMs > 0
-                     && orion.shotLeadMaxUsableMs < orion.actuationLeadMaxMs
-            Layout.fillWidth: true
-            // [ORION_CARD_TRIM 2026-08-13] One line, not three. The mark on the slider already
-            // shows WHERE; this only has to say what crossing it costs.
-            text: "Above " + orion.shotLeadMaxUsableMs.toFixed(0) + " ms (the slider mark), "
-                  + "live tip shots abort."
-            color: Theme.textFaint
-            font.family: Theme.fontUi
-            font.pixelSize: 11
-            wrapMode: Text.WordWrap
-        }
+        // [ORION_CARD_TRIM 2026-08-13 pass 2] The separate "shotLeadMaxUsableCaption" that used
+        // to sit here is DELETED, not shortened. It said "Above N ms (the slider mark), live tip
+        // shots abort" directly under ShotLeadUsableMaxIndicator's "Usable max N ms" readout and
+        // the warning slot that spells the same thing out in red the moment it applies — three
+        // surfaces for one fact, on a card the owner called vertically long. The tick on the
+        // slider plus the readout keep the boundary visible; the indicator's own red line keeps
+        // the consequence. Nothing is lost.
 
         // THE line the whole feature rests on. A user who reads only this sentence must be able to
         // act correctly, and the direction in it is the one verified in the header comment above.
         Text {
             objectName: "shotLeadGuidance"
             Layout.fillWidth: true
-            // [ORION_CARD_TRIM 2026-08-13] Two lines instead of three. The direction is the whole
-            // point of this sentence, so it stays; "a few ms at a time" is implied by ±1 buttons.
             text: "Watch the game's TIMING banner: landing LATE? Raise this. EARLY? Lower it."
             color: Theme.textSecondary
             font.family: Theme.fontUi
@@ -384,14 +375,16 @@ Card {
         Text {
             objectName: "shotLeadMeasurement"
             Layout.fillWidth: true
-            // [ORION_CARD_TRIM 2026-08-13] Same three states, one line each.
+            // [ORION_CARD_TRIM 2026-08-13 pass 2] Held to one rendered line at ~302px: the
+            // measured branch was "Measured N ms over K shots — yours is used instead." (~55
+            // chars, wrapping to two). Same three states, same meaning, shorter wording.
             text: root.measured
-                  ? ("Measured " + orion.actuationLeadMeasuredMs.toFixed(0) + " ms over "
+                  ? ("Measured " + orion.actuationLeadMeasuredMs.toFixed(0) + " ms / "
                      + orion.actuationLeadMeasuredSamples + " shots"
-                     + (orion.actuationLeadUserSet ? " — yours is used instead." : "."))
+                     + (orion.actuationLeadUserSet ? " — yours wins." : "."))
                   : (orion.latencyCalibrationReady
-                     ? "Venice fills this in after about a dozen bot shots."
-                     : "Timing still warming up — set this by hand for now.")
+                     ? "Venice fills this in after ~12 bot shots."
+                     : "Timing warming up — set this by hand for now.")
             color: Theme.textFaint
             font.family: Theme.fontUi
             font.pixelSize: 11
