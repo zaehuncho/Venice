@@ -1200,6 +1200,11 @@ struct RemapConfig {
     // tip_phase_aim_frozen, default OFF). Measured cause of within-session degradation: the aim
     // walked 8.2ms across one 70-release batch while landing sd was 10.5ms. See the use site.
     bool tipPhaseAimFrozen = false;
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] Kill switch for the sustained-divergence auto-unlock
+    // (settings tip_timing_auto_unlock, default ON). ON because the failure it prevents is
+    // silent and total -- a locked aim the instrument refutes stops the learner dead and reads
+    // to the user as "the bot doesn't adjust". Off restores the previous warn-only behaviour.
+    bool tipTimingAutoUnlockEnabled = true;
     // [ORION_ANCHOR_BASE20] Candidate B of the 93ms decision-budget work (settings
     // tip_phase_anchor_base20, default OFF): move the base anchor 30 -> 20, widening the
     // anchor->deadline decision budget by the measured 20->30 animation time (58.3ms,
@@ -2913,6 +2918,12 @@ signals:
     // restore path can warn when the manual value disagrees with the rig's own instrument.
     // Persistence-only: nothing on the decision path consumes it.
     void phaseMeasuredMedianUpdated(double measuredPhysicalMs);
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] The locked aim has been contradicted by this rig's own
+    // full-window instrument for kTipTimingAutoUnlockConfirmations consecutive windows. The
+    // engine cannot write settings, so it asks: the controller clears the lock via the same
+    // resetTipTiming() path the card's Reset button uses (learner control back, manual value
+    // retained as its prior). Emitted at most once per session so a user who re-locks keeps it.
+    void tipTimingAutoUnlockRequested(double frozenPhysicalMs, double measuredPhysicalMs);
     // [ORION_LEAD_CONFLICT] The engine has established -- by config arithmetic at apply time, or
     // by a live missed deadline -- that the active Shot Lead cannot be scheduled against the
     // active tip-timing constant: the phase member's command deadline is already behind `now` on
@@ -4288,6 +4299,11 @@ private:
     // again. -1 = never warned.
     double tipTimingDivergenceWarnedFrozenMs_ = -1.0;
     double tipTimingDivergenceWarnedMeasuredMs_ = -1.0;
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] Consecutive FULL-window medians that disagreed with the
+    // locked aim, and the once-per-session latch. The streak resets the moment one window agrees,
+    // so only a sustained contradiction unlocks; the latch means a user who re-locks keeps it.
+    int tipTimingDivergenceStreak_ = 0;
+    bool tipTimingAutoUnlockEmitted_ = false;
     // [ORION_LEAD_CONFLICT] De-dup pair for the lead-vs-validated-authority disagreement
     // advisory (10 ms grid -- ingestion runs per telemetry frame and a posterior refining by a
     // millisecond per label must not re-warn). -1 = never warned.
@@ -4314,6 +4330,10 @@ private:
     // kTipTimingDivergenceWarnMs. De-duplicated via the warned pair above. Diagnostic-only:
     // never changes the consumed constant, the persisted slots, or the freeze.
     void maybeWarnTipTimingDivergence(double frozenPhysicalMs, double measuredPhysicalMs);
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] The consequence the warning above never had. Requires a
+    // FULL window (n >= window) and kTipTimingAutoUnlockConfirmations consecutive disagreements
+    // before asking the controller to hand the value back to the learner. See the use site.
+    void maybeAutoUnlockTipTiming(double measuredPhysicalMs, int n, int window);
     double maxFillThisShot_ = 0.0;        // peak fill seen during the active shot, for recede/LATE
     void startPostReleaseMeterCapture(double now);
     void evaluatePostReleaseMeter();

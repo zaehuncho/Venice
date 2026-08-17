@@ -2706,6 +2706,25 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // which used to discard the session's own measurement at the last instruction — so the
     // measured_phase_physical_ms key stayed empty and the restore-time manual-vs-measured
     // divergence warning died at every restart. Nothing on the decision path consumes this.
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] The engine has established, over ten consecutive FULL
+    // learner windows, that the locked aim disagrees with this rig's own measured animation by
+    // more than kTipTimingDivergenceWarnMs. Hand the value back to the learner through exactly
+    // the path the card's Reset button uses, so the manual value survives as the learner's prior
+    // and there is no mid-session snap. The engine cannot do this itself: settings are the
+    // controller's to write, and routing it here keeps one owner for the lock.
+    connect(&automation_, &AutomationEngine::tipTimingAutoUnlockRequested, this,
+            [this](double frozenPhysicalMs, double measuredPhysicalMs) {
+        Q_UNUSED(frozenPhysicalMs);
+        Q_UNUSED(measuredPhysicalMs);
+        if (!config_.data().tipPhaseAimFrozen && !config_.data().tipTimingUserSet) {
+            return;   // already unlocked (user got there first) -- nothing to do, stay quiet
+        }
+        // The engine has already emitted the plain-language TIP TIMING AUTO-UNLOCKED line through
+        // engineDiagnostic, which is what reaches the activity log and the user log; adding a
+        // second sentence here would double-report one event. resetTipTiming() emits
+        // tipTimingChanged(), so the card drops its "Locked" pill on the same beat.
+        resetTipTiming();
+    });
     connect(&automation_, &AutomationEngine::phaseMeasuredMedianUpdated, this,
             [this](double measuredPhysicalMs) {
         persistMeasuredPhaseMedian(config_, measuredPhysicalMs);

@@ -273,6 +273,12 @@ struct AppConfigData {
     // that session's second half measured worse than its first. Demo/batch tool — freeze a
     // known-good aim; clear it when the equipped jumpshot changes.
     bool tipPhaseAimFrozen = false;
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] When the locked aim above is contradicted by this rig's
+    // own full-window instrument for ten consecutive windows, hand the value back to the learner
+    // instead of only logging it. Default ON: the 2026-08-13 session proved the warn-only path
+    // is invisible in practice (fifteen divergence lines, none acted on) and the failure it
+    // leaves behind is a learner that measures every shot and discards every measurement.
+    bool tipTimingAutoUnlockEnabled = true;
     // Rung-imminent hold flag (2026-08-06, default OFF): extend the [ORION_TIP_PHASE_IMMINENT]
     // hold so it also waits for the next LADDER RUNG, not only the base anchor. Measured need
     // (logs 2026-08-04..06): 27 of 62 rejected_missed aborts were FIRST-TICK sampler kills

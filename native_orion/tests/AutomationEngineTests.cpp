@@ -429,6 +429,12 @@ private slots:
     void settingsMigrationIsIdempotentAcrossLoads();
     void settingsMigrationRegistryIsAnExplicitAllowlist();
     void ownersSettingsFileRoundTripsLosslesslyThroughMigration();
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13]
+    void tipTimingAutoUnlockHandsBackARefutedLock();
+    void tipTimingAutoUnlockNeedsAFullWindowNotAShrunkOne();
+    void tipTimingAutoUnlockIgnoresBurstsTooShortToMoveTheWindow();
+    void tipTimingAutoUnlockRespectsItsKillSwitch();
+    void tipTimingAutoUnlockLeavesAnAgreeingLockAlone();
     void freshInstallLoadNeverWritesASettingsFile();
     void productionConfigRepairsNoMeterAuthority();
     void productionConfigPreservesExplicitInputSourceModes();
@@ -762,6 +768,9 @@ private:
     // member (not a free helper) because only this class is a friend of AutomationEngine.
     static void primeRollingLeaseEngine(orion::AutomationEngine& engine, double now,
                                         double frameAgeMs);
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] Feed `count` accepted phase samples of the same observed
+    // animation length. Same friendship reason as the note above: it touches meterCapPhase*.
+    static void feedPhaseSamples(orion::AutomationEngine& engine, double observedMs, int count);
     // [ORION_INFLIGHT_TOKEN] shared fixture: a genuinely owned autonomous shot driven far enough
     // up its own trajectory that a live vision token is armed. Returns the last fill fed.
     static double armLiveAutonomousToken(orion::AutomationEngine& engine, ControllerState& square,
@@ -8747,6 +8756,149 @@ void AutomationEngineTests::settingsMigrationRegistryIsAnExplicitAllowlist()
     }
 }
 
+
+// [ORION_AIM_AUTOUNLOCK 2026-08-13] --------------------------------------------------------
+// A locked aim that this rig's own full-window instrument contradicts is not holding a
+// known-good value; it is silencing the learner. The 2026-08-13 session: tip_phase_aim_frozen
+// on, animation measuring 411 ms, aim firing 390 ms, the divergence correctly DETECTED and
+// announced fifteen times -- to a log and a card banner that reached nobody -- while every
+// measurement was taken and discarded. The owner's words were "even when configuring values
+// the bot doesn't adjust". These tests pin the consequence the warning never had.
+void AutomationEngineTests::feedPhaseSamples(AutomationEngine& engine, double observedMs,
+                                             int count)
+{
+    for (int i = 0; i < count; ++i) {
+        engine.meterCapPhaseAnchorMs_ = 1'000.0;
+        engine.meterCapPhaseStopMs_ = 1'000.0 + observedMs;
+        engine.meterCapPhaseStopConfirmed_ = true;
+        engine.recordPhaseConstantSample();
+    }
+}
+
+void AutomationEngineTests::tipTimingAutoUnlockHandsBackARefutedLock()
+{
+    AppConfigData config;
+    config.tipPhaseAimFrozen = true;
+    LearningData learning;
+    learning.learnedPhasePhysicalMs = 300.0;   // the locked aim
+    AutomationEngine engine;
+    engine.applyConfig(config, learning);
+    QSignalSpy unlockSpy(&engine, &AutomationEngine::tipTimingAutoUnlockRequested);
+
+    const int window = engine.config().tipPhaseLearnWindow;
+    // A full window of an animation 30 ms away from the lock, then the confirmations.
+    const double measured = engine.learnedPhasePhysicalMsForTests() + 30.0;
+    // The sample that FILLS the window is confirmation #1 (it is the first evaluation the gate
+    // lets through), so the tenth lands at window + 9 -- not window + 10.
+    feedPhaseSamples(engine, measured, window);
+    QCOMPARE(unlockSpy.count(), 0);   // a full window ALONE must not unlock: sustained, not once
+
+    feedPhaseSamples(engine, measured, 8);
+    QCOMPARE(unlockSpy.count(), 0);   // nine consecutive is still not ten
+
+    feedPhaseSamples(engine, measured, 1);
+    QCOMPARE(unlockSpy.count(), 1);
+
+    // Latched: a session cannot fight a user who re-locks.
+    feedPhaseSamples(engine, measured, 40);
+    QCOMPARE(unlockSpy.count(), 1);
+}
+
+void AutomationEngineTests::tipTimingAutoUnlockNeedsAFullWindowNotAShrunkOne()
+{
+    // A partial-window median is a SHRUNK compromise with the prior, not independent evidence.
+    // Unlocking a user's setting off one would be acting on the prior we are supposed to test.
+    AppConfigData config;
+    config.tipPhaseAimFrozen = true;
+    LearningData learning;
+    learning.learnedPhasePhysicalMs = 300.0;
+    AutomationEngine engine;
+    engine.applyConfig(config, learning);
+    QSignalSpy unlockSpy(&engine, &AutomationEngine::tipTimingAutoUnlockRequested);
+
+    const int window = engine.config().tipPhaseLearnWindow;
+    const double measured = engine.learnedPhasePhysicalMsForTests() + 40.0;
+    // Half a window is enough to WARN (n*2 >= window) but must never be enough to unlock,
+    // however far apart the values are.
+    feedPhaseSamples(engine, measured, window / 2);
+    QCOMPARE(unlockSpy.count(), 0);
+}
+
+void AutomationEngineTests::tipTimingAutoUnlockIgnoresBurstsTooShortToMoveTheWindow()
+{
+    // The practical protection: a scatter of odd shots must never accumulate into an unlock.
+    //
+    // WHAT THIS TEST IS *NOT*, and why. The obvious test -- run the streak up, flood the window
+    // back to agreement, prove the count restarted -- is unbuildable, and finding that out was
+    // worth more than the test would have been. A rolling median of `window` lags a population
+    // change by half a window: going from a disagreeing median to an agreeing one costs ten
+    // evaluations during which the median is STILL disagreeing. Ten is exactly the unlock
+    // threshold, so any flip between populations reaches it by construction. That is correct
+    // behaviour -- an animation that contradicted the lock for twenty-plus straight shots really
+    // was contradicting it -- but it means the reset branch cannot be reached by flipping
+    // populations, only by a median that straddles the 20 ms line.
+    //
+    // So this pins the case that actually protects a user: bursts too short to move the median
+    // never reach the gate at all, no matter how many of them there are.
+    AppConfigData config;
+    config.tipPhaseAimFrozen = true;
+    LearningData learning;
+    learning.learnedPhasePhysicalMs = 300.0;
+    AutomationEngine engine;
+    engine.applyConfig(config, learning);
+    QSignalSpy unlockSpy(&engine, &AutomationEngine::tipTimingAutoUnlockRequested);
+
+    const int window = engine.config().tipPhaseLearnWindow;
+    const double locked = engine.learnedPhasePhysicalMsForTests();
+    feedPhaseSamples(engine, locked, window);      // settled, agreeing
+    QCOMPARE(unlockSpy.count(), 0);
+
+    // Five separate bursts of wild shots, each a quarter of a window -- far more bad shots in
+    // total than the ten the gate needs, but never enough at once to move the median off the
+    // locked value.
+    for (int burst = 0; burst < 5; ++burst) {
+        feedPhaseSamples(engine, locked + 60.0, window / 4);
+        feedPhaseSamples(engine, locked, window / 2);
+        QCOMPARE(unlockSpy.count(), 0);
+    }
+}
+
+void AutomationEngineTests::tipTimingAutoUnlockRespectsItsKillSwitch()
+{
+    AppConfigData config;
+    config.tipPhaseAimFrozen = true;
+    config.tipTimingAutoUnlockEnabled = false;   // previous warn-only behaviour
+    LearningData learning;
+    learning.learnedPhasePhysicalMs = 300.0;
+    AutomationEngine engine;
+    engine.applyConfig(config, learning);
+    QSignalSpy unlockSpy(&engine, &AutomationEngine::tipTimingAutoUnlockRequested);
+
+    const int window = engine.config().tipPhaseLearnWindow;
+    feedPhaseSamples(engine, engine.learnedPhasePhysicalMsForTests() + 40.0, window + 30);
+    QCOMPARE(unlockSpy.count(), 0);
+}
+
+void AutomationEngineTests::tipTimingAutoUnlockLeavesAnAgreeingLockAlone()
+{
+    // The freeze exists to hold a good aim still. A lock the instrument AGREES with must be
+    // untouchable, or the feature would just be a slow way of deleting the freeze.
+    AppConfigData config;
+    config.tipPhaseAimFrozen = true;
+    LearningData learning;
+    learning.learnedPhasePhysicalMs = 300.0;
+    AutomationEngine engine;
+    engine.applyConfig(config, learning);
+    QSignalSpy unlockSpy(&engine, &AutomationEngine::tipTimingAutoUnlockRequested);
+
+    const int window = engine.config().tipPhaseLearnWindow;
+    // 15 ms apart: real, but inside kTipTimingDivergenceWarnMs (20).
+    feedPhaseSamples(engine, engine.learnedPhasePhysicalMsForTests() + 15.0, window + 40);
+    QCOMPARE(unlockSpy.count(), 0);
+    // And the aim itself never moved -- the freeze still holds while it holds.
+    QCOMPARE(engine.learnedPhasePhysicalMsForTests(), 300.0 + engine.phasePriorShiftMsForTests());
+}
+
 void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigration()
 {
 #ifdef ORION_PRODUCTION_BUILD
@@ -8848,6 +9000,14 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // exactly as before. It is written so the Go-To A/B can be run without a rebuild, which is
         // what the 2026-08-11 commit claimed and never delivered.
         QStringLiteral("meter_settle_allow_smooth_motion"),
+        // [ORION_AIM_AUTOUNLOCK 2026-08-13] Persists at the compiled default (true). This DOES
+        // change behaviour for an existing install that has tip_phase_aim_frozen set -- which is
+        // the entire point: such an install currently measures the animation every shot and
+        // discards it, and the only symptom is that the bot stops adapting. The unlock requires
+        // ten consecutive FULL-window disagreements above 20 ms, fires once per session, and
+        // leaves the manual value in place as the learner's prior, so a user who meant the lock
+        // simply re-locks. An install without the lock set is untouched.
+        QStringLiteral("tip_timing_auto_unlock"),
     };
     QStringList newKeys;
     const QStringList persistedKeys = persisted.keys();

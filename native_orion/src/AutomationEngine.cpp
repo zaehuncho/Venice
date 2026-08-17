@@ -72,6 +72,13 @@ constexpr double kTipLeadScheduleMarginMs = 30.0;
 // landing measurement is 5-11 ms, so at the half-window sample floor the median's standard
 // error is ~3-5 ms; 20 ms is ~4 sigma -- a real animation mismatch, not instrument noise.
 constexpr double kTipTimingDivergenceWarnMs = 20.0;
+// [ORION_AIM_AUTOUNLOCK 2026-08-13] Consecutive FULL-window medians that must all exceed
+// kTipTimingDivergenceWarnMs before the lock is handed back to the learner. Ten, not one: the
+// full-window median's standard error is ~2.8 ms at the measured 5-11 ms per-type rMAD, so a
+// single 20 ms reading is already ~7 SE and ten in a row puts a false unlock out of reach --
+// while still landing well inside one ordinary session (the 2026-08-13 rig produced fifteen
+// divergence readings in about twenty minutes). See maybeAutoUnlockTipTiming.
+constexpr int kTipTimingAutoUnlockConfirmations = 10;
 // [ORION_STOP_SUBFRAME] Re-centring constant added to the refined sub-frame stop so the learned
 // physical constant keeps the SAME MEAN it had under frame-snapped dating. The seed, the shipped
 // constant, and every persisted learning.json prior were calibrated against snapped stops, and the
@@ -1544,6 +1551,7 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     parseDevFireOffsetEnv();
     config_.phaseVetoDirectional = settings.phaseVetoDirectional;
     config_.tipPhaseAimFrozen = settings.tipPhaseAimFrozen;
+    config_.tipTimingAutoUnlockEnabled = settings.tipTimingAutoUnlockEnabled;
     // [ORION_RUNG_IMMINENT] Extend the imminent hold's target to ladder rungs (default OFF).
     config_.tipPhaseRungImminentHold = settings.tipPhaseRungImminentHold;
     // [ORION_TEMPO_PARITY] TempoStick joins the canonical tip pipeline (default OFF).
@@ -13670,6 +13678,62 @@ void AutomationEngine::maybeWarnTipTimingDivergence(double frozenPhysicalMs,
                               .arg(measuredPhysicalMs - frozenPhysicalMs, 0, 'f', 0));
 }
 
+void AutomationEngine::maybeAutoUnlockTipTiming(double measuredPhysicalMs, int n, int window)
+{
+    // [ORION_AIM_AUTOUNLOCK 2026-08-13] A lock the rig's own instrument refutes is not holding a
+    // known-good aim; it is holding a stale one, and it silences the learner while it does.
+    //
+    // THE SESSION THIS COMES FROM. tip_phase_aim_frozen was on with tip_timing_user_set false --
+    // nobody had typed the value it was holding. The animation measured 411 ms, the frozen aim
+    // fired 390 ms, and the learner took the measurement every shot, logged it, persisted it and
+    // then discarded it (learnedPhasePhysicalMs_ = frozenAimPhysicalMs_). The owner's report was
+    // "even when configuring values the bot doesn't adjust" -- which was exactly true. The
+    // divergence was DETECTED correctly and announced fifteen times, to a log file and to a card
+    // banner, and neither reached anyone. Detection without consequence is not a safeguard.
+    //
+    // WHY THIS IS SAFE TO DO AUTOMATICALLY, and where it deliberately stops:
+    //   * FULL WINDOW ONLY. A partial-window median is a shrunk compromise with the prior (see
+    //     the [ORION_PHASE_COLD_START] note), so it is not independent evidence and must never
+    //     unlock a user's setting. The warning speaks at half a window; this does not.
+    //   * SUSTAINED. kTipTimingAutoUnlockConfirmations consecutive full-window medians must all
+    //     disagree. At n=20 with the measured per-type rMAD of 5-11 ms the median's standard
+    //     error is ~2.8 ms, so a 20 ms gap is ~7 SE -- ten of those in a row is not noise.
+    //   * ONCE PER SESSION. Latched, so a user who disagrees can simply re-lock and keep it. This
+    //     hands control back; it does not win an argument with the operator.
+    //   * REVERSIBLE AND LOUD. The unlock says what it did and why, in the effective frame the
+    //     card shows, so re-locking is one action away.
+    // The learner then walks off the manual value as landings arrive (resetTipTiming keeps it as
+    // the prior) rather than snapping to a number nobody has graded.
+    if (!config_.tipTimingAutoUnlockEnabled || tipTimingAutoUnlockEmitted_) {
+        return;
+    }
+    if (n < window || !(frozenAimPhysicalMs_ > 0.0) || !(measuredPhysicalMs > 0.0)) {
+        return;
+    }
+    const double diffMs = measuredPhysicalMs - frozenAimPhysicalMs_;
+    if (std::abs(diffMs) <= kTipTimingDivergenceWarnMs) {
+        tipTimingDivergenceStreak_ = 0;
+        return;
+    }
+    if (++tipTimingDivergenceStreak_ < kTipTimingAutoUnlockConfirmations) {
+        return;
+    }
+    tipTimingAutoUnlockEmitted_ = true;
+    tipTimingDivergenceStreak_ = 0;
+    const double aimOffsetMs = std::isfinite(config_.tipPhaseSeedPhysicalMs)
+        ? config_.tipPhaseConstantMs - config_.tipPhaseSeedPhysicalMs
+        : 0.0;
+    emit engineDiagnostic(QStringLiteral(
+        "TIP TIMING AUTO-UNLOCKED: the locked aim %1ms disagreed with this rig's measured "
+        "animation %2ms (d=%3ms) for %4 consecutive full windows, so Venice has handed the "
+        "value back to its learner. Re-lock on the Tip Timing card to override.")
+                              .arg(frozenAimPhysicalMs_ + aimOffsetMs, 0, 'f', 0)
+                              .arg(measuredPhysicalMs + aimOffsetMs, 0, 'f', 0)
+                              .arg(diffMs, 0, 'f', 0)
+                              .arg(kTipTimingAutoUnlockConfirmations));
+    emit tipTimingAutoUnlockRequested(frozenAimPhysicalMs_, measuredPhysicalMs);
+}
+
 void AutomationEngine::maybeWarnLeadAuthorityDisagreement()
 {
     // [ORION_LEAD_CONFLICT] Compare only against a VALIDATED posterior: the factory prior is a
@@ -13994,6 +14058,7 @@ void AutomationEngine::recordPhaseConstantSample()
     // an aim the rig's own instrument refuted, which is what walked the pair unschedulable.
     if (config_.tipPhaseAimFrozen && frozenAimPhysicalMs_ > 0.0 && n * 2 >= window) {
         maybeWarnTipTimingDivergence(frozenAimPhysicalMs_, medianMs);
+        maybeAutoUnlockTipTiming(medianMs, n, window);
     }
     // [ORION_PHASE_COLD_START] SHRINK toward the observation instead of waiting for a full window.
     //
