@@ -279,6 +279,12 @@ struct AppConfigData {
     // is invisible in practice (fifteen divergence lines, none acted on) and the failure it
     // leaves behind is a learner that measures every shot and discards every measurement.
     bool tipTimingAutoUnlockEnabled = true;
+    // [ORION_SOURCE_STEAL_GUARD 2026-08-13] A candidate decision whose sigma is materially worse
+    // than the armed token's may not replace it (default ON). The measured rare-late mechanism:
+    // fallback arms that evicted a phase token in the final ~100 ms landed bad 59-75% vs phase
+    // 14.7% (n=314, 2026-08-13). Replacement-only -- fallback members still arm freely when
+    // nothing is armed.
+    bool tipSourceStealGuardEnabled = true;
     // Rung-imminent hold flag (2026-08-06, default OFF): extend the [ORION_TIP_PHASE_IMMINENT]
     // hold so it also waits for the next LADDER RUNG, not only the base anchor. Measured need
     // (logs 2026-08-04..06): 27 of 62 rejected_missed aborts were FIRST-TICK sampler kills

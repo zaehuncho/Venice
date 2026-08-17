@@ -435,6 +435,10 @@ private slots:
     void tipTimingAutoUnlockIgnoresBurstsTooShortToMoveTheWindow();
     void tipTimingAutoUnlockRespectsItsKillSwitch();
     void tipTimingAutoUnlockLeavesAnAgreeingLockAlone();
+    // [ORION_SOURCE_STEAL_GUARD 2026-08-13]
+    void sourceStealGuardKeepsABetterSigmaToken();
+    void sourceStealGuardNeverBlocksAFreshArm();
+    void sourceStealGuardRespectsItsKillSwitch();
     void freshInstallLoadNeverWritesASettingsFile();
     void productionConfigRepairsNoMeterAuthority();
     void productionConfigPreservesExplicitInputSourceModes();
@@ -8775,6 +8779,111 @@ void AutomationEngineTests::feedPhaseSamples(AutomationEngine& engine, double ob
     }
 }
 
+// [ORION_SOURCE_STEAL_GUARD 2026-08-13] --------------------------------------------------
+// The measured rare-late mechanism: a fused decision labelled registration+sampler_far
+// (sigma 21.6+) evicted a phase-armed token (sigma 13-15) via subtick_reschedule in the
+// final ~100 ms, and the phase member's next decision arrived after the original deadline
+// had passed. Fallback-armed landings ran 59-75% bad vs phase 14.7% (n=314). These pin the
+// arbitration rule at the exact member boundary the reschedule sites consult.
+void AutomationEngineTests::sourceStealGuardKeepsABetterSigmaToken()
+{
+    AppConfigData config;
+    AutomationEngine engine;
+    engine.applyConfig(config, LearningData{});
+    // An armed token stamped with the phase member's live sigma (seq=93: 15.101).
+    engine.schedFireDeadlineMs_ = 10'000.0;
+    engine.schedFireArmedSource_ = QStringLiteral("phase");
+    engine.schedFireArmedSigmaMs_ = 15.101;
+
+    // The exact decision that stole seq=93's arm: labelled registration+sampler_far at fused
+    // sigma 21.6 -- WITH the phase member alive inside it (the stealing update lines printed
+    // phase_tip_eta_ms=396.5, phase_weight=0.81).
+    AutomationEngine::AutonomousTipDecision d;
+    d.source = QStringLiteral("registration+sampler_far");
+    d.combinedSigmaMs = 21.628;
+    d.phaseTipAbsMs = 10'396.5;
+    QVERIFY2(engine.candidateStealBlocked(d),
+             "a sigma-21.6 fallback must not evict a sigma-15.1 phase token while phase is alive");
+    // Registration alone (sigma ~123) is blocked a fortiori.
+    d.source = QStringLiteral("registration");
+    d.combinedSigmaMs = 123.0;
+    QVERIFY(engine.candidateStealBlocked(d));
+    // A sigma-less cross-source candidate is a guess, not a measurement -- blocked.
+    d.source = QStringLiteral("registration+sampler_far");
+    d.combinedSigmaMs = -1.0;
+    QVERIFY(engine.candidateStealBlocked(d));
+
+    // THE ARMED MEMBER MUST BE ALIVE, or the guard stands down. A phase member that stood down
+    // mid-shot (late acquire, re-lock, anchor never dated) cannot re-assert its deadline, so
+    // defending its token would fire on a dead instrument's schedule against the only live
+    // evidence -- the deceleration scenario autonomousFreshSampleMovesUnconfirmedDeadlineLater
+    // pins, and the exact way the first two drafts of this guard broke that test.
+    d.combinedSigmaMs = 40.0;
+    d.phaseTipAbsMs = -1.0;
+    QVERIFY2(!engine.candidateStealBlocked(d),
+             "a dead armed member must not be defended against live evidence");
+    d.phaseTipAbsMs = 10'396.5;
+
+    // SELF-refinement is sigma-exempt: the armed member may move its own deadline freely,
+    // whatever its sigma reads this frame. Sigma compares instruments, so it applies only
+    // ACROSS instruments.
+    d.source = QStringLiteral("phase");
+    d.combinedSigmaMs = 99.0;
+    QVERIFY2(!engine.candidateStealBlocked(d),
+             "the armed member's own refinement must never be blocked, at any sigma");
+    // Near-peer cross-source inside the 5 ms margin also stays free.
+    d.source = QStringLiteral("registration+sampler_far");
+    d.combinedSigmaMs = 19.9;
+    QVERIFY(!engine.candidateStealBlocked(d));
+    // And a genuinely better instrument may always reclaim the arm (phase evicting a
+    // fallback-armed token). The sampler member is alive in the reclaiming decision.
+    engine.schedFireArmedSource_ = QStringLiteral("registration+sampler_far");
+    engine.schedFireArmedSigmaMs_ = 21.628;
+    d.source = QStringLiteral("phase");
+    d.combinedSigmaMs = 15.101;
+    d.samplerCrossingMs = 10'450.0;
+    QVERIFY2(!engine.candidateStealBlocked(d),
+             "phase must be able to take the arm BACK from a fallback-armed token");
+}
+
+void AutomationEngineTests::sourceStealGuardNeverBlocksAFreshArm()
+{
+    // Replacement-only, by construction: with nothing armed the fallback members' whole job is
+    // to arm (phase never promoted / vision degraded mid-shot). A guard that blocked fresh arms
+    // would convert tonight's rare LATES into no-fires, which is strictly worse.
+    AppConfigData config;
+    AutomationEngine engine;
+    engine.applyConfig(config, LearningData{});
+    QCOMPARE(engine.schedFireDeadlineMs_, -1.0);
+    AutomationEngine::AutonomousTipDecision d;
+    d.source = QStringLiteral("registration");
+    d.combinedSigmaMs = 123.0;
+    d.phaseTipAbsMs = 10'396.5;
+    QVERIFY(!engine.candidateStealBlocked(d));
+    // An armed token WITHOUT a quality snapshot (pre-guard state, or a non-vision authority)
+    // also stays replaceable -- there is no measured sigma to defend it with.
+    engine.schedFireDeadlineMs_ = 10'000.0;
+    engine.schedFireArmedSigmaMs_ = -1.0;
+    QVERIFY(!engine.candidateStealBlocked(d));
+}
+
+void AutomationEngineTests::sourceStealGuardRespectsItsKillSwitch()
+{
+    AppConfigData config;
+    config.tipSourceStealGuardEnabled = false;
+    AutomationEngine engine;
+    engine.applyConfig(config, LearningData{});
+    engine.schedFireDeadlineMs_ = 10'000.0;
+    engine.schedFireArmedSource_ = QStringLiteral("phase");
+    engine.schedFireArmedSigmaMs_ = 15.101;
+    // Off restores the previous timing-only guard chain: quality is not consulted.
+    AutomationEngine::AutonomousTipDecision d;
+    d.source = QStringLiteral("registration");
+    d.combinedSigmaMs = 123.0;
+    d.phaseTipAbsMs = 10'396.5;
+    QVERIFY(!engine.candidateStealBlocked(d));
+}
+
 void AutomationEngineTests::tipTimingAutoUnlockHandsBackARefutedLock()
 {
     AppConfigData config;
@@ -9008,6 +9117,12 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // leaves the manual value in place as the learner's prior, so a user who meant the lock
         // simply re-locks. An install without the lock set is untouched.
         QStringLiteral("tip_timing_auto_unlock"),
+        // [ORION_SOURCE_STEAL_GUARD 2026-08-13] Persists at the compiled default (true). Changes
+        // behaviour only in the exact measured-defect case: a worse-sigma fallback decision
+        // evicting an armed better-sigma token in the reschedule mirrors (fallback-armed
+        // landings 59-75% bad vs phase 14.7%, n=314). Fresh arms and same-family refinements
+        // are byte-identical.
+        QStringLiteral("tip_source_steal_guard"),
     };
     QStringList newKeys;
     const QStringList persistedKeys = persisted.keys();

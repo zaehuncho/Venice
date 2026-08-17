@@ -434,6 +434,7 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("phase_veto_directional"), data.phaseVetoDirectional);
     obj.insert(QStringLiteral("tip_phase_aim_frozen"), data.tipPhaseAimFrozen);
     obj.insert(QStringLiteral("tip_timing_auto_unlock"), data.tipTimingAutoUnlockEnabled);
+    obj.insert(QStringLiteral("tip_source_steal_guard"), data.tipSourceStealGuardEnabled);
     obj.insert(QStringLiteral("tip_phase_rung_imminent_hold"), data.tipPhaseRungImminentHold);
     obj.insert(QStringLiteral("tempo_tip_parity"), data.tempoTipParity);
     obj.insert(QStringLiteral("goto_tip_parity"), data.gotoTipParity);
@@ -1051,6 +1052,9 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     // [ORION_AIM_AUTOUNLOCK] Hand a refuted lock back to the learner (default ON).
     data_.tipTimingAutoUnlockEnabled = cleanBool(obj, "tip_timing_auto_unlock",
                                                  data_.tipTimingAutoUnlockEnabled);
+    // [ORION_SOURCE_STEAL_GUARD] worse-sigma decisions may not evict an armed token (default ON).
+    data_.tipSourceStealGuardEnabled = cleanBool(obj, "tip_source_steal_guard",
+                                                 data_.tipSourceStealGuardEnabled);
     // Rung-imminent hold flag: extend the imminent hold to ladder rungs (default OFF).
     data_.tipPhaseRungImminentHold = cleanBool(obj, "tip_phase_rung_imminent_hold", data_.tipPhaseRungImminentHold);
     // Tempo tip-parity flag: TempoStick joins the canonical ButtonShot tip pipeline (default OFF).

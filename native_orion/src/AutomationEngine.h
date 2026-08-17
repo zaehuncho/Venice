@@ -1205,6 +1205,12 @@ struct RemapConfig {
     // silent and total -- a locked aim the instrument refutes stops the learner dead and reads
     // to the user as "the bot doesn't adjust". Off restores the previous warn-only behaviour.
     bool tipTimingAutoUnlockEnabled = true;
+    // [ORION_SOURCE_STEAL_GUARD 2026-08-13] Kill switch for the quality steal guard (settings
+    // tip_source_steal_guard, default ON). ON because the failure it prevents is the measured
+    // rare-late mechanism: a wider-sigma fallback decision evicting a phase-armed token in the
+    // final ~100 ms (fallback-armed landings 59-75% bad vs phase 14.7%, n=314). Off restores
+    // the previous timing-only guard chain.
+    bool tipSourceStealGuardEnabled = true;
     // [ORION_ANCHOR_BASE20] Candidate B of the 93ms decision-budget work (settings
     // tip_phase_anchor_base20, default OFF): move the base anchor 30 -> 20, widening the
     // anchor->deadline decision budget by the measured 20->30 animation time (58.3ms,
@@ -3204,6 +3210,13 @@ private:
     [[nodiscard]] double imminentTokenWindowMs() const noexcept;
     // True when an armed vision token is inside imminentTokenWindowMs() of firing.
     [[nodiscard]] bool armedTokenIrreplaceable(double now) const noexcept;
+    struct AutonomousTipDecision;   // defined below with the fusion machinery
+    // [ORION_SOURCE_STEAL_GUARD 2026-08-13] True when an armed token must be KEPT because the
+    // candidate decision comes from a DIFFERENT, materially worse instrument while the armed
+    // member is still alive in that decision (both reschedule sites). Replacement-only: never
+    // blocks a fresh arm. See the definition for the measured defect (fallback arms 59-75% bad
+    // landings vs phase 14.7%) and the deliberate edges.
+    [[nodiscard]] bool candidateStealBlocked(const AutonomousTipDecision& decision) const noexcept;
     // [ORION_INFLIGHT_TOKEN] True when an armed, unconfirmed vision token's own deadline has
     // PASSED but its submit is still legitimately in flight, i.e. `now` is inside
     // schedulerGraceMs of that deadline.
@@ -3811,6 +3824,10 @@ private:
     // and one line per protected token is the whole story. Monotonic token ids make a reset
     // unnecessary.
     quint64 slowMeterDeferKeepLoggedToken_ = 0;
+    // [ORION_SOURCE_STEAL_GUARD] De-dup for the TIP TOKEN STEAL REFUSED line: the subtick mirror
+    // runs per sidecar payload, so an un-de-duped emit would log the same refusal every ~4 ms for
+    // the token's whole remaining life. One line per protected token.
+    quint64 tipStealRefusedLoggedToken_ = 0;
 
     // --- Sub-tick scheduler state -------------------------------------------------------
     double schedFireDeadlineMs_ = -1.0;   // -1 = nothing armed

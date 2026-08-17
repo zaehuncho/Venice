@@ -72,6 +72,11 @@ constexpr double kTipLeadScheduleMarginMs = 30.0;
 // landing measurement is 5-11 ms, so at the half-window sample floor the median's standard
 // error is ~3-5 ms; 20 ms is ~4 sigma -- a real animation mismatch, not instrument noise.
 constexpr double kTipTimingDivergenceWarnMs = 20.0;
+// [ORION_SOURCE_STEAL_GUARD 2026-08-13] How much WORSE a candidate decision's sigma may be than
+// the armed token's before it is refused as a replacement. 5 ms separates the measured member
+// populations (phase 13.0-15.1 ms vs sampler_far 21.6+ / registration ~123) while leaving every
+// same-family refinement free. See candidateStealBlocked.
+constexpr double kTipSourceStealSigmaMarginMs = 5.0;
 // [ORION_AIM_AUTOUNLOCK 2026-08-13] Consecutive FULL-window medians that must all exceed
 // kTipTimingDivergenceWarnMs before the lock is handed back to the learner. Ten, not one: the
 // full-window median's standard error is ~2.8 ms at the measured 5-11 ms per-type rMAD, so a
@@ -1552,6 +1557,7 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     config_.phaseVetoDirectional = settings.phaseVetoDirectional;
     config_.tipPhaseAimFrozen = settings.tipPhaseAimFrozen;
     config_.tipTimingAutoUnlockEnabled = settings.tipTimingAutoUnlockEnabled;
+    config_.tipSourceStealGuardEnabled = settings.tipSourceStealGuardEnabled;
     // [ORION_RUNG_IMMINENT] Extend the imminent hold's target to ladder rungs (default OFF).
     config_.tipPhaseRungImminentHold = settings.tipPhaseRungImminentHold;
     // [ORION_TEMPO_PARITY] TempoStick joins the canonical tip pipeline (default OFF).
@@ -7271,8 +7277,24 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                                       .arg(fit.slopePctPerMs, 0, 'f', 4)
                                       .arg(fit.n));
         }
+        // [ORION_SOURCE_STEAL_GUARD 2026-08-13] Quality gate, mirrored at the subtick site (which
+        // reaches an armed token first on every sidecar payload -- see [ORION_SUBTICK_PARITY]).
+        const bool qualityStealRefused = candidateStealBlocked(tipDecision);
+        if (qualityStealRefused && tipStealRefusedLoggedToken_ != schedFireToken_) {
+            tipStealRefusedLoggedToken_ = schedFireToken_;
+            emit engineDiagnostic(QStringLiteral(
+                "TIP TOKEN STEAL REFUSED: site=tick candidate_source=%1 candidate_sigma_ms=%2 "
+                "armed_source=%3 armed_sigma_ms=%4 candidate_eta_ms=%5 armed_eta_ms=%6 token=%7")
+                                      .arg(predictedTipSource.left(64))
+                                      .arg(tipDecision.combinedSigmaMs, 0, 'f', 3)
+                                      .arg(schedFireArmedSource_)
+                                      .arg(schedFireArmedSigmaMs_, 0, 'f', 3)
+                                      .arg(fireAtMs - now, 0, 'f', 3)
+                                      .arg(schedFireDeadlineMs_ - now, 0, 'f', 3)
+                                      .arg(schedFireToken_));
+        }
         if (std::abs(fireAtMs - armedBaseMs) <= tokenDeadlineDriftToleranceMs()
-            || irreplaceable || deferEarlierCandidate) {
+            || irreplaceable || deferEarlierCandidate || qualityStealRefused) {
             shot_.releasePlan = QStringLiteral("Live meter tip scheduled");
             shot_.releaseReason = QStringLiteral("release_scheduled");
             shot_.releaseReasonCode = QStringLiteral("release_scheduled");
@@ -9976,6 +9998,82 @@ bool AutomationEngine::armedTokenIrreplaceable(double now) const noexcept
     return untilArmedMs > 0.0 && untilArmedMs <= imminentTokenWindowMs();
 }
 
+bool AutomationEngine::candidateStealBlocked(const AutonomousTipDecision& decision) const noexcept
+{
+    // [ORION_SOURCE_STEAL_GUARD 2026-08-13] A materially worse instrument may not replace the
+    // token a better one armed.
+    //
+    // THE DEFECT (2026-08-13 rig, n=314 landings): phase-armed releases landed bad 14.7%;
+    // registration+sampler_far 58.8%; sampler 75%. Nearly every "way off" shot was one where
+    // the phase member armed a token and then LOST it in the final ~100 ms: a sidecar payload
+    // produced a fused decision labelled registration+sampler_far whose deadline differed by
+    // more than the 1 ms drift tolerance, the subtick mirror tore the phase token down
+    // (TIP TOKEN KILL site=subtick_reschedule), re-armed at the fallback's deadline, and the
+    // phase member's next decision arrived after the original deadline had passed. seq=93:
+    // phase token killed at until_armed 19.3 ms -- just OUTSIDE the ~16.7 ms imminent window --
+    // replaced by a sigma-21.6 arm 65 ms later; landing settled 85.9 (LATE). The guard chain
+    // considered timing (drift tolerance, imminence, in-flight, slow-meter undercut) but never
+    // QUALITY: a sigma-21 decision could freely evict a sigma-15 token.
+    //
+    // The rule, and its deliberate edges:
+    //   * REPLACEMENT only. With no token armed the fallback members still arm freely -- that
+    //     is their whole job (phase never promoted / vision degraded), and it is untouched.
+    //   * BOTH directions. A worse-sigma candidate may not move the deadline later (tonight's
+    //     failure) OR earlier (the 2026-08-06 seq=52 class: transient sampler swing armed
+    //     90-116 ms early). Direction is irrelevant to the principle; the armed token's own
+    //     source remains free to refine its deadline either way, because its sigma passes.
+    //   * SAME SOURCE ALWAYS PASSES, sigma unconsulted. The member that armed the token owns its
+    //     own refinement: a decelerating meter legitimately widens the sampler's sigma while
+    //     moving its deadline LATER, and blocking that would freeze the deadline and fire early
+    //     -- the exact defect autonomousFreshSampleMovesUnconfirmedDeadlineLater pins (and it
+    //     caught the first draft of this guard doing precisely that). Sigma is an instrument
+    //     comparison, so it applies only ACROSS instruments.
+    //   * MARGIN, not equality, across sources. +5 ms sits between the measured populations
+    //     (phase 13.0-15.1 vs sampler_far 21.6+ / registration 123), so near-peer cross-labels
+    //     (sampler 23.6 vs registration+sampler_far 27) stay free and genuine cross-family
+    //     steals are blocked. A BETTER-sigma candidate (phase reclaiming from a fallback arm)
+    //     always passes.
+    //   * KNOWN LIMITATION, accepted deliberately: phase_sigma_ms is currently a constant 13.0,
+    //     so while a phase token is armed no fallback can ever evict it -- even mid-shot on a
+    //     stale constant. Tonight's outcome split says that trade is right today (a stale phase
+    //     still outlanded the fallbacks), and the planned honest phase sigma makes this guard
+    //     adaptive for free: a stale phase member's sigma rises and the fallbacks win again.
+    if (!config_.tipSourceStealGuardEnabled) {
+        return false;
+    }
+    if (schedFireDeadlineMs_ < 0.0 || !(schedFireArmedSigmaMs_ > 0.0)) {
+        return false;   // nothing armed, or the armed token carries no quality snapshot
+    }
+    if (decision.source == schedFireArmedSource_) {
+        return false;   // self-refinement: the armed member may move its own deadline freely
+    }
+    // THE ARMED MEMBER MUST STILL BE ALIVE IN THIS DECISION, or the guard stands down. A member
+    // that has stood down mid-shot (late acquire, re-lock, carryover-rejected episode, phase
+    // anchor never dated) cannot re-assert its deadline, so defending its token means firing on
+    // a dead instrument's schedule while the only LIVE evidence disagrees -- the exact scenario
+    // autonomousFreshSampleMovesUnconfirmedDeadlineLater pins (a slope collapse after the phase
+    // member stands down must still move the deadline later; the second draft of this guard
+    // froze it). Tonight's steals are the opposite case and stay blocked: phase was alive in
+    // the very decisions that stole from it (phase_tip_eta_ms=396.5, weight 0.81 printed on the
+    // stealing update lines).
+    const bool armedMemberAlive =
+        schedFireArmedSource_.contains(QLatin1String("phase"))
+            ? decision.phaseTipAbsMs > 0.0
+            : schedFireArmedSource_.contains(QLatin1String("sampler"))
+                  ? (decision.samplerCrossingMs > 0.0
+                     || decision.samplerFit.crossingMs > 0.0)
+                  : schedFireArmedSource_.contains(QLatin1String("registration"))
+                        ? decision.regTipAbsMs > 0.0
+                        : false;
+    if (!armedMemberAlive) {
+        return false;
+    }
+    if (!std::isfinite(decision.combinedSigmaMs) || decision.combinedSigmaMs <= 0.0) {
+        return true;    // an armed, quality-stamped token is never evicted by a sigma-less guess
+    }
+    return decision.combinedSigmaMs > schedFireArmedSigmaMs_ + kTipSourceStealSigmaMarginMs;
+}
+
 bool AutomationEngine::armedTokenSubmitInFlight(double now) const noexcept
 {
     // [ORION_INFLIGHT_TOKEN] See the contract on the declaration. The window opens AT the armed
@@ -12207,10 +12305,28 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
             && slowMeterDeferBinds(tipDecision, fireAtMs, effectiveLeadMs, now);
         // [ORION_DEV_FIRE_OFFSET] undisplaced comparison (offset 0 when disarmed).
         const double armedBaseMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
+        // [ORION_SOURCE_STEAL_GUARD 2026-08-13] Quality gate, mirror of the tick site's. This
+        // mirror is where tonight's steals actually happened (every TIP TOKEN KILL in the seq=93
+        // class was site=subtick_reschedule), so parity here is the fix, not a nicety.
+        const bool qualityStealRefused = candidateStealBlocked(tipDecision);
+        if (qualityStealRefused && tipStealRefusedLoggedToken_ != schedFireToken_) {
+            tipStealRefusedLoggedToken_ = schedFireToken_;
+            emit engineDiagnostic(QStringLiteral(
+                "TIP TOKEN STEAL REFUSED: site=subtick candidate_source=%1 candidate_sigma_ms=%2 "
+                "armed_source=%3 armed_sigma_ms=%4 candidate_eta_ms=%5 armed_eta_ms=%6 token=%7")
+                                      .arg(tipDecision.source.left(64))
+                                      .arg(tipDecision.combinedSigmaMs, 0, 'f', 3)
+                                      .arg(schedFireArmedSource_)
+                                      .arg(schedFireArmedSigmaMs_, 0, 'f', 3)
+                                      .arg(fireAtMs - now, 0, 'f', 3)
+                                      .arg(schedFireDeadlineMs_ - now, 0, 'f', 3)
+                                      .arg(schedFireToken_));
+        }
         if (schedFireDeadlineMs_ >= 0.0
             && (std::abs(fireAtMs - armedBaseMs) <= tokenDeadlineDriftToleranceMs()
                 || armedTokenIrreplaceable(now)
                 || armedTokenSubmitInFlight(now)
+                || qualityStealRefused
                 || (deferUndercuttingCandidate
                     && fireAtMs + 1e-6 < armedBaseMs))) {
             return;
