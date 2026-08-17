@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from decoder_pipe_identity import (
     canonical_executable_path,
@@ -968,8 +968,30 @@ class RemotePlayClientManager:
 
         # Auto-discover registered console nickname via `chiaki list` so we can
         # invoke direct stream mode and bypass the Chiaki lobby/discovery UI.
-        nickname = _detect_chiaki_nickname(chiaki)
+        probe = _probe_chiaki_client(chiaki)
+        nickname = probe.nickname
         host = str(self._config.console_ip or "").strip()
+
+        # [ORION_CLIENT_LAUNCHABILITY 2026-08-13] Fail HERE, loudly, when the client
+        # itself will not run. Falling through to the lobby in this state cannot work
+        # — the lobby is the same executable — and it costs the caller its whole
+        # readiness deadline before reporting a registration problem that does not
+        # exist. Scoped deliberately narrow: only the unambiguous "never reached
+        # main()" exits set client_ran=False, so a slow or chatty client keeps the
+        # historical fallback.
+        if not probe.client_ran:
+            logger.error("Remote Play client is not runnable: %s", probe.detail)
+            return RemotePlayClientStatus(
+                ok=False,
+                mode="chiaki",
+                path=chiaki,
+                message=(
+                    f"{probe.detail}. This is a broken client install, not a console "
+                    f"or network problem — the console registration is untouched. "
+                    f"Reinstall Venice, or restore a known-good OrionStream.exe in "
+                    f"{os.path.dirname(chiaki) or chiaki}."
+                ),
+            )
 
         if nickname and host:
             # IMPORTANT: chiaki-ng uses QCommandLineParser::ParseAsPositionalArguments mode,
@@ -1101,12 +1123,51 @@ class RemotePlayClientManager:
             return RemotePlayClientStatus(ok=False, mode=mode, path=path, message=f"Failed to start {mode}: {exc}")
 
 
-def _detect_chiaki_nickname(chiaki_path: str) -> str:
-    """Run `chiaki list` and return the first registered console nickname.
+class ChiakiClientProbe(NamedTuple):
+    """Result of the pre-launch `OrionStream list` probe.
+
+    `nickname` is the first registered console, "" if none.
+    `client_ran` is False ONLY when the client could not execute at all (loader
+    failure / not spawnable) — i.e. when an empty nickname says nothing about
+    whether a console is registered.
+    `detail` is the human-readable reason, empty when the probe was clean.
+    """
+
+    nickname: str
+    client_ran: bool
+    detail: str
+
+
+# Windows NTSTATUS exit codes that mean "the process never reached main()", mapped to
+# what the operator can actually do about them. A client that dies in the loader writes
+# nothing to stdout, which is indistinguishable from a clean "no console registered"
+# unless the exit code is read — see _probe_chiaki_client.
+_NTSTATUS_LAUNCH_FAILURES = {
+    0xC0000135: "a DLL it needs is missing from the client folder (STATUS_DLL_NOT_FOUND)",
+    0xC0000139: "a DLL it needs is the wrong version (STATUS_ENTRYPOINT_NOT_FOUND)",
+    0xC0000142: "a DLL failed to initialize (STATUS_DLL_INIT_FAILED)",
+    0xC000007B: "a 32/64-bit mismatch in its DLLs (STATUS_INVALID_IMAGE_FORMAT)",
+    0xC0000005: "an access violation during start-up (STATUS_ACCESS_VIOLATION)",
+    0xC0000409: "a stack buffer overrun during start-up (STATUS_STACK_BUFFER_OVERRUN)",
+}
+
+
+def _probe_chiaki_client(chiaki_path: str) -> ChiakiClientProbe:
+    """Run `chiaki list` and report BOTH the registered nickname and whether the
+    client is runnable at all.
 
     Output format (chiaki-ng):
         Host: <nickname>
-    Returns "" if no console is registered or chiaki invocation fails.
+
+    WHY THIS RETURNS client_ran (2026-08-13): this used to return a bare string, and
+    every failure — including "the executable died in the Windows loader" — collapsed
+    into "". The caller read that as "no console registered", logged exactly that, and
+    fell back to the Chiaki lobby, which then burned the full readiness deadline and
+    reported a registration problem. That is what happened on this rig: a rebuilt
+    OrionStream.exe linked against FFmpeg 8 while the deploy folder shipped FFmpeg 7,
+    so it exited 0xC0000135 before main() with empty stdout. The registration was
+    intact the whole time; the log said it was missing. An unrunnable client and an
+    unregistered console need different fixes, so they must not share a message.
     """
     try:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1117,12 +1178,42 @@ def _detect_chiaki_nickname(chiaki_path: str) -> str:
             timeout=4.0,
             creationflags=flags if os.name == "nt" else 0,
         )
-        for line in (result.stdout or "").splitlines():
-            line = line.strip()
-            if line.lower().startswith("host:"):
-                nickname = line.split(":", 1)[1].strip()
-                if nickname:
-                    return nickname
-    except Exception as exc:
+    except subprocess.TimeoutExpired:
+        # It STARTED and then hung. Deliberately still "ran": a slow machine must keep
+        # its historical lobby fallback rather than being newly hard-blocked here.
+        logger.warning("chiaki list timed out after 4s; falling back to lobby launch.")
+        return ChiakiClientProbe("", True, "the client did not answer within 4 seconds")
+    except OSError as exc:
+        return ChiakiClientProbe("", False, f"the client could not be started ({exc})")
+    except Exception as exc:  # noqa: BLE001 - probe must never take the caller down
         logger.debug("chiaki list failed: %s", exc)
-    return ""
+        return ChiakiClientProbe("", True, f"the client probe failed ({exc})")
+
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line.lower().startswith("host:"):
+            nickname = line.split(":", 1)[1].strip()
+            if nickname:
+                return ChiakiClientProbe(nickname, True, "")
+
+    rc = int(result.returncode or 0)
+    status = rc & 0xFFFFFFFF
+    if status in _NTSTATUS_LAUNCH_FAILURES:
+        return ChiakiClientProbe(
+            "", False,
+            f"the Remote Play client cannot start: {_NTSTATUS_LAUNCH_FAILURES[status]}"
+            f" [exit 0x{status:08X}]")
+    if status >= 0xC0000000:
+        # Unmapped NTSTATUS. Still unambiguously a crash, not a clean empty list.
+        return ChiakiClientProbe(
+            "", False,
+            f"the Remote Play client crashed during start-up [exit 0x{status:08X}]")
+
+    # Exited normally with no Host: line — genuinely no registered console.
+    return ChiakiClientProbe("", True, "")
+
+
+def _detect_chiaki_nickname(chiaki_path: str) -> str:
+    """Back-compat shim: nickname only. Prefer _probe_chiaki_client, which also says
+    whether an empty result means 'nothing registered' or 'client will not run'."""
+    return _probe_chiaki_client(chiaki_path).nickname

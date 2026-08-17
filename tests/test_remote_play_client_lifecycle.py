@@ -87,8 +87,9 @@ def test_hook_enabled_launch_performs_only_one_stale_client_sweep(monkeypatch, t
                         lambda _title="": (0, ""))
     monkeypatch.setattr(remote_play_client, "find_chiaki_binary",
                         lambda _explicit="": str(tmp_path / "OrionStream.exe"))
-    monkeypatch.setattr(remote_play_client, "_detect_chiaki_nickname",
-                        lambda _path: "registered-console")
+    monkeypatch.setattr(
+        remote_play_client, "_probe_chiaki_client",
+        lambda _path: remote_play_client.ChiakiClientProbe("registered-console", True, ""))
 
     manager = remote_play_client.RemotePlayClientManager(
         remote_play_client.RemotePlayClientConfig(
@@ -419,3 +420,90 @@ def test_live_ready_status_is_revoked_when_current_session_quits(tmp_path):
 
     assert manager.is_session_ready() is False
     assert manager.status.session_ready is False
+
+
+# --- [ORION_CLIENT_LAUNCHABILITY 2026-08-13] -------------------------------------------
+# Regression cover for the 2026-08-13 rig failure: a rebuilt OrionStream.exe linked
+# against FFmpeg 8 while the deploy folder shipped FFmpeg 7, so the client exited
+# 0xC0000135 (STATUS_DLL_NOT_FOUND) in the Windows loader with EMPTY stdout. The old
+# probe returned "" for that, identical to "no console registered", and the caller
+# logged a registration problem and opened the lobby. The console registration was
+# intact throughout. These pin the two states apart.
+
+class _CompletedProbe:
+    def __init__(self, returncode, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _probe_with(monkeypatch, returncode, stdout=""):
+    monkeypatch.setattr(
+        remote_play_client.subprocess, "run",
+        lambda *a, **k: _CompletedProbe(returncode, stdout))
+    return remote_play_client._probe_chiaki_client("OrionStream.exe")
+
+
+def test_probe_reports_registered_console(monkeypatch):
+    probe = _probe_with(monkeypatch, 0, "Host: Isaiahs PS5 \n")
+    assert probe.nickname == "Isaiahs PS5"
+    assert probe.client_ran is True
+    assert probe.detail == ""
+
+
+def test_probe_clean_exit_with_no_host_means_nothing_registered(monkeypatch):
+    probe = _probe_with(monkeypatch, 0, "")
+    assert probe.nickname == ""
+    # The client RAN. An empty list here is real information, and the lobby fallback
+    # (pair a console manually) is the correct response.
+    assert probe.client_ran is True
+
+
+def test_probe_loader_failure_is_not_reported_as_missing_registration(monkeypatch):
+    # 0xC0000135 as Python surfaces it: the exact code seen on the rig.
+    probe = _probe_with(monkeypatch, 3221225781, "")
+    assert probe.nickname == ""
+    assert probe.client_ran is False
+    assert "STATUS_DLL_NOT_FOUND" in probe.detail
+    assert "cannot start" in probe.detail
+
+
+def test_probe_unmapped_crash_still_counts_as_unrunnable(monkeypatch):
+    probe = _probe_with(monkeypatch, 0xC0000374 - (1 << 32), "")  # heap corruption
+    assert probe.client_ran is False
+    assert "0xC0000374" in probe.detail
+
+
+def test_probe_timeout_keeps_the_historical_lobby_fallback(monkeypatch):
+    def _boom(*a, **k):
+        raise remote_play_client.subprocess.TimeoutExpired(cmd="list", timeout=4.0)
+    monkeypatch.setattr(remote_play_client.subprocess, "run", _boom)
+    probe = remote_play_client._probe_chiaki_client("OrionStream.exe")
+    # A slow machine must NOT be newly hard-blocked; only unambiguous loader deaths are.
+    assert probe.client_ran is True
+    assert probe.nickname == ""
+
+
+def test_launch_refuses_and_explains_when_client_cannot_run(monkeypatch, tmp_path):
+    spawned = []
+    monkeypatch.setattr(remote_play_client, "terminate_chiaki_processes", lambda: None)
+    monkeypatch.setattr(remote_play_client, "find_chiaki_binary",
+                        lambda _explicit="": str(tmp_path / "OrionStream.exe"))
+    monkeypatch.setattr(
+        remote_play_client, "_probe_chiaki_client",
+        lambda _path: remote_play_client.ChiakiClientProbe(
+            "", False, "the Remote Play client cannot start: a DLL it needs is missing "
+                       "from the client folder (STATUS_DLL_NOT_FOUND) [exit 0xC0000135]"))
+    monkeypatch.setattr(remote_play_client.subprocess, "Popen",
+                        lambda *a, **k: spawned.append(a) or _Process(None))
+
+    manager = remote_play_client.RemotePlayClientManager(
+        remote_play_client.RemotePlayClientConfig(console_ip="1.2.3.4"))
+    status = manager._launch("chiaki")
+
+    assert status.ok is False
+    # Names the real fault and explicitly clears the console/registration of blame.
+    assert "STATUS_DLL_NOT_FOUND" in status.message
+    assert "not a console" in status.message
+    # And it must not burn the readiness deadline launching a client that cannot run.
+    assert spawned == []
