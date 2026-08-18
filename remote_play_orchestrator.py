@@ -525,6 +525,27 @@ def _capture_mode_descriptor(mode_values) -> str:
         f'|fourcc={mode_fourcc.lower()}|buffer={buffer_identity}')
 
 
+_SCOPE_REJECT_LOGGED: set = set()
+
+
+def _scope_reject(reason: str) -> str:
+    """Log WHY the latency route scope is empty, once per distinct reason per process.
+
+    [ORION_SCOPE_DIAG 2026-08-18] An empty scope makes the sidecar reject every controller
+    route attestation with the single opaque token `route_scope_rejected`, and the bot sits
+    benched in waiting_for_latency_calibration for the whole session. That exact bench has now
+    cost three debugging sessions (2026-08-08 the 72-second bench; 2026-08-17; 2026-08-18 a
+    full session with zero bot releases) because nothing ever said WHICH of the dozen
+    conditions failed. Fail-closed stays fail-closed -- but it must name itself.
+    """
+    if reason not in _SCOPE_REJECT_LOGGED:
+        _SCOPE_REJECT_LOGGED.add(reason)
+        logger.warning(
+            'Latency route scope EMPTY (%s): timing attestation will be rejected as '
+            'route_scope_rejected until this is resolved', reason)
+    return ''
+
+
 def _latency_route_scope(config) -> str:
     """Stable fixed-path identity for reusable measured-latency posteriors.
 
@@ -536,17 +557,17 @@ def _latency_route_scope(config) -> str:
     if source in ('capturecard', 'card'):
         source = 'capture_card'
     if source not in ('capture_card', 'decoder'):
-        return ''
+        return ''   # legacy/window sources are silently unscoped by design
     console_identity = str(getattr(config, 'console_identity', '') or '').strip().lower()
     console_prefix = 'registered-host-sha256-v1:'
     if (not console_identity.startswith(console_prefix)
             or len(console_identity) != len(console_prefix) + 64
             or any(ch not in '0123456789abcdef'
                    for ch in console_identity[len(console_prefix):])):
-        return ''
+        return _scope_reject('console_identity_missing_or_malformed')
     controller_route = str(getattr(config, 'controller_route', '') or '').strip().lower()
     if controller_route not in ('pipe', 'vigem_ds4', 'vigem_xusb'):
-        return ''
+        return _scope_reject('controller_route_unproven (%r)' % controller_route)
     parts = [
         # v4 adds an opaque, registration-derived console identity. A DHCP address is not an
         # identity and two paired consoles must never share the same timing posterior.
@@ -565,7 +586,7 @@ def _latency_route_scope(config) -> str:
         capture_mode = str(getattr(config, 'capture_mode', '') or '').strip().lower()
         if (not capture_mode or len(capture_mode) > 128
                 or any(not (ch.isalnum() or ch in '.@x|=_-') for ch in capture_mode)):
-            return ''
+            return _scope_reject('capture_mode_unattested (%r)' % capture_mode[:64])
         # Index alone is not a device identity: unplugging/reordering cards can put a different
         # pipeline at index 0. Native supplies the DirectShow names in index order. Restore only
         # when the configured index names exactly one unambiguous capture card and every other
@@ -578,27 +599,45 @@ def _latency_route_scope(config) -> str:
         try:
             index = int(str(os.environ.get('ORION_CAPTURE_CARD_INDEX', '') or '').strip())
         except (TypeError, ValueError, OverflowError):
-            return ''
+            return _scope_reject('capture_index_env_missing_or_malformed')
         if (index < 0 or index >= len(names) or not names[index]
                 or len(stable_ids) != len(names)
                 or any(not value for value in stable_ids)
                 or len(set(stable_ids)) != len(stable_ids)):
-            return ''
+            return _scope_reject(
+                'device_inventory_inconsistent (index=%d names=%d ids=%d)'
+                % (index, len(names), len(stable_ids)))
         id_prefix = 'dshow-moniker-sha256-v1:'
         if any(
                 not value.startswith(id_prefix)
                 or len(value) != len(id_prefix) + 64
                 or any(ch not in '0123456789abcdef' for ch in value[len(id_prefix):])
                 for value in stable_ids):
-            return ''
+            return _scope_reject('device_moniker_ids_malformed')
         try:
             from capture_card_backend import _classify_name
             classes = [_classify_name(name) if name else 'unknown' for name in names]
         except Exception:
-            return ''
-        if classes[index] != 'card' or any(
-                kind != 'webcam' for i, kind in enumerate(classes) if i != index):
-            return ''
+            return _scope_reject('name_classifier_unavailable')
+        # [ORION_SCOPE_IDENTITY 2026-08-18] The old rule here also demanded that EVERY OTHER
+        # device on the system classify as a known webcam. That keyed timing eligibility on the
+        # machine's entire device census, and it benched the 2026-08-18 rig for a full session
+        # (zero bot releases, route_scope_rejected every 1.5s): Elgato's driver had registered a
+        # second DirectShow filter for the same physical card, two entries classified 'card', and
+        # the scope emptied -- with the configured Elgato sitting at its configured index,
+        # streaming perfectly, its identity fully verifiable. Any new virtual camera with an
+        # unrecognized name ('NVIDIA Broadcast' classifies unknown) would do the same.
+        #
+        # The census never carried the identity anyway. The scope embeds device-id= -- the
+        # configured index's DirectShow moniker SHA -- so a swapped card yields a DIFFERENT
+        # scope string and the old posterior is unreachable
+        # (test_latency_cache_capture_scope_rejects_identically_named_card_swap proves exactly
+        # this with no census involved). What the configured device IS remains load-bearing;
+        # what else exists on the machine does not.
+        if classes[index] != 'card':
+            return _scope_reject(
+                'configured_index_not_a_capture_card (%r -> %s)'
+                % (names[index][:48], classes[index]))
         stable_name = ' '.join(names[index].casefold().split())
         parts.extend([
             str(index),
@@ -3221,6 +3260,13 @@ class RemotePlayOrchestrator:
                     self._capture_warm_cache_expected_index = actual_index
                     expected = actual_index
                     self._capture_warm_cache_revoked = True
+                    # [ORION_SCOPE_IDENTITY 2026-08-18] The route scope derives the device
+                    # identity (name + moniker SHA) from ORION_CAPTURE_CARD_INDEX. Follow the
+                    # adoption in this process's env so every later scope evaluation keys on the
+                    # device timing actually runs on -- otherwise evidence earned on the adopted
+                    # card would persist under the CONFIGURED row's identity, which is exactly
+                    # the cross-device contamination the scope exists to prevent.
+                    os.environ['ORION_CAPTURE_CARD_INDEX'] = str(actual_index)
 
             prior_mode = str(getattr(self.config, 'capture_mode', '') or '').strip().lower()
             mode_changed = actual_mode != prior_mode

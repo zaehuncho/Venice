@@ -1417,10 +1417,37 @@ def test_latency_cache_scope_never_crosses_capture_routes(monkeypatch, tmp_path)
     assert rpo._latency_route_scope(rpo.OrchestratorConfig(
         frame_source="capture_card", **common)) == ""
 
+    # [ORION_SCOPE_IDENTITY 2026-08-18] DELIBERATE CONTRACT CHANGE. This used to assert that a
+    # second card-classified device on the system empties the scope (the census rule). That rule
+    # benched the real rig for a whole session -- Elgato's driver registered a second DirectShow
+    # filter for the same physical card, and timing died with the configured card streaming
+    # perfectly at its configured index. Identity rides device-id= (the moniker SHA), which the
+    # identically-named-swap test below proves is sufficient on its own; the census is gone. The
+    # configured index must still BE a card, and each sibling's presence must still be reflected
+    # in a consistent names/ids inventory.
+    monkeypatch.setenv("ORION_CAPTURE_CARD_INDEX", "0")
     monkeypatch.setenv("ORION_VIDEO_DEVICE_NAMES", "Elgato HD60 X|Elgato 4K60 Pro")
-    monkeypatch.setenv("ORION_VIDEO_DEVICE_IDS", f"{webcam_id}|{card_id}")
+    monkeypatch.setenv("ORION_VIDEO_DEVICE_IDS", f"{card_id}|{webcam_id}")
+    two_cards = rpo._latency_route_scope(rpo.OrchestratorConfig(
+        frame_source="capture_card", resolution="1920x1080", target_fps=60,
+        capture_mode="1920x1080@60.000|fourcc=yuy2|buffer=1.000", **common))
+    assert two_cards, "a sibling card-classified filter must not bench timing"
+    assert "device=elgato hd60 x" in two_cards
+    assert f"device-id={card_id}" in two_cards
+
+    # An unknown-named sibling (the 'NVIDIA Broadcast' class of virtual camera) is equally
+    # irrelevant to the configured device's identity.
+    monkeypatch.setenv("ORION_VIDEO_DEVICE_NAMES", "Elgato HD60 X|NVIDIA Broadcast")
     assert rpo._latency_route_scope(rpo.OrchestratorConfig(
-        frame_source="capture_card", **common)) == ""
+        frame_source="capture_card", resolution="1920x1080", target_fps=60,
+        capture_mode="1920x1080@60.000|fourcc=yuy2|buffer=1.000", **common))
+
+    # Still fail-closed where identity actually breaks: the CONFIGURED index not being a
+    # capture card at all.
+    monkeypatch.setenv("ORION_VIDEO_DEVICE_NAMES", "Logitech Webcam C925e|Elgato HD60 X")
+    assert rpo._latency_route_scope(rpo.OrchestratorConfig(
+        frame_source="capture_card", resolution="1920x1080", target_fps=60,
+        capture_mode="1920x1080@60.000|fourcc=yuy2|buffer=1.000", **common)) == ""
 
 
 def test_latency_cache_capture_scope_rejects_identically_named_card_swap(monkeypatch):
@@ -1658,6 +1685,10 @@ def test_capture_route_drift_to_name_verified_card_is_adopted_cold(monkeypatch):
     # route this process never opened can never be restored onto the adopted one.
     assert orch._capture_warm_cache_revoked
     assert not getattr(orch, "_capture_route_currently_invalid", False)
+    # [ORION_SCOPE_IDENTITY 2026-08-18] The scope must key on the ADOPTED device's identity
+    # row, not the stale configured one -- otherwise evidence earned on the adopted card would
+    # persist under another device's moniker.
+    assert os.environ.get("ORION_CAPTURE_CARD_INDEX") == "1"
 
 
 def test_capture_route_drift_without_identity_evidence_still_bricks(monkeypatch):
