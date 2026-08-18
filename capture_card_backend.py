@@ -390,6 +390,15 @@ class CaptureCardBackend:
         # arbitrary thread mid-read; the reader's own teardown (or process exit) reclaims it.
         self._wedged_cap = None
         self._api_name = ""
+        # [ORION_ROUTE_ADOPT 2026-08-17] WHY the resolved index was chosen, for the orchestrator's
+        # route guard. "configured" = it is the configured index; "card_name" = the name-gated
+        # candidate walk resolved a DIFFERENT index whose DirectShow name classifies as a capture
+        # card (identity evidence: same physical card, enumeration drift); "uncertain" = any other
+        # basis (cached index without a name list, unknown-named device, legacy brightness scan).
+        # The guard may adopt a "card_name" resolution for COLD timing authority; it must keep
+        # bricking on "uncertain" -- an index with no identity evidence could be a different
+        # pipeline entirely, and timing on it would be the exact trap the guard exists to close.
+        self._route_basis = "configured"
         self._frame_number = 0
         self._source_generation = 0
         self._last_geom = (0, 0)
@@ -540,6 +549,18 @@ class CaptureCardBackend:
                 return [msmf, dshow]
             return [dshow, msmf]
         return [(cv2.CAP_ANY, "ANY")]
+
+    def route_identity_basis(self) -> str:
+        """Why the resolved index was chosen: "configured" | "card_name" | "uncertain".
+
+        [ORION_ROUTE_ADOPT 2026-08-17] Consumed by the orchestrator's capture-route guard.
+        "card_name" is the only value that licenses adopting a non-configured index for COLD
+        timing authority: it means the name-gated candidate walk resolved a device whose
+        DirectShow name classifies as a capture card -- the same physical card at a drifted
+        enumeration index, which is exactly what bricked the 2026-08-17 session for its whole
+        lifetime under the old configured-index-only comparison.
+        """
+        return str(self._route_basis or "uncertain")
 
     def active_route(self):
         """Return ``(actual_api, resolved_index)`` for warm-cache authority.
@@ -861,6 +882,7 @@ class CaptureCardBackend:
         # A BUSY candidate is the informative one, so remember it across the whole sweep: a later
         # "absent" index must not overwrite the fact that the real card opened-but-would-not-stream.
         any_busy = False
+        configured_index = self._device_index
         for idx in self._candidate_indices():
             self._open_diag = ""
             cap, api_name = self._open(idx)
@@ -869,6 +891,17 @@ class CaptureCardBackend:
                     logger.info("Capture-card: configured index %d had no live feed; using device "
                                 "at index %d", self._device_index, idx)
                 self._device_index = idx
+                # [ORION_ROUTE_ADOPT 2026-08-17] Record the identity basis of this resolution.
+                # Only a name-verified CARD earns "card_name": the walk may also have reached
+                # this index from the persisted cache or as an unknown-named candidate, and
+                # neither is evidence about WHAT is on the index.
+                if idx == configured_index:
+                    self._route_basis = "configured"
+                elif (names is not None and 0 <= idx < len(names)
+                      and _classify_name(names[idx]) == "card"):
+                    self._route_basis = "card_name"
+                else:
+                    self._route_basis = "uncertain"
                 break
             if self._open_diag == "busy":
                 any_busy = True
@@ -880,6 +913,8 @@ class CaptureCardBackend:
                     logger.info("Capture-card: auto-detected live device at index %d (one-shot scan)",
                                 best)
                 self._device_index = best
+                # [ORION_ROUTE_ADOPT] A brightness scan proves a live picture, not an identity.
+                self._route_basis = ("configured" if best == configured_index else "uncertain")
                 cap, api_name = self._open(best)
         if cap is None:
             # "no live device" is NOT one failure -- it is two, with opposite fixes. Say which.

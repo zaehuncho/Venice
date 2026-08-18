@@ -1604,3 +1604,79 @@ def test_native_sidecar_config_carries_selected_latency_route():
     assert 'console_identity=str(cfg.get("console_identity", ""))' in sidecar
     assert 'chiaki_identity_size=(_safe_uint64(cfg.get("chiaki_identity_size")) or -1)' in sidecar
     assert 'chiaki_identity_sha256=str(cfg.get("chiaki_identity_sha256", ""))' in sidecar
+
+
+# --- [ORION_ROUTE_ADOPT 2026-08-17] ----------------------------------------------------
+# The 2026-08-17 session: the Elgato enumerated at DSHOW index 1 for the whole boot
+# (configured 0 had no live feed), the backend deliberately resolved it BY NAME at 1 and
+# said so in its log -- and the route guard bricked timing for the entire session anyway,
+# because the 08-11 recovery only lifts when the card RETURNS to the configured index.
+# These pin the adoption rule and, just as deliberately, every case that must still brick.
+
+def _drifted_card_orch(monkeypatch, *, basis: str, api: str = "DSHOW"):
+    monkeypatch.setenv("ORION_MEASURE_LATENCY", "1")
+    monkeypatch.setenv("ORION_CAPTURE_CARD_INDEX", "0")
+    monkeypatch.setenv(
+        "ORION_VIDEO_DEVICE_NAMES", "OBS Virtual Camera|Elgato HD60 X")
+    monkeypatch.setenv(
+        "ORION_VIDEO_DEVICE_IDS",
+        "|".join(("dshow-moniker-sha256-v1:" + "1" * 64,
+                  "dshow-moniker-sha256-v1:" + "2" * 64)))
+    orch = rpo.RemotePlayOrchestrator(rpo.OrchestratorConfig(
+        frame_source="capture_card", auto_launch_client=False,
+        virtual_controller=False,
+        console_identity="registered-host-sha256-v1:" + "a" * 64,
+        controller_route="pipe", capture_mode="",
+    ))
+    orch._capture_warm_cache_expected_index = 0
+    orch._frame_backend = SimpleNamespace(
+        active_route=lambda: (api, 1),
+        negotiated_mode=lambda: (1920, 1080, 60.00024, "YUY2", -1.0),
+        route_identity_basis=lambda: basis,
+    )
+    fd = FrameData(
+        frame=_owned_frame(width=1920, height=1080), frame_number=1,
+        timestamp_ns=time.perf_counter_ns(), capture_api=api,
+        capture_device_index=1, capture_width=1920, capture_height=1080,
+        capture_fps=60.00024, capture_fourcc="YUY2",
+        capture_buffer_size=-1.0,
+    )
+    return orch, fd
+
+
+def test_capture_route_drift_to_name_verified_card_is_adopted_cold(monkeypatch):
+    orch, fd = _drifted_card_orch(monkeypatch, basis="card_name")
+
+    assert orch._guard_capture_latency_route(frame_data=fd), (
+        "a DSHOW route the backend resolved by capture-card NAME must be adopted, "
+        "not bricked for the life of the session")
+    # The process-local expectation followed the card, so every later frame matches too.
+    assert orch._capture_warm_cache_expected_index == 1
+    assert orch._guard_capture_latency_route(frame_data=fd)
+    # COLD only, permanently: adoption poisons the warm cache, and poisoning forces
+    # restore_cache off inside _replace_latency_authority -- the persisted posterior of a
+    # route this process never opened can never be restored onto the adopted one.
+    assert orch._capture_warm_cache_revoked
+    assert not getattr(orch, "_capture_route_currently_invalid", False)
+
+
+def test_capture_route_drift_without_identity_evidence_still_bricks(monkeypatch):
+    # Same drift, but the backend reached index 1 from the persisted cache / an
+    # unknown-named device / a brightness scan: no evidence about WHAT is on the index,
+    # so the fail-closed behaviour is unchanged.
+    orch, fd = _drifted_card_orch(monkeypatch, basis="uncertain")
+
+    assert not orch._guard_capture_latency_route(frame_data=fd)
+    assert orch._capture_warm_cache_expected_index == 0
+    assert orch._capture_warm_cache_revoked
+    assert getattr(orch, "_capture_route_currently_invalid", False)
+
+
+def test_capture_route_msmf_fallback_still_bricks_even_with_card_name(monkeypatch):
+    # SHIP BLOCKER #47's other half is a DIFFERENT failure: an MSMF fallback open. Name
+    # identity does not make MSMF timing trustworthy, and the fail-closed path stays.
+    orch, fd = _drifted_card_orch(monkeypatch, basis="card_name", api="MSMF")
+
+    assert not orch._guard_capture_latency_route(frame_data=fd)
+    assert orch._capture_warm_cache_expected_index == 0
+    assert orch._capture_warm_cache_revoked

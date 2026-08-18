@@ -3169,6 +3169,59 @@ class RemotePlayOrchestrator:
 
             actual_mode = _capture_mode_descriptor(mode_values)
 
+            # [ORION_ROUTE_ADOPT 2026-08-17] #47, the half the 08-11 fix could not reach. That fix
+            # lets a session recover when the card RETURNS to the configured index -- but on
+            # 2026-08-17 the Elgato enumerated at index 1 for the whole boot (configured 0 had no
+            # live feed), so "return to 0" was unreachable and the session was timing-dead for its
+            # entire life while the backend's own log said it had deliberately resolved the card
+            # by NAME at index 1. Our own name-gated resolution was being treated as an untrusted
+            # route forever.
+            #
+            # ADOPT such a resolution, under every condition that keeps this safe:
+            #   * DSHOW only, healthy negotiated mode, geometry verified -- the same bar `matches`
+            #     itself sets. An MSMF fallback still revokes (the #47 brick-on-MSMF ship blocker
+            #     is a DIFFERENT failure and keeps its fail-closed behaviour).
+            #   * The backend must attest the index was chosen by CARD-NAME identity
+            #     (route_identity_basis() == 'card_name'). A cached index, an unknown-named
+            #     device, or a brightness-scan hit carries no identity evidence and still bricks.
+            #   * COLD only, permanently: poisoning is set with the adoption, so the persisted
+            #     posterior (scoped to a route this process did not open) can never be restored
+            #     here -- _replace_latency_authority forces restore_cache=False while poisoned.
+            #     Fresh controlled evidence re-earns authority from zero, exactly like the 08-11
+            #     recovery path.
+            # Adoption mutates the process-local expectation and falls through: `matches` then
+            # holds on this and every later frame, and the existing recovered/transition branches
+            # do the re-keying with their own reasons.
+            if (actual_api == 'DSHOW' and expected >= 0
+                    and actual_index >= 0 and actual_index != expected
+                    and bool(actual_mode) and geometry_matches):
+                basis_backend = (backend if backend is not None
+                                 else getattr(self, '_frame_backend', None))
+                basis_fn = getattr(basis_backend, 'route_identity_basis', None)
+                basis = ''
+                try:
+                    basis = str(basis_fn()) if callable(basis_fn) else ''
+                except Exception:
+                    basis = ''
+                resolved_route = getattr(basis_backend, 'active_route', None)
+                try:
+                    backend_api, backend_index = (resolved_route()
+                                                  if callable(resolved_route) else ('', -1))
+                except Exception:
+                    backend_api, backend_index = '', -1
+                if (basis == 'card_name'
+                        and str(backend_api or '').strip().upper() == 'DSHOW'
+                        and int(backend_index) == actual_index):
+                    logger.warning(
+                        'Capture-card route ADOPTED: configured DirectShow index %d had no live '
+                        'feed; the backend resolved the capture card BY NAME at index %d and '
+                        'timing continues with COLD calibration there (the persisted posterior '
+                        'stays revoked). This replaces the former whole-session timing brick.',
+                        expected, actual_index)
+                    self._capture_warm_cache_expected_index = actual_index
+                    expected = actual_index
+                    self._capture_warm_cache_revoked = True
+
             prior_mode = str(getattr(self.config, 'capture_mode', '') or '').strip().lower()
             mode_changed = actual_mode != prior_mode
             actual_route = (actual_api, actual_index, actual_mode)
