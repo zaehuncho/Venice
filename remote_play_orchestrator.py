@@ -2084,6 +2084,33 @@ class RemotePlayOrchestrator:
             logger.warning('Latency route re-keyed (%s); restored authority awaits fresh health',
                            str(reason or 'config_transition')[:48])
 
+    def _attest_reject(self, reason: str) -> bool:
+        """Name WHY a controller-route attestation was refused, once per distinct reason.
+
+        [ORION_ATTEST_DIAG 2026-08-18] attest_controller_latency_route has ~10 refusal paths
+        and the sidecar collapses every one of them into the single token
+        `route_scope_rejected`. Three sessions have now been lost to that opacity (08-08,
+        08-17, 08-18 -- the 08-18 evening session rejected 161 times in 4 minutes with the
+        scope NON-empty, refuting the first diagnosis made from the bare token). Fail-closed
+        stays fail-closed; it names itself. Returns False so callers can `return
+        self._attest_reject(...)`.
+        """
+        seen = getattr(self, '_attest_reject_logged', None)
+        if seen is None:
+            seen = set()
+            self._attest_reject_logged = seen
+        if reason not in seen:
+            seen.add(reason)
+            logger.warning(
+                'Controller-route attestation REFUSED (%s): verified=%s route_invalid=%s '
+                'epoch=%s highest_gen=%s -- native will log this as route_scope_rejected',
+                reason,
+                bool(getattr(self, '_capture_warm_cache_verified', False)),
+                bool(getattr(self, '_capture_route_currently_invalid', False)),
+                getattr(self, '_latency_estimator_scope_epoch', '?'),
+                getattr(self, '_latency_controller_highest_attestation_generation', '?'))
+        return False
+
     def attest_controller_latency_route(self, delivery_route: str,
                                         attestation_generation: int) -> bool:
         """Bind cache provenance to a distinct native-confirmed neutral delivery backend.
@@ -2094,11 +2121,11 @@ class RemotePlayOrchestrator:
         """
         route = str(delivery_route or '').strip().lower()
         if route not in ('pipe', 'vigem_ds4', 'vigem_xusb'):
-            return False
+            return self._attest_reject('delivery_route_invalid (%r)' % route[:24])
         if (isinstance(attestation_generation, bool)
                 or not isinstance(attestation_generation, int)
                 or not 0 < attestation_generation <= 0xFFFFFFFFFFFFFFFF):
-            return False
+            return self._attest_reject('attestation_generation_invalid')
         command_lock = getattr(self, '_latency_attestation_command_lock', None)
         if command_lock is None:
             command_lock = threading.Lock()
@@ -2113,14 +2140,14 @@ class RemotePlayOrchestrator:
             if (capture_source and (bool(getattr(
                     self, '_capture_route_currently_invalid', False)) or not bool(getattr(
                     self, '_capture_warm_cache_verified', False)))):
-                return False
+                return self._attest_reject('capture_route_invalid_or_unverified')
             if (source == 'decoder' and bool(getattr(
                     self, '_decoder_warm_cache_revoked', False))):
-                return False
+                return self._attest_reject('decoder_warm_cache_revoked')
 
             lock = getattr(self, '_latency_route_lock', None)
             if lock is None:
-                return False
+                return self._attest_reject('latency_route_lock_missing')
             # Reject a replay before it can mutate config or replace authority.
             with lock:
                 highest = int(getattr(
@@ -2130,7 +2157,9 @@ class RemotePlayOrchestrator:
                 if (attestation_generation < highest
                         or (attestation_generation == highest
                             and route != highest_route)):
-                    return False
+                    return self._attest_reject(
+                        'generation_replay_precheck (gen=%d highest=%d)'
+                        % (attestation_generation, highest))
 
             if route != str(getattr(
                     self.config, 'controller_route', '') or '').strip().lower():
@@ -2154,7 +2183,7 @@ class RemotePlayOrchestrator:
                         self, '_capture_warm_cache_verified', False))))
                         or (source == 'decoder' and bool(getattr(
                             self, '_decoder_warm_cache_revoked', False)))):
-                    return False
+                    return self._attest_reject('capture_route_invalid_or_unverified_postkey')
                 scope = _latency_route_scope(self.config)
                 current_scope = str(getattr(
                     self, '_latency_route_scope_value', '') or '')
@@ -2165,7 +2194,11 @@ class RemotePlayOrchestrator:
                     self._latency_controller_attestation_generation = 0
                     self._latency_controller_attestation_scope = ''
                     self._latency_controller_attestation_route = ''
-                    return False
+                    return self._attest_reject(
+                        'scope_mismatch_or_estimator_missing (scope_empty=%s equal=%s '
+                        'estimator=%s)'
+                        % (not scope, scope == current_scope,
+                           getattr(self, '_latency_estimator', None) is not None))
 
                 highest = int(getattr(
                     self, '_latency_controller_highest_attestation_generation', 0) or 0)
@@ -2178,10 +2211,16 @@ class RemotePlayOrchestrator:
                         self, '_latency_controller_highest_attestation_epoch', 0) or 0),
                 )
                 if attestation_generation < highest:
-                    return False
+                    return self._attest_reject(
+                        'generation_replay (gen=%d highest=%d)'
+                        % (attestation_generation, highest))
                 if (attestation_generation == highest
                         and binding != (route, scope, epoch)):
-                    return False
+                    return self._attest_reject(
+                        'generation_binding_mismatch (gen=%d route_same=%s scope_same=%s '
+                        'epoch %s vs %s)'
+                        % (attestation_generation, binding[0] == route,
+                           binding[1] == scope, binding[2], epoch))
                 if attestation_generation > highest:
                     self._latency_controller_highest_attestation_generation = \
                         attestation_generation
