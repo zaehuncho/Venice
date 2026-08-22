@@ -63,6 +63,12 @@ class RemotePlayClientConfig:
     # deliberately explicit instead of inferred from the parent environment so
     # a later no-card decoder launch can never inherit input-only behaviour.
     disable_video: bool = False
+    # Pre-launch rest-mode wake + post-failure console probes. Mid-session
+    # input-link RECOVERY sets this False: the console was awake moments ago,
+    # every probe second there comes out of a 17s/20s watchdog budget sized
+    # before these probes existed, and auto-waking a console the user just
+    # rested would fight an explicit user action.
+    console_wake_allowed: bool = True
 
 
 @dataclass
@@ -617,6 +623,14 @@ class RemotePlayClientManager:
         return True
 
     def ensure_running(self) -> RemotePlayClientStatus:
+        # The native side hands us wait_timeout_s sized against ITS OWN hard
+        # promotion deadline (15s vs kStreamPromoteDeadlineMs=20000): everything
+        # this method does — stale sweeps, client probe, console wake, launch,
+        # readiness poll — must fit inside that budget TOGETHER. Anchor the
+        # whole run here so prep time (including a rest-mode wake) comes out of
+        # the readiness poll instead of extending the total past the native
+        # deadline, where our carefully-built error text is never surfaced.
+        self._prep_started = time.time()
         self._failed_start_reaped = False
         self._stale_client_cleanup_done = False
         # The Orion input/frame hooks use fixed named pipes. A stale OrionStream
@@ -651,7 +665,7 @@ class RemotePlayClientManager:
             self._status = launch
             return launch
 
-        deadline = time.time() + max(3.0, float(self._config.wait_timeout_s))
+        deadline = self._readiness_deadline(time.time())
         ready_hwnd = 0
         ready_title = ""
         last_session_state = "waiting"
@@ -729,6 +743,7 @@ class RemotePlayClientManager:
                 "Verify the PS5 is powered/reachable on the selected adapter and registered "
                 "in Chiaki, then press Connect again."
             )
+            message += self._console_failure_evidence()
         else:
             message = (
                 "Remote Play client launched, but no stream window appeared. "
@@ -945,6 +960,136 @@ class RemotePlayClientManager:
             return "chiaki"
         return "chiaki"
 
+    def _readiness_deadline(self, now: float) -> float:
+        """Prep-anchored readiness deadline.
+
+        The poll ends when the ORIGINAL budget (measured from ensure_running
+        entry) runs out, never later than the un-anchored deadline — so stale
+        sweeps, the client probe, and a rest-mode wake come out of the poll
+        instead of extending the total past the native promotion deadline. The
+        5s floor keeps a freshly-woken console's handshake (~2.4s) viable even
+        after a long wake wait consumed most of the prep.
+        """
+        budget = max(3.0, float(self._config.wait_timeout_s))
+        anchored = getattr(self, "_prep_started", now) + budget
+        return min(now + budget, max(now + 5.0, anchored))
+
+    def _console_failure_evidence(self) -> str:
+        """One bounded re-probe so a session failure names the console's actual
+        state instead of leaving the user with the generic checklist.
+
+        Hard-capped at ~1.5s (1.0 probe + 0.5 port): it runs after the
+        readiness budget already expired, inside the ~5s the native deadline
+        leaves for wrap-up and the reap. Suppressed entirely for recovery
+        launches (console_wake_allowed=False), whose watchdog arithmetic
+        predates these probes.
+        """
+        if not bool(getattr(self._config, "console_wake_allowed", True)):
+            return ""
+        host = str(getattr(self._config, "console_ip", "") or "").strip()
+        if not host:
+            return ""
+        try:
+            import ps5_wake
+            if not ps5_wake.is_ip_literal(host):
+                return ""
+            probe = ps5_wake.probe_console_state(host, timeout_s=1.0)
+            if probe.state == "standby":
+                return (" Console check: the PS5 is answering discovery but is in "
+                        "REST MODE - wake it (or reconnect to let Orion wake it).")
+            if probe.state == "no_answer":
+                if ps5_wake.session_port_open(host, timeout_s=0.5):
+                    return ""  # console is up; the failure is session-level
+                return (" Console check: the PS5 answered neither discovery nor its "
+                        "Remote Play port - it looks powered off, unplugged from the "
+                        "network, or in rest mode with 'Stay Connected to the "
+                        "Internet' disabled. Power it on at the console.")
+        except Exception:
+            pass
+        return ""
+
+    def _ensure_console_awake(self, nickname: str, host: str,
+                              chiaki_path: str) -> Optional["RemotePlayClientStatus"]:
+        """Wake a resting PS5 before the input client is spawned.
+
+        Returns None to proceed with the launch, or a terminal
+        RemotePlayClientStatus when launching now cannot succeed. Budgeted to
+        fit inside the native side's 20s stream-promotion deadline
+        (kStreamPromoteDeadlineMs): probe <=2.5s, then at most ~9s waiting for
+        a woken console's session port. A console that needs longer gets an
+        honest "waking - reconnect shortly" verdict instead of the generic
+        session-timeout text. Fail-open: any error in the wake plumbing means
+        "proceed", never a new failure mode.
+        """
+        self._last_console_probe = "unprobed"
+        if not bool(getattr(self._config, "console_wake_allowed", True)):
+            return None
+        if str(os.environ.get("ORION_PS5_WAKE", "1")).strip().lower() in {"0", "false", "off"}:
+            return None
+        try:
+            import ps5_wake
+        except ImportError:
+            return None
+        try:
+            if not ps5_wake.is_ip_literal(host):
+                # A hostname would drag synchronous DNS resolution into every
+                # probe send, unbounded by the probe budget. Production always
+                # configures an IP literal (native discovery yields IPs).
+                return None
+            probe = ps5_wake.probe_console_state(host, timeout_s=2.5)
+            self._last_console_probe = probe.state
+            if probe.state != "standby":
+                # ready -> normal launch; no_answer -> can't distinguish a
+                # firewall eating UDP replies from a powered-off console, so
+                # keep today's behavior and let the failure path add evidence.
+                return None
+            logger.info(
+                "PS5 at %s is in rest mode - sending Remote Play wakeup", host)
+            regist_key, is_ps5 = ps5_wake.read_chiaki_regist_key(nickname)
+            if not regist_key:
+                return RemotePlayClientStatus(
+                    ok=False,
+                    mode="chiaki",
+                    path=chiaki_path,
+                    message=(
+                        "The PS5 is in rest mode and the stored Remote Play "
+                        "wakeup key could not be read, so it cannot be woken "
+                        "from here. Wake the console manually (power button or "
+                        "PS button), then press Connect again."
+                    ),
+                )
+            if not ps5_wake.send_wakeup(host, regist_key, ps5=is_ps5):
+                return RemotePlayClientStatus(
+                    ok=False,
+                    mode="chiaki",
+                    path=chiaki_path,
+                    message=(
+                        "The PS5 is in rest mode and the Remote Play wakeup "
+                        "packet could not be sent. Wake the console manually, "
+                        "then press Connect again."
+                    ),
+                )
+            wake_started = time.time()
+            if ps5_wake.wait_for_session_port(host, budget_s=9.0):
+                logger.info(
+                    "PS5 woke and is accepting Remote Play sessions (%.1fs)",
+                    time.time() - wake_started)
+                self._last_console_probe = "ready"
+                return None
+            return RemotePlayClientStatus(
+                ok=False,
+                mode="chiaki",
+                path=chiaki_path,
+                message=(
+                    "The PS5 was in rest mode - a Remote Play wakeup was sent "
+                    "and the console is waking now (this takes ~15-25 "
+                    "seconds). Press Connect again in a moment."
+                ),
+            )
+        except Exception as exc:  # fail-open: wake plumbing must never block a launch
+            logger.warning("Console wake check failed (proceeding to launch): %s", exc)
+            return None
+
     def _launch(self, mode: str) -> RemotePlayClientStatus:
         chiaki = find_chiaki_binary(self._config.chiaki_path)
         if not chiaki:
@@ -994,6 +1139,14 @@ class RemotePlayClientManager:
             )
 
         if nickname and host:
+            # CLI direct-stream mode never wakes a sleeping console (chiaki-ng's
+            # `stream` path skips discovery entirely; only the GUI click path
+            # sends WAKEUP). Detect standby here and wake it BEFORE spawning the
+            # client, or every Connect against a resting PS5 dies ~5s in with
+            # "Session request connect failed: Timeout".
+            wake_refusal = self._ensure_console_awake(nickname, host, chiaki)
+            if wake_refusal is not None:
+                return wake_refusal
             # IMPORTANT: chiaki-ng uses QCommandLineParser::ParseAsPositionalArguments mode,
             # which means any options PLACED AFTER the positional args (`stream nickname host`)
             # are treated as additional positional args. Putting `--fullscreen` at the end

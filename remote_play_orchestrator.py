@@ -1935,7 +1935,7 @@ class RemotePlayOrchestrator:
         except Exception as e:
             logger.error(f'update_meter failed: {e}')
 
-    def _launch_remote_play_client(self, wait_timeout_s=None):
+    def _launch_remote_play_client(self, wait_timeout_s=None, console_wake_allowed=True):
         """Launch (or reuse) the Chiaki client + input hook via the client manager.
 
         This is the SHARED Chiaki/input bring-up used by both the cold-connect path
@@ -1988,6 +1988,11 @@ class RemotePlayOrchestrator:
             # hidden Chiaki child input/audio-only so its unused decoder cannot
             # steal presentation time from the capture-card SHM preview.
             disable_video=bool(self._cc_mode),
+            # Recovery attempts run under a 17s/20s watchdog whose plan
+            # arithmetic predates the rest-mode wake; they must not spend
+            # attempt time probing or waking a console the user may have
+            # just rested deliberately.
+            console_wake_allowed=bool(console_wake_allowed),
         )
         self._client_manager = RemotePlayClientManager(client_cfg)
         status = self._client_manager.ensure_running()
@@ -2376,7 +2381,8 @@ class RemotePlayOrchestrator:
             logger.warning(
                 'Input-link recovery attempt %d/%d (readiness_budget=%.2fs)',
                 attempts, len(plans), wait_s)
-            if self._launch_remote_play_client(wait_timeout_s=wait_s):
+            if self._launch_remote_play_client(wait_timeout_s=wait_s,
+                                               console_wake_allowed=False):
                 # Defense in depth: never promote process liveness. The manager
                 # must still prove this exact launch generation is session-ready.
                 if self.input_link_ready():
