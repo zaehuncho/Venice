@@ -1318,6 +1318,9 @@ class SimpleMeterReader:
         # 2.5 against a measured genuine worst case of ~1.75s = ~40% headroom.
         # 0 disables.
         self._capless_max_s = max(0.0, _fnum('ORION_READER_WHITE_CAPLESS_S', 2.5))
+        # Green pixels inside the top 35% of the box that count as "cap present".
+        # 8 measured: keeps 91% of true locks, admits 5% of false ones.
+        self._capless_px_min = max(1, _inum('ORION_READER_WHITE_CAP_PX', 8))
         # (3b) FAKE-LOCK / DEAD-HOLD breaker (default ON): suppress a detection whose REPORTED fill
         # is byte-identical for longer than a physical hold (static red dÃ©cor / stuck hold). Caps are
         # frames @ the mid-fill / near-tip tiers. DEFAULT-OFF: it catches the real 222-frame dead-holds
@@ -6691,14 +6694,33 @@ class SimpleMeterReader:
         # owner was physically arming throughout, which is exactly what suppresses
         # the static breaker, and a capless lock is invalid whatever the arm says.
         if self._meter_color == "White":
+            # MEASURE THE CAP DIRECTLY, do not trust `s["green"]`.
+            #
+            # The reader's own cap search reports green_not_found on 48-95% of
+            # detections, yet the green apex is demonstrably present: measured
+            # over session_20260826_204615, boxes sitting ON the true meter carry
+            # a median of 24 green px inside their top 35%, and only 9% carry
+            # fewer than 8. Boxes sitting OFF the meter (court lines, the bright
+            # sideline -- a long white stripe looks exactly like a bar) carry a
+            # median of 0, with 95% under 8px.
+            #
+            # So >=8px inside the box top keeps 91% of TRUE locks while admitting
+            # 5% of FALSE ones. Trusting `s["green"]` instead made this breaker
+            # blind, because a true lock and a false one looked equally capless.
             _cap_seen = False
             try:
-                _g = s.get("green")
-                _cap_seen = bool(_g) and float(
-                    getattr(_g, "center_pct", None)
-                    if not isinstance(_g, dict) else _g.get("center_pct", -1.0)) >= 0.0
+                _bb = s.get("bbox") or []
+                if len(_bb) == 4 and int(_bb[2]) > 0 and int(_bb[3]) > 0:
+                    _bx, _by, _bw, _bh = (int(v) for v in _bb)
+                    _y1 = min(frame_bgr.shape[0], _by + max(4, int(_bh * 0.35)))
+                    _x0 = max(0, _bx - 2); _x1 = min(frame_bgr.shape[1], _bx + _bw + 2)
+                    _y0 = max(0, _by)
+                    if _x1 > _x0 and _y1 > _y0:
+                        _cap = self._greenmask(
+                            cv2.cvtColor(frame_bgr[_y0:_y1, _x0:_x1], cv2.COLOR_BGR2HSV))
+                        _cap_seen = int(_cap.sum() // 255) >= self._capless_px_min
             except Exception:
-                _cap_seen = False
+                _cap_seen = True     # fail OPEN: never let the probe blind the reader
             if not _bk_det or _cap_seen:
                 self._capless_since = None
             elif self._capless_since is None:
