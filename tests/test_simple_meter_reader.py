@@ -3901,3 +3901,51 @@ def test_white_capless_breaker_can_be_disabled():
             _os.environ.pop("ORION_READER_WHITE_CAPLESS_S", None)
         else:
             _os.environ["ORION_READER_WHITE_CAPLESS_S"] = prev
+
+
+def test_stale_lock_is_dropped_at_a_new_press():
+    """A held HIGH fill at a fresh press is stale by definition, and it costs the shot.
+
+    AutomationEngine opens its ownership episode AT the press and refuses to own a
+    shot whose FIRST observed fill exceeds anchorMaxFirstFillPct (40) -- that cannot
+    be the beginning of a new meter. Live 2026-08-27 every shot aborted with
+    `SHOT NOT OWNED: reason=ownership_proof_incomplete samples=0 first_fill=51.0`:
+    the engine's first sample WAS a lock left over from the previous shot, so the
+    bot armed and then refused itself on every attempt.
+
+    notify_physical_shot_start deliberately preserves tracker state so a genuinely
+    continuing meter can bridge a new shot identity; this drops ONLY the inherited
+    locks that are already past the ownership ceiling.
+    """
+    r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+    r.box = (10, 20, 25, 110); r.conf = 1.0; r.last_fill = 51.0
+    r._physical_shot_epoch = 1
+    r.notify_physical_shot_start(2)
+    assert r.box is None and r.conf == 0.0, "a stale high-fill lock must not cross a press"
+
+
+def test_a_rising_lock_survives_a_new_press():
+    """The bridge case the docstring protects: a low/rising meter keeps its lock."""
+    r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+    r.box = (10, 20, 25, 110); r.conf = 1.0; r.last_fill = 12.0
+    r._physical_shot_epoch = 1
+    r.notify_physical_shot_start(2)
+    assert r.box is not None and r.conf == 1.0
+
+
+def test_stale_press_drop_is_tunable_and_disablable():
+    import os as _os
+    prev = _os.environ.get("ORION_READER_STALE_PRESS_DROP_PCT")
+    _os.environ["ORION_READER_STALE_PRESS_DROP_PCT"] = "0"
+    try:
+        r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+        assert r._stale_press_drop_pct == 0.0
+        r.box = (10, 20, 25, 110); r.conf = 1.0; r.last_fill = 90.0
+        r._physical_shot_epoch = 1
+        r.notify_physical_shot_start(2)
+        assert r.box is not None, "0 must disable the drop entirely"
+    finally:
+        if prev is None:
+            _os.environ.pop("ORION_READER_STALE_PRESS_DROP_PCT", None)
+        else:
+            _os.environ["ORION_READER_STALE_PRESS_DROP_PCT"] = prev

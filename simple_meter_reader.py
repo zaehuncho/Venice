@@ -1318,6 +1318,11 @@ class SimpleMeterReader:
         # 2.5 against a measured genuine worst case of ~1.75s = ~40% headroom.
         # 0 disables.
         self._capless_max_s = max(0.0, _fnum('ORION_READER_WHITE_CAPLESS_S', 2.5))
+        # Held fill at/above which a NEW physical shot epoch drops the inherited
+        # lock as stale. Matches AppConfig.anchorMaxFirstFillPct (40): above that
+        # the engine will refuse to own the shot anyway, so carrying the lock
+        # across can only poison the press. 0 disables.
+        self._stale_press_drop_pct = max(0.0, _fnum('ORION_READER_STALE_PRESS_DROP_PCT', 40.0))
         # Green pixels inside the top 35% of the box that count as "cap present".
         # 8 measured: keeps 91% of true locks, admits 5% of false ones.
         self._capless_px_min = max(1, _inum('ORION_READER_WHITE_CAP_PX', 8))
@@ -3192,8 +3197,54 @@ class SimpleMeterReader:
             parsed_epoch = int(shot_epoch)
         except (TypeError, ValueError, OverflowError):
             parsed_epoch = 0
+        _prev_epoch = int(getattr(self, "_physical_shot_epoch", 0) or 0)
         self._physical_shot_epoch = (
             parsed_epoch if 0 < parsed_epoch <= 0xFFFFFFFFFFFFFFFF else 0)
+        # STALE-LOCK DROP AT THE PRESS.
+        #
+        # This method deliberately leaves pixel/tracker state intact (see the
+        # docstring) so a genuinely continuing meter can bridge across a new
+        # shot identity. That is right for a meter that is still rising; it is
+        # WRONG for a lock that outlived its shot, and on 2K27 that case
+        # dominates -- ~half of published locks sit on decor or on the previous
+        # shot's meter.
+        #
+        # The consequence is not cosmetic. AutomationEngine opens its ownership
+        # episode AT the press and refuses to own a shot whose FIRST observed
+        # fill exceeds anchorMaxFirstFillPct (40%), because that cannot be the
+        # beginning of a new meter. Live 2026-08-27, every shot aborted with
+        # `SHOT NOT OWNED: reason=ownership_proof_incomplete samples=0
+        # first_fill=51.0` -- the engine's first sample WAS the stale lock. The
+        # bot armed and then refused itself, on every single shot.
+        #
+        # A brand-new shot's meter starts near empty, so a HELD HIGH FILL at a
+        # fresh press is stale by definition. Drop it and let the next frame run
+        # the ordinary cold acquire on the real rise. Self-limiting: it only
+        # fires on a genuine new epoch that inherited a high fill, which is
+        # exactly the poisoning case, and never touches a low/rising lock.
+        if (self._stale_press_drop_pct > 0.0
+                and self._physical_shot_epoch != 0
+                and self._physical_shot_epoch != _prev_epoch
+                and self.box is not None
+                and float(getattr(self, "last_fill", 0.0) or 0.0)
+                >= self._stale_press_drop_pct):
+            _stale_fill = float(getattr(self, "last_fill", 0.0) or 0.0)
+            self.conf = 0.0
+            self.box = None
+            self.tmpl = None
+            self._consec = 0
+            self._peak_fill = 0.0
+            self._coast_n = 0
+            self._capless_since = None
+            # Name it in the log. Offline replay could NOT reproduce the stale
+            # state this fixes (the harness's synthetic presses do not align with
+            # real shot cycles), so the live log is the only arbiter of whether
+            # this fires and whether it helps. ERROR level for the same reason as
+            # _scope_reject: the native relay throttles sidecar WARNINGs.
+            _acq_logger.error(
+                "STALE LOCK DROPPED AT PRESS: epoch=%d held_fill=%.1f%% (>= %.1f%%) "
+                "- the engine would have refused to own this shot",
+                self._physical_shot_epoch, _stale_fill, self._stale_press_drop_pct)
         if self._prev_hw_armed:
             if self._calibrator is not None:
                 try:
