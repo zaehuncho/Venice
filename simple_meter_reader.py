@@ -1314,6 +1314,10 @@ class SimpleMeterReader:
         # (3) no-disappear-during-shot armed hold (default ON) + the wall-clock coast cap (frames).
         self._armed_hold = _flag('ORION_READER_ARMED_HOLD', '1')
         self._armed_coast_max = max(1, _inum('ORION_READER_ARMED_COAST', 180))
+        # Seconds a WHITE lock may report with no green cap before it is broken.
+        # 2.5 against a measured genuine worst case of ~1.75s = ~40% headroom.
+        # 0 disables.
+        self._capless_max_s = max(0.0, _fnum('ORION_READER_WHITE_CAPLESS_S', 2.5))
         # (3b) FAKE-LOCK / DEAD-HOLD breaker (default ON): suppress a detection whose REPORTED fill
         # is byte-identical for longer than a physical hold (static red dÃ©cor / stuck hold). Caps are
         # frames @ the mid-fill / near-tip tiers. DEFAULT-OFF: it catches the real 222-frame dead-holds
@@ -2023,6 +2027,10 @@ class SimpleMeterReader:
         self._size_base = 0.0                    # 0 = baseline not yet established this session
         self._scale_est = 1.0
         self._coast_n = 0                        # consecutive coast frames (bounds box forward-pred)
+        # [ORION_WHITE_CAPLESS_BREAKER 2026-08-27] wall-clock start of the current
+        # run of DETECTED frames that showed no green make-window cap. Wall clock,
+        # not frames, so the bound is independent of detector rate.
+        self._capless_since = None
         # Latch the configured bar colour BEFORE anything that depends on it (the calibrator's
         # envelope, the colour-tolerance widening, the tier band table).
         self._resolve_colour()
@@ -6663,6 +6671,52 @@ class SimpleMeterReader:
         # peak survives. Guarded on fill>0.5 so a legit run of true-zero reads never trips it.
         _bk_det = bool(s.get("detected"))
         _bk_fill = float(s.get("fill", 0.0) or 0.0)
+        # CAPLESS-LOCK BREAKER (WHITE ONLY). The static breaker above catches a
+        # BYTE-FROZEN fill; it cannot catch a false lock whose fill wobbles. On a
+        # WHITE meter that gap is wide open, because bright neutral pixels are the
+        # most abundant thing in an arena and a lock on a jersey or a painted lane
+        # line reads a small, drifting fill indefinitely.
+        #
+        # Measured on session_20260826_204615 (live 2K27, owner shooting):
+        #   * 4 phantom locks, the worst holding 15.3s with the box ~stationary and
+        #     a mean fill of 5.5% -- the "FILL 6% on bare court" the owner
+        #     photographed. `_coast_n` never tripped its cap because the phantom
+        #     RE-FINDS its white column every frame, which resets the coast.
+        #   * longest run with no green cap: GENUINE shots 56 frames (~1.75s);
+        #     PHANTOM locks 141 frames and beyond. The tails separate cleanly.
+        #
+        # The green apex is the meter's identity and decor does not have one. A
+        # brief loss is normal (occlusion, a player's arm), so this bounds the
+        # loss rather than forbidding it. Deliberately NOT gated on arm grace: the
+        # owner was physically arming throughout, which is exactly what suppresses
+        # the static breaker, and a capless lock is invalid whatever the arm says.
+        if self._meter_color == "White":
+            _cap_seen = False
+            try:
+                _g = s.get("green")
+                _cap_seen = bool(_g) and float(
+                    getattr(_g, "center_pct", None)
+                    if not isinstance(_g, dict) else _g.get("center_pct", -1.0)) >= 0.0
+            except Exception:
+                _cap_seen = False
+            if not _bk_det or _cap_seen:
+                self._capless_since = None
+            elif self._capless_since is None:
+                self._capless_since = ts
+            elif (self._capless_max_s > 0.0 and ts is not None
+                  and (ts - self._capless_since) >= self._capless_max_s):
+                s = {"detected": False, "meter_present": False, "fill": 0.0,
+                     "fill_coarse": 0.0, "bbox": [0, 0, 0, 0], "stage": "capless_suppressed",
+                     "confidence": 0.0, "velocity_pct_s": 0.0,
+                     "rejection_reason": "capless_fake_lock", "rise_state": ""}
+                try:
+                    self.last_debug = {"stage": "capless_suppressed",
+                                       "capless_s": round(float(ts - self._capless_since), 2)}
+                except Exception:
+                    pass
+                self.conf = 0.0; self.box = None; self.tmpl = None
+                self._capless_since = None
+                _bk_det = False; _bk_fill = 0.0
         # [ORION_READER_POST_RELEASE_YIELD] P1 frozen-streak census (flag-gated, attribute-only:
         # nothing below reads these when the flag is off). Counts consecutive STATIC (<=0.75pp
         # step -- far under the ~3pp/frame of a real near-tip rise) emissions at/above the

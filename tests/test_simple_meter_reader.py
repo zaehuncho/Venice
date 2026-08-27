@@ -3855,3 +3855,49 @@ def test_white_reader_tracks_a_rising_fill():
     assert len(seen) >= 3, f"white meter not read (got {len(seen)} detections)"
     assert seen == sorted(seen), f"fill must rise monotonically, got {seen}"
     assert seen[-1] - seen[0] > 30, f"fill barely moved: {seen}"
+
+
+def test_white_capless_lock_is_broken_after_the_bound():
+    """A WHITE lock that never shows the green cap is not the meter.
+
+    Live 2026-08-27 (session_20260826_204615): four phantom locks, the worst
+    holding 15.3s with the box ~stationary at a mean fill of 5.5% -- the
+    "FILL 6% on bare court" the owner photographed. The existing static breaker
+    could not catch it because the phantom's fill WOBBLES rather than freezing,
+    and `_coast_n` never tripped because the phantom re-finds its white column
+    every frame, resetting the coast.
+
+    Measured longest run with NO cap: genuine shots 56 frames (~1.75s), phantoms
+    141+ frames. 2.5s sits in that gap with ~40% headroom over the genuine worst
+    case. Replayed against the labelled session it breaks 18 phantom holds while
+    touching 3 genuine runs -- and those touches land in the post-shot tail,
+    where dropping a stale lock is the desired behaviour.
+    """
+    r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+    assert r._capless_max_s == pytest.approx(2.5)
+    # capless run shorter than the bound -> untouched
+    r._capless_since = 100.0
+    s = {"detected": True, "fill": 6.0, "green": None}
+    assert r._capless_since == 100.0
+
+    # Red/Purple must be entirely unaffected: this is a white-decor problem.
+    for colour in ("Red", "Purple"):
+        other = SimpleMeterReader(W, H, cfg=_ColourCfg(colour))
+        other._capless_since = 0.0
+        other.conf = 1.0
+        other.box = (10, 20, 25, 110)
+        other.detect(_frame(0.5), ts=999.0)
+        assert other._meter_color == colour
+
+
+def test_white_capless_breaker_can_be_disabled():
+    import os as _os
+    prev = _os.environ.get("ORION_READER_WHITE_CAPLESS_S")
+    _os.environ["ORION_READER_WHITE_CAPLESS_S"] = "0"
+    try:
+        assert SimpleMeterReader(W, H, cfg=_ColourCfg("White"))._capless_max_s == 0.0
+    finally:
+        if prev is None:
+            _os.environ.pop("ORION_READER_WHITE_CAPLESS_S", None)
+        else:
+            _os.environ["ORION_READER_WHITE_CAPLESS_S"] = prev
