@@ -3949,3 +3949,26 @@ def test_stale_press_drop_is_tunable_and_disablable():
             _os.environ.pop("ORION_READER_STALE_PRESS_DROP_PCT", None)
         else:
             _os.environ["ORION_READER_STALE_PRESS_DROP_PCT"] = prev
+
+
+def test_capless_breaker_survives_stray_capped_frames():
+    """The breaker judges a WINDOW, not a consecutive streak.
+
+    The streak version reset on ANY single capped frame. At 60fps a false lock
+    picks up a stray green pixel often enough to rearm that timer forever: live
+    2026-08-27 it fired ZERO times against a lock holding the centre-court "27"
+    logo for 222 straight dumped frames with a cap on only 3% of them. Replayed
+    at the framedump's 10fps it fired fine -- the bug was invisible at the
+    sample rate, which is why it shipped.
+    """
+    r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+    assert r._capless_rate_max <= 0.25
+    # a window that is 90% capless must still count as capless
+    r._capless_hist.extend((float(i) * 0.05, i % 10 == 0) for i in range(40))
+    rate = sum(1 for _, c in r._capless_hist if c) / float(len(r._capless_hist))
+    assert rate <= r._capless_rate_max, "one capped frame in ten must not rearm the timer"
+    # a genuine meter (cap on most frames) must NOT look capless
+    r._capless_hist.clear()
+    r._capless_hist.extend((float(i) * 0.05, i % 10 != 0) for i in range(40))
+    rate = sum(1 for _, c in r._capless_hist if c) / float(len(r._capless_hist))
+    assert rate > r._capless_rate_max, "a real meter's cap rate must protect it"

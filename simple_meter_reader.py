@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import datetime as _datetime
 import json as _json
+import collections as _collections
 import logging as _logging
 import os as _os
 import time as _time
@@ -1326,6 +1327,10 @@ class SimpleMeterReader:
         # Green pixels inside the top 35% of the box that count as "cap present".
         # 8 measured: keeps 91% of true locks, admits 5% of false ones.
         self._capless_px_min = max(1, _inum('ORION_READER_WHITE_CAP_PX', 8))
+        # Max fraction of a window's frames that may show a cap and still count
+        # as capless. A true meter measures ~91%; 0.25 leaves wide margin.
+        self._capless_rate_max = min(1.0, max(0.0,
+            _fnum('ORION_READER_WHITE_CAP_RATE_MAX', 0.25)))
         # (3b) FAKE-LOCK / DEAD-HOLD breaker (default ON): suppress a detection whose REPORTED fill
         # is byte-identical for longer than a physical hold (static red dÃ©cor / stuck hold). Caps are
         # frames @ the mid-fill / near-tip tiers. DEFAULT-OFF: it catches the real 222-frame dead-holds
@@ -2039,6 +2044,7 @@ class SimpleMeterReader:
         # run of DETECTED frames that showed no green make-window cap. Wall clock,
         # not frames, so the bound is independent of detector rate.
         self._capless_since = None
+        self._capless_hist = _collections.deque()
         # Latch the configured bar colour BEFORE anything that depends on it (the calibrator's
         # envelope, the colour-tolerance widening, the tier band table).
         self._resolve_colour()
@@ -6786,12 +6792,36 @@ class SimpleMeterReader:
                         _cap_seen = int(_cap.sum() // 255) >= self._capless_px_min
             except Exception:
                 _cap_seen = True     # fail OPEN: never let the probe blind the reader
-            if not _bk_det or _cap_seen:
+            # WINDOWED, not a consecutive streak. The streak version reset on ANY
+            # single capped frame, and at 60fps a false lock picks up a stray
+            # green pixel often enough to rearm the timer forever: live
+            # 2026-08-27 the breaker fired ZERO times against a lock that held
+            # the centre-court "27" logo for 222 straight dumped frames with the
+            # cap reported on 3% of them. Offline it fired fine at 10fps -- the
+            # bug was invisible at the framedump's sample rate.
+            #
+            # Judge the WINDOW instead: a true meter shows its cap on most
+            # frames (measured 91% of on-meter locks carry >=8 green px in the
+            # box top), so a lock whose cap-rate sits near zero across a whole
+            # window is not the meter, whatever the odd frame says.
+            if not _bk_det:
                 self._capless_since = None
-            elif self._capless_since is None:
-                self._capless_since = ts
-            elif (self._capless_max_s > 0.0 and ts is not None
-                  and (ts - self._capless_since) >= self._capless_max_s):
+                self._capless_hist.clear()
+            else:
+                if ts is not None:
+                    self._capless_hist.append((float(ts), bool(_cap_seen)))
+                    _cut = float(ts) - self._capless_max_s
+                    while self._capless_hist and self._capless_hist[0][0] < _cut:
+                        self._capless_hist.popleft()
+                if self._capless_since is None:
+                    self._capless_since = ts
+            _cap_rate = (sum(1 for _, c in self._capless_hist if c)
+                         / float(len(self._capless_hist))) if self._capless_hist else 1.0
+            if (_bk_det and self._capless_max_s > 0.0 and ts is not None
+                    and self._capless_since is not None
+                    and (ts - self._capless_since) >= self._capless_max_s
+                    and len(self._capless_hist) >= 8
+                    and _cap_rate <= self._capless_rate_max):
                 s = {"detected": False, "meter_present": False, "fill": 0.0,
                      "fill_coarse": 0.0, "bbox": [0, 0, 0, 0], "stage": "capless_suppressed",
                      "confidence": 0.0, "velocity_pct_s": 0.0,
@@ -6803,6 +6833,7 @@ class SimpleMeterReader:
                     pass
                 self.conf = 0.0; self.box = None; self.tmpl = None
                 self._capless_since = None
+                self._capless_hist.clear()
                 _bk_det = False; _bk_fill = 0.0
         # [ORION_READER_POST_RELEASE_YIELD] P1 frozen-streak census (flag-gated, attribute-only:
         # nothing below reads these when the flag is off). Counts consecutive STATIC (<=0.75pp
