@@ -430,6 +430,8 @@ private slots:
     void settingsMigrationRegistryIsAnExplicitAllowlist();
     void ownersSettingsFileRoundTripsLosslesslyThroughMigration();
     // [ORION_AIM_AUTOUNLOCK 2026-08-13]
+    void meterGateArmsOnACapturePreviewWithNoInputSession();
+    void meterGateArmStillRequiresSecurityAndAValidEpoch();
     void tipTimingAutoUnlockHandsBackARefutedLock();
     void tipTimingAutoUnlockNeedsAFullWindowNotAShrunkOne();
     void tipTimingAutoUnlockIgnoresBurstsTooShortToMoveTheWindow();
@@ -31720,6 +31722,30 @@ void AutomationEngineTests::lowPeakSettledLandingStillEmitsGradedZeroEvidence()
     const int shotAt = landing.indexOf(QStringLiteral("shot="));
     QVERIFY(shotAt > landing.indexOf(QStringLiteral("meter_jump=")));
     QCOMPARE(landing.mid(shotAt), QStringLiteral("shot=Left Fade"));
+}
+
+// A live CAPTURE PREVIEW is a live detection feed. The arm used to require a live
+// Chiaki INPUT session, which on a capture-card rig has nothing to do with where
+// the detector's frames come from -- so a console that was merely unreachable
+// benched vision. Measured 2026-08-26: 3859 consecutive frames rejected
+// `gameplay_ineligible` while the card ran at 60fps and the same footage read
+// 99.9% when armed.
+void AutomationEngineTests::meterGateArmsOnACapturePreviewWithNoInputSession()
+{
+    // remote dead, nothing embedded, but the preview is live -> ARM.
+    QVERIFY(orion::meterGateArmAllowed(false, false, true, true, 1u));
+    // the paths that already worked keep working
+    QVERIFY(orion::meterGateArmAllowed(true, false, false, true, 1u));
+    QVERIFY(orion::meterGateArmAllowed(false, true, false, true, 1u));
+    // no feed at all -> still refuse; this is not a blanket open
+    QVERIFY(!orion::meterGateArmAllowed(false, false, false, true, 1u));
+}
+
+// Widening the FEED test must not widen the AUTHORITY test.
+void AutomationEngineTests::meterGateArmStillRequiresSecurityAndAValidEpoch()
+{
+    QVERIFY(!orion::meterGateArmAllowed(true, true, true, false, 1u));   // security denied
+    QVERIFY(!orion::meterGateArmAllowed(true, true, true, true, 0u));    // 0 = invalid wire sentinel
 }
 
 QTEST_MAIN(AutomationEngineTests)

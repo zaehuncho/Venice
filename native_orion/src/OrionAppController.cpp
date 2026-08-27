@@ -3173,9 +3173,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // Same streamActive definition the physical arm site uses (remoteRunning_ OR an embedded
         // Chiaki surface). A narrower guard here would silently drop the arm in the embedded case
         // and reproduce the exact "meter on screen, nothing looking at it" failure.
-        const bool streamActive =
-            remoteRunning_ || chiakiEmbedStatus_ == QLatin1String("Embedded");
-        if (!streamActive || !automationSecurityAllowed()) {
+        // Same authority as the physical arm site (see orion::meterGateArmAllowed):
+        // a live capture preview is a live detection feed even when the Chiaki
+        // input session is Error/absent.
+        if (!orion::meterGateArmAllowed(
+                remoteRunning_,
+                chiakiEmbedStatus_ == QLatin1String("Embedded"),
+                capturePreviewActive_,
+                automationSecurityAllowed(),
+                1u)) {
             return;
         }
         ++physicalShotEpochCounter_;
@@ -10709,8 +10715,35 @@ void OrionAppController::pollPhysicalController()
                           .arg(static_cast<unsigned int>(physicalState.l2))
                           .arg(static_cast<unsigned int>(physicalState.r2)));
         }
-        if (streamActive && automationSecurityAllowed() && physicalShotEpoch != 0) {
+        // Arm on ANY live detection feed, not just a live Chiaki input session:
+        // in capture-card mode the meter comes from HDMI, so a failed/absent
+        // Remote Play session must never bench the reader. See
+        // orion::meterGateArmAllowed() for the incident this encodes.
+        const bool armAllowed = orion::meterGateArmAllowed(
+            remoteRunning_,
+            chiakiEmbedStatus_ == QLatin1String("Embedded"),
+            capturePreviewActive_,
+            automationSecurityAllowed(),
+            static_cast<unsigned int>(physicalShotEpoch));
+        if (armAllowed) {
             remotePlay_.armMeterGate(intentSource, physicalShotEpoch);
+        } else if (physicalShotEpoch != 0) {
+            // NAME THE REFUSAL. This failure was previously diagnosable only by
+            // the ABSENCE of a "shot_gate_arm send" line next to a "Physical
+            // shot epoch" line -- i.e. by noticing something that was not there.
+            // Throttled so a long unarmed stretch cannot flood the ring.
+            static qint64 lastArmRefusalLogMs = 0;
+            const qint64 nowRefusalMs = QDateTime::currentMSecsSinceEpoch();
+            if (nowRefusalMs - lastArmRefusalLogMs >= 5000) {
+                lastArmRefusalLogMs = nowRefusalMs;
+                appendLog(QStringLiteral(
+                    "Meter-gate arm SUPPRESSED (remote=%1 embedded=%2 preview=%3 security=%4) "
+                    "- the reader will not see this shot")
+                        .arg(remoteRunning_ ? 1 : 0)
+                        .arg(chiakiEmbedStatus_ == QLatin1String("Embedded") ? 1 : 0)
+                        .arg(capturePreviewActive_ ? 1 : 0)
+                        .arg(automationSecurityAllowed() ? 1 : 0));
+            }
         }
 
         // [DPAD-UP DEFENSE HOTKEY 2026-08-08] Owner-requested physical toggle for

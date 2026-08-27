@@ -284,4 +284,49 @@ private:
     int inactiveSamples_ = kReleaseSamples;
 };
 
+// ---------------------------------------------------------------------------
+//  METER-GATE ARM AUTHORITY
+//
+//  Whether a physical shot edge may WAKE THE METER READER. This is deliberately
+//  NOT the same question as "is the input session live".
+//
+//  [2026-08-26] The arm used to be gated on `streamActive` alone (remoteRunning_
+//  || an embedded Chiaki surface). In CAPTURE-CARD mode the detector's frames
+//  come from the HDMI capture card and have nothing to do with Chiaki, which is
+//  input-only on that rig -- so a purely NETWORK failure benched VISION:
+//
+//    00:38:27  epoch=1 ... shot_gate_arm send: sent=1        <- worked
+//    00:38:27  start_stream: Chiaki/input bring-up FAILED    <- console unreachable
+//    00:38:27+ "Physical shot epoch" x30, NO arm send at all <- guard closed
+//
+//  RemotePlayState::Error is terminal for input authority and never retries, so
+//  `streamActive` stayed false for the rest of the session. The reader's last
+//  eligibility window (opened by epoch=1) expired 20s later and every frame
+//  after it was rejected `gameplay_ineligible` -- 3859 of them -- while the
+//  capture card ran at a healthy 60fps and the meter was plainly on screen.
+//  Measured on that same footage, the reader detects 99.9% of frames when armed.
+//
+//  A failed promotion explicitly RESTORES the live preview
+//  (RemotePlaySession::restoreWarmPreviewAfterPromotionFailure), so
+//  `capturePreviewActive` is exactly the "we still have frames" signal the arm
+//  should follow.
+//
+//  SAFETY: this edge carries NO fire authority. Release still requires the
+//  scoped tokenized pose_arm, the server lease, and controller-route
+//  attestation; and timing trust is held separately by the capture warm-cache
+//  revocation. Widening this only lets the reader LOOK at a meter that is
+//  already on screen -- which is the advertised behaviour of preview mode.
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline bool meterGateArmAllowed(bool remoteRunning,
+                                              bool chiakiEmbedded,
+                                              bool capturePreviewActive,
+                                              bool securityAllowed,
+                                              unsigned int physicalShotEpoch) noexcept
+{
+    if (!securityAllowed || physicalShotEpoch == 0) {
+        return false;
+    }
+    return remoteRunning || chiakiEmbedded || capturePreviewActive;
+}
+
 } // namespace orion
