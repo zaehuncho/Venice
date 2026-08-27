@@ -556,8 +556,29 @@ def _latency_route_scope(config) -> str:
     source = str(getattr(config, 'frame_source', '') or '').strip().lower()
     if source in ('capturecard', 'card'):
         source = 'capture_card'
+    if source == 'auto':
+        # RESOLVE 'auto' THE SAME WAY THE PIPELINE DOES. The config token the
+        # native sends defaults to 'auto' (autogreen_sidecar.py: cfg.get(
+        # "frame_source", "auto")), while capture-card mode is actually
+        # established by ORION_CAPTURE_CARD -- exactly the predicate `_cc_mode`
+        # uses at __init__. This function used to compare the UNRESOLVED token
+        # against the resolved names, so on the shipped capture-card rig it fell
+        # through to the bare `return ''` below and produced an EMPTY scope on a
+        # perfectly healthy route.
+        #
+        # An empty scope is not cosmetic: attest_controller_latency_route
+        # refuses on it, the native logs the bare `route_scope_rejected`, and
+        # the bot is benched with fire authority it can never earn -- observed
+        # 2026-08-18 (161 refusals in 4 minutes) and again live on 2026-08-27
+        # ("scope_empty=True equal=True estimator=True", route_invalid=False,
+        # i.e. everything else about the route was provably fine.)
+        if str(os.environ.get('ORION_CAPTURE_CARD', '')).strip().lower() in (
+                '1', 'true', 'yes', 'on'):
+            source = 'capture_card'
     if source not in ('capture_card', 'decoder'):
-        return ''   # legacy/window sources are silently unscoped by design
+        # Never silent again. Legacy/window/wgc sources are still unscoped BY
+        # DESIGN, but an unscoped route benches the bot, so it must say so.
+        return _scope_reject('frame_source_unscopeable (%r)' % source[:32])
     console_identity = str(getattr(config, 'console_identity', '') or '').strip().lower()
     console_prefix = 'registered-host-sha256-v1:'
     if (not console_identity.startswith(console_prefix)
