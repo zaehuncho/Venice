@@ -60,7 +60,7 @@ BAND_COURTWIDE = "courtwide"
 BAND_MICRO = "micro"
 
 #: The only colours this reader will run an inference mask for.
-SUPPORTED: Tuple[str, ...] = ("Red", "Purple")
+SUPPORTED: Tuple[str, ...] = ("Red", "Purple", "White")
 
 #: Colour used when an unsupported/unknown name is configured.
 FALLBACK = "Red"
@@ -155,9 +155,51 @@ _PURPLE = {
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+#  WHITE -- BGR rows.  NBA 2K27 (early access, 2026-08-26) ships a WHITE-ONLY
+#  shot meter: there is no colour choice in the game any more, so this is not an
+#  optional extra rail -- it is the only one 2K27 can be read through.
+#
+#  MEASURED, not ported from a config table (the standard this module sets at
+#  its top).  Evidence: framedump session_20260826_185753, 1629 live capture-card
+#  frames of 2K27 practice shooting, 791 of them with the meter on screen:
+#
+#    fill interior      : H irrelevant, S=1, V=255 (B255 G254 R255) -- the fill is
+#                         opaque pure white.  Across all 791 frames the fill's
+#                         saturation p95 was median 1 / worst 30, and its value
+#                         p05 was median 240 / worst 176 (edge antialiasing).
+#    meter's own frame  : the grey outline + graduation ticks peak at V~199.
+#                         THIS is what sets the floors below -- 235/220/210 clear
+#                         the meter's own furniture by 36/21/11 points.  Do not
+#                         drop a floor to 200 or the ticks join the mask and the
+#                         fill edge walks.
+#    false positives    : a V>=235 / S<=30 gate found spurious white above the
+#                         fill in 1 frame out of 791 (0.1%) over real court,
+#                         including white court lines, jerseys and backboard.
+#
+#  WHY BGR AND NOT HSV.  White is achromatic, and the HSV row form here is
+#  FLOORS-only (hue window + S floor + V floor) precisely so the grey axis is
+#  unrepresentable -- see _derive_bar_hsv's HSV_SAT_FLOOR_MIN.  White cannot be
+#  written in that form at all.  A BGR box can: requiring all three channels
+#  >= the floor implicitly bounds saturation to <= (255-floor), i.e. <=20 at the
+#  nominal floor, which is exactly the achromatic gate we want and rejects any
+#  saturated bright colour (a blue court line has B high but G/R low).
+#
+#  THE MICRO TIER IS DELIBERATELY REFUSED FOR WHITE -- see micro_supported().
+#  A row is still defined here because BAND_MICRO doubles as the reader's
+#  widest-band reference for the arm-edge decor veto, which wants recall.
+# --------------------------------------------------------------------------- #
+_WHITE = {
+    BAND_NOMINAL:   ("bgr", (235, 235, 235), (255, 255, 255)),
+    BAND_COURTWIDE: ("bgr", (220, 220, 220), (255, 255, 255)),
+    BAND_MICRO:     ("bgr", (210, 210, 210), (255, 255, 255)),
+}
+
+
 _TABLE: Dict[str, Dict[str, tuple]] = {
     "Red": _RED,
     "Purple": _PURPLE,
+    "White": _WHITE,
 }
 
 
@@ -210,6 +252,54 @@ def is_hsv(row: tuple) -> bool:
     return bool(row) and row[0] == "hsv"
 
 
+#: Per-colour acquisition WIDTH FLOOR, in 1080p-reference pixels (the reader
+#: scales it by the live frame width). None = keep the reader's own W_MIN.
+#:
+#: The reader's W_MIN/W_MAX = 20/34 are commented "Arrow2 contour width 23-30",
+#: i.e. measured off the OLD red meter of the previous game. NBA 2K27's white meter is a
+#: much narrower ribbon: measured across 791 live frames it is 11-12 px wide at
+#: 1280x720, which is ~17 px at 1920x1080. Both fall UNDER the scaled floor
+#: (13 px at 720p, 20 px at 1080p), so the real meter was rejected at every
+#: resolution and the reader latched whatever small decor blob passed instead --
+#: observed directly: an 11x8 acquire while the true meter was 102x11.
+#:
+#: 12 admits the measured ~17 px bar with ~5 px of slack for perspective and
+#: compression, without touching Red/Purple, whose floors stay exactly as shipped.
+_WIDTH_FLOOR_1080P: Dict[str, int] = {"White": 12}
+
+
+def width_floor(meter_color, default: int) -> int:
+    """The 1080p-reference acquisition width floor for this colour."""
+    return _WIDTH_FLOOR_1080P.get(normalize(meter_color), default)
+
+
+def micro_supported(meter_color) -> bool:
+    """May the FULL-FRAME micro acquire tier run for this colour?
+
+    Red/Purple: yes.  White: NO, and this is a safety refusal, not a gap.
+
+    The micro tier is the only tier that scans the whole frame, and it is the
+    most false-positive-prone surface in the reader.  Two things make it
+    specifically unsafe for a white bar:
+
+      * A useful micro row has to relax its floor toward grey, and grey is where
+        every bright neutral in an arena lives (court lines, jersey numbers,
+        scoreboard, backboard).  Red repairs that hole with the red-DOMINANCE
+        floor (r - max(g,b) >= N); white HAS no dominance -- r == g == b is its
+        definition -- so the repair is unavailable in principle.
+      * `_MICRO_GREEN`'s saturation floor is 45, which OVERLAPS white's legal
+        saturation band.  Under a micro lock the reader latches that green band
+        for the life of the lock, so tinted-white bar pixels could be masked AS
+        the make-window cap -- collapsing track_top onto the fill and reading
+        ~100% every frame.  That is the green fail-open pathology, and it fails
+        OPEN (a bot that fires instantly at full confidence) rather than closed.
+
+    White does not need the tier: it is measured at S<=30 / V>=235 against real
+    court, where the nominal and courtwide tiers already separate it cleanly.
+    """
+    return normalize(meter_color) != "White"
+
+
 def micro_needs_dominance(row: tuple) -> bool:
     """Does the micro tier's red-DOMINANCE floor apply to this row?
 
@@ -220,6 +310,13 @@ def micro_needs_dominance(row: tuple) -> bool:
     the exact property dominance was bolted on to recover.  Applying a
     red-dominance test to a purple mask would additionally be WRONG on its own
     terms, since purple's blue channel legitimately exceeds its red channel.
+
+    NOTE: this is a row-FORM test and White is also a BGR row, so it answers True
+    for White.  That is why `micro_supported()` refuses White's micro tier
+    outright: relying on `r - max(g,b) >= N` to zero a white mask would be
+    correct only by accident (white has no dominance, so the mask empties), and
+    an accident is not a safety property.  Callers must consult
+    `micro_supported()` first.
     """
     return is_bgr(row)
 

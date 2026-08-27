@@ -49,12 +49,13 @@ Item {
                         Text { text: "Color"; color: Theme.textMuted; font.family: Theme.fontUi; font.pixelSize: 11; font.weight: Font.DemiBold }
                         DashboardCombo {
                             Layout.fillWidth: true
-                            // Red and Purple are the only bar colours the reader can actually
-                            // detect. White/Yellow (and Orange/Cyan) were selectable here but
-                            // had no reader support at all: picking one changed the HUD label,
-                            // left every mask red, and detected nothing with no explanation.
-                            // Nothing unsupported may be selectable.
-                            model: ["Red", "Purple"]
+                            // Only bar colours the reader can actually detect may be listed.
+                            // Yellow/Orange/Cyan stay OFF this list: they change the HUD label,
+                            // leave every mask red, and detect nothing with no explanation.
+                            // White joined on 2026-08-26 -- NBA 2K27 early access ships a
+                            // WHITE-ONLY meter, and White now has live reader support measured
+                            // off real capture-card frames (see meter_bar_colors._WHITE).
+                            model: ["White", "Red", "Purple"]
                             value: orion.meterColor
                             onValueChanged: orion.meterColor = value
                         }

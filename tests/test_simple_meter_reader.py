@@ -3263,7 +3263,10 @@ def test_green_is_refused_and_falls_back_to_red(caplog):
     assert cap_lo < green_bar_hi and cap_hi > green_bar_lo
 
 
-@pytest.mark.parametrize("name", ["White", "Yellow", "Orange", "Cyan", "Chartreuse", "", None])
+# "White" left this list on 2026-08-26: NBA 2K27 early access ships a white-only
+# meter, and White is now a SUPPORTED colour with live evidence behind it
+# (framedump session_20260826_185753). See test_white_is_supported_and_not_red.
+@pytest.mark.parametrize("name", ["Yellow", "Orange", "Cyan", "Chartreuse", "", None])
 def test_unsupported_colours_fall_back_to_red_and_keep_reading(name):
     """A mislabeled config must never blind the reader; it falls back to the validated colour."""
     r = SimpleMeterReader(W, H, cfg=_ColourCfg(name))
@@ -3718,3 +3721,137 @@ def test_dead_hold_grace_requires_the_lock_to_have_been_seen_rising():
     # meter's proof. reset_tracking() discards the lock identity.
     r.reset_tracking()
     assert r._lock_ever_rose is False, "a re-lock must not inherit the previous lock's rise proof"
+
+
+# --------------------------------------------------------------------------- #
+#  WHITE -- NBA 2K27 (early access) ships a WHITE-ONLY shot meter.
+#
+#  Every constant asserted here was MEASURED off real capture-card gameplay:
+#  framedump session_20260826_185753, 1629 frames of 2K27 practice shooting,
+#  791 of them with the meter on screen. The reader's own contract
+#  (meter_bar_colors module docstring) is that a colour needs live evidence, not
+#  a copied table row -- these tests are where that evidence is pinned.
+# --------------------------------------------------------------------------- #
+
+def _white_frame(fill_frac=0.5, col_x=COL_X, col_w=12, bg=40,
+                 floor_y=FLOOR_Y, track_top_y=TRACK_TOP_Y, green=True):
+    """A synthetic 2K27 meter: opaque WHITE fill, grey furniture, small green tip.
+
+    Mirrors the measured live article -- fill B255 G254 R255 (S=1, V=255), the
+    meter's own outline/graduation ticks peaking at V~199 (so the band floors
+    must clear them), and a SMALL green apex (median ~2 rows at 720p) rather
+    than the big green block the customisation screen previews.
+    """
+    f = np.full((H, W, 3), bg, np.uint8)
+    track_h = floor_y - track_top_y
+    fill_top = int(round(floor_y - fill_frac * track_h))
+    # grey outline + ticks: the brightest NON-fill furniture on the real meter
+    f[track_top_y:floor_y, col_x - 2:col_x + col_w + 2] = (199, 199, 199)
+    f[track_top_y:floor_y, col_x:col_x + col_w] = (60, 55, 50)     # empty track
+    if fill_frac > 0:
+        f[fill_top:floor_y, col_x:col_x + col_w] = (255, 254, 255)  # measured fill
+    if green:
+        f[track_top_y - 3:track_top_y, col_x:col_x + col_w] = GREEN
+    return f
+
+
+def test_white_is_supported_and_never_silently_becomes_red():
+    """THE TRAP. White is a BGR row, and `_rebuild_bands` used to dispatch on the row
+    FORM (`is_bgr`) -- which sent every BGR colour down the branch that mirrors the RED
+    instance constants. A White reader therefore scanned with _RED_LO/_RED_HI: a red mask
+    on a white meter, i.e. zero detections and no explanation. Dispatch must key on the
+    COLOUR NAME."""
+    r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+    assert r._meter_color == "White"
+    assert r._bands[mbc.BAND_NOMINAL] == mbc.band("White", mbc.BAND_NOMINAL)
+    assert r._bands[mbc.BAND_NOMINAL] != ("bgr", r._RED_LO, r._RED_HI)
+    # Red keeps its byte-identity guarantee.
+    assert SimpleMeterReader(W, H, cfg=_ColourCfg("Red"))._bands[mbc.BAND_NOMINAL] == (
+        "bgr", r._RED_LO, r._RED_HI)
+
+
+def test_white_band_floors_clear_the_meters_own_furniture():
+    """Measured: the 2K27 meter's outline + graduation ticks peak at V~199. Every White
+    tier floor must sit ABOVE that or the mask swallows the meter's own frame and the fill
+    edge walks. This is the constraint that caps how far White may be relaxed."""
+    for tier in (mbc.BAND_NOMINAL, mbc.BAND_COURTWIDE, mbc.BAND_MICRO):
+        kind, lo, hi = mbc.band("White", tier)
+        assert kind == "bgr"
+        assert min(lo) > 199, f"{tier} floor {lo} does not clear the meter's own furniture"
+        assert hi == (255, 255, 255)
+    # ...and the tiers relax monotonically without ever crossing that line.
+    floors = [min(mbc.band("White", t)[1]) for t in
+              (mbc.BAND_NOMINAL, mbc.BAND_COURTWIDE, mbc.BAND_MICRO)]
+    assert floors == sorted(floors, reverse=True)
+
+
+def test_white_bgr_box_implicitly_bounds_saturation():
+    """White has no hue, so the achromatic gate has to come from the box itself: requiring
+    all three channels >= floor bounds saturation to <= 255-floor. At the nominal floor that
+    is <=20, which is why a saturated bright colour (a blue court line: B high, G/R low)
+    cannot enter the mask."""
+    _, lo, _ = mbc.band("White", mbc.BAND_NOMINAL)
+    assert 255 - min(lo) <= 30, "nominal box must bound saturation to the measured fill (S<=30)"
+    blue_line = np.array([[[255, 90, 60]]], np.uint8)      # bright but saturated
+    assert _cv2_mc.inRange(blue_line, np.array(lo, np.uint8),
+                           np.array((255, 255, 255), np.uint8)).sum() == 0
+
+
+def test_white_refuses_the_full_frame_micro_tier():
+    """The micro tier is the only full-frame scan, and for White it is unsafe in principle:
+    no dominance repair exists for the grey corner (white IS r==g==b), and _MICRO_GREEN's
+    saturation floor of 45 overlaps white's legal band -- a white bar masked AS the cap
+    collapses track_top and reads ~100% every frame, which fails OPEN."""
+    assert mbc.micro_supported("Red") and mbc.micro_supported("Purple")
+    assert not mbc.micro_supported("White")
+    # the overlap that makes it unsafe is real, not hypothetical
+    assert SimpleMeterReader._MICRO_GREEN[0][1] < 70
+
+
+def test_white_acquisition_width_floor_admits_the_real_meter():
+    """Measured: the 2K27 white ribbon is 11-12 px wide at 1280x720 (~17 at 1080p). The
+    shipped W_MIN of 20 scales to 13/20 and REJECTED it at both resolutions -- the reader
+    then latched decor instead (observed: an 11x8 acquire while the meter was 102x11)."""
+    for (fw, fh, measured) in ((1280, 720, 11), (1920, 1080, 17)):
+        white = SimpleMeterReader(fw, fh, cfg=_ColourCfg("White"))
+        assert white._w_min <= measured, (
+            f"White floor {white._w_min} rejects the measured {measured}px meter at {fw}x{fh}")
+    # Red and Purple floors are untouched.
+    for colour in ("Red", "Purple"):
+        r = SimpleMeterReader(1920, 1080, cfg=_ColourCfg(colour))
+        assert r._w_min == max(3, int(round(SimpleMeterReader.W_MIN * r._sx))) if hasattr(r, "_sx") \
+            else r._w_min == 20
+
+
+def test_white_never_mutates_the_red_instance_constants():
+    """ORION_READER_COLOR_TOL widening is red-shaped per-channel arithmetic ON _RED_LO/_RED_HI.
+    White is a BGR row too, so a form-only gate would drag a white reader through it -- mutating
+    constants its bands no longer come from."""
+    import os as _os
+    prev = _os.environ.get("ORION_READER_COLOR_TOL")
+    _os.environ["ORION_READER_COLOR_TOL"] = "20"
+    try:
+        w = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+        assert (w._RED_LO, w._RED_HI) == ((0, 0, 220), (60, 60, 255))
+        assert w._bands[mbc.BAND_NOMINAL] == mbc.band("White", mbc.BAND_NOMINAL)
+        red = SimpleMeterReader(W, H, cfg=_ColourCfg("Red"))
+        assert red._RED_LO != (0, 0, 220), "Red must still widen as it always did"
+    finally:
+        if prev is None:
+            _os.environ.pop("ORION_READER_COLOR_TOL", None)
+        else:
+            _os.environ["ORION_READER_COLOR_TOL"] = prev
+
+
+def test_white_reader_tracks_a_rising_fill():
+    """End-to-end on the measured geometry: fill% must rise with the bar, not sit flat."""
+    r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
+    seen = []
+    for i, frac in enumerate((0.25, 0.45, 0.70, 0.95)):
+        r.set_shot_state(True, 1.0, True)
+        res = r.detect(_white_frame(fill_frac=frac), ts=i * 0.1)
+        if getattr(res, "detected", False):
+            seen.append(float(res.fill_pct))
+    assert len(seen) >= 3, f"white meter not read (got {len(seen)} detections)"
+    assert seen == sorted(seen), f"fill must rise monotonically, got {seen}"
+    assert seen[-1] - seen[0] > 30, f"fill barely moved: {seen}"

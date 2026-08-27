@@ -2084,7 +2084,15 @@ class SimpleMeterReader:
             # window sideways into a neighbouring colour -- for Purple, straight up into the pink
             # floatie at Hue~166 that the band exists to exclude. HSV colours express the same
             # "be more tolerant" idea through their relaxed courtwide/micro tiers instead.
-            if _mbc.supports_channel_widening(_mbc.band(self._meter_color, _mbc.BAND_NOMINAL)):
+            # Gated on Red BY NAME for the same reason as _rebuild_bands: the
+            # widening below is red-shaped per-channel arithmetic applied to the
+            # RED instance constants. White is a BGR row too, so the row-form
+            # test alone would drag a white reader through red arithmetic on
+            # constants its bands no longer come from. White widens through its
+            # relaxed courtwide tier instead, exactly as the HSV colours do.
+            if (self._meter_color == "Red"
+                    and _mbc.supports_channel_widening(
+                        _mbc.band(self._meter_color, _mbc.BAND_NOMINAL))):
                 rl, rh = self._RED_LO, self._RED_HI
                 self._RED_LO = (_c8(rl[0]), _c8(rl[1]), _c8(rl[2] - t))
                 self._RED_HI = (_c8(rh[0] + t), _c8(rh[1] + t), _c8(rh[2]))
@@ -2119,8 +2127,15 @@ class SimpleMeterReader:
         keep reading on a mislabeled config rather than go blind.
         """
         colour = self._resolve_colour()
-        if _mbc.is_bgr(_mbc.band(colour, _mbc.BAND_NOMINAL)):
-            # Red (the only BGR colour): mirror the instance constants verbatim.
+        if colour == "Red":
+            # Red ONLY: mirror the instance constants verbatim.
+            #
+            # This MUST key on the colour name, not on `is_bgr(row)`. White is
+            # also a BGR row, and under the old form-test a White-configured
+            # reader took this branch and silently scanned with _RED_LO/_RED_HI --
+            # a red mask on a white meter, i.e. zero detections and no
+            # explanation. The byte-identity guarantee this branch exists for is
+            # a claim about RED specifically, so name Red specifically.
             self._bands = {
                 _mbc.BAND_NOMINAL:   ("bgr", tuple(self._RED_LO), tuple(self._RED_HI)),
                 _mbc.BAND_COURTWIDE: ("bgr", tuple(self._COURTWIDE_RED[0]),
@@ -2339,7 +2354,11 @@ class SimpleMeterReader:
         sy = self.H / self._REF_H if self.H else 1.0
         self._band = (int(round(self.BAND[0] * sx)), int(round(self.BAND[1] * sy)),
                       int(round(self.BAND[2] * sx)), int(round(self.BAND[3] * sy)))
-        self._w_min = max(3, int(round(self.W_MIN * sx)))
+        # Colour-scoped floor: 2K27's white ribbon is far narrower than the
+        # Arrow2 red bar W_MIN was measured from, and the unscoped floor rejected
+        # it at every resolution. Red/Purple resolve to self.W_MIN unchanged.
+        self._w_min = max(3, int(round(
+            _mbc.width_floor(getattr(self, "_meter_color", None), self.W_MIN) * sx)))
         self._w_max = max(self._w_min + 1, int(round(self.W_MAX * sx)))
         self._h_acq = max(4, int(round(self.H_ACQ * sy)))
         self._h_acq_armed = max(3, int(round(self.H_ACQ_ARMED * sy)))
@@ -4287,6 +4306,15 @@ class SimpleMeterReader:
         # B9: ...and only when this capture is one the tier could plausibly be
         # rescuing. The reader's own measured full-track height decides; see
         # _micro_tier_plausible (flag OFF -> always True -> byte-identical).
+        # Colour refusal comes BEFORE plausibility: the micro tier is the only
+        # full-frame scan in the reader, and for White it is unsafe in principle
+        # (no dominance repair for the grey corner, and _MICRO_GREEN's S floor of
+        # 45 overlaps white's legal saturation -- a white bar masked AS the cap
+        # collapses track_top and reads ~100% every frame). See
+        # meter_bar_colors.micro_supported().
+        if not _mbc.micro_supported(self._meter_color):
+            self._clear_micro_candidate()
+            return None, "", None, None
         if not self._micro_tier_plausible():
             self._clear_micro_candidate()
             return None, "", None, None
