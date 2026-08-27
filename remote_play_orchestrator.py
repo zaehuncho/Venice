@@ -4921,10 +4921,19 @@ class RemotePlayOrchestrator:
         try:
             fh = getattr(self, '_framedump_index_fh', None)
             if fh is None:
-                fh = open(os.path.join(self._framedump_dir, 'frames.csv'),
-                          'w', encoding='utf-8', newline='')
-                fh.write('idx,t_ms,detected,fill_pct,conf,green_center_pct,'
-                         'bbox_x,bbox_y,bbox_w,bbox_h,rejection\n')
+                # APPEND, never truncate. The launcher hands the same
+                # ORION_FRAMEDUMP_DIR to every sidecar generation, and a restart
+                # mid-session (a failed stream promotion will do it) restarts the
+                # frame index at 0. Opening 'w' silently erased the previous
+                # generation's rows -- observed 2026-08-26, where the generation
+                # that captured the route mismatch was lost. t_wall disambiguates
+                # generations that both restart t_ms at 0.
+                _pth = os.path.join(self._framedump_dir, 'frames.csv')
+                _new = not os.path.exists(_pth) or os.path.getsize(_pth) == 0
+                fh = open(_pth, 'a', encoding='utf-8', newline='')
+                if _new:
+                    fh.write('idx,t_ms,t_wall,detected,fill_pct,conf,green_center_pct,'
+                             'bbox_x,bbox_y,bbox_w,bbox_h,rejection\n')
                 self._framedump_index_fh = fh
                 self._framedump_index_t0 = float(info.get('t', 0.0))
             t0 = getattr(self, '_framedump_index_t0', 0.0)
@@ -4935,8 +4944,9 @@ class RemotePlayOrchestrator:
             except (TypeError, ValueError):
                 bx = by = bw = bh = 0
             rej = str(info.get('rej', '') or '').replace(',', ';')
-            fh.write(f"{idx},{t_ms:.2f},{int(bool(info['det']))},{info['fill']:.2f},"
-                     f"{info['conf']:.3f},{info['gc']:.2f},{bx},{by},{bw},{bh},{rej}\n")
+            fh.write(f"{idx},{t_ms:.2f},{time.time():.3f},"
+                     f"{int(bool(info['det']))},{info['fill']:.2f},{info['conf']:.3f},"
+                     f"{info['gc']:.2f},{bx},{by},{bw},{bh},{rej}\n")
             fh.flush()
         except Exception as exc:
             self._framedump_index_failed = True
