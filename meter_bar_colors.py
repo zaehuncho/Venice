@@ -268,6 +268,41 @@ def is_hsv(row: tuple) -> bool:
 _WIDTH_FLOOR_1080P: Dict[str, int] = {"White": 12}
 
 
+#: Per-colour GREEN-TIP anchor geometry, in 1080p-reference pixels.
+#: {colour: (gw_min, gh_min, g_area_min)}; absent = keep the reader's own constants.
+#:
+#: The reader's GW_MIN/GH_MIN/G_AREA_MIN (16 / 6 / 200) are commented "Measured on the
+#: live Red/Arrow2 meter: w~28-30, h~24-30, area~500-690 @1080p". NBA 2K27's white meter
+#: has a far smaller apex: measured median 11w x 5h, area 32 at 1280x720, i.e. roughly
+#: 17 x 8 / ~72px at 1080p. Against the red-era floors it fails on height (33% of frames),
+#: width (34%) and area (29%) -- so the green-tip anchor NEVER FIRES on 2K27.
+#:
+#: That anchor is what holds the lock when the white column is too small to scan, which is
+#: exactly the low-fill window the shot is timed in. With it dead, 42.6% of true-meter
+#: frames fall through to coast, and a coasted frame reports no cap at all -- which is why
+#: the cap was reported on 24% of frames while being findable on 98%.
+#:
+#: Floors are set to admit the measured p05 apex, NOT to the median, so a genuinely small
+#: tip still anchors. See the risk note in `green_tip_floors`.
+_GREEN_TIP_1080P: Dict[str, tuple] = {"White": (8, 2, 40)}
+
+
+def green_tip_floors(meter_color, default: tuple) -> tuple:
+    """(gw_min, gh_min, g_area_min) at 1080p reference for this colour.
+
+    RISK, stated plainly: G_AREA_MIN is the reader's principal anti-decor guard for green
+    anchors -- its comment notes decor "carries NO saturated green in the band -> no false
+    hold". Lowering it for White admits small saturated-green blobs (jersey trim, court
+    paint, scoreboard) as potential anchors. Three things bound that: this is scoped by
+    COLOUR NAME so Red/Purple are untouched, the strict-tip paths keep their compactness
+    and centring checks, and a capless false hold is broken within 2.5s by the White
+    capless breaker. The alternative -- relaxing the white column's width/height gates
+    instead -- was rejected: it rescues fewer frames AND increases white-decor acceptance,
+    which is already the dominant wrong-lock mode.
+    """
+    return _GREEN_TIP_1080P.get(normalize(meter_color), default)
+
+
 def width_floor(meter_color, default: int) -> int:
     """The 1080p-reference acquisition width floor for this colour."""
     return _WIDTH_FLOOR_1080P.get(normalize(meter_color), default)

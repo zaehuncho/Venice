@@ -2378,11 +2378,18 @@ class SimpleMeterReader:
         self._pad_x = max(6, int(round(self.ROI_PAD_X * sx)))
         self._pad_up = max(8, int(round(self.ROI_PAD_UP * sy)))
         self._pad_dn = max(4, int(round(self.ROI_PAD_DN * sy)))
-        self._gw_min = max(4, int(round(self.GW_MIN * sx)))
+        # Colour-scoped green-tip floors. The shipped constants were measured on the
+        # RED Arrow2 cap (w~28-30, h~24-30, area~500-690 @1080p); 2K27's white meter has a
+        # much smaller apex, so on those floors the tip anchor never fires. Red/Purple
+        # resolve to the class constants unchanged. See meter_bar_colors.green_tip_floors.
+        _gwf, _ghf, _gaf = _mbc.green_tip_floors(
+            getattr(self, "_meter_color", None),
+            (self.GW_MIN, self.GH_MIN, self.G_AREA_MIN))
+        self._gw_min = max(4, int(round(_gwf * sx)))
         self._gw_max = max(self._gw_min + 1, int(round(self.GW_MAX * sx)))
-        self._gh_min = max(2, int(round(self.GH_MIN * sy)))
+        self._gh_min = max(1, int(round(_ghf * sy)))
         self._gh_max = max(self._gh_min + 1, int(round(self.GH_MAX * sy)))
-        self._g_area_min = max(20, int(round(self.G_AREA_MIN * sx * sy)))
+        self._g_area_min = max(8, int(round(_gaf * sx * sy)))
         self._tip_dx = max(8, int(round(self.TIP_DX * sx)))
         self._tip_up_min = max(20, int(round(self.TIP_UP_MIN * sy)))
         self._tip_up_max = max(self._tip_up_min + 8, int(round(self.TIP_UP_MAX * sy)))
@@ -4412,7 +4419,11 @@ class SimpleMeterReader:
         rf_min = max(0.30, 0.45 - 0.02 * bvx) if self._robust else None
         # blur red band = the vetted Arrow2 R>=170 (legacy style band), ONLY at |bvx|>3 and only
         # here -- the window is clipped to the band's right edge so it cannot reach the banner.
-        red_b = ((0, 0, 170), (70, 70, 255)) if blur_on else None
+        # COLOUR-CORRECT relocate band. This was the literal _COURTWIDE_RED, which on a
+        # WHITE meter matches nothing at all -- the blur rescue was dead by construction.
+        # Use the CONFIGURED colour's courtwide tier: same "relaxed band" intent, right
+        # colour. Red resolves to its own courtwide row, i.e. the identical constants.
+        red_b = self._bands[_mbc.BAND_COURTWIDE] if blur_on else None
         # (1) RED column (primary: present for a make AND a miss). ar_min RELAXED: the window is
         #     already position-bounded + colour-gated, and the default 1.8 aspect floor silently
         #     rejected every SHORT tracked column (h<~50 on a w28 meter) -- the early rise right
@@ -4432,8 +4443,11 @@ class SimpleMeterReader:
         #      never reaches here -> the pristine read is byte-identical. DÃ©cor-safe: the window is
         #      tight around the last meter box + colour-gated (a grey mullion carries no red).
         if self._occl and red_b is None:
+            # Same fix as the blur band above: the hardcoded red literal made this
+            # occlusion retry a no-op in White mode, and _occl defaults ON -- so every
+            # strict miss fell straight through to coast instead of being rescued.
             col, _c = self._scan(frame, win, self._h_hold, ar_min=self.params.relocate_ar_min,
-                                 bounds=((0, 0, 170), (70, 70, 255)),
+                                 bounds=self._bands[_mbc.BAND_COURTWIDE],
                                  w_max_extra=max(w_extra, 6), red_frac_min=0.30)
             if col is not None:
                 return col, "red"

@@ -565,10 +565,45 @@ QString registeredConsoleRouteIdentity(const QString& consoleIp)
             }
         }
     }
-    // No match or an ambiguous IP is intentionally cold. Never fall back to hashing the IP,
-    // nickname, account id, or registration secret; none is an exact console identity here.
+    // [2026-08-27] DHCP DRIFT FALLBACK. Matching on the registration's stored address
+    // alone made the whole timing stack hostage to a DHCP lease. Observed live: the
+    // console registered at 192.168.137.100, ICS later handed it .138, and the mismatch
+    // produced an EMPTY identity -> empty latency scope -> `route_scope_rejected` on every
+    // attestation -> the bot sat in "TIMING WARMING UP - SHOTS STAY MANUAL" and never fired
+    // a single shot. Nothing was wrong with the console, the card, or the route.
+    //
+    // An IP is not an identity, and when the machine has exactly ONE registered console
+    // there is nothing to disambiguate: that console IS the answer whatever address it
+    // currently holds. So fall back to the sole registration rather than going cold.
+    //
+    // The original safety still stands where it means something: with two or more
+    // registrations an unmatched address stays ambiguous and returns empty, because
+    // binding a timing posterior to the WRONG console is the failure this guard exists to
+    // prevent. Still never hashes the IP, nickname, account id or registration secret --
+    // the digest is over the host id exactly as before.
     if (matchingHostIds.size() != 1) {
-        return {};
+        QSet<QString> allValidHostIds;
+        for (const auto& host : readRegisteredHosts()) {
+            const QString hostId = normalizeHostId(host.hostIdHex);
+            if (hostId.size() != 12) {
+                continue;
+            }
+            bool hexOnly = true;
+            for (const QChar c : hostId) {
+                if (!((c >= QLatin1Char('0') && c <= QLatin1Char('9'))
+                      || (c >= QLatin1Char('A') && c <= QLatin1Char('F')))) {
+                    hexOnly = false;
+                    break;
+                }
+            }
+            if (hexOnly) {
+                allValidHostIds.insert(hostId);
+            }
+        }
+        if (allValidHostIds.size() != 1) {
+            return {};
+        }
+        matchingHostIds = allValidHostIds;
     }
 
     QByteArray material("orion-console-route-v1", 22);
