@@ -76,22 +76,12 @@ def test_meter_controls_are_autonomous_not_a_setup_batch() -> None:
     assert 'subtitle: "Automatic detection on every shot"' in meter
     assert 'text: "Style"' in meter
     assert 'text: "Color"' in meter
-    assert 'text: "Tempo Remap"' in meter
-    assert 'text: "Input"' in meter
-    # [ORION_TEMPO_INPUT_DROPDOWN 2026-08-13] The three-segment pill row (Square / Stick / Both)
-    # is now a two-option dropdown. "Both" is no longer offerable: it was documented as adding
-    # "Stick and Go-To shot gestures", but Go-To arms on gotoEnabled plus a strict RS-up and
-    # never consults stickInputAllowed() -- verified live, a Go-To fired with input_source=square.
-    # All it really added was the RS-DOWN TempoStick gesture layered on Square.
+
     assert "DashboardCombo" in meter
-    assert 'objectName: "tempoInputSourceCombo"' in meter
-    assert '["Square", "Stick"]' in meter
-    assert "orion.tempoInputSource = value.toLowerCase()" in meter
     # The BACKEND still understands "both" (AppConfig normalization, RemotePlaySession,
     # AutomationEngine input_mode), so a settings.json carrying it keeps working -- and the combo
     # must still SHOW it while it is the live value, or such an install would silently read
     # "Square" over a stored "both".
-    assert 'orion.tempoInputSource === "both"' in meter
     assert "Calibrate Meter" not in meter
     assert "trainRequested" not in meter
     assert "meterCalibration" not in meter
@@ -307,3 +297,16 @@ def test_internal_orion_runtime_contracts_are_not_rebranded() -> None:
     assert 'QStringLiteral("OrionPreviewFrame_%1")' in remote
     assert "OrionUpdater.exe" in updater
     assert 'QStringLiteral("OrionNative.exe")' in updater
+
+
+def test_tempo_remap_is_retired_from_the_meter_panel():
+    """Owner retired Tempo Remap on 2026-08-26.
+
+    SURFACE removal only: the card and its Square/Stick picker leave the UI, but
+    `orion.tempoInputSource` and the engine's tempo handling stay, so a persisted
+    setting cannot change behaviour just because a control disappeared.
+    """
+    meter = source("native_orion/qml/components/MeterConfigPanel.qml")
+    assert "tempoCard" not in meter
+    assert "tempoInputSourceCombo" not in meter
+    assert 'text: "Tempo Remap"' not in meter

@@ -540,7 +540,15 @@ def _scope_reject(reason: str) -> str:
     """
     if reason not in _SCOPE_REJECT_LOGGED:
         _SCOPE_REJECT_LOGGED.add(reason)
-        logger.warning(
+        # ERROR, not WARNING, and the level is load-bearing. The native relay
+        # throttles sidecar WARNING lines (RemotePlaySession.cpp: isWarning ->
+        # kSidecarWarnThrottleMs) but lets ERROR through unthrottled. Emitted at
+        # WARNING on 2026-08-18 this line NEVER ONCE reached orion_native.log --
+        # it was competing with per-second capture-health and reader warnings --
+        # so the diagnostic built specifically to end this bench was itself
+        # invisible for another two sessions. A once-per-process cause-of-death
+        # line must never be sampled.
+        logger.error(
             'Latency route scope EMPTY (%s): timing attestation will be rejected as '
             'route_scope_rejected until this is resolved', reason)
     return ''
