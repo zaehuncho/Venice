@@ -556,6 +556,18 @@ def _latency_route_scope(config) -> str:
     source = str(getattr(config, 'frame_source', '') or '').strip().lower()
     if source in ('capturecard', 'card'):
         source = 'capture_card'
+    # CAPTURE-CARD MODE IS AUTHORITATIVE OVER THE CONFIG TOKEN.
+    # `_cc_mode` (see __init__) is `frame_source in (capture_card...) OR
+    # ORION_CAPTURE_CARD`, and in that mode the card is the EXCLUSIVE video
+    # source -- the decoder pipe is never used. But the native still ships
+    # frame_source='decoder' (the decoded-frame pipe is enabled for the
+    # PREVIEW), so this function saw 'decoder', walked the decoder branch,
+    # failed its identity check and returned '' -- on a rig whose timing feed
+    # was a perfectly healthy capture card. Resolve the same way the pipeline
+    # does, or the scope describes a source that is not being used.
+    if str(os.environ.get('ORION_CAPTURE_CARD', '')).strip().lower() in (
+            '1', 'true', 'yes', 'on'):
+        source = 'capture_card'
     if source == 'auto':
         # RESOLVE 'auto' THE SAME WAY THE PIPELINE DOES. The config token the
         # native sends defaults to 'auto' (autogreen_sidecar.py: cfg.get(
@@ -673,7 +685,13 @@ def _latency_route_scope(config) -> str:
         if (identity is None
                 or re.fullmatch(r'orf2:[1-9][0-9]{2,4}x[1-9][0-9]{2,4}:(?:nv12|i420)',
                                 decoder_mode) is None):
-            return ''
+            # The LAST silent return. This one hid the live 2026-08-27 failure:
+            # capture-card mode with frame_source='decoder' walked in here and
+            # returned '' with nothing logged, so three sessions of hunting saw
+            # only the downstream `route_scope_rejected`.
+            return _scope_reject(
+                'decoder_identity_unproven (identity=%s mode=%r)'
+                % ('missing' if identity is None else 'ok', decoder_mode[:32]))
         binary_stamp = f'{identity.size}:sha256={identity.sha256}'
         parts.extend([identity.path, binary_stamp, 'wire=' + decoder_mode])
     return '|'.join(parts)
