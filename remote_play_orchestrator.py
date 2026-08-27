@@ -4873,6 +4873,13 @@ class RemotePlayOrchestrator:
                 return
             idx = self._framedump_count
             info = {
+                # WALL-CLOCK OF THE FRAME, not of the PNG write. Without this the dump is
+                # index-only, and index*interval is NOT a time axis: the throttle jitters
+                # against the capture cadence, and on a full queue we DROP without consuming
+                # the index (below), so consecutive indices can be one frame apart or ten.
+                # Any offline rate measurement (meter fill ms, appear->tip) read off the index
+                # is therefore silently wrong -- and looks perfectly plausible.
+                't': now,
                 'det': bool(getattr(result, 'detected', False)) if result else False,
                 'fill': float(getattr(result, 'fill_pct', 0.0) or 0.0) if result else 0.0,
                 'conf': float(getattr(result, 'confidence', 0.0) or 0.0) if result else 0.0,
@@ -4901,6 +4908,40 @@ class RemotePlayOrchestrator:
         except Exception as exc:
             logger.warning("frame dump enqueue error: %s", exc)
 
+    def _framedump_write_index(self, idx, info):
+        """Append this frame's row to frames.csv (the dump's time axis + reader verdict).
+
+        Best-effort and self-silencing: an index-file problem must never cost us the
+        PNG stream, so every failure disables the index and leaves the dump running.
+        `t_ms` is relative to the first dumped frame, so it is directly usable as the
+        x-axis for fill-rate work without needing to know the session start.
+        """
+        if getattr(self, '_framedump_index_failed', False):
+            return
+        try:
+            fh = getattr(self, '_framedump_index_fh', None)
+            if fh is None:
+                fh = open(os.path.join(self._framedump_dir, 'frames.csv'),
+                          'w', encoding='utf-8', newline='')
+                fh.write('idx,t_ms,detected,fill_pct,conf,green_center_pct,'
+                         'bbox_x,bbox_y,bbox_w,bbox_h,rejection\n')
+                self._framedump_index_fh = fh
+                self._framedump_index_t0 = float(info.get('t', 0.0))
+            t0 = getattr(self, '_framedump_index_t0', 0.0)
+            t_ms = (float(info.get('t', 0.0)) - t0) * 1000.0
+            bbox = info.get('bbox') or (0, 0, 0, 0)
+            try:
+                bx, by, bw, bh = (int(v) for v in bbox)
+            except (TypeError, ValueError):
+                bx = by = bw = bh = 0
+            rej = str(info.get('rej', '') or '').replace(',', ';')
+            fh.write(f"{idx},{t_ms:.2f},{int(bool(info['det']))},{info['fill']:.2f},"
+                     f"{info['conf']:.3f},{info['gc']:.2f},{bx},{by},{bw},{bh},{rej}\n")
+            fh.flush()
+        except Exception as exc:
+            self._framedump_index_failed = True
+            logger.warning("frame dump index disabled (%s); PNG stream continues", exc)
+
     def _framedump_writer_loop(self):
         """Daemon: pop (idx, frame, info) and write the PNG(s) off the capture thread."""
         while True:
@@ -4914,6 +4955,7 @@ class RemotePlayOrchestrator:
                 idx, frame, info = item
                 base = os.path.join(self._framedump_dir, f"f{idx:05d}_{int(bool(info['det']))}")
                 cv2.imwrite(base + '_raw.png', frame)   # raw = what the detector receives
+                self._framedump_write_index(idx, info)
                 if not self._framedump_raw_only:
                     ann = frame.copy()
                     bbox = info.get('bbox')
