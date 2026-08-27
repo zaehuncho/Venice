@@ -4729,6 +4729,7 @@ class RemotePlayOrchestrator:
                     # backend queries, dict/log formatting, handlers, and stdout
                     # now execute on the bounded diagnostics worker.
                     self._queue_capture_health_diagnostic(_suspect)
+                self._reclaim_dshow_route_if_invalid(now)
                 # DISPLAY forward. The decoder-pipe path polls a latest-wins ring, so a 60fps poll
                 # against a 60fps decode with independent phase re-reads the SAME frame on ~half the
                 # polls -> forwarding every poll showed each image for 2 vsyncs (a "held" frame) =
@@ -4907,6 +4908,72 @@ class RemotePlayOrchestrator:
                                self._framedump_max, self._framedump_dir, self._framedump_dropped)
         except Exception as exc:
             logger.warning("frame dump enqueue error: %s", exc)
+
+    def _reclaim_dshow_route_if_invalid(self, now: float) -> None:
+        """Periodically retry the configured DirectShow route while the card is on MSMF.
+
+        WHY THIS EXISTS. `_guard_capture_latency_route` fails closed on any route
+        that is not DSHOW-at-the-expected-index, which is correct: MSMF's index
+        namespace is a different enumeration, so nothing attests WHICH device
+        "MSMF index 0" is, and the negotiated mode arrives without a FOURCC (the
+        observed MSMF open was 1080p30 with a blank fourcc, against a 60fps
+        timing budget). Adopting MSMF would be unsound, and this method
+        deliberately does NOT do that.
+
+        The problem was that the failure had no way OUT. A HEALTHY MSMF backend
+        satisfies neither of the existing reopen triggers -- the 2s card retry
+        needs `_frame_backend is None`, and the self-heal detach needs
+        `is_healthy()` False -- so it produced frames forever while every guard
+        call failed and the bot stayed benched for the life of the process.
+        Observed 2026-08-26: the PS5 was asleep, the dark HDMI feed gave
+        DirectShow no usable first frame, `_open` fell through to MSMF, and
+        timing was disabled from that moment on.
+
+        The fix is to release the card and let the EXISTING DSHOW-first `_open`
+        run again. Recovery needs no new trust logic: when DSHOW at the expected
+        index comes back, the guard's own `matches` branch re-earns COLD
+        authority (`capture_route_recovered_cold`). Worst case DSHOW is still
+        dead, we reopen on MSMF and probe again after the cooldown -- and timing
+        is already disabled in that state, so the only cost is a brief preview
+        blink. Never calls `_replace_latency_authority` itself; it only detaches.
+        """
+        if not getattr(self, '_cc_mode', False):
+            return
+        if not getattr(self, '_capture_route_currently_invalid', False):
+            return
+        backend = self._frame_backend
+        if backend is None:
+            return
+        try:
+            cooldown = float(os.environ.get('ORION_CAPTURE_DSHOW_RECLAIM_S', '15') or 15.0)
+        except (TypeError, ValueError):
+            cooldown = 15.0
+        if cooldown <= 0.0:
+            return          # explicitly disabled
+        if str(os.environ.get('ORION_CAPTURE_API', '')).strip().lower() == 'msmf':
+            return          # the operator asked for MSMF; do not fight them
+        try:
+            api = str(backend.active_route()[0] or '').upper()
+        except Exception:
+            return
+        if api == 'DSHOW':
+            return          # already on the configured API; the guard decides the rest
+        last = float(getattr(self, '_cc_route_reclaim_last', 0.0) or 0.0)
+        if last and (now - last) < cooldown:
+            return
+        self._cc_route_reclaim_last = now
+        logger.warning(
+            'Capture route is %s, not the configured DirectShow route, so shot timing is '
+            'fail-closed; releasing the card to retry DirectShow', api or 'UNKNOWN')
+        try:
+            backend.stop()
+        except Exception:
+            pass
+        self._frame_backend = None
+        self._frame_backend_mode = 'capture'
+        # Land the reopen after the card's handle-release window rather than
+        # immediately, or the reopen races the release and lands on MSMF again.
+        self._cc_last_retry = now + 1.0
 
     def _framedump_write_index(self, idx, info):
         """Append this frame's row to frames.csv (the dump's time axis + reader verdict).

@@ -2687,7 +2687,12 @@ void RemotePlaySession::onSidecarStderr()
         const bool isAuthorityDeath =
             trimmed.contains("warm timing revoked")
             || trimmed.contains("Latency authority reset")
-            || trimmed.contains("capture_route_mismatch");
+            || trimmed.contains("capture_route_mismatch")
+            // The HEAL must bypass the throttle for the same reason the death does:
+            // a customer told "timing disabled" needs to see it come back, and the
+            // reclaim probe's release line explains an otherwise silent preview blink.
+            || trimmed.contains("route recovered")
+            || trimmed.contains("retry DirectShow");
         if (isError || isReleaseMarkerInfo || isProbeDiagnostic || isAuthorityDeath) {
             emit setupMessage(QStringLiteral("Sidecar: %1").arg(QString::fromUtf8(trimmed.left(300))));
             // [ORION_AUTHORITY_DEATH 2026-08-10] The cause line above survives the throttle but
@@ -2713,11 +2718,21 @@ void RemotePlaySession::onSidecarStderr()
             // rule, same reason, as captureResolution() in RemotePlaySession.h.
             if (!authorityDeathAnnounced_ && trimmed.contains("warm timing revoked")) {
                 authorityDeathAnnounced_ = true;
+                // [2026-08-26] Reworded twice over. The old copy asserted a CAUSE it does not
+                // know ("changed route mid-session") and a REMEDY that is no longer true
+                // ("Close Venice"). Measured that day: the card OPENED on MSMF because the PS5
+                // was asleep, so the dark HDMI feed gave DirectShow no usable first frame --
+                // nothing changed mid-session and nothing else held the card. Recovery no longer
+                // needs a restart either: the orchestrator now releases the card and retries the
+                // configured DirectShow route on a cooldown
+                // (_reclaim_dshow_route_if_invalid), and an in-process return to DSHOW re-earns
+                // cold authority. State the consequence, not a guessed cause.
                 emit setupMessage(QStringLiteral(
-                    "TIMING DISABLED - the capture card changed route mid-session, so shot timing "
-                    "cannot be trusted and the bot will stop firing. Close Venice and reopen it to "
-                    "recover. If it repeats, close anything else using the capture card (OBS, "
-                    "Camera, a browser tab) before reconnecting."));
+                    "TIMING DISABLED - the capture card is not on its configured DirectShow "
+                    "route, so shot timing cannot be trusted and the bot will not fire. Venice "
+                    "keeps retrying that route on its own. If timing does not come back, check "
+                    "that the console is awake and sending a picture, then close anything else "
+                    "using the capture card (OBS, Camera, a browser tab)."));
             }
         } else if (isWarning) {
             const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();

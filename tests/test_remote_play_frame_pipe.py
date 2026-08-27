@@ -1711,3 +1711,90 @@ def test_capture_route_msmf_fallback_still_bricks_even_with_card_name(monkeypatc
     assert not orch._guard_capture_latency_route(frame_data=fd)
     assert orch._capture_warm_cache_expected_index == 0
     assert orch._capture_warm_cache_revoked
+
+
+# --------------------------------------------------------------------------- #
+#  DSHOW RECLAIM -- the way OUT of a fail-closed MSMF route.
+#
+#  Adopting MSMF is unsound (its index namespace is a different enumeration, so
+#  nothing attests which device "MSMF index 0" is, and the observed open carried
+#  no FOURCC at 30fps against a 60fps timing budget). But the old code had no way
+#  out either: a HEALTHY MSMF backend triggers neither reopen path, so timing
+#  stayed disabled for the life of the process. 2026-08-26: the PS5 was asleep,
+#  the dark HDMI feed gave DirectShow no usable first frame, `_open` fell to
+#  MSMF, and the bot was benched from that moment.
+# --------------------------------------------------------------------------- #
+
+class _RouteBackend:
+    def __init__(self, api):
+        self._api = api
+        self.stopped = False
+
+    def active_route(self):
+        return (self._api, 0)
+
+    def stop(self):
+        self.stopped = True
+
+
+def _reclaim_orch(api="MSMF", invalid=True):
+    orch = rpo.RemotePlayOrchestrator.__new__(rpo.RemotePlayOrchestrator)
+    orch._cc_mode = True
+    orch._capture_route_currently_invalid = invalid
+    orch._frame_backend = _RouteBackend(api)
+    orch._frame_backend_mode = 'decoder'
+    orch._cc_route_reclaim_last = 0.0
+    orch._cc_last_retry = 0.0
+    return orch
+
+
+def test_msmf_route_is_released_so_dshow_can_be_retried(monkeypatch):
+    monkeypatch.delenv("ORION_CAPTURE_API", raising=False)
+    orch = _reclaim_orch()
+    backend = orch._frame_backend
+    orch._reclaim_dshow_route_if_invalid(1000.0)
+    assert backend.stopped, "the card must be released so the DSHOW-first reopen can run"
+    assert orch._frame_backend is None
+    assert orch._frame_backend_mode == 'capture'
+    # The reopen is deliberately deferred past the card's handle-release window.
+    assert orch._cc_last_retry > 1000.0
+
+
+def test_reclaim_respects_its_cooldown(monkeypatch):
+    monkeypatch.delenv("ORION_CAPTURE_API", raising=False)
+    monkeypatch.setenv("ORION_CAPTURE_DSHOW_RECLAIM_S", "15")
+    orch = _reclaim_orch()
+    orch._reclaim_dshow_route_if_invalid(1000.0)
+    reopened = _RouteBackend("MSMF")                     # reopened, still MSMF
+    orch._frame_backend = reopened
+    orch._reclaim_dshow_route_if_invalid(1005.0)         # inside the cooldown
+    assert not reopened.stopped
+    orch._reclaim_dshow_route_if_invalid(1020.0)         # past it
+    assert reopened.stopped and orch._frame_backend is None
+
+
+def test_reclaim_never_touches_a_valid_or_dshow_route(monkeypatch):
+    monkeypatch.delenv("ORION_CAPTURE_API", raising=False)
+    # already on DSHOW -> the guard owns the decision, not this probe
+    orch = _reclaim_orch(api="DSHOW")
+    orch._reclaim_dshow_route_if_invalid(1000.0)
+    assert not orch._frame_backend.stopped
+    # route not flagged invalid -> nothing to reclaim
+    orch2 = _reclaim_orch(api="MSMF", invalid=False)
+    orch2._reclaim_dshow_route_if_invalid(1000.0)
+    assert not orch2._frame_backend.stopped
+
+
+def test_reclaim_is_disabled_when_the_operator_asked_for_msmf(monkeypatch):
+    monkeypatch.setenv("ORION_CAPTURE_API", "msmf")
+    orch = _reclaim_orch()
+    orch._reclaim_dshow_route_if_invalid(1000.0)
+    assert not orch._frame_backend.stopped, "do not fight an explicit ORION_CAPTURE_API=msmf"
+
+
+def test_reclaim_can_be_switched_off(monkeypatch):
+    monkeypatch.delenv("ORION_CAPTURE_API", raising=False)
+    monkeypatch.setenv("ORION_CAPTURE_DSHOW_RECLAIM_S", "0")
+    orch = _reclaim_orch()
+    orch._reclaim_dshow_route_if_invalid(1000.0)
+    assert not orch._frame_backend.stopped
