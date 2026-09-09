@@ -3925,9 +3925,14 @@ def test_stale_lock_is_dropped_at_a_new_press():
 
 
 def test_a_rising_lock_survives_a_new_press():
-    """The bridge case the docstring protects: a low/rising meter keeps its lock."""
+    """The bridge case needs measured rise plus a fresh locator, not a low value alone."""
     r = SimpleMeterReader(W, H, cfg=_ColourCfg("White"))
-    r.box = (10, 20, 25, 110); r.conf = 1.0; r.last_fill = 12.0
+    box = (10, 20, 25, 110)
+    r.box = box; r.conf = 1.0; r.last_fill = 12.0; r.last_coarse = 12.0
+    r._det_state = "locked"
+    r._det_last_box = box
+    r._det_last_found_ts = 10.03
+    r._det_coarse_fill_hist.extend(((10.00, 8.0), (10.03, 12.0)))
     r._physical_shot_epoch = 1
     r.notify_physical_shot_start(2)
     assert r.box is not None and r.conf == 1.0

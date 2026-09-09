@@ -91,6 +91,8 @@ except Exception:  # pragma: no cover
         consecutive_frames: int
         raw_fill_pct: float = 0.0
         smoothed_fill_pct: float = 0.0
+        fill_estimator_mode: str = ""
+        fill_estimator_generation: int = 0
         fill_velocity_pct_s: float = 0.0
         fill_acceleration_pct_s2: float = 0.0
         eta_ms: float = -1.0
@@ -105,6 +107,9 @@ except Exception:  # pragma: no cover
         rise_state: str = ""
         gameplay_structure_verified: bool = False
         gameplay_structure_epoch: int = 0
+        # Diagnostic frame-start identity, including samples that have not earned proof.
+        # This field never grants timing/ownership authority.
+        gameplay_sample_epoch: int = 0
     _HAVE_REAL_RESULT = False
 
 
@@ -1074,6 +1079,9 @@ class SimpleMeterReader:
     # search band 5/250/1915/770 -> right trimmed to 1815 to drop the STATIC NBA-logo banner
     # (x~1846-1902) which yields a width-30 red contour the shape gate alone can't reject.
     BAND = (5, 250, 1815, 770)        # x0,y0,x1,y1 px @1080p
+    # Notch band around the meter's bottom edge (meter_detector._grab_patch: b-12 .. b+5).
+    _NOTCH_ABOVE = 12
+    _NOTCH_BELOW = 5
     W_MIN, W_MAX = 20, 34             # Arrow2 contour width 23-30 (+/- capture slack)
     H_ACQ = 33                        # Arrow2 contour height min 33 (cold acquire)
     H_ACQ_ARMED = 15                  # RELAXED acquire height when the shot-gate is ARMED (early rise)
@@ -1176,6 +1184,16 @@ class SimpleMeterReader:
     # reset_tracking() mid-session (a live colour/style change), where an unanchored read is a
     # confidently-wrong number the bot would time a shot off.
     _ever_capped = False
+    # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] class-level defaults so the press-clock veto
+    # state is always present (subclass __init__ ordering / pickled readers): flag-off and
+    # reference-less until __init__ / the per-press reset install the live values.
+    _press_onset_plaus = False
+    _press_last_pub_fill = None
+    _press_last_pub_ts = None
+    _press_onset_cand = None
+    _press_implausible_n = 0
+    _press_implausible_logged = False
+    _press_rise_run = 0
 
     def __init__(self, frame_w: Optional[int] = None, frame_h: Optional[int] = None,
                  cfg=None, shot_gate=None, params: Optional[ReaderParams] = None,
@@ -1184,6 +1202,9 @@ class SimpleMeterReader:
         self.W = int(frame_w) if frame_w else 0
         self.H = int(frame_h) if frame_h else 0
         self._cfg = cfg                          # DetectorConfig (orch update_meter reads det._cfg)
+        # The orchestrator mutates the shared cfg BEFORE calling set_active_style.
+        # Keep our own identity so a real profile change cannot look like a no-op.
+        self._tracking_meter_style = str(getattr(cfg, "meter_style", "") or "").strip().casefold()
         self._shot_gate = shot_gate              # optional callable() -> (armed, pose_conf)
         self._shot_armed = False
         self._shot_armed_hw = False              # PHYSICAL arm only (set_shot_state 3rd arg);
@@ -1204,6 +1225,20 @@ class SimpleMeterReader:
         self._gameplay_structure_proof_epoch = 0
         self._physical_shot_epoch = 0
         self._gameplay_verify_frames = 0
+        # STRUCTURE NECROPSY (2026-08-30, diagnostics only -- zero behaviour change).
+        # Live 20260830_112306: the engine aborted 18 presses with
+        # ownership_structure_stamp_missing / stamp_epoch_seen=0, yet a faithful offline
+        # replay of the SAME frames + press times latches the proof on every one of those
+        # epochs (green cap present on 37/37 rises; latch <=40% fill on 37/37 runs). The
+        # divergence is live-only state this census names at the NEXT live run: per hw
+        # epoch, how many frames detect() EMITTED as detected, how many reached
+        # _qualify_gameplay_sample detected, how many of those carried the green cap, the
+        # best consecutive-fresh-rise count, and whether the latch ever fired. Logged at
+        # ERROR once per closing epoch that had frames but no latch (untrottled by the
+        # native relay, ~one line per silent shot).
+        self._ep_census = {"epoch": 0, "emit_det": 0, "qual_det": 0, "green": 0,
+                           "max_fresh_up": 0, "latched": False, "authorized": 0,
+                           "last_stage": ""}
         # A physically-armed discontinuous re-seat is a new visual identity, so it must prove
         # structure/rise again before timing can trust it.  Keep that bounded re-verification
         # visible to the overlay as sampler-stale continuity; otherwise the production scene gate
@@ -1331,6 +1366,891 @@ class SimpleMeterReader:
         # as capless. A true meter measures ~91%; 0.25 leaves wide margin.
         self._capless_rate_max = min(1.0, max(0.0,
             _fnum('ORION_READER_WHITE_CAP_RATE_MAX', 0.25)))
+        # (3c) DETECTOR-DRIVEN LOCATION (ORION_METER_DETECTOR; default OFF in code, ENABLED
+        # by run_orion.local.ps1 for live 2K27 -- off keeps the unit suite's synthetic frames,
+        # which the real-meter detector correctly rejects, from being vetoed). The colour
+        # locator finds a meter by scanning for bright columns, and an arena is full of
+        # them; measured on the 2K27 white meter it mis-located 99% of its detections
+        # (latching the white jersey ~49px beside the real bar: reader x534 vs true x485)
+        # and MISSED 471 of 756 real meters a trained detector found. So a single-class
+        # YOLO11n (2079 labelled 2K27 frames + 693 non-gameplay negatives, mAP50-95 0.973)
+        # PROPOSES where the meter is; the colour reader still measures fill/green INSIDE
+        # that box through its shipped relocate/_read_fill path. The detector runs on an
+        # async worker thread so its inference (~14 ms GPU / ~174 ms CPU) NEVER blocks the
+        # timing loop -- the reader consumes the freshest result with a TTL staleness guard.
+        # Fully subtractive w.r.t. risk: if onnxruntime or the model is absent the locator
+        # is None and every path below is byte-identical to the shipped colour reader.
+        self._meter_detector = None
+        self._det_seeded = False
+        self._det_no_meter = False
+        self._det_region = None
+        # DETECTOR-AUTHORITATIVE state. Live, read()'s white-blind acquire wandered back onto
+        # décor even with the box seeded (rendered proof: detector dead-on the meter, reader on
+        # the player at 0% fill). So when the detector holds a meter we measure fill DIRECTLY in
+        # its box and emit that. _det_last_box/ts bridge brief async found=False gaps so the box
+        # persists through the shot; _det_fill_hist is an independent velocity history (read()'s
+        # is polluted by the décor lock).
+        self._det_active_box = None
+        self._det_last_box = None
+        self._det_last_found_ts = -1.0e9
+        self._det_fill_hist = _collections.deque(maxlen=12)
+        # Press/ghost ownership uses the same row-quantized ruler native consumes. Keep a
+        # parallel history so that choice does not lower the resolution of the velocity fit.
+        self._det_coarse_fill_hist = _collections.deque(maxlen=12)
+        self._det_hold_s = max(0.0, _fnum('ORION_METER_DETECTOR_HOLD_S', 0.35))
+        # BOX MOTION EXTRAPOLATION. The detector runs on its own thread at ~50ms inference
+        # (+ throttle), so its newest box is tens of ms STALE -- and the 2K27 meter is anchored
+        # to the SHOOTING PLAYER, so a stale box trails a moving meter. That is both the visible
+        # "detection lags behind the meter" and a silent accuracy bug: fill is measured inside a
+        # mispositioned box, which feeds the engine bad first-fills (-> ownership_proof_incomplete)
+        # and late samples (-> live_tip_deadline_missed). Tracking the box's own velocity and
+        # extrapolating it to NOW cancels that staleness with no extra GPU cost.
+        # Detector motion is represented by the same anchors used everywhere downstream:
+        # horizontal centre + BOTTOM edge.  Do not store vertical centre here.  The learned
+        # detector's height breathes by a few pixels as the ribbon fills/zooms; with a fixed
+        # bottom, ``cy = bottom - h/2`` therefore moves even though the meter does not.  Feeding
+        # that artefact to vertical extrapolation manufactured ~5-10px tracking errors -- nearly
+        # the measured 12px fill-dropout threshold.  Tuple = (source_ts, cx, bottom, w, h).
+        self._det_box_hist = _collections.deque(maxlen=6)
+        # Per-frame NCC tracker (see _track_box_ncc): template + search window + accept floor.
+        self._det_tmpl = None
+        self._det_tmpl_size = None      # detector dimensions at the appearance seed
+        self._det_tmpl_cx_offset = 0.0
+        self._det_tmpl_bottom_offset = 0.0
+        self._det_track_score = 0.0
+        # Smoothed per-axis velocity of the tracked notch (px/frame).  Horizontal motion
+        # dominates ordinary pans, but moving/fade shots also camera-dive vertically; both
+        # axes must predict the search centre or the vertical matcher trails and drops weak.
+        self._det_track_vx = 0.0
+        self._det_track_vy = 0.0
+        self._det_track_last_match = None
+        # Velocity retains the historical px/sample units, paired with the actual
+        # source-time interval that produced it. A dropped/occluded frame is not
+        # one nominal frame of movement; only the bounded SEARCH centre advances
+        # by elapsed time, never the served position or visibility authority.
+        self._det_track_velocity_dt_s = 1.0 / 60.0
+        self._det_track_box_ts = None
+        self._det_track_last_match_ts = None
+        self._det_track_sample_ts = None
+        self._det_track_clock_timed = None
+        self._det_track_scale_match = None  # current-frame appearance/geometry proposal only
+        self._subpx_camera_ref = None       # canonical ruler + independently measured span
+        self._subpx_camera_scale = 1.0
+        self._det_scale_reference = None    # fixed appearance at an accepted physical scale
+        self._det_scale_pending = None      # two unique local-pixel resize observations
+        self._det_track = _flag('ORION_METER_DETECTOR_TRACK', '1')
+        # +/-30px @720p is the retired tracker's _TPL_WIN, sized for the ~9-13px/frame camera stride.
+        self._det_track_pad_x = max(4, _inum('ORION_METER_DETECTOR_TRACK_PAD_X', 30))
+        self._det_track_pad_y = max(4, _inum('ORION_METER_DETECTOR_TRACK_PAD_Y', 22))
+        # 0.55 = the retired tracker's measured floor on this same notch patch (match is 0.74-1.0
+        # while the meter is visible, <=0.24 once it is gone), so it is a real discriminator
+        # rather than the 0.45 guess the whole-box version used.
+        self._det_track_min = min(1.0, max(0.0, _fnum('ORION_METER_DETECTOR_TRACK_MIN', 0.55)))
+        # ---- TRACK CONTINUITY (2026-08-30, the Left_Fade fill-dropout fix) -------------- #
+        # Measured on session_20260828_195034 e12 (instrumented replay at bench pacing): during
+        # a fade pan the meter moves ~0.12px/ms while the detector's newest box is 60-180ms
+        # stale, so every fresh box is already 7-22px behind the meter -- and the fill read
+        # hard-zeroes past ~12px of box error (offset sweep on frames 2371/2374/2377: clean
+        # plateau within +-10px, 0.00 at +-12..14). The shipped wiring then made it worse:
+        # the template was seeded from the CURRENT frame at that STALE box (baking the lag
+        # into the template) and the tracker was re-based on the stale detector box every
+        # frame, so the NCC match (score ~1.0, a partial self-match) SNAPPED the box back to
+        # the stale position, actively undoing the velocity extrapolation. Result: fill 0.00
+        # on 69-75% of every Left_Fade rise -> engine starved -> detector_authority_lost_abort
+        # on 100% of typed Left_Fade runs (bench run_20260830). _det_track_step keeps the
+        # tracker's OWN box across frames instead (1-frame-old reference), refreshes the
+        # template from the TRACKED position at detector cadence after localization, and stays
+        # bounded to the detector through a small per-frame pull toward its (extrapolated) box
+        # plus a hard snap when they disagree by more than the snap gate.
+        self._det_track_cont = _flag('ORION_METER_TRACK_CONTINUITY', '1')
+        # Per-frame fraction of the (tracked - detector-box) gap pulled back toward the
+        # detector: template random-walk drift and any seed bias decay geometrically at this
+        # gain, while the equilibrium cost during a pan is only ~gain * detector-lag (~1-2px).
+        self._det_track_gain = min(1.0, max(0.0, _fnum('ORION_METER_TRACK_RECONCILE_GAIN', 0.15)))
+        # On a trusted moving track the detector proposal is commonly 40-100px behind
+        # the current frame.  A percentage-only pull therefore drags an accurate NCC
+        # match backward by 6-15px in one frame.  Retain the strong static correction,
+        # but cap the moving-track reconciliation impulse to a physical 2px/frame.
+        self._det_track_reconcile_max_px = max(
+            0.0, _fnum('ORION_METER_TRACK_RECONCILE_MAX_PX', 1.5))
+        # Tracked-vs-detector disagreement (px @720p width scale, either axis) beyond which
+        # the detector wins outright and the template is dropped with the position. Must sit
+        # ABOVE the worst honest pan lag of a raw age-capped detector box (~22px measured) or
+        # the stale box steals the lock back mid-pan; teleports are hundreds of px.
+        self._det_track_snap_px = max(4.0, _fnum('ORION_METER_TRACK_SNAP_PX', 26.0))
+        # A template that keeps matching weak for longer than this is stale appearance
+        # (occlusion/lighting), not a briefly-blurred notch -> re-bootstrap at the detector box.
+        self._det_tmpl_max_s = max(0.0, _fnum('ORION_METER_TRACK_TMPL_MAX_S', 0.5))
+        # (Two rejected template-reseed policies, both MEASURED on 195034 e14, a NEAR-STATIC
+        # meter at rise onset: reseeding from the TRACKED position every strong frame let
+        # the box random-walk 19-22px off the meter -- the moving fill edge lives INSIDE
+        # the notch band below ~12% fill, so every-frame reseeds capture a transient and
+        # compound their own match error; and reseed-only-on-box-motion could not tell real
+        # motion from match error, so it walked identically. Detection-cadence refresh still
+        # keeps statics stable, but it now happens AFTER the old template localizes the frame;
+        # refreshing before the match created an exact self-match that copied detector lag and
+        # placement jitter into the 60fps output -- see _det_track_step.)
+        # DEVIATION BUDGET (measured on 195034 e14): even with motion-gated reseeding the
+        # match itself ran off a NEAR-STATIC meter during the low-fill onset (the fill edge
+        # transits the notch band below ~12% fill, so the anchored template mismatches the
+        # meter exactly then, and similar-looking decor nearby out-correlates it: box err
+        # grew to 22px at score 0.75-0.95 while the detector box stood still). The tracker
+        # exists ONLY to cancel detector STALENESS, so its deviation from the detector's
+        # (extrapolated) box is clamped to what staleness can explain:
+        #     cap = DEV_BASE + speed * DEV_S      (speed from the detection history, px/s)
+        # Static meter -> cap ~7.1px @1280 (runaway impossible; the fill read tolerates
+        # ~10-12px, and a static meter's legit deviation is only detector noise ~2-3px);
+        # measured fast pans (300-580 px/s) -> cap 67-123px (full lag correction allowed).
+        # 4px base (was 6, was 8): the onset transient -- the fill edge transiting the notch
+        # band below ~12% fill -- makes the between-seed match wander toward nearby decor on
+        # near-static meters (e14 measured 13.5px, 003937 e21 7-10px), and any excursion
+        # past ~10px zeroes the read. 4px keeps a full-cap excursion safely inside read
+        # tolerance while still covering static detector noise.
+        self._det_track_dev_base = max(0.0, _fnum('ORION_METER_TRACK_DEV_BASE_PX', 4.0))
+        self._det_track_dev_s = max(0.0, _fnum('ORION_METER_TRACK_DEV_S', 0.20))
+        # MATCH-INNOVATION GATE.  NCC needs a broad search window to follow a fast fade, but a
+        # broad window also contains repeated court/jersey texture.  A high NCC score alone can
+        # therefore jump to a duplicate patch for one frame; the detector snap notices only on
+        # the NEXT frame, after the bad box has already reached fill measurement/overlay.
+        #
+        # Judge displacement against the tracker's one-frame velocity prediction, not against
+        # the previous box.  At the measured fastest fade (~13px/frame), the default allowance
+        # is 16 + .65*13 = 24.45px, almost twice the physical step and comfortably above camera
+        # acceleration.  A 28px cap remains over 2x that measured step while staying below the
+        # 30-60px search radius where duplicate-scene matches live.  Rejection falls back to the
+        # detector-held box and rolls back the candidate's velocity update; it never kills a
+        # lock or extends its lifetime.
+        self._det_track_innov_base = max(
+            4.0, _fnum('ORION_METER_TRACK_INNOV_BASE_PX', 16.0))
+        self._det_track_innov_vel_gain = max(
+            0.0, _fnum('ORION_METER_TRACK_INNOV_VEL_GAIN', 0.65))
+        self._det_track_innov_max = max(
+            self._det_track_innov_base,
+            _fnum('ORION_METER_TRACK_INNOV_MAX_PX', 28.0))
+        # Template-texture floor (grey std) below which the NCC match is treated as
+        # unmatchable this frame (see _seed_track_template). Real locked-meter notch crops
+        # measure std 40+; the hazardous onset/pre-fill crops sit far below.
+        self._det_tmpl_std_min = max(0.0, _fnum('ORION_METER_TRACK_TMPL_STD_MIN', 7.0))
+        self._det_tmpl_std = 0.0
+        # Minimum detection-history span before ANY velocity estimate is trusted (see
+        # _det_hist_vel: below this, detector placement jitter masquerades as motion).
+        self._det_vel_min_span_s = max(0.0, _fnum('ORION_METER_TRACK_VEL_MIN_SPAN_S', 0.15))
+        # Magnitude clamp on an UNTRUSTED (short-history) velocity estimate, px/s -- lets
+        # the extrapolation apply a small bounded correction at a fast fade's onset while
+        # a jitter-faked "velocity" on a static meter can shift the box only a few px.
+        self._det_early_v_max = max(0.0, _fnum('ORION_METER_TRACK_EARLY_V_MAX', 100.0))
+        # Absolute cap (px) on the extrapolation SHIFT while velocity is untrusted.
+        self._det_early_shift_max = max(0.0, _fnum('ORION_METER_TRACK_EARLY_SHIFT_MAX', 8.0))
+        self._det_track_box = None       # last TRACKED box (pre-emit-smoothing), per-frame ref
+        # P2 experimental reader lane. Display damping must never determine the
+        # measurement crop. Pixel geometry requires BOTH a local green cap and a
+        # narrow neutral ribbon; brightness alone previously selected jerseys.
+        self._det_measure_raw = _flag('ORION_METER_MEASUREMENT_BOX', '0')
+        self._det_pixel_ruler = _flag('ORION_METER_PIXEL_RULER', '0')
+        self._det_kalman_search = _flag('ORION_METER_KALMAN_SEARCH', '0')
+        self._det_pixel_geometry = None
+        self._det_pixel_ruler_reject = False
+        self._det_pixel_span_hist = _collections.deque(maxlen=128)
+        self._det_pixel_ruler_epoch = 0
+        self._det_kalman_state = None
+        self._det_measurement_box = None
+        self._det_display_box = None
+        if self._det_measure_raw or self._det_pixel_ruler or self._det_kalman_search:
+            _acq_logger.warning(
+                "METER PIXEL TRACKING: measurement_box=%d pixel_ruler=%d "
+                "kalman_search=%d prediction_authority=0",
+                self._det_measure_raw, self._det_pixel_ruler, self._det_kalman_search)
+        self._det_tmpl_ts = -1.0e9       # when the current template was seeded
+        self._det_tmpl_pos = None        # (x, y) the current template was seeded at
+        self._det_fresh_accept = False   # a fresh detector proposal was accepted THIS frame
+        self._det_new_accept = False     # that proposal is a NEW source result, not latest() replay
+        # Fractional box-height change that counts as a genuine meter RESCALE rather than
+        # jitter (used by the sub-pixel per-shot latch below). 0.15 sits far above the
+        # measured within-shot wobble and far below a real zoom step.
+        self._fill_denom_relatch = max(0.02, _fnum('ORION_METER_FILL_DENOM_RELATCH', 0.15))
+        # FILL-DENOMINATOR LATCH: REMOVED 2026-08-30 after a valid A/B refuted it.
+        # (ORION_METER_FILL_DENOM_LATCH, default-off, latched the first confident box height
+        # as the denominator per shot.) The A/B that killed it resolved shot runs ONCE and
+        # replayed the SAME frames through every arm (offline recompute from identical
+        # per-frame top/bbox measurables, so the arms cannot diverge -- the flaw that
+        # invalidated the earlier attempt), 3 sessions / 22 evaluated rises:
+        #   * the motivating "4.5-6.0px height wobble within a rise" does NOT reproduce:
+        #     within the pre-commit fit window the box-height range is 1-2px median (live
+        #     frames.csv AND replay); 4.5-6px matches whole-LOCK ranges, i.e. acquisition +
+        #     post-peak frames the slope fit never sees.
+        #   * the latch arm measured WORSE than the live denominator: sigma_y about a
+        #     pre-commit line 0.97 vs 0.87 med (+12%), worse half-window slope drift, worse
+        #     engine-replica crossing stability. Mechanism: fill=(D-top)/D with D latched
+        #     re-anchors the numerator to the box TOP edge (y0 jitter, ~0.9px detrended sd,
+        #     enters at full 0.93%/px weight), while live fill=(bh-1-top)/(bh-1) is
+        #     bottom-anchored and takes height wobble only multiplicatively (~fill*d(bh)/bh,
+        #     ~0.3%/px at commit fills).
+        #   * the one part that helped -- a latched SCALE under a bottom/base-anchored
+        #     numerator (sigma_y -2.5%) -- ships inside the sub-pixel path as _subpx_D.
+        # Do not rebuild a top-anchored denominator latch without beating that A/B.
+        # ---- SUB-PIXEL FILL EDGE (2026-08-30) ------------------------------------------- #
+        # The coarse walk quantizes the fill edge to whole rows (1 row ~= 0.93% of scale on
+        # the ~107px meter) and its per-frame noise is the sigma_y that dominates the tip-
+        # crossing variance (sigma(t*) ~= (sigma_y/b)*sqrt(1/N + (t*-tbar)^2/S_tt); the
+        # extrapolation term is ~98% of the observed ~12ms). This measures the edge
+        # CONTINUOUSLY: collapse the bar's CORE columns (white below the edge -- the box also
+        # contains outline/shadow columns, measured wfrac saturates at 0.50) to a 1-D LUMA
+        # profile (V only: capture chroma is 4:2:0, i.e. subsampled along the axis being
+        # localized -- the bt601/709 class of bug), estimate BOTH plateau levels (empty track
+        # ~V138, fill core V255 measured), and take the 50% crossing with linear
+        # interpolation. Synthetic ground-truth sweep (edge swept across sub-pixel phases,
+        # measured noise/blur/JPEG): coarse RMS 0.288px (= textbook q/sqrt(12)), 50%-crossing
+        # RMS 0.038-0.070px, phase-locking bias <= 0.08px; probit/erf fits measured equal
+        # within noise, so the closed-form crossing ships. The BASE of the white run (the
+        # meter's own bottom structure) is measured the same way and used as a per-frame
+        # ANCHOR: the fill numerator becomes (base - edge), both sub-pixel image
+        # measurements, so per-frame BOX-EDGE jitter (measured ~0.7-0.9px detrended sd,
+        # corr +0.86..0.90 with the fill residual -- it, not luma noise, dominates sigma_y)
+        # cancels out of the numerator entirely; the box only sets latched per-shot
+        # constants. MEASURED on 24 replayed rises across 3 framedump sessions
+        # (20260828_201813 / 20260830_003937 / 20260829_123758), runs resolved once and
+        # both estimators computed on identical frames:
+        #   * sigma_y about a line over the engine's commit band (fill 15-40):
+        #     1.10 -> 0.54 %-of-scale median (-51%); whole pre-window 1.00 -> 0.73.
+        #   * engine-replica (exp-weighted lambda=.5, 180ms window) crossing-prediction
+        #     scatter: median -23%, p90 -37%.
+        #   * run-to-run fitted-slope spread (IQR/med): 0.19 -> 0.12 (-35%).
+        #   * SLOPE SHIFT, SAY IT LOUDLY: the fitted rise slope reads ~+7.7% HIGHER
+        #     (paired median). Green-cap referee (the cap is fixed meter structure,
+        #     recovered box-independently) shows why: the DETECTOR BOX slides -9.5px per
+        #     100pp of fill against the meter during a rise (IQR -16.6..-4.1), so the
+        #     box-anchored coarse fill UNDERSTATES the true rate by ~9% with per-shot
+        #     variance; the base anchor holds at +1.1px/100pp. The shift is bias REMOVAL,
+        #     not scale drift -- but the learned rate constant (0.196 %/ms, learned
+        #     through the coarse instrument) will re-learn ~7% higher once this is live.
+        #   * parity at matched positions: +0.0pp at rise start; grows to ~+1.4pp
+        #     mid-run, which is the coarse reading's own box-slide error accumulating,
+        #     not a scale change in this estimator. Per-shot constant offset sd ~1.0pp
+        #     (off/D latch seed noise) -- the cost paid for a jitter-free anchor.
+        # Fill emission switches to the sub-pixel value; the coarse value still ships in
+        # fill_coarse/raw_fill_pct as a permanent per-frame A/B breadcrumb, and the
+        # false-lock breakers keep judging the coarse value (see the production boundary).
+        self._subpx_fill = _flag('ORION_METER_SUBPIXEL_FILL', '1')
+        # Parity offset (rows) aligning the sub-pixel 50%-crossing to the coarse walk's
+        # first-white-row convention, so the FILL SCALE the engine's constants were tuned on
+        # (rate 0.196 %/ms, green tip ~96%) does not move. Measured on replayed real rises:
+        # median(coarse_top - y50) = 0.67-0.71 rows (n=335 clean frames, 3 sessions); with
+        # 0.71 the matched-frame parity at rise start is +0.0pp. A wrong value here shifts
+        # fill by a constant, it never changes the slope.
+        self._subpx_bias = _fnum('ORION_METER_SUBPIXEL_BIAS_ROWS', 0.71)
+        # Per-lock latched scale/anchor constants (seeded from the median of the first 3
+        # frames where both edges measured cleanly -- the box is least accurate at
+        # acquisition, so a first-frame latch freezes a bad height; med3 measured tighter):
+        #   _subpx_D   = latched fill denominator (px)
+        #   _subpx_off = latched (box_bottom-1 - base_abs) alignment so the base-anchored
+        #                numerator stays on the box-relative scale the engine knows.
+        self._subpx_D = None; self._subpx_provisional = False
+        self._subpx_off = None
+        self._subpx_seed = []
+        self._subpx_base_hist = []; self._subpx_last_base_rel = None
+        # ---- SESSION RULER (2026-09-02, ORION_METER_SUBPIXEL_SESSION_RULER) ------------- #
+        # The 3-frame per-shot seed above is the ruler's weak point: it is taken at
+        # acquisition (fill 5-30%, the box still settling, the shooter often moving on a
+        # fade / off-the-dribble), so (D, off) carry a per-SHOT error the rest of the shot
+        # inherits as a constant. MEASURED on session_20260901_190427 (47 shots, right corner
+        # -> left corner -> off-dribble -> fades, 733 dumped frames, true edges measured
+        # from pixels): the reader's ruler moved 2.2pp rMAD between shots and its read of
+        # the GREEN CAP -- fixed meter structure that must read the same every shot --
+        # wandered 93-99 (rMAD 2.15, corr with screen x -0.44) while a ruler built on the
+        # served box read the same cap at rMAD 0.81, corr -0.10. On the same frames the
+        # 20% phase anchor was dated up to 19 ms apart by the two rulers. 1pp of ruler
+        # error is ~5 ms of anchor and 1pp of landing, the size of the residual earlies /
+        # lates. The meter's on-screen SCALE does not change between shots of one session
+        # (same resolution, same detector), so the ruler should not either: keep every
+        # shot's seed and emit the MEDIAN over the last N seeds once M have accumulated.
+        # The numerator (base - edge, both image measurements) is untouched, so per-frame
+        # box jitter still cancels; only the per-shot constant stops moving. Units are the
+        # same box-relative scale (the median of today's seeds), so the engine's aim, the
+        # learned rate and the 0.71-row parity are unchanged. A genuine rescale (>15%
+        # height jump, the existing relatch) or a seed that disagrees with the session
+        # median by the same margin clears the history; every per-shot / per-lock reset
+        # keeps it. Fail-open: fewer than M seeds -> today's per-shot latch, byte-identical.
+        self._subpx_session_ruler = _flag('ORION_METER_SUBPIXEL_SESSION_RULER', '0')
+        self._subpx_session_window = max(3, int(_fnum('ORION_METER_SUBPIXEL_SESSION_WINDOW', 15)))
+        self._subpx_session_min = max(2, min(self._subpx_session_window,
+                                             int(_fnum('ORION_METER_SUBPIXEL_SESSION_MIN', 3))))
+        self._subpx_ruler_hist = []       # [(D, off)] one entry per completed per-shot seed
+        self._subpx_ruler_kind = ""       # "shot" | "session" for the frame's _dbg_subpx
+        # ---- PROVISIONAL SESSION RULER AT LOCK START (2026-09-02, fleet reader lane) ------ #
+        # The session median above only takes over once a lock's OWN 3-frame seed completes;
+        # replaying today's four dumps showed 92% of shots date their 20% anchor crossing
+        # BEFORE that, on the seeding path (anchor = this frame's box bottom, the per-shot /
+        # per-jitter scale). Paired at the same edge, that path differs from the session ruler
+        # by 0.46-0.63 pp rMAD per shot = 2.5-3.5 ms of anchor jitter that the session ruler
+        # was built to remove and never touched. With this flag a new lock adopts the session
+        # median from its FIRST measured frame (validated against the frame's box height
+        # within the carry jitter, so a genuine rescale still cold-seeds), keeps collecting its
+        # own seed, and re-adopts the updated median when the seed completes. Byte-identical
+        # while the history holds fewer than the minimum seeds.
+        self._subpx_session_provisional = _flag('ORION_METER_SUBPIXEL_SESSION_PROVISIONAL', '0')
+        # [ORION_METER_SUBPIXEL_RULER_LOCK 2026-09-03] a lock that started on the provisional
+        # session ruler keeps it for the whole shot; its own seed joins the history for the NEXT
+        # shot. Live e71: the seed completing mid-shot re-emitted the ruler twice (seed, then the
+        # new median), the engine saw a +7.3 pp step 19 ms before a scheduled fire and killed it.
+        self._subpx_ruler_lock = _flag('ORION_METER_SUBPIXEL_RULER_LOCK', '1')
+        # [ORION_METER_SUBPIXEL_NOTCH 2026-09-08] anchor the sub-pixel fill on the meter's own
+        # chevron-notch apex (2 centre columns, whiteness) instead of the core-mean base, and
+        # measure the fill edge on whiteness min(B,G,R) instead of V. Measured on 3 framedump
+        # sessions (2519 frames): anchor sd 0.4-0.5 px -> 0.065 px; V-only edge loses the
+        # red-court frames (26 counts of contrast), whiteness keeps them (210).
+        self._subpx_notch = _flag('ORION_METER_SUBPIXEL_NOTCH', '1')
+        self._subpx_provisional = False   # this lock is on the provisional session ruler
+        # ---- BOX-RELATIVE BASE HOLD (2026-09-02, ORION_METER_SUBPIXEL_BASE_HOLD) -------- #
+        # When the base falloff is not measurable on a frame (occluder, dark shelf, plateau)
+        # and the velocity hold above has aged out (<= 120 ms), the ruler used to drop to the
+        # BOX anchor for that frame: a different ruler family, so native saw an estimator
+        # generation step mid-shot. Live 2026-09-02 13:00: 7 of 35 shots stepped 2-3 pp after
+        # the arm (tolerated since the fence change, but the landing read and the post-arm
+        # refinement still jump). The detector box tracks the meter, so the best estimate of
+        # an unmeasurable base is the box bottom plus this shot's LAST MEASURED base-to-box
+        # offset -- the same ruler family, no step. Bounded by age; a new lock clears it.
+        self._subpx_base_hold = _flag('ORION_METER_SUBPIXEL_BASE_HOLD', '0')
+        self._subpx_base_hold_max_s = min(2.0, max(0.1, _fnum('ORION_METER_SUBPIXEL_BASE_HOLD_MAX_S', 0.8)))
+        self._subpx_last_base_rel = None  # last measured (base_row - (bh-1)) of this lock
+        self._subpx_last_base_ts = -1.0e9
+        # A controller press does not, by itself, move or resize a bridged meter lock.
+        # Keep a validated base-anchored ruler across that boundary, then validate its
+        # scale against the first box of the new shot before it is allowed to emit.
+        # This avoids paying the three-frame latch delay on every rapid/fade shot while
+        # still dropping the carry immediately when camera distance really changed.
+        self._subpx_carry_pending = False
+        self._subpx_carry_jitter_px = max(
+            0.5, _fnum('ORION_METER_SUBPIXEL_CARRY_JITTER_PX', 2.0))
+        self._subpx_bridge_max_s = min(
+            0.20, max(0.02, _fnum('ORION_METER_SUBPIXEL_BRIDGE_MAX_S', 0.12)))
+        self._dbg_subpx = None
+        # [ORION_GREEN_SCALE_UNIFY] per-frame (anchor, D) of the last successful
+        # sub-pixel fill measure; pairs the green band onto the emitted fill's ruler.
+        self._last_subpx_transform = None
+        self._last_fill_coarse = 0.0
+        # Process-monotonic identity for the exact ruler that emitted fill_pct.
+        # Native phase timing may interpolate only between samples carrying the
+        # same non-zero generation.  The identity key changes on coarse/sub-pixel
+        # fallback, sub-pixel latch/re-latch, or a base-vs-box anchor change.
+        self._fill_estimator_generation = 0
+        self._fill_estimator_identity = None
+        self._last_fill_estimator_mode = ""
+        self._last_fill_estimator_generation = 0
+        # The coarse row walk divides by (detector-box height - 1).  Treating every
+        # height as the same "row_walk" ruler allowed native to interpolate an
+        # anchor across a genuine detector rescale.  Do not key directly on every
+        # height either: latest live telemetry measured all near-adjacent det_h
+        # steps within two pixels, so doing that would churn provenance on ordinary
+        # tracking quantization and suppress otherwise valid crossings.  Latch one
+        # identity reference and start a new local ruler epoch only outside that
+        # measured +/-2 px band.  This labels provenance only; it does not alter the
+        # coarse numerical measurement or its previously-refuted top-edge latch.
+        self._coarse_denom_ref = None
+        self._coarse_denom_epoch = 0
+        self._coarse_denom_jitter_px = 2.0
+        # ---- RUNG-TOLERANT FILL (2026-08-30, the Pill flat-0.0 fix) -------------------- #
+        # The 2K27 Pill (park/rec) capsule is a LADDER: the fill is a stack of bright
+        # segments separated by 1-3-row dark divider lines, and the glossy fill core is
+        # only ~6 of the ~30 detector-box columns @1080p (~4 of ~20 @720p). Measured on
+        # the seven 1080p owner clips: per-row wfrac tops out at 0.20-0.26 (0.14-0.20
+        # @720p), so the coarse walk's 0.28 floor NEVER passes and the reader emitted
+        # fill 0.00 on 190/192 ground-truth frames while the true fill rose 4->95pp.
+        # (The empty track also carries 1-row bright rung TICKS every ~12.7 rows @1080p
+        # -- 0.23 wfrac, brighter than some fill rows -- which alias away at 720p.)
+        # _rung_fill_block measures the fill as the base-touching stack of bright rows
+        # over the meter's own narrow CORE column band, bridging divider-sized gaps.
+        # It is geometry-gated, not style-gated (narrow flank-dark band, base contact,
+        # measured gap structure), so a wrong/changed style setting cannot break it:
+        # censused over 6064 detected Arrow2 framedump frames it changes 2 (0.03%),
+        # both mid-onset zero-fill dropout frames whose neighbours read 9.43 live and
+        # which it reads at 12.3 -- i.e. it never touches a frame the solid-ribbon walk
+        # already reads. ORION_METER_RUNG_FILL=0 restores the shipped walk byte-for-byte.
+        self._rung_fill = _flag('ORION_METER_RUNG_FILL', '1')
+        self._dbg_rung = None
+        self._det_extrap = _flag('ORION_METER_DETECTOR_EXTRAP', '1')
+        # Never extrapolate further than this (a long gap means the box is unknown, not fast).
+        # 0.14 -> 0.22 (2026-08-30): measured at bench pacing the consumed result's age runs
+        # 50-185ms between accepted detections mid-shot, and the frames whose age fell past
+        # the old cap served the RAW stale box -- on a fade pan that is 16-22px behind the
+        # meter, which is past the fill read's ~10-12px tolerance and was one leg of the
+        # Left_Fade zero-fill dropout. 0.22 covers the observed refresh jitter while the
+        # 0.20 TTL and the 0.35s hold still bound a genuinely dead result.
+        self._det_extrap_max_s = max(0.0, _fnum('ORION_METER_DETECTOR_EXTRAP_MAX_S', 0.22))
+        # A result older than TTL (meter moves with the shooter) is ignored -> fall back
+        # to the colour reader rather than seat a stale box.
+        self._det_ttl_s = max(0.0, _fnum('ORION_METER_DETECTOR_TTL_S', 0.20))
+        # Already tracking a box this close to the detector's -> let relocate keep it;
+        # only re-seat when the colour lock has drifted off the detector's meter.
+        self._det_seat_iou = min(1.0, max(0.0, _fnum('ORION_METER_DETECTOR_SEAT_IOU', 0.30)))
+        # PRIORITY-ON-ACQUIRE (legacy knob name: SYNC_ACQUIRE): while the reader holds NO detector
+        # box, ask the async locator to process the freshest frame without its ordinary breathing
+        # gap.  This used to call ORT synchronously on the capture callback.  A live real-game run
+        # measured 44-70ms per call, 80-170ms callback gaps and source/presentation collapse from
+        # 60fps into the 30s when an arm remained active or read-rescue retriggered.  Priority keeps
+        # the early/current-frame scheduling intent while inference stays exclusively on the worker.
+        #
+        # Historical acquisition rationale: while the reader holds NO detector box (acquisition), the
+        # async single-worker pipeline delivers the FIRST box ~4-5 frames late -- the worker is
+        # almost always mid-inference (30ms > 16.7ms/frame) when the meter pops in, so the onset
+        # frame waits ~2 frames to be picked up, ~2 frames to infer, +1 read round-trip. Measured on
+        # session_20260828_201813 the meter fills ~5-6%/frame at onset, so those 4-5 frames put the
+        # first REPORTED fill at ~25% (SYNC replay: ~5%). When enabled, the acquire path runs one
+        # high-priority detection request on the current frame so the worker grabs the newest pixels
+        # immediately.  The moment a meter is held we return to ordinary async cadence + box-hold.
+        # No-meter veto and lifecycle policy are unchanged; only where expensive inference executes
+        # changed.
+        #
+        # MODE (ORION_METER_DETECTOR_SYNC_ACQUIRE): '0' off (default); '1' ARMED-gated -- priority only
+        # while the reader is physically shot-armed (_shot_armed_hw), i.e. the bounded ~250ms between
+        # the shot-button press and the meter appearing, so normal no-meter gameplay stays fully async
+        # (no added GIL load / preview stutter, and it degrades to the async baseline if the arm
+        # signal never arrives -- never worse); '2'/'always' unconditional on every acquisition frame
+        # (for rigs with no reliable arm signal, or offline A/B -- costs continuous background
+        # acquisition inference, but never blocks the timing/capture callback).
+        # Measured on session_20260828_201813 (mode 'always', acq=33ms): first-fill 26% -> ~10.5%.
+        _sa = _os.environ.get('ORION_METER_DETECTOR_SYNC_ACQUIRE', '0').strip().lower()
+        self._det_sync_acquire = _sa in ('1', '2', 'true', 'yes', 'armed', 'always')
+        self._det_sync_acq_always = _sa in ('2', 'always')
+        self._det_acq_interval_s = max(0.0, _fnum('ORION_METER_DETECTOR_ACQ_INTERVAL_MS', 33.0) / 1000.0)
+        self._det_last_sync_acq = -1.0e9
+        # One priority wake at each physical epoch plus one for each new PENDING
+        # candidate is enough in the ordinary full-frame path. Repeating it every
+        # 33ms while a hardware arm was stuck removed the worker's GIL breathing gap
+        # indefinitely. The optional three-view phased scan still needs periodic
+        # opportunities, but at a bounded 100ms default rather than per-inference.
+        self._det_priority_epoch = None
+        self._det_priority_pending_ts = -1.0e9
+        # [ORION_METER_DETECTOR_ARMED_HOT 2026-09-08] while the shot button is physically held
+        # (the meter appears 340-630 ms later and fills for ~600 ms) every frame goes to the
+        # worker with the priority wake, so inference runs back to back on the freshest frame
+        # instead of at the 15 ms-gap cadence: measured onset->first read 105 ms median, ~64 ms
+        # of it cadence. Bounded per arm epoch so a stuck hardware arm cannot pin the worker.
+        self._det_armed_hot = _flag('ORION_METER_DETECTOR_ARMED_HOT', '1')
+        self._det_armed_hot_max_s = max(0.0, _fnum('ORION_METER_DETECTOR_ARMED_HOT_MAX_MS', 1200.0) / 1000.0)
+        self._det_hot_epoch = None
+        self._det_hot_open_ts = -1.0e9
+        self._det_phased_priority_s = max(
+            self._det_acq_interval_s,
+            _fnum('ORION_METER_DETECTOR_PHASED_PRIORITY_MS', 100.0) / 1000.0)
+        # PHASED EDGE ACQUIRE (default OFF; local batch opt-in). Full-frame 960px
+        # inference reduces a 23px-wide 720p meter to ~17 model pixels. On the hard
+        # human-audited holdout, full + two overlapping 55%-width edge views recovered
+        # 11 additional meters (436/460 -> 447/460) with 0 new finds across 727
+        # held-out no-meter frames. Sequentially stacking all three costs ~77ms and
+        # starves capture, so acquisition rotates ONE view per sync opportunity:
+        # last proven side, full, opposite (or full/left/right without history).
+        # Confidence, full-frame geometry, lifecycle and ownership gates are unchanged.
+        self._det_phased_acquire = _flag(
+            'ORION_METER_DETECTOR_PHASED_ACQUIRE', '0')
+        self._det_acq_scan_epoch = None
+        self._det_acq_scan_index = 0
+        self._det_acq_last_side = None       # left/right only after a proven meter rise
+        self._det_acq_scan_last = 'full'
+        # READ-RESCUE (2026-08-30, the Standstill/pan zero-fill dropout fix). MEASURED on
+        # session_20260830_112306 (live, 37 Arrow2 Standstill runs, per-frame census against
+        # synchronous YOLO ground truth on the SAME frames): 131 mid-rise frames reported
+        # detected=1 with fill 0.0, and on 113 of them (86%) the SERVED box sat 12-44px off
+        # the meter (|dcx| med 16, p90 29) during a camera pan burst/reversal while the
+        # same-frame YOLO found the meter at conf .90-.96 and the fill read 92-94% inside
+        # its box. Every box-serving mechanism is bounded BELOW that error by design (the
+        # extrapolation shift cap, the tracker's deviation budget, the emit slew -- each
+        # tuned against static-meter walk-offs), and the async result itself is 60-100ms
+        # stale, so during a pan burst no served box can stay on the meter. The rescue:
+        # when the held box cannot measure ANY fill run (top_row < 0), enqueue THIS frame
+        # as a priority/latest-worker request. The trigger frame stays an honest zero; the
+        # next unique full-frame result passes the ordinary lifecycle/jump/no-meter gates
+        # and, if accepted, hard-reseats emit/tracker state on the following callback.
+        # One request remains in flight until result/TTL, and RESCUE_GAP_MS bounds later
+        # retries. No preprocessing or inference ever runs on the timing/capture thread.
+        self._read_rescue = _flag('ORION_METER_READ_RESCUE', '1')
+        self._rescue_gap_s = max(0.0, _fnum('ORION_METER_RESCUE_GAP_MS', 35.0) / 1000.0)
+        self._det_last_rescue = -1.0e9
+        # Source timestamp of a non-blocking read-rescue request awaiting one fresh
+        # full-frame locator result.  A qualifying result earns the same lifecycle-gated
+        # hard reseat the old inline call earned, on a later callback; it expires at TTL.
+        self._det_rescue_request_ts = -1.0e9
+        # DETECTOR-FILL STRUCTURE LATCH (2026-08-30, the live silent-shot fix).
+        # THE MEASURED LIVE CHAIN (session_20260830_112306 + orion_native.log): the
+        # sidecar config said meter_color=Red against 2K27's WHITE meter (the exact
+        # settings drift _measure_fill_in_box exists for). read()'s colour path masks
+        # the CONFIGURED colour, so its qualify-time sample almost never carries red
+        # evidence -- and _qualify_gameplay_sample (which runs on READ's sample,
+        # BEFORE the colour-agnostic detector-fill override) therefore never latches
+        # the structure proof. The emitted detector-fill samples still flowed
+        # (fills 6->47 reached the engine), so the engine saw genuine rising frames
+        # with NO stamp: 18 presses aborted ownership_structure_stamp_missing with
+        # stamp_epoch_seen=0. A faithful offline replay (same frames, real press
+        # times/epochs, live-like detector staleness) with the colour CORRECT
+        # latches every one of those epochs, which acquits the fill dropouts and
+        # convicts the read-side evidence starvation.
+        #
+        # THE FIX: the authoritative, colour-agnostic detector-fill sample may latch
+        # the proof ITSELF -- but only on the meter's own identity, the green
+        # make-window cap ("nothing in the scene fakes the chevron"), measured
+        # >=8 green px in the box (the same floor the capless breaker measured:
+        # 91% of true locks carry it, 95% of false locks do not) on 2 CONSECUTIVE
+        # detector-fill frames of a LOCKED lifecycle box, inside the current armed
+        # hw epoch. No authorization or publication state is touched; a no-green
+        # (contested/Go-To) rise still needs the existing read-side rise proof.
+        self._detfill_green_latch = _flag('ORION_METER_DETFILL_GREEN_LATCH', '1')
+        self._df_green_streak = 0
+        # [ORION_READER_GHOST_PRESS_BREAK] LEFTOVER-METER (GHOST) EVICTION AT/AFTER A PRESS
+        # (2026-08-30, the stale-meter-at-press category).
+        #
+        # THE MEASURED MECHANISM (session_20260830_112306 + orion_native.log, epochs 4/21/23/
+        # 33/34/35/44/45; session_20260830_113732 epochs 12/13; session_20260828_195034 epochs
+        # 5/20/23): 2K27 leaves the PREVIOUS rep's meter rendered for seconds between shots --
+        # frozen at ~43-55% after an early/aborted release, at ~88-95% after a full release
+        # (frame crops verified: a real meter image, green cap and all, drifting with the
+        # camera pan). The reader idles LOCKED on it, and the lock BRIDGES the next press:
+        # the engine's first genuine samples are a static ~46%, which its ownership anchor
+        # rightly refuses (anchorMaxFirstFillPct=40 -- a shot first seen high was never seen
+        # starting). The bridge costs the press twice over: the ghost's frames are stamped and
+        # stale-censused, and the lock is BUSY when the real meter renders ~450-650ms after
+        # the press, so the true onset is acquired 1-3 frames late -- measured proof-completion
+        # ~40-80ms later than clean presses (fill ~25-30 vs ~15-20 at proof; the fire deadline
+        # at the shipped lead sits at ~35).
+        #
+        # Two defenses, both PRESS-SCOPED (they exist only between a physical press and the
+        # first low-fill sighting of that press's own meter, bounded by _ghost_press_window_s):
+        #   (1) notify_physical_shot_start's stale-lock drop now judges the RECENT nonzero
+        #       fill (max of last_fill and the detector-fill history) -- the ghost's fill
+        #       read flickers to 0.0 on pan-blurred frames, and the old instantaneous test
+        #       let exactly those presses bridge (epochs 41/45: held ghost read 0.00 at the
+        #       press instant, 88.9/45.1 one frame later) -- and it now drops the DETECTOR
+        #       lifecycle lock too (state/warm/history), which the original drop predates:
+        #       clearing self.box alone is undone one frame later when the held detector box
+        #       re-seats it.
+        #   (2) a post-press breaker: while this press has never yet seen its own meter low
+        #       (no nonzero fill <= _ghost_press_low_pct), a lock that reads >= the stale
+        #       floor (_stale_press_drop_pct, 40) on _ghost_press_frames nonzero frames whose
+        #       spread stays inside _ghost_press_spread_pp is the leftover meter, never this
+        #       shot's: a real rise crosses that band at ~6pp/frame and cannot hold the
+        #       spread, and a real rise that STARTED below the floor has already disarmed the
+        #       guard via the low sighting. Zero reads (blur/fade) neither feed nor reset the
+        #       run, so the flicker cannot shield the ghost.
+        #
+        # FAIL-CLOSED: both paths only ever DROP a lock the engine could never own (first
+        # sight above the anchor bound) inside the press window; neither invents evidence,
+        # touches the structure latch, nor fires outside a physically-armed epoch. The
+        # settled-meter plateau that follows OUR OWN release (grading needs it) is protected
+        # by the low-sighting disarm: a graded shot's rise passed through low fills first.
+        # THE QUARANTINE ZONE (measured necessity, replay A/B 2026-08-30): plain eviction is
+        # NOT enough. Each evict->relock cycle reseeds the per-lock sub-pixel calibration, and
+        # the fresh lock's first reads on the SAME ghost land noisy -- observed 35.0/40.0
+        # against a stable 46.5 -- which crosses the engine's 40% first-sight bound and OPENED
+        # false ownership episodes on the static ghost in the offline replay (epochs 23/24/38:
+        # proof at +128..235ms on a leftover meter, before the real meter could even render).
+        # So an identified ghost's POSITION is quarantined for the rest of the guard: in-zone
+        # reads are suppressed (never published) and the lock is re-evicted, with one
+        # exemption -- two CONSECUTIVE in-zone nonzero reads at/below _ghost_zone_low_pct are
+        # a real meter rendering inside the zone (its onset reads 0-20; a single blurred
+        # partial read of the ghost cannot make two in a row), which publishes and stands the
+        # guard down. The zone FOLLOWS the ghost (center updates on every suppressed read) so
+        # a camera pan cannot walk it out of its own quarantine.
+        # [ORION_READER_BOX_WIDTH_GATE 2026-09-03] A detector box far wider than this session's
+        # accepted meter boxes is not the meter (live e50: 39-41 px against 25-28 px re-read the
+        # previous shot's frozen bar as a rising 33/39.6/46.2 and armed an early). Keep the last
+        # accepted widths; once >= min_n exist, a box wider than ratio x median (or narrower than
+        # 1/ratio) gets NO fill read this frame (0.0, no top row). Style-agnostic: the median is
+        # whatever this session's detector has been accepting.
+        self._box_w_gate = _flag('ORION_READER_BOX_WIDTH_GATE', '1')
+        # [ORION_READER_RESEAT_X 2026-09-08] a held box that reads 0.0 is re-seated on the
+        # white ribbon found on THIS frame within +-18 px (the served box is the worker's
+        # 30-50 ms-old proposal; during a fade pan it sits 7-34 px beside the meter and the
+        # row walk hard-zeroes past ~12 px: 26/329 shots lost 50-180 ms of the rise that way).
+        self._reseat_x = _flag('ORION_READER_RESEAT_X', '1')
+        self._reseat_x_max = max(4, _inum('ORION_READER_RESEAT_X_MAX_PX', 18))
+        self._reseat_x_n = 0
+        self._box_w_ratio = max(1.1, _fnum('ORION_READER_BOX_WIDTH_RATIO', 1.35))
+        self._box_w_min_n = max(3, _inum('ORION_READER_BOX_WIDTH_MIN_N', 8))
+        self._box_w_hist = deque(maxlen=40)
+        self._box_w_gate_hits = 0
+        self._box_w_consec = 0
+        self._box_w_retire_n = max(1, _inum('ORION_READER_BOX_WIDTH_RETIRE_N', 3))
+        self._box_w_retired = 0
+        # No consecutive-hit "reset": the ratio key is already scale-invariant, and clearing the
+        # history after N hits would be a deterministic fail-open for a persistent false geometry
+        # (Sol, review #59). Baseline invalidation, if ever needed, must come from an explicit
+        # source/style/session lifecycle change, never from persistence of the anomaly itself.
+        self._box_w_log_ts = -1e9
+        self._ghost_press_break = _flag('ORION_READER_GHOST_PRESS_BREAK', '1')
+        self._ghost_press_window_s = max(0.0, _fnum('ORION_READER_GHOST_PRESS_WINDOW_S', 1.6))
+        self._ghost_press_low_pct = max(0.0, _fnum('ORION_READER_GHOST_PRESS_LOW_PCT', 35.0))
+        self._ghost_press_frames = max(2, _inum('ORION_READER_GHOST_PRESS_FRAMES', 3))
+        self._ghost_press_spread_pp = max(0.0, _fnum('ORION_READER_GHOST_PRESS_SPREAD_PP', 2.5))
+        self._ghost_zone_low_pct = max(0.0, _fnum('ORION_READER_GHOST_ZONE_LOW_PCT', 25.0))
+        self._ghost_zone_radius_scale = max(0.5, _fnum('ORION_READER_GHOST_ZONE_RADIUS_SCALE', 1.8))
+        # LEVEL-AWARE escape (measured on session_20260830_113732 epoch 18): the zone
+        # remembers the ghost's own fill LEVEL, and only reads within _ghost_zone_band_pp
+        # below it (or above) are the ghost; a read far UNDER the level is a real meter
+        # rendering inside the zone. A fixed low threshold was tried first and lost a real
+        # shot: a ~93% leftover bridged the press, the real onset rendered in-zone reading
+        # 25.5/31.1 -- above the fixed 25 exemption, far below 93 -- and was quarantined
+        # until the guard window expired. Two CONSECUTIVE sub-band nonzero reads stand the
+        # guard down (one blurred partial read of the ghost cannot make two in a row);
+        # suppressed ghost reads reset the pair, zero reads leave it alone.
+        self._ghost_zone_band_pp = max(0.0, _fnum('ORION_READER_GHOST_ZONE_BAND_PP', 15.0))
+        # ZERO-READ HOLD (2026-08-30 session_20260830_191051): an in-zone lock reading 0.0
+        # used to be evicted instantly ("a held zero keeps the lock busy"), but 51 of the
+        # session's 336 evictions carried fill=0.0 and the late cluster (press+0.44-0.63s)
+        # sat 30-80px from the ghost -- exactly where that press's REAL meter renders its
+        # first EMPTY frame. Each such eviction cost a cold re-acquire plus a reseeded
+        # sub-pixel calibration at the very moment the engine anchors its first fills.
+        # So a zero read now SUPPRESSES the publish but keeps the lock; only
+        # _ghost_zero_evict_n CONSECUTIVE zero reads evict (a fading/blurred leftover keeps
+        # reading zero and still dies, at most ~2 frames later than before; an empty real
+        # meter shows a nonzero fill within a frame or two and is then classified by the
+        # level band). Set to 1 to restore the instant-evict behaviour.
+        self._ghost_zero_evict_n = max(1, _inum('ORION_READER_GHOST_ZERO_EVICT_N', 3))
+        # GHOST IDENTITY RETIREMENT (2026-09-01): a quarantine belongs to one rendered
+        # leftover meter, not to a permanent court location. Two consecutive UNIQUE,
+        # fresh, FULL-frame locator verdicts with no meter prove that identity ended. The
+        # next meter may legitimately spawn in the same player-relative zone and must be
+        # judged as a new low/rising onset. Partial left/right scans never count as absence.
+        self._ghost_full_absence_results = max(
+            2, _inum('ORION_READER_GHOST_FULL_ABSENCE_RESULTS', 2))
+        self._press_low_seen = True     # no press yet -> guard idle until the first epoch
+        self._press_ghost_reads = _collections.deque(maxlen=max(
+            2, _inum('ORION_READER_GHOST_PRESS_FRAMES', 3)))
+        self._press_ghost_zone = None   # (cx, cy) of the quarantined leftover meter
+        self._press_ghost_level = None  # the leftover meter's own fill level (EMA)
+        self._press_ghost_zone_low_n = 0
+        self._press_ghost_zero_n = 0    # consecutive in-zone zero reads (zero-read hold)
+        self._press_ghost_full_nofind_n = 0
+        # EVICTION LOG IDEMPOTENCE (2026-08-30): the per-frame suppress+evict cycle is the
+        # mechanism (it frees the single locker so the real onset can be acquired the frame
+        # it renders), but logging EVERY cycle at ERROR spammed 336 lines / 62 presses
+        # through the throttled native relay (5.4 per press; epochs 29/30/56/61 logged every
+        # 15-20ms). Log the FIRST eviction of a press in full, again only when the zone
+        # centre moves >64px (a different object) or 0.5s passes, and emit ONE per-press
+        # summary carrying the totals when the guard stands down (or at the next press).
+        self._press_ghost_log_ts = -1.0e9
+        self._press_ghost_log_zone = None
+        self._press_ghost_evict_total = 0     # lifecycle resets this press
+        self._press_ghost_suppress_total = 0  # zero-read holds this press
+        self._press_ghost_summary_epoch = 0   # epoch the totals belong to
+        # [ORION_READER_COLD_FIRST_READ_VETO] COLD-LOCK FIRST-READ SANITY (2026-08-30,
+        # session_20260830_191051). A COLD lock's first 1-2 fill reads on a raw proposal
+        # box can measure garbage-HIGH before the box/denominator settles: measured live,
+        # stick-shot first locks published 72.6/73.6/77.4 then corrected to 11.8/13.5 one
+        # frame later (epochs 46/52; epoch 16 pre-press read 72.9 then 11.8). The engine's
+        # ownership anchor refuses an episode whose FIRST sight is > 40 (a shot first seen
+        # high was never seen starting), so one garbage frame killed those stick presses
+        # outright -- and the same 2-frame pre-identification window let epoch 18's SECOND
+        # leftover (a 44.8% aborted-shot ghost the press-time drop did not hold) reach the
+        # sampler and become a reservation that instantly missed its deadline.
+        # So: the first _cold_first_read_n reads of a COLD (not warm-reacquired) lock are
+        # NOT published when they measure >= _cold_first_read_pct (the engine's anchor
+        # bound: such a first sight is unownable anyway). The lock is KEPT -- read #2/#3
+        # publishes the corrected value, so a stick shot's first PUBLISHED sight is the
+        # ownable low read. A real onset (reads 0-10) is never touched, a warm mid-rise
+        # re-lock is exempt, and the ghost breaker runs FIRST (zone-following and eviction
+        # cadence unchanged). Fail-closed: this only ever WITHHOLDS frames the engine
+        # would refuse to anchor on.
+        self._cold_first_read_veto = _flag('ORION_READER_COLD_FIRST_READ_VETO', '1')
+        self._cold_first_read_n = max(1, _inum('ORION_READER_COLD_FIRST_READ_N', 2))
+        self._cold_first_read_pct = max(0.0, _fnum('ORION_READER_COLD_FIRST_READ_PCT', 40.0))
+        # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] PRESS-CLOCK SERVE PLAUSIBILITY (2026-08-31,
+        # live 04:51-04:54Z bout, epochs 32/50/51/58 = all four detector_authority_lost_abort).
+        # The leftover meter's FADE-OUT defeats the ghost guard's low-sighting model: as the
+        # alpha fade collapses the masked fill, the read DECLINES THROUGH the low band and
+        # manufactures exactly the "real onset" signature the guard trusts -- one low read
+        # (2.8/5.1/12.7/32.4 measured) stood the guard down, the very next read re-locked the
+        # fading leftover HIGH (63.2/94.3/51.4/56.2), the engine anchored its ownership on
+        # that trace, and the leftover then finished fading to 0.0 -> presence rejected ->
+        # authority lost, in every case BEFORE the real meter had even rendered (ownership at
+        # press_age 36-292ms vs the measured real-onset floor of ~400ms; capture+render alone
+        # is ~230ms, so NO real meter can be on screen that early).
+        #
+        # Two physical invariants close the hole, both press-scoped and inert once the press
+        # has seen its own genuine low (same fail-closed gate shape as the guards above):
+        #   * ONSET CLOCK -- a real meter cannot show fill F before the press clock allows it:
+        #     F <= first_margin + max_rate * (press_age - onset_floor). Fastest measured live
+        #     rate 0.2835 %/ms (cap 0.35 with headroom); earliest measured genuine ownership
+        #     226ms (floor 120ms with headroom; capture latency alone is ~230ms).
+        #   * RISE STEP -- an UPWARD jump between published serves that lands AT/ABOVE the
+        #     engine's 40% anchor bound and outruns max_rate*dt (+step margin) is a tracker
+        #     OBJECT SWITCH, never the same meter rising (the failures jumped
+        #     +38.7..+89.2pp in <=85ms, all landing 51-94). Jumps landing BELOW 40 are
+        #     always served: a genuine POP-IN serve out-steps the ribbon rate while the bar
+        #     itself is still growing (measured 0.59 pct/ms on real rises, epochs 25/26/40
+        #     of session_20260830_191051) but always lands low -- clamping those benched
+        #     three real shots in the replay A/B before this narrowing.
+        # A read that violates either is withheld; at/above the anchor bound the lock is
+        # also evicted (it is holding the single locker the real onset needs) and, on an
+        # onset-clock veto, the ghost quarantine is armed at its box so the fading object's
+        # follow-up reads are owned by the level-band machinery. The stand-down paths
+        # additionally demand a RISING pair (see _press_pair_min_rise_pp): two low reads
+        # that do not rise are a fade, not an onset. Real onsets are untouched: every
+        # genuine first serve measured tonight (3.0-38.7 at press_age 226-805ms) passes the
+        # clock with >=2x margin.
+        self._press_onset_plaus = _flag('ORION_READER_PRESS_ONSET_PLAUSIBILITY', '1')
+        self._press_max_rate_pct_ms = max(0.0, _fnum('ORION_READER_PRESS_MAX_RATE_PCT_MS', 0.35))
+        self._press_onset_floor_ms = max(0.0, _fnum('ORION_READER_PRESS_ONSET_FLOOR_MS', 120.0))
+        self._press_first_margin_pp = max(0.0, _fnum('ORION_READER_PRESS_FIRST_MARGIN_PP', 6.0))
+        self._press_step_margin_pp = max(0.0, _fnum('ORION_READER_PRESS_STEP_MARGIN_PP', 4.0))
+        self._press_pair_min_rise_pp = max(0.0, _fnum('ORION_READER_ONSET_PAIR_MIN_RISE_PP', 0.2))
+        self._press_last_pub_fill = None   # last PUBLISHED nonzero detector fill this press
+        self._press_last_pub_ts = None
+        self._press_onset_cand = None      # (fill, ts) sliding onset-pair candidate (both paths)
+        self._press_implausible_n = 0      # per-press veto count (flushed into the summary)
+        self._press_implausible_logged = False
+        self._press_rise_run = 0           # consecutive plausible rising published steps
+        # ------------------------------------------------------------------------------------ #
+        # LOCK LIFECYCLE (port of the retired meter_detector.py's ACQUIRE/KEEP/COAST/DROP,
+        # 2026-08-30). The owner's direction: "the meter detector previous to this one had all
+        # of this solved" -- its lifecycle was stable; only its colour-based LOCATING failed on
+        # the 2K27 white meter. Here YOLO (+ the region/size plausibility gate) IS the locator,
+        # and the retired lifecycle governs what a proposal may do:
+        #
+        #   ACQUIRE  a lock needs _det_acq_frames CONSISTENT fresh proposals (retired
+        #            _MIN_FRAMES=2: "2 locks at ~40% fill with ZERO new false-locks"), OR one
+        #            STRONG proposal paired with behavioural evidence (retired T-a4: "loc_strong
+        #            is NOT a standalone corroboration ... require it PAIRED with a behavioral
+        #            signal") -- our pairing is the PHYSICAL shot arm (a press just happened, a
+        #            meter is expected; the same signal sync-on-acquire already trusts), so the
+        #            armed first lock still lands on the onset frame (first-fill 0-10% today,
+        #            must not regress), OR a WARM re-acquire near a recently dropped lock
+        #            (retired _WARM_REACQ_S=1.2s: "a 1-2 frame dropout mid-rise doesn't leave
+        #            the rest of the rise blind re-proving itself").
+        #   KEEP     a fresh proposal within the tracking jump gate updates the lock; one that
+        #            TELEPORTS does NOT move it (retired MeterBoxKalman: "on 'reject' the
+        #            COASTED prediction is served, not the raw jump") -- it must win
+        #            _det_reseed_n mutually-consistent strikes first (retired 3-strike re-seed).
+        #            This kills the live 543px |dcx| box teleport and the off/on churn around it.
+        #   COAST    misses are bridged by the held+extrapolated box for _det_hold_s as today,
+        #            EXTENDED to _det_coast_max_s once the lock has PROVEN a rise (retired
+        #            peak-hold: at the cap the meter is hardest to detect exactly when the shot
+        #            matters most; _PEAK_HOLD_S=0.6 wall-clock bound so it can't hallucinate).
+        #   DROP     needs MORE evidence than keep (retired hysteresis: max_freeze_frames=10 /
+        #            low_conf_grace_frames=8): _det_nometer_drop consecutive fresh confident
+        #            no-meter results force the drop even inside the coast, so the veto's safety
+        #            property survives; a single no-meter blip no longer flickers the lock.
+        #
+        # ORION_METER_LIFECYCLE=0 restores the pre-port behaviour byte-for-byte.
+        self._det_lifecycle = _flag('ORION_METER_LIFECYCLE', '1')
+        self._det_state = 'idle'            # idle | pending | locked
+        self._det_streak = 0                # consecutive CONSISTENT fresh proposals (pending)
+        self._det_pend_box = None
+        self._det_pend_ts = -1.0e9
+        self._det_seen_dts = -1.0e9         # newest CONSUMED detector-result stamp: in async
+        #                                     mode latest() repeats one result across frames, and
+        #                                     counting it twice would fake a 2-frame streak.
+        self._det_nm_strikes = 0            # consecutive fresh no-meter results while locked
+        self._det_strike_box = None         # teleport re-seed candidate + count (3-strike)
+        self._det_strike_n = 0
+        self._det_lock_fill0 = None         # first fill of this lock (rise corroboration)
+        self._det_lock_fill_max = -1.0
+        self._det_lock_was_warm = False     # warm re-acquire -> first-read veto exempt
+        self._det_lock_read_n = 0           # fill reads served by THIS lock
+        # Monotonic identity for a lifecycle-approved detector lock.  The capless
+        # onset proof below must never combine measurements from two acquisitions,
+        # even when both happen to occupy nearly the same pixels.
+        self._det_lock_generation = 0
+        self._df_nogreen_key = None
+        self._df_nogreen_samples = []
+        self._det_last_presence = False     # last frame's box still measured a white ribbon
+        self._det_warm_pos = None           # where a lock was lost (warm re-acquire memory)
+        self._det_warm_ts = -1.0e9
+        self._det_emit = None               # smoothed EMIT state [cx, bottom, w, h] -- retired
+        #                                     _Tk kept RESPONSIVE matching state but emitted an
+        #                                     EMA'd, slew-capped box ("kills the box drift")
+        # 2 = retired _ParkTracker._MIN_FRAMES (5->2 measured: locks at ~40% fill, zero new
+        # false-locks; the spatial gates do the rejection, not a long wait).
+        self._det_acq_frames = max(1, _inum('ORION_METER_ACQ_FRAMES', 2))
+        # 0.55 = retired _LOC_STRONG_CONF (a conf>=0.55 learned-detector box was "the appearance
+        # proof the rise-check stands in for").
+        self._det_acq_strong = _fnum('ORION_METER_ACQ_STRONG_CONF', 0.55)
+        # 80px @720-wide reference, scaled by frame width = retired position_jump_max_px +
+        # _acq_jump_gate_px scaling. The outlier scale is 1.5 = the retired MeterBoxKalman's
+        # MOVEMENT gate (meter_detector.py ~4749: update_pose(..., _acq_jump_gate_px() * 1.5))
+        # -- the retired system had TWO gates and the validator's looser x3 only decided lock
+        # SURVIVAL, which strikes now govern; whether a measurement may MOVE the box was always
+        # the tighter 1.5x (~213px @1280), and real motion is ~9-13px/frame, far inside it.
+        self._det_jump_base = _fnum('ORION_METER_JUMP_GATE_PX', 80.0)
+        self._det_track_scale = _fnum('ORION_METER_OUTLIER_JUMP_SCALE', 1.5)
+        self._det_reseed_n = max(1, _inum('ORION_METER_RESEED_STRIKES', 3))
+        # 3 fresh full-frame "no meter anywhere" verdicts to drop a held lock. The retired
+        # detector granted 8-10 frames of grace on a mere CONTOUR miss; a trained detector's
+        # explicit no-find is much stronger evidence, so 3 is already conservative -- and it is
+        # deliberately MORE than the acquire streak (2), the drop-harder-than-keep hysteresis.
+        self._det_nm_drop = max(1, _inum('ORION_METER_NOMETER_DROP', 3))
+        # 0.6s = retired _PEAK_HOLD_S (RC-3 wall-clock bound on the post-peak coast).
+        self._det_coast_max_s = max(0.0, _fnum('ORION_METER_COAST_MAX_S', 0.6))
+        # 8pp fill rise to earn the extended coast ~= retired _RISE_MIN=8px on the ~107px bar
+        # (the peak-hold latch demanded a PROVEN rise so static decor never earns the hold).
+        self._det_coast_rise_pp = _fnum('ORION_METER_COAST_RISE_MIN_PP', 8.0)
+        self._det_warm_s = max(0.0, _fnum('ORION_METER_WARM_REACQ_S', 1.2))
+        # PARTIAL-OCCLUSION FILL RECOVERY.  The locator/lifecycle owns *whether* a
+        # meter exists; this path only recovers *where the white fill edge is* when
+        # a foreground limb masks enough of the ribbon that the ordinary row-mean
+        # walk falls below its 28% width threshold.  It is deliberately incapable
+        # of cold acquisition: recovery requires a current hardware-shot epoch, a
+        # lifecycle-approved lock, structure proof for that same epoch, three
+        # recent direct rising reads, and surviving bottom-connected meter pixels.
+        # Recovered reads never refresh their own deadline/history, so a stale box
+        # or a fully hidden meter expires after this short wall-clock budget.
+        self._det_occ_fill = _flag('ORION_METER_PARTIAL_OCCLUSION', '1')
+        self._det_occ_max_gap_s = min(0.25, max(
+            0.0, _fnum('ORION_METER_PARTIAL_OCCLUSION_MAX_MS', 120.0) / 1000.0))
+        self._det_occ_negative_bridge_s = min(0.045, max(
+            0.0, _fnum('ORION_METER_NEGATIVE_BRIDGE_MAX_MS', 45.0) / 1000.0))
+        self._det_occ_min_direct = max(
+            3, _inum('ORION_METER_PARTIAL_OCCLUSION_MIN_DIRECT', 3))
+        self._det_occ_min_cols = max(
+            2, _inum('ORION_METER_PARTIAL_OCCLUSION_MIN_COLS', 2))
+        self._det_occ_direct = _collections.deque(maxlen=8)
+        self._det_occ_key = None
+        # Verdict from the newest unique locator result.  A new full-frame
+        # negative, stale result, refused proposal, or pre-arm result clears it;
+        # repeated reads of one still-fresh accepted positive leave it set.
+        self._det_occ_locator_source_positive = False
+        self._det_occ_recovered = False
+        self._det_occ_support = 0.0
+        self._det_occ_kind = ""
+        self._det_occ_censored_reject = False
+        self._det_occ_current_full_negative = False
+        self._det_occ_current_source_age = float("inf")
+        self._det_occ_negative_bridge_used = False
+        # 8px/frame emit slew = retired _Tk.add's display cap ("a ~50px 1-frame contour-SPLIT
+        # spike can't stride the box"); the NCC-matched position bypasses the cap exactly as the
+        # retired template match wrote cx_emit directly (0.12px MAE beats any smoothing).
+        self._det_emit_slew = _fnum('ORION_METER_EMIT_SLEW_PX', 8.0)
+        # Live health counters (see the throttled DETECTOR HEALTH log in detect()).
+        self._det_diag = {"calls": 0, "found": 0, "fresh": 0, "seeded": 0,
+                          "vetoed": 0, "stale": 0, "nofound": 0, "sync_acq": 0,
+                          "priority_acq": 0,
+                          "lock": 0, "drop": 0, "reseed": 0, "outlier": 0,
+                          "rescue": 0, "rescue_seat": 0,
+                          "scan_full": 0, "scan_full_hit": 0,
+                          "scan_left": 0, "scan_left_hit": 0,
+                          "scan_right": 0, "scan_right_hit": 0,
+                          "scan_partial_miss": 0, "occlusion_fill": 0,
+                          "occlusion_top": 0, "occlusion_negative": 0,
+                          "occlusion_reject": 0}
+        self._det_diag_last = 0.0
+        if _flag('ORION_METER_DETECTOR', '0'):
+            try:
+                import meter_detector_yolo as _mdy
+                self._meter_detector = _mdy.get_async_locator()
+                # ERROR level so the native relay does not throttle this away; it is a
+                # one-line load record, not spam. Reports the actual ORT provider so a
+                # silent CPU fallback (which would run ~174 ms and starve the seed) is visible.
+                _acq_logger.error(
+                    "METER DETECTOR load: ok=%s provider=%s model=%s gpu_prep=%s%s",
+                    self._meter_detector is not None,
+                    getattr(self._meter_detector, "provider", "?"),
+                    getattr(getattr(self._meter_detector, "_base", None), "model_path", "?"),
+                    getattr(getattr(self._meter_detector, "_base", None), "_prep_sess", None) is not None,
+                    ("" if getattr(getattr(self._meter_detector, "_base", None), "_prep_sess", None) is not None
+                     else " (%s)" % getattr(getattr(self._meter_detector, "_base", None), "_prep_disabled", "?")))
+            except Exception as _e:
+                self._meter_detector = None
+                try:
+                    _acq_logger.error("METER DETECTOR load FAILED: %r", _e)
+                except Exception:
+                    pass
         # (3b) FAKE-LOCK / DEAD-HOLD breaker (default ON): suppress a detection whose REPORTED fill
         # is byte-identical for longer than a physical hold (static red dÃ©cor / stuck hold). Caps are
         # frames @ the mid-fill / near-tip tiers. DEFAULT-OFF: it catches the real 222-frame dead-holds
@@ -1953,6 +2873,38 @@ class SimpleMeterReader:
             'ORION_READER_BOX_TIGHT_SIDE_FRAC', 0.625)))
         self._tight_vpad_frac = min(0.5, max(0.0, _fnum(
             'ORION_READER_BOX_TIGHT_VPAD_FRAC', 0.045)))
+        # DISPLAY VERTICAL HUG CLAMP (2026-08-31, session_20260831_114137). Max px
+        # the DRAWN box may extend beyond the served box, above the top and below the
+        # base. The served box wraps the meter cap->chevron on 100% of frames (its
+        # height never moves >6px), but the mode-2 pre-latch `pre` union and the
+        # translate-branch top_row raise intermittently ran the drawn top 44-66px
+        # above it onto the wall seam behind the meter (and, less often, the base
+        # 24-32px below it, or floated the whole box off the meter on a stale
+        # translate offset), toggling the drawn height 120<->176 on 9.3% of detected
+        # frames -- the "flicker" the owner reports. The correct reference-hug sits
+        # 0-15px past each served edge (bimodal, gap 15-30), so 18 is inert on every
+        # correct frame and pulls only the over-reach / float-off back to a hug.
+        # Env-tunable; a negative TOP value disables the whole clamp. The clamp only
+        # trusts the served box as the meter when the served box is itself
+        # meter-plausibly tall (>= HUG_MIN_FRAC of the frame height, ~40px @720p);
+        # below that the served box is a bar-only stub and mode-2's design of
+        # UNIONING a taller reconstructed track is left intact, never clipped. In
+        # practice detect() passes the STABILIZED full-meter box (measured ~106px,
+        # min 104 on session_20260831_114137), so the gate is live on every real
+        # frame and only spares the synthetic short-stub case.
+        self._tight_top_reach = _inum('ORION_READER_BOX_TIGHT_TOP_REACH', 18)
+        self._tight_bot_reach = _inum('ORION_READER_BOX_TIGHT_BOT_REACH', 18)
+        # Horizontal twin of the vertical hug clamp.  A fresh colour-path source
+        # can disagree with the detector-authoritative full-meter box (for example,
+        # a red court/decor column while detector_fill remains locked on the real
+        # meter).  Without an x-axis bound that unrelated source can move the drawn
+        # box hundreds of pixels away even though fill/timing stayed healthy.  Keep
+        # the reference air when it is local, but never let presentation abandon the
+        # served meter span.  Negative disables only the horizontal half; the legacy
+        # negative TOP_REACH still disables the entire hug clamp below.
+        self._tight_side_reach = _inum('ORION_READER_BOX_TIGHT_SIDE_REACH', 18)
+        self._tight_hug_min_frac = min(0.5, max(0.0, _fnum(
+            'ORION_READER_BOX_TIGHT_HUG_MIN_FRAC', 0.055)))
         # ------------------------------------------------------------------ #
         #  ORION_READER_PERF: the two OUTPUT-IDENTICAL latency sheds (S1+S2,
         #  spec docs/ORION_PERF_AND_CROSSING_SPEC.md Part A). The reader's
@@ -2360,15 +3312,75 @@ class SimpleMeterReader:
         # first cap-less frames instead of emitting a confidently-wrong number.
 
     def reset_tracking(self):
-        """Drop stale tracking (orch update_meter calls this on a colour change)."""
+        """End a source/profile epoch, not an ordinary per-shot lock.
+
+        Session rulers reduce shot-to-shot jitter only for the SAME meter. A new
+        source, geometry or profile must not inherit its box/base offset, warm
+        lock, template or an in-flight locator result from the previous one.
+        """
+        reset_locator = getattr(self._meter_detector, "reset", None)
+        if callable(reset_locator):
+            reset_locator()  # generation fence; no wait for in-flight inference
         self._clear_gameplay_structure_proof()
         self._reset_state()
+        self._det_reset_lock_state()
+        self._det_active_box = None
+        self._det_warm_pos = None
+        self._det_warm_ts = -1.0e9
+        self._det_seen_dts = -1.0e9
+        self._det_no_meter = False
+        self._det_region = None
+        self._det_priority_epoch = None
+        self._det_priority_pending_ts = -1.0e9
+        self._det_hot_epoch = None
+        self._det_hot_open_ts = -1.0e9
+        self._det_last_sync_acq = -1.0e9
+        self._det_acq_scan_epoch = None
+        self._det_acq_scan_index = 0
+        self._det_acq_last_side = None
+        self._det_acq_scan_last = 'full'
+        self._det_pixel_span_hist.clear()
+        self._det_pixel_ruler_epoch += 1
+        self._subpx_ruler_hist = []
+        self._subpx_ruler_kind = ""
+        self._last_subpx_transform = None
+        self._dbg_subpx = None
+        # Preserve the monotonic counter so native never joins two source rulers.
+        self._fill_estimator_identity = None
+        self._last_fill_estimator_mode = ""
+        self._last_fill_estimator_generation = 0
+        self._arm_edge_mask = None
+        self._arm_edge_mask_epoch = 0
+        self._scan_raw_key = None
+        self._scan_raw = None
+        self._capless_since = None
+        self._capless_hist.clear()
+        self._prob_refuse_n = 0
         # A colour/style change is a NEW METER, not a re-acquire of the same one -> end the epoch.
         # Deliberately NOT called from the confidence-decay lock-drop path, which keeps the scale
         # (same meter, same size, it will be back).
         self.reset_session_scale()
         # B9b: ...and a DIFFERENT meter invalidates the measured scale the micro gate reads.
         self._sess_track_h = []
+        self._tracking_meter_style = str(
+            getattr(self._cfg, "meter_style", "") or "").strip().casefold()
+        # reload_config rebuilt the bands; same-sized colour changes must also
+        # refresh colour-specific width/green-cap floors, not keep the old ones.
+        self._recompute_scale()
+
+    def _prepare_frame_geometry(self, frame):
+        """Refresh size-dependent priors before either production or legacy read.
+
+        detect() can bypass read() on the detector-fill path, so both entry points
+        call this idempotent helper. Same-size frames never discard calibration.
+        """
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        if (height, width) == (self.H, self.W):
+            return
+        if self.H and self.W:
+            self.reset_tracking()
+        self.H, self.W = height, width
+        self._recompute_scale()
 
     # scaled geometry priors for the live capture size (identity at 1920x1080)
     def _recompute_scale(self):
@@ -2565,6 +3577,12 @@ class SimpleMeterReader:
         a widen (the nominal area is always still scanned), it requires a live lock
         (self.box -- a cold/off-shot frame never widens, so no off-shot dÃ©cor area is ever
         admitted) and a floor comfortably inside the band never triggers it."""
+        # DETECTOR REGION: when the trained detector has located the meter this frame, every
+        # colour search (cold acquire, steal, tracking bounds) is confined to that box so read()
+        # cannot re-lock décor it cannot tell from a white meter. Overrides the nominal band and
+        # the vzoom shift for this frame; None (detector off/stale) -> shipped behaviour.
+        if getattr(self, "_det_region", None) is not None:
+            return self._det_region
         if not self._vzoom or self._vz_ref is None:
             return self._band
         if self.box is None and self._vz_ref_age > self._vzoom_ref_frames:
@@ -3046,7 +4064,7 @@ class SimpleMeterReader:
         ty = max(bnd[1], min(ty, max(bnd[1], bnd[3] - th)))
         return [tx, ty, tw, th]
 
-    def _tight_display_box(self, bbox, top_row=-1):
+    def _tight_display_box(self, bbox, top_row=-1, h_cap=0):
         """BOX-TIGHT (ORION_READER_BOX_TIGHT): re-shape the outgoing bbox so the drawn
         overlay hugs the meter, not the presentation envelope. Called ONLY at the detect()
         production boundary, AFTER the frame's dict is final -- no internal state
@@ -3104,6 +4122,21 @@ class SimpleMeterReader:
                 vpad = max(1, int(round(self._tight_vpad_frac * max(1, bot - top))))
                 top -= vpad
                 bot += vpad
+                # DETECTOR-FILL HEIGHT CLAMP (2026-08-30). On a detector_fill frame the
+                # SERVED box is already the meter's full tip-to-base extent, so the
+                # legitimate mode-2 height is <= ~1.25x of it (track + 4.5% vpad).
+                # Under a meter_color drift, read()'s red-masked path latches decor and
+                # hands _tight_src a track candidate spanning most of the frame --
+                # measured live (session_20260830_112306, meter_color=Red vs the white
+                # meter): 227 frames served 29x320..556 rectangles while the emitted
+                # fill (detector-authoritative) read fine. The engine consumes this
+                # rectangle (geometry continuity / meter_x/meter_y), so cap the
+                # vertical extent at h_cap anchored on the served box; the never-shrink
+                # containment below then applies to a sane extent. h_cap==0 (colour
+                # path, where a short bar legitimately unions a taller track) is inert.
+                if h_cap > 0 and (bot - top) > h_cap:
+                    top = out[1] - max(0, (h_cap - out[3]) // 2)
+                    bot = top + h_cap
                 self._tight_wh_hist.append((right - left, bot - top))
                 ws = sorted(p[0] for p in self._tight_wh_hist)
                 hs = sorted(p[1] for p in self._tight_wh_hist)
@@ -3112,9 +4145,10 @@ class SimpleMeterReader:
                 tight = [int(round(ctr - 0.5 * w_d)), int(round(bot - h_d)),
                          int(w_d), int(h_d)]
                 l2 = min(tight[0], cx)
-                t2 = min(tight[1], bar_top)
+                t2 = min(tight[1], bar_top if h_cap <= 0 else max(bar_top, top))
                 r2 = max(tight[0] + tight[2], cx + cw)
-                b2 = max(tight[1] + tight[3], bar_bot)
+                b2 = max(tight[1] + tight[3], bar_bot if h_cap <= 0
+                         else min(bar_bot, bot))
                 tight = [l2, t2, r2 - l2, b2 - t2]
             else:
                 tight = [int(cx), int(bar_top), int(cw), int(bar_bot - bar_top)]
@@ -3125,10 +4159,72 @@ class SimpleMeterReader:
             if top_row >= 0 and tight[1] > int(top_row):
                 tight[3] = tight[1] + tight[3] - int(top_row)
                 tight[1] = int(top_row)
+            # TRANSLATED-SHAPE HEIGHT CLAMP (2026-08-30, session_20260830_191051): the
+            # detector-fill h_cap above only bounded the FRESH branch; this translate
+            # branch re-served a poisoned remembered shape (or a bogus top_row from the
+            # White track-top search running up a bright wall seam) unbounded -- live
+            # epochs 16/32/41/42 published 25x349..420 rectangles (bottom anchored on the
+            # real meter, top ~230px up the wall) for 100-200ms right after the cold
+            # post-ghost acquire. The engine consumes this rectangle (meter_x/meter_y
+            # continuity), read it as a teleport (meter_jump 0.16-0.26) and distrusted
+            # the early rise -- reservation validation late by ~200ms on the two
+            # live_tip_deadline_missed shots. Clamp BOTTOM-ANCHORED: the bar base was the
+            # measured-stable edge on every tall live frame, the wandering top is the
+            # artefact. h_cap==0 (colour path) stays inert, matching the fresh branch.
+            if h_cap > 0 and tight[3] > h_cap:
+                tight[1] = tight[1] + tight[3] - h_cap
+                tight[3] = h_cap
         else:
             return out
         if tight[2] <= 0 or tight[3] <= 0:
             return out
+        # DISPLAY VERTICAL HUG CLAMP (2026-08-31, session_20260831_114137). The
+        # round-2 h_cap clamps above bound the drawn height at 1.6x the served box,
+        # but 1.6x is looser than the reference-hug's OWN legitimate extent (that
+        # clamp's comment states "<= ~1.25x of it (track + 4.5% vpad)"), so it still
+        # permits the mode-2 pre-latch `pre` union (fresh branch) and the top_row
+        # raise (translate branch) to run the DRAWN top 44-66px ABOVE the served
+        # meter box onto the wall seam / court behind it, the base 24-32px BELOW it,
+        # or -- on a stale translate offset -- to float the whole box off the meter.
+        # Measured on the byte-identical (ORION_METER_DETECTOR_SYNC) replay of this
+        # session's raw frames: the served box `out` hugs the green cap->chevron on
+        # 100% of frames and its height never moves >6px, while the DRAWN height
+        # toggled 120<->176 on 349/3755 detected frames (9.3%), jumping >=15px
+        # frame-to-frame on 2.6% -- exactly the vertical flicker the owner sees.
+        # Force the drawn box to COVER the served meter span [out_top, out_bot] and
+        # to extend no further than `_tight_top_reach` above / `_tight_bot_reach`
+        # below it: an over-reaching edge is pulled in, a floated-off edge is pushed
+        # out to re-hug. The correct reference-hug already sits 0-15px past each
+        # served edge (bimodal, clean 15-30px gap), so 18 (~= the round-2 clamp's own
+        # 1.25x for a ~107px meter) is inert on every correct frame. Applies on BOTH
+        # paths (the emit stage here is detector_fill, h_cap>0), anchored on `out`,
+        # the reliable served box on both -- the YOLO/served meter box, never the
+        # decor-poisoned `pre` the round-2 clamp guarded against. Because the drawn
+        # box always contains [out_top, out_bot] and the fill lives inside `out`, a
+        # rising bar can never be clipped. DISPLAY-ONLY: `out` (the served/engine
+        # box) and every timing sample (fill/velocity/green) are already final and
+        # unchanged at this production boundary.
+        _hug_min_h = int(self._tight_hug_min_frac * self.H) if self.H else 0
+        if (self._tight_top_reach >= 0 and out[3] > _hug_min_h):
+            _o_left = out[0]
+            _o_right = out[0] + out[2]
+            _o_top = out[1]
+            _o_bot = out[1] + out[3]
+            _t_right = tight[0] + tight[2]
+            _t_bot = tight[1] + tight[3]
+            if self._tight_side_reach >= 0:
+                _n_left = min(
+                    _o_left,
+                    max(tight[0], _o_left - int(self._tight_side_reach)))
+                _n_right = max(
+                    _o_right,
+                    min(_t_right, _o_right + int(self._tight_side_reach)))
+                tight[0] = _n_left
+                tight[2] = max(1, _n_right - _n_left)
+            _n_top = min(_o_top, max(tight[1], _o_top - int(self._tight_top_reach)))
+            _n_bot = max(_o_bot, min(_t_bot, _o_bot + int(self._tight_bot_reach)))
+            tight[1] = _n_top
+            tight[3] = max(1, _n_bot - _n_top)
         if self.W and self.H:
             tight[2] = max(1, min(tight[2], int(self.W)))
             tight[3] = max(1, min(tight[3], int(self.H)))
@@ -3154,11 +4250,14 @@ class SimpleMeterReader:
         if armed_hw is not None:
             next_hw = bool(armed_hw)
             if self._shot_armed_hw and not next_hw:
+                self._close_epoch_census("hw_disarm")
                 self._clear_gameplay_structure_proof()
                 self._physical_shot_epoch = 0
                 self._clear_micro_candidate()
             self._shot_armed_hw = next_hw
         elif not armed:
+            if self._shot_armed_hw:
+                self._close_epoch_census("full_disarm")
             self._shot_armed_hw = False   # a full disarm always closes the hw window too
             self._clear_gameplay_structure_proof()
             self._physical_shot_epoch = 0
@@ -3167,6 +4266,132 @@ class SimpleMeterReader:
     def _clear_gameplay_structure_proof(self) -> None:
         self._gameplay_structure_verified = False
         self._gameplay_structure_proof_epoch = 0
+        # A proof clear is an epoch/identity boundary.  In particular,
+        # notify_physical_shot_start clears this before installing the next epoch;
+        # capless rise evidence from the previous press must not survive it.
+        self._reset_detfill_nogreen_evidence()
+
+    def _close_epoch_census(self, reason: str) -> None:
+        """STRUCTURE NECROPSY (see __init__): one ERROR line when a hw epoch that saw
+        detected frames closes without EVER latching the structure proof -- the exact
+        silent-shot signature the engine logs as ownership_structure_stamp_missing.
+        Pure diagnostics; resets the census either way."""
+        c = self._ep_census
+        try:
+            if (int(c.get("epoch", 0)) > 0 and int(c.get("emit_det", 0)) >= 10
+                    and not c.get("latched")):
+                _acq_logger.error(
+                    "STRUCTURE NECROPSY epoch=%d (%s): never latched under this press"
+                    " - emit_det=%d qual_det=%d qual_green=%d max_fresh_up=%d"
+                    " authorized_frames=%d last_stage=%s color=%s det_state=%s"
+                    " (qual_det=0 with emit_det>0 => read()'s colour path starved"
+                    " the latch: check meter_color vs the on-screen meter)",
+                    int(c.get("epoch", 0)), str(reason), int(c.get("emit_det", 0)),
+                    int(c.get("qual_det", 0)), int(c.get("green", 0)),
+                    int(c.get("max_fresh_up", 0)), int(c.get("authorized", 0)),
+                    str(c.get("last_stage", "") or "-"),
+                    str(getattr(self, "_meter_color", "?")),
+                    str(getattr(self, "_det_state", "?")))
+        except Exception:
+            pass
+        self._ep_census = {"epoch": 0, "emit_det": 0, "qual_det": 0, "green": 0,
+                           "max_fresh_up": 0, "latched": False, "authorized": 0,
+                           "last_stage": ""}
+
+    def _clear_per_shot_rise_evidence(self) -> None:
+        """Drop the RISE evidence of the previous press so the next one can re-prove itself.
+
+        THE SILENT-SHOT BUG (measured 2026-08-29: 11 of 19 presses produced no fire, no abort,
+        no log at all). Clearing the structure proof at a press is not enough, because the proof
+        can only be RE-LATCHED while `monotonic_rise` holds -- and monotonic_rise is computed
+        from evidence that spans the press when the lock BRIDGES it. A bridged lock carries the
+        previous shot's tail (90-95%) or the inter-shot plateau (~42-47%) in its fill history, so
+        the new meter starting at 0 reads as a DROP, not a rise: rise_state leaves "rising",
+        `_fresh_up_n` is starved, no latch fires, and AutomationEngine discards every ownership
+        frame on the stamp clause -- silently, since no episode ever opens (see the census the
+        engine now emits as `ownership_structure_stamp_missing`).
+
+        The engine's requirement is explicit: publish gameplay_structure_verified with
+        gameplay_structure_epoch == N on the fresh rise frames of press N, BEFORE fill crosses
+        ~40% (~250-300ms of the ~650ms rise). That is only reachable if the rise counters start
+        from this shot's own frames.
+
+        STATUS (be honest): this is PRINCIPLED but UNVALIDATED. A synthetic bridged-press replay
+        (shot A to peak -> new press while the lock is held at 0% -> shot B's rise) latches proof
+        at frame 1 / 14.9% fill BOTH with and without this reset, so it does not reproduce the
+        live failure and this change is not proven to fix it. It is kept because rise evidence
+        crossing a press boundary is wrong on its own terms -- the same reason the structure
+        proof beside it is cleared here. `_peak_fill` was deliberately left OUT of the reset: it
+        feeds other peak/stale logic and clearing it was not justified by any evidence. The
+        engine's new per-press census (`ownership_structure_stamp_missing`, with
+        `stamp_epoch_seen` = 0 vs N-1) will name the real upstream mode on the next live run.
+
+        Scope: per-shot EVIDENCE only. Pixel/tracker state (box/tmpl/conf) is deliberately left
+        alone -- the bridge-vs-cold-acquire policy remains its sole owner, exactly as
+        notify_physical_shot_start documents -- so this narrows what crosses a press without
+        dropping a lock that is still on the meter. Fail-closed: it can only DELAY proof, never
+        manufacture it; every engine gate (3 unique frames, first sight <= 40%, >= 3.0pp rise,
+        live current-epoch stick-up) is untouched.
+        """
+        # A validated sub-pixel D/off describes the physical meter scale, not rise
+        # evidence.  Preserve it across a bridged press and guard it against the first
+        # new-shot box height in _measure_fill_in_box.  Base positions are temporal and
+        # must never cross the press, so their history is still cleared.
+        _carry_subpx = (getattr(self, "_subpx_D", None) is not None
+                        and getattr(self, "_subpx_off", None) is not None)
+        if not _carry_subpx:
+            self._subpx_D = None; self._subpx_provisional = False
+            self._subpx_off = None
+        self._subpx_carry_pending = bool(_carry_subpx)
+        self._subpx_camera_ref = None
+        self._subpx_camera_scale = 1.0
+        self._det_scale_reference = None
+        self._det_scale_pending = None
+        self._det_track_scale_match = None
+        self._last_subpx_transform = None
+        for _attr, _val in (("_fresh_up_n", 0),
+                            ("_fresh_prev_fill", None),
+                            ("_fresh_rise_left", 0),
+                            ("_fresh_lock_streak", 0),
+                            # detector-fill chevron streak: green seen under the OLD
+                            # press must not seed the new press's structure latch
+                            ("_df_green_streak", 0),
+                            ("_static_fill_n", 0),
+                            ("_rep_fill_prev", None),
+                            ("_rise_recent_n", 0),
+                            ("_lock_ever_rose", False),
+                            ("_subpx_seed", []),
+                            ("_subpx_base_hist", []),
+                             # Coarse detector-box scale is shot/lock scoped too.
+                             # Clearing only the reference makes the next valid
+                             # coarse sample mint a distinct local ruler epoch.
+                             ("_coarse_denom_ref", None)):
+            if hasattr(self, _attr):
+                try:
+                    setattr(self, _attr, _val)
+                except Exception:
+                    pass
+        _hist = getattr(self, "_rep_fill_hist", None)
+        if _hist is not None:
+            try:
+                _hist.clear()
+            except Exception:
+                pass
+        _occ_hist = getattr(self, "_det_occ_direct", None)
+        if _occ_hist is not None:
+            try:
+                _occ_hist.clear()
+                self._det_occ_key = None
+                self._det_occ_locator_source_positive = False
+                self._det_occ_recovered = False
+                self._det_occ_support = 0.0
+                self._det_occ_kind = ""
+                self._det_occ_censored_reject = False
+                self._det_occ_current_full_negative = False
+                self._det_occ_current_source_age = float("inf")
+                self._det_occ_negative_bridge_used = False
+            except Exception:
+                pass
 
     def _latch_gameplay_structure_proof(self, shot_epoch) -> None:
         """Attach structural evidence to its captured epoch, never the mutable current epoch."""
@@ -3177,6 +4402,9 @@ class SimpleMeterReader:
         self._gameplay_structure_proof_epoch = (
             parsed_epoch if 0 < parsed_epoch <= 0xFFFFFFFFFFFFFFFF else 0)
         self._gameplay_structure_verified = self._gameplay_structure_proof_epoch != 0
+        if (self._gameplay_structure_verified
+                and self._ep_census.get("epoch") == self._gameplay_structure_proof_epoch):
+            self._ep_census["latched"] = True
 
     def notify_physical_shot_start(self, shot_epoch=0) -> None:
         """Start a new hardware-owned shot even if the prior arm window is still open.
@@ -3192,7 +4420,9 @@ class SimpleMeterReader:
         # Clear proof BEFORE installing the new identity. The stdin/control thread may run
         # between detector bytecodes; this ordering can expose false/old or false/new, never
         # a prior proof paired to the new shot epoch.
+        self._close_epoch_census("next_press")
         self._clear_gameplay_structure_proof()
+        self._clear_per_shot_rise_evidence()
         self._clear_micro_candidate()
         # [ORION_READER_POST_RELEASE_YIELD] an explicit new shot identity ends the
         # post-release window exactly like the read()-side arm edge does.
@@ -3206,6 +4436,7 @@ class SimpleMeterReader:
         _prev_epoch = int(getattr(self, "_physical_shot_epoch", 0) or 0)
         self._physical_shot_epoch = (
             parsed_epoch if 0 < parsed_epoch <= 0xFFFFFFFFFFFFFFFF else 0)
+        self._ep_census["epoch"] = int(self._physical_shot_epoch)
         # STALE-LOCK DROP AT THE PRESS.
         #
         # This method deliberately leaves pixel/tracker state intact (see the
@@ -3228,13 +4459,67 @@ class SimpleMeterReader:
         # the ordinary cold acquire on the real rise. Self-limiting: it only
         # fires on a genuine new epoch that inherited a high fill, which is
         # exactly the poisoning case, and never touches a low/rising lock.
+        # [ORION_READER_GHOST_PRESS_BREAK] Arm the per-press ghost guard (see __init__): a new
+        # epoch has, by definition, not yet seen its own meter low. Consumed by the post-press
+        # breaker at the production boundary; inert once the low sighting disarms it.
+        if self._physical_shot_epoch != 0 and self._physical_shot_epoch != _prev_epoch:
+            # Flush the PREVIOUS press's eviction summary if its guard never stood down
+            # (window expired with the leftover still on screen) -- exactly one summary
+            # line per press either way.
+            self._ghost_press_flush_summary("window_end")
+            self._press_low_seen = False
+            self._press_ghost_reads.clear()
+            self._press_ghost_zone = None
+            self._press_ghost_level = None
+            self._press_ghost_zone_low_n = 0
+            self._press_ghost_zero_n = 0
+            self._press_ghost_full_nofind_n = 0
+            self._press_ghost_log_ts = -1.0e9
+            self._press_ghost_log_zone = None
+            self._press_ghost_summary_epoch = int(self._physical_shot_epoch or 0)
+            # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] fresh press -> fresh serve clock
+            self._press_last_pub_fill = None
+            self._press_last_pub_ts = None
+            self._press_onset_cand = None
+            self._press_implausible_n = 0
+            self._press_implausible_logged = False
+            self._press_rise_run = 0
+        # ROBUST held fill: the ghost's read flickers to 0.0 on pan-blurred frames (measured
+        # epochs 41/45: 0.00 at the press instant, 88.9/45.1 one frame later), so judge the
+        # recent nonzero detector-fill history alongside the instantaneous value. The history
+        # deque is pruned to ~0.5s by the detector-fill path, so it cannot resurrect a meter
+        # from a previous shot cycle.
+        _detector_holds_lock = bool(
+            getattr(self, "_det_state", "idle") == "locked"
+            or getattr(self, "_det_active_box", None) is not None)
+        # Native ownership consumes detector-fill's row-quantized value.  Stale/bridge
+        # classification must use that same ruler: a 41.5 sub-pixel / 38.7 coarse sample
+        # is ownable, so it must bridge rather than seed a high-fill quarantine here.
+        _held_now = float(getattr(
+            self, "last_coarse" if _detector_holds_lock else "last_fill", 0.0) or 0.0)
+        _held_recent = 0.0
+        try:
+            _held_hist = (self._det_coarse_fill_hist
+                          if _detector_holds_lock else self._det_fill_hist)
+            for _, _hf in _held_hist:
+                if float(_hf) > _held_recent:
+                    _held_recent = float(_hf)
+        except Exception:
+            _held_recent = 0.0
+        _held_lock = (self.box is not None
+                      or getattr(self, "_det_last_box", None) is not None
+                      or getattr(self, "_det_state", "idle") == 'locked')
         if (self._stale_press_drop_pct > 0.0
                 and self._physical_shot_epoch != 0
                 and self._physical_shot_epoch != _prev_epoch
-                and self.box is not None
-                and float(getattr(self, "last_fill", 0.0) or 0.0)
-                >= self._stale_press_drop_pct):
-            _stale_fill = float(getattr(self, "last_fill", 0.0) or 0.0)
+                and _held_lock
+                and max(_held_now, _held_recent) >= self._stale_press_drop_pct):
+            _stale_fill = max(_held_now, _held_recent)
+            # Captured BEFORE the clears below zero it: the quarantine zone needs the
+            # dropped lock's position whichever side (detector lifecycle or colour
+            # reader) was holding it.
+            _zb = (getattr(self, "_det_last_box", None)
+                   or getattr(self, "box", None))
             self.conf = 0.0
             self.box = None
             self.tmpl = None
@@ -3242,6 +4527,30 @@ class SimpleMeterReader:
             self._peak_fill = 0.0
             self._coast_n = 0
             self._capless_since = None
+            # The detector lifecycle holds its own copy of the lock (state/box/history) and
+            # re-seats self.box from it one frame later, which made the original drop a
+            # single-frame no-op under detector-authoritative serving. The lifecycle dies
+            # with the lock -- and WITHOUT arming the warm re-acquire memory, which would
+            # re-latch the same ghost within its 1.2s window.
+            try:
+                # Seed the quarantine zone from the dropped lock's position (captured
+                # above): we KNOW where the leftover meter is (we just dropped it for
+                # holding a high fill at a fresh press), so post-press relocks there are
+                # suppressed immediately instead of publishing 2-3 noisy reads first
+                # (the false-episode source measured in the replay A/B).
+                if self._ghost_press_break and _zb is not None:
+                    self._press_ghost_zone = (float(_zb[0]) + float(_zb[2]) * 0.5,
+                                              float(_zb[1]) + float(_zb[3]) * 0.5)
+                    self._press_ghost_level = float(_stale_fill)
+                    self._press_ghost_zone_low_n = 0
+                    self._press_ghost_zero_n = 0
+                    self._press_ghost_full_nofind_n = 0
+                self._det_reset_lock_state()
+                self._det_warm_pos = None
+                self._det_warm_ts = -1.0e9
+                self._det_active_box = None
+            except Exception:
+                pass
             # Name it in the log. Offline replay could NOT reproduce the stale
             # state this fixes (the harness's synthetic presses do not align with
             # real shot cycles), so the live log is the only arbiter of whether
@@ -3251,6 +4560,50 @@ class SimpleMeterReader:
                 "STALE LOCK DROPPED AT PRESS: epoch=%d held_fill=%.1f%% (>= %.1f%%) "
                 "- the engine would have refused to own this shot",
                 self._physical_shot_epoch, _stale_fill, self._stale_press_drop_pct)
+        elif (self._press_onset_plaus and self._ghost_press_break
+                and self._physical_shot_epoch != 0
+                and self._physical_shot_epoch != _prev_epoch
+                and _held_lock
+                and 0.0 < max(_held_now, _held_recent) < self._stale_press_drop_pct):
+            # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] BRIDGED PRESS: the stale drop above
+            # deliberately spares a LOW/RISING lock ("a genuinely continuing meter can
+            # bridge across a new shot identity" -- the docstring's design intent), and on
+            # a rapid re-press that lock IS a real meter mid-rise (measured
+            # session_20260830_191051 press 16, 641ms after press 15: the held lock read
+            # 27->34 rising at the press and the shot continued on-screen). Arming the
+            # per-press guard against it starves that real meter: the guard demands this
+            # press's OWN low sighting, which a meter already at 30-40%% can never give.
+            # A low VALUE alone is not continuity. Epoch 38 carried a static 14.3% court/
+            # player false box across the press and the engine eventually owned it before
+            # the real fade meter rendered. Bridge only when the immediately preceding
+            # canonical-fill pair genuinely rose and the locator corroborated the held box
+            # recently. Otherwise retire the unproven pre-arm identity and require the new
+            # press to acquire fresh evidence; no quarantine is seeded for a low unknown.
+            if self._press_bridge_has_fresh_rise():
+                self._press_low_seen = True
+                self._press_ghost_zone = None
+                self._press_ghost_level = None
+                self._press_ghost_zone_low_n = 0
+                self._press_ghost_full_nofind_n = 0
+                _acq_logger.debug(
+                    "PRESS BRIDGED BY LOW/RISING LOCK: epoch=%d held_fill=%.1f%% "
+                    "(fresh rising continuity proved; the continuing meter keeps serving)",
+                    self._physical_shot_epoch, max(_held_now, _held_recent))
+            else:
+                self.conf = 0.0
+                self.box = None
+                self.tmpl = None
+                try:
+                    self._det_reset_lock_state()
+                    self._det_warm_pos = None
+                    self._det_warm_ts = -1.0e9
+                    self._det_active_box = None
+                except Exception:
+                    pass
+                _acq_logger.error(
+                    "UNPROVEN LOW LOCK DROPPED AT PRESS: epoch=%d held_fill=%.1f%% "
+                    "(no fresh rising continuity; new press must reacquire)",
+                    self._physical_shot_epoch, max(_held_now, _held_recent))
         if self._prev_hw_armed:
             if self._calibrator is not None:
                 try:
@@ -3387,6 +4740,18 @@ class SimpleMeterReader:
             proof_epoch > 0 and self._shot_armed_hw
             and self._physical_shot_epoch == proof_epoch)
         stage = str(sample.get("stage", "") or "")
+        # STRUCTURE NECROPSY bookkeeping (see __init__; pure counters, no behaviour).
+        if proof_epoch > 0 and self._ep_census.get("epoch") == proof_epoch:
+            c = self._ep_census
+            c["last_stage"] = stage
+            if bool(sample.get("detected")):
+                c["qual_det"] += 1
+                if sample.get("green") is not None:
+                    c["green"] += 1
+                if self._gameplay_lock_authorized:
+                    c["authorized"] += 1
+            if int(self._fresh_up_n) > int(c.get("max_fresh_up", 0)):
+                c["max_fresh_up"] = int(self._fresh_up_n)
         # A discontinuous coast-steal is a new visual identity.  It may remain visible as held
         # continuity internally, but it cannot inherit the old meter's timing authority.  A
         # fill-continuous same-meter reseat (`held_reseat`, no hw_reseat marker) stays authorized.
@@ -3657,6 +5022,3145 @@ class SimpleMeterReader:
         return cv2.inRange(src,
                            np.array((int(h_lo), s_min, v_min), np.uint8),
                            np.array((int(h_hi), 255, 255), np.uint8))
+
+    def _det_track_template_candidates(self, width, height):
+        """Old appearance, plus one detector-supported camera-scale transform.
+
+        A fixed-size notch cannot correlate with a physically zoomed notch. The
+        old weak/rescale branch then learned current pixels at the inference-old
+        location, baking a moving camera's lag into the new template. Test the
+        measured dimension ratio BEFORE that fallback. Keep the original too:
+        detector box breathing is not proof that the actual pixels rescaled.
+
+        This is not a scale sweep or presence detector. One measured dimension
+        ratio gets a second candidate, bounded by the existing 35% scale-step
+        limit. Do not gate this on fill-denominator relatching: even an 8% zoom
+        can destroy an otherwise exact notch correlation, well below the ruler's
+        relatch threshold. Integer-identical crops cost no extra match. Score,
+        texture, local-search,
+        innovation, deviation, source cadence and lifetime checks stay intact.
+        """
+        tmpl = self._det_tmpl
+        candidates = [(tmpl, float(self._NOTCH_ABOVE),
+                       float(self._det_tmpl_cx_offset),
+                       float(self._det_tmpl_bottom_offset))]
+        size = self._det_tmpl_size
+        if not self._det_track_cont or tmpl is None or size is None:
+            return candidates
+        sx = float(width) / max(1., float(size[0]))
+        sy = float(height) / max(1., float(size[1]))
+        delta = max(abs(sx - 1.), abs(sy - 1.))
+        if not (0.0 < delta <= min(.35, float(self._scale_step_max))):
+            return candidates
+        th, tw = tmpl.shape[:2]
+        nw, nh = int(round(tw * sx)), int(round(th * sy))
+        if nw < 8 or nh < 4 or (nw == tw and nh == th):
+            return candidates
+        scaled = cv2.resize(tmpl, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if float(scaled.std()) < float(self._det_tmpl_std_min):
+            return candidates
+        # Resize uses integer output dimensions; carry those actual ratios into
+        # the template's centre/bottom anchor rather than rounding the motion.
+        sx, sy = float(nw) / tw, float(nh) / th
+        candidates.append((scaled, float(self._NOTCH_ABOVE) * sy,
+                           float(self._det_tmpl_cx_offset) * sx,
+                           float(self._det_tmpl_bottom_offset) * sy))
+        return candidates
+
+    def _det_track_predicted_step(self, vx, vy):
+        """Elapsed-source-time search displacement from the retained pixel origin.
+
+        Previously a preserved origin always predicted just one px/frame step,
+        even after several hidden frames or a decoder callback gap. Keep that
+        origin immutable while advancing its SEARCH centre across at most the
+        existing short base-bridge horizon. Innovation/deviation and detector
+        lifetime checks still decide whether current pixels can be served.
+        """
+        now, origin = self._det_track_sample_ts, self._det_track_box_ts
+        k = self._det_kalman_state if self._det_kalman_search else None
+        if k is not None and now is not None and origin is not None:
+            age = float(now) - k['ts']
+            dt = float(now) - float(origin)
+            horizon = min(float(self._subpx_bridge_max_s), float(self._det_tmpl_max_s))
+            if k['n'] >= 2 and 0.0 <= age <= horizon and 0.0 < dt <= horizon:
+                # Retain the last accepted pixel origin. Kalman velocity only
+                # steers the bounded NCC search/innovation window across a gap.
+                return float(k['x'][2]) * dt, float(k['x'][3]) * dt
+        if now is None or origin is None:
+            return float(vx), float(vy)
+        dt = float(now) - float(origin)
+        if not np.isfinite(dt) or dt <= 0.0:
+            return 0.0, 0.0
+        horizon = min(float(self._subpx_bridge_max_s), float(self._det_tmpl_max_s))
+        ratio = min(dt, max(0.0, horizon)) / max(
+            1.0e-3, float(self._det_track_velocity_dt_s))
+        return float(vx) * ratio, float(vy) * ratio
+
+    def _remember_det_scale_reference(self, ref, scale, bh, span, ts):
+        """Keep scale evidence independent of detector-cadence appearance refresh.
+
+        Store only a current, already-localized mid-rise notch with a directly
+        measured cap/base span at the ACCEPTED ruler scale. Ordinary template
+        refresh must not move this reference: repeated one-pixel zoom steps
+        otherwise get absorbed before the 17-row notch ever needs resizing.
+        """
+        previous = self._det_scale_reference
+        if previous is not None and previous['ruler'] == ref[0] and previous['scale'] == scale:
+            return
+        evidence = self._det_track_scale_match
+        if (ts is None or not np.isfinite(float(ts))
+                or evidence is None or len(evidence) != 4
+                or abs(float(evidence[3]) - float(ts)) > 1e-6
+                or abs(float(self._det_tmpl_ts) - float(ts)) > 1e-6
+                or not self._det_new_accept or self._det_tmpl is None
+                or self._det_tmpl_size is None
+                or self._det_track_score < self._det_track_min
+                or self._det_tmpl_std < self._det_tmpl_std_min
+                or self._det_occ_current_full_negative or self._det_occ_recovered
+                or not (15.0 <= float(self._last_fill_coarse) <= 80.0)):
+            return
+        # Below ~12% fill the moving edge crosses the notch itself; do not
+        # freeze that transient as independent camera-scale appearance.
+        target_h = float(ref[2]) * float(scale)
+        if (abs(float(bh) - target_h) > 2.0
+                or abs(float(self._det_tmpl_size[1]) - target_h) > 2.0
+                or abs(float(span) - float(ref[1]) * float(scale)) > 2.0):
+            return
+        self._det_scale_reference = {
+            'ruler': ref[0], 'scale': float(scale),
+            'template': self._det_tmpl.copy(), 'size': tuple(self._det_tmpl_size),
+            'cx_offset': float(self._det_tmpl_cx_offset),
+            'bottom_offset': float(self._det_tmpl_bottom_offset),
+        }
+        self._det_scale_pending = None
+
+    def _det_cumulative_scale_match(self, frame, box, now):
+        """Corroborate gradual zoom at an ALREADY localized notch, not a new position.
+
+        The active patch may match perfectly after every small camera step was
+        refreshed into it. Compare a persistent accepted-scale reference with
+        its one detector-proposed resize at the same current anchor. Two unique
+        agreeing frames must favor the resize, and the previous vote must have
+        earned independent measured cap/base-span proof. The current frame's
+        span still has to certify any resulting ruler correction afterward.
+        """
+        reference = self._det_scale_reference
+        if (reference is None or self._subpx_camera_ref is None
+                or reference['ruler'] != (self._subpx_D, self._subpx_off)
+                or reference['scale'] != self._subpx_camera_scale
+                or self._det_track_sample_ts is None
+                or self._det_occ_current_full_negative or self._det_occ_recovered):
+            self._det_scale_pending = None
+            return False
+        x, y, w, h = (int(v) for v in box)
+        template = reference['template']
+        th, tw = template.shape[:2]
+        sx = float(w) / max(1.0, float(reference['size'][0]))
+        sy = float(h) / max(1.0, float(reference['size'][1]))
+        delta = max(abs(sx - 1.0), abs(sy - 1.0))
+        nw, nh = int(round(tw * sx)), int(round(th * sy))
+        if (not (0.0 < delta <= min(.35, float(self._scale_step_max)))
+                or nw < 8 or nh < 4 or (nw, nh) == (tw, th)):
+            self._det_scale_pending = None
+            return False
+        scaled = cv2.resize(template, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if float(scaled.std()) < float(self._det_tmpl_std_min):
+            self._det_scale_pending = None
+            return False
+        H, W = frame.shape[:2]
+        cx, bottom = x + w * .5, y + h
+
+        def score_at_anchor(patch, above, off_x, off_bottom):
+            ph, pw = patch.shape[:2]
+            # Only two rasterization pixels around the independently localized
+            # anchor; this secondary check never searches for another meter.
+            x0 = max(0, int(np.floor(cx + off_x - pw * .5 - 2.0)))
+            x1 = min(W, int(np.ceil(cx + off_x + pw * .5 + 2.0)))
+            y0 = max(0, int(np.floor(bottom + off_bottom - above - 2.0)))
+            y1 = min(H, int(np.ceil(bottom + off_bottom - above + ph + 2.0)))
+            if x1 - x0 < pw or y1 - y0 < ph:
+                return -1.0
+            gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            scores = cv2.matchTemplate(gray, patch, cv2.TM_CCOEFF_NORMED)
+            cols = x0 + np.arange(scores.shape[1]) + pw * .5 - off_x
+            rows = y0 + np.arange(scores.shape[0]) + above - off_bottom
+            allowed = ((np.abs(rows - bottom) <= 2.0)[:, None]
+                       & (np.abs(cols - cx) <= 2.0)[None, :])
+            scores[~allowed] = -1.0
+            _, value, _, _ = cv2.minMaxLoc(scores)
+            return float(value) if np.isfinite(value) else -1.0
+
+        raw_score = score_at_anchor(template, float(self._NOTCH_ABOVE),
+                                    reference['cx_offset'], reference['bottom_offset'])
+        sx, sy = float(nw) / tw, float(nh) / th
+        scaled_score = score_at_anchor(scaled, float(self._NOTCH_ABOVE) * sy,
+                                       reference['cx_offset'] * sx,
+                                       reference['bottom_offset'] * sy)
+        if (raw_score < 0.0 or scaled_score < float(self._det_track_min)
+                or scaled_score <= raw_score + .03):
+            self._det_scale_pending = None
+            return False
+        previous = self._det_scale_pending
+        count = 1
+        if (previous is not None
+                and 0.0 < float(now) - previous[0] <= float(self._subpx_bridge_max_s)
+                and abs(w - previous[1]) <= 1 and abs(h - previous[2]) <= 2
+                and previous[4]):
+            count = min(2, previous[3] + 1)
+        # This frame's cap/base measurement happens after position tracking.
+        # It must certify this exact vote before a following frame can use it.
+        self._det_scale_pending = (float(now), w, h, count, False)
+        return count >= 2
+
+    def _track_box_ncc(self, frame, box):
+        """Per-frame METER tracker: NCC match on the meter's BOTTOM NOTCH, around a
+        velocity-predicted centre.
+
+        WHY A NOTCH, NOT THE WHOLE BOX (2026-08-29): the YOLO detector costs ~30ms, so the box
+        only refreshes every ~45ms and drifts off a meter that moves with the shooter. The first
+        version of this tracker templated the WHOLE box -- but the box's appearance CHANGES as
+        the meter fills, so the match decayed within a few frames, fell under the accept floor,
+        and the lock snapped back to the stale detector box: accurate on average, visibly laggy
+        and unstable frame to frame (owner-reported).
+
+        The retired 5700-LOC detector (meter_detector.py `_track_locked`, "LOCK-THEN-TRACK",
+        measured 0.12px MAE @ 0.095ms) had already solved this, and this is a port of its idea:
+        template the meter's BOTTOM EDGE + lower fill -- the one region whose appearance is
+        STABLE while the bar fills -- and search a tight window around `cx + vx`, the
+        velocity-predicted centre, so a camera pan (~9-13px/frame) never outruns the search.
+        Velocity retains the old 0.6/0.4 blend on ordinary intervals, with
+        source-time normalization across changing callback cadence.
+
+        POSITION ONLY, exactly as in the original: a weak match returns the box unchanged and
+        never decides that the meter is gone -- survival stays with the detector's veto, because
+        a grey patch over-matches static court furniture."""
+        try:
+            self._det_track_score = 0.0
+            self._det_track_scale_match = None
+            tmpl = self._det_tmpl
+            if tmpl is None:
+                return box
+            x, y, w, h = (int(v) for v in box)
+            if w <= 0 or h <= 0:
+                return box
+            th, tw = tmpl.shape[:2]
+            if th < 4 or tw < 8:
+                return box
+            H, W = frame.shape[:2]
+            # Predict where the notch is NOW from the last centre/bottom + smoothed
+            # per-axis velocity.  The old path predicted x only and used the x padding
+            # on y as well, so a camera dive could outrun the vertical search even while
+            # horizontal tracking remained healthy.
+            cx = x + w * 0.5
+            step_x, step_y = (self._det_track_predicted_step(
+                self._det_track_vx, self._det_track_vy) if self._det_track_cont
+                else (float(self._det_track_vx), float(self._det_track_vy)))
+            pcx = cx + step_x
+            b = y + h             # meter bottom edge (the notch anchor)
+            pb = b + step_y
+            win_x = int(self._det_track_pad_x)
+            win_y = int(self._det_track_pad_y)
+            if self._det_track_cont:
+                # Motion-aware, per-axis widening. Bounded at 60px so an uncertain
+                # velocity can never turn the local tracker into a court-wide matcher.
+                win_x = int(max(win_x, min(
+                    60.0, abs(step_x) * 2.5 + 10.0)))
+                win_y = int(max(win_y, min(
+                    60.0, abs(step_y) * 2.5 + 10.0)))
+            best = None
+            for candidate, above, cx_offset, bottom_offset in (
+                    self._det_track_template_candidates(w, h)):
+                th, tw = candidate.shape[:2]
+                x0 = int(max(0, pcx - tw * 0.5 - win_x))
+                x1 = int(min(W, pcx + tw * 0.5 + win_x))
+                y0 = int(max(0, pb - above - win_y))
+                y1 = int(min(H, pb + (th - above) + win_y))
+                if (x1 - x0) < tw + 2 or (y1 - y0) < th + 2:
+                    continue
+                gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+                if float(gray.std()) < 1e-3 or float(candidate.std()) < 1e-3:
+                    continue
+                res = cv2.matchTemplate(gray, candidate, cv2.TM_CCOEFF_NORMED)
+                _, mx, _, loc = cv2.minMaxLoc(res)
+                if self._det_track_cont and float(mx) >= float(self._det_track_min):
+                    candidate_box = (
+                        max(0, min(W - w, int(round(
+                            x0 + loc[0] + tw * .5 - cx_offset - w * .5)))),
+                        max(0, min(H - h, int(round(
+                            y0 + loc[1] + above - bottom_offset - h)))), w, h)
+                    if not self._det_track_innovation_allowed(
+                            self._det_track_vx, self._det_track_vy, box, candidate_box):
+                        # An exact off-path court/jersey duplicate can outscore
+                        # the real, slightly blurred/occluded notch. Rejecting
+                        # that global argmax AFTER matching discarded genuine
+                        # in-gate pixels and snapped back to the delayed box.
+                        # Search the SAME correlation surface inside the SAME
+                        # innovation envelope; no broader motion/presence budget
+                        # and no second template inference are introduced.
+                        pred_x, pred_y, allow_x, allow_y = self._det_track_innovation_limits(
+                            self._det_track_vx, self._det_track_vy, box)
+                        # Mirror the rounded/clipped output geometry exactly,
+                        # including odd-width half-pixel centres and frame edges.
+                        cols = np.clip(np.rint(
+                            x0 + np.arange(res.shape[1]) + tw * .5
+                            - cx_offset - w * .5), 0, W - w) + w * .5
+                        rows = np.clip(np.rint(
+                            y0 + np.arange(res.shape[0]) + above
+                            - bottom_offset - h), 0, H - h) + h
+                        allowed = ((np.abs(rows - pred_y) <= allow_y)[:, None]
+                                   & (np.abs(cols - pred_x) <= allow_x)[None, :])
+                        res[~allowed] = -1.0
+                        _, mx, _, loc = cv2.minMaxLoc(res)
+                        if float(mx) < float(self._det_track_min):
+                            continue  # no admissible current-pixel match
+                if best is None or float(mx) > best[0]:
+                    best = (float(mx), x0 + loc[0] + tw * .5,
+                            y0 + loc[1] + above, cx_offset, bottom_offset,
+                            candidate is not tmpl)
+            if best is None:
+                return box
+            mx, raw_mcx, raw_mby, cx_offset, bottom_offset, rescaled = best
+            self._det_track_score = float(mx)
+            if mx < self._det_track_min:
+                return box                      # weak match -> keep the detector's box
+            if self._det_track_cont:
+                self._det_track_scale_match = (bool(rescaled), int(w), int(h))
+            # Integer crop bounds can sit half a pixel left of an odd-width
+            # bbox centre. Carry that seed offset instead of re-learning it
+            # as a position shift at every detector-cadence template refresh.
+            mcx = (raw_mcx - cx_offset
+                   if self._det_track_cont else raw_mcx)
+            # Differentiate accepted TEMPLATE anchors, not rounded output boxes.
+            # An odd-width integer bbox has a half-pixel centre while an even-width
+            # notch crop can match at an integer centre. Subtracting the bbox centre
+            # injected a persistent +/-0.5px/frame "motion" on a stationary meter.
+            # The exact template anchor also excludes deliberate reconciliation of
+            # the served rectangle from physical motion. A weak frame clears this
+            # baseline; reacquisition seeds a new pair instead of assigning a
+            # multi-frame displacement to one frame. The legacy/off route is unchanged.
+            last_match = self._det_track_last_match if self._det_track_cont else None
+            velocity_ratio = 1.0
+            velocity_gain = 0.4
+            update_velocity = not self._det_track_cont or last_match is not None
+            if (self._det_track_cont and last_match is not None
+                    and self._det_track_sample_ts is not None
+                    and self._det_track_last_match_ts is not None):
+                pair_dt = (float(self._det_track_sample_ts)
+                           - float(self._det_track_last_match_ts))
+                update_velocity = 0.0 < pair_dt <= float(self._subpx_bridge_max_s)
+                if update_velocity:
+                    # Blend velocities in the SAME elapsed-time units. Otherwise
+                    # a 33ms frame followed by a 16ms frame is interpreted as
+                    # camera acceleration/deceleration on a constant-speed pan.
+                    old_dt = max(1.0e-3, float(self._det_track_velocity_dt_s))
+                    effective_dt = max(1.0e-3, pair_dt)
+                    velocity_ratio = effective_dt / old_dt
+                    self._det_track_velocity_dt_s = effective_dt
+                    if pair_dt < max(1.0e-3, 0.25 * old_dt):
+                        # A compressed timestamp interval must not magnify one
+                        # raster/placement pixel into a huge next-frame stride.
+                        # Re-express the old velocity in the new cadence, but
+                        # require its next pair before learning displacement.
+                        # Current pixels still locate and serve the box now.
+                        velocity_gain = 0.0
+            elif (self._det_track_cont and last_match is not None
+                    and self._det_track_sample_ts is not None):
+                # A caller may have supplied appearance before its first timed
+                # step. Attach that first displacement to the known seed age,
+                # without rescaling an as-yet uncalibrated px/sample velocity.
+                seed_dt = float(self._det_track_sample_ts) - float(self._det_tmpl_ts)
+                if 0.0 < seed_dt <= float(self._subpx_bridge_max_s):
+                    if seed_dt < 1.0e-3:
+                        velocity_gain = 0.0
+                        velocity_ratio = 1.0e-3 / max(
+                            1.0e-3, float(self._det_track_velocity_dt_s))
+                    self._det_track_velocity_dt_s = max(1.0e-3, seed_dt)
+            if update_velocity:
+                prev_cx = float(last_match[0]) if last_match is not None else cx
+                self._det_track_vx = ((1.0 - velocity_gain) * float(self._det_track_vx) * velocity_ratio
+                                      + velocity_gain * ((raw_mcx if self._det_track_cont else mcx) - prev_cx))
+            nx = int(round(mcx - w * 0.5))
+            nx = max(0, min(W - w, nx))
+            # Vertical: the notch match also pins the bottom edge, so carry y with it.
+            mby = (raw_mby - bottom_offset
+                   if self._det_track_cont else raw_mby)
+            if update_velocity:
+                prev_bottom = float(last_match[1]) if last_match is not None else b
+                self._det_track_vy = ((1.0 - velocity_gain) * float(self._det_track_vy) * velocity_ratio
+                                      + velocity_gain * ((raw_mby if self._det_track_cont else mby) - prev_bottom))
+            if self._det_track_cont:
+                self._det_track_last_match = (float(raw_mcx), float(raw_mby))
+                self._det_track_last_match_ts = self._det_track_sample_ts
+            ny = int(round(mby - h))
+            ny = max(0, min(H - h, ny))
+            return (nx, ny, int(w), int(h))
+        except Exception:
+            # A failed coordinate/motion update is not an accepted localization,
+            # even if matchTemplate produced a strong score before the failure.
+            self._det_track_score = 0.0
+            self._det_track_scale_match = None
+            return box
+
+    def _det_hist_vel(self):
+        """Robust meter velocity (centre-vx, bottom-vy, px/s) from detector boxes.
+
+        Use a Theil-Sen slope (the median of every pairwise slope) on each component.
+        The old ``min(first-to-last, consecutive-pair median)`` rule protected static
+        locks from one detector hop, but it was biased on a translating fade whenever
+        the detector's normal +/-8..12 px placement error alternated across refreshes.
+        A measured/synthetic -780 px/s pan then toggled between about -300 and -876
+        px/s; extrapolation moved the served box 66-116 px off the ribbon and the fill
+        read hard-zeroed.  The pairwise median rejects one acquisition hop (at most
+        n-1 of n*(n-1)/2 slopes) while averaging placement error across all baselines,
+        so the same pan remains centred on its physical velocity.  The vertical component is
+        the box BOTTOM edge, deliberately matching NCC, emit smoothing and fill geometry.  A
+        changing detector height at a stationary bottom must therefore contribute exactly zero
+        vertical motion instead of the false ``-dh/2`` produced by centre-Y history.
+
+        Velocity still earns TRUST only after >=4 detections spanning
+        ``VEL_MIN_SPAN_S``.  A shorter estimate is magnitude-clamped to EARLY_V_MAX;
+        consumers which open motion budgets continue to require the trusted bit.
+
+        Returns (vx, vy, speed, trusted)."""
+        try:
+            if len(self._det_box_hist) < 3:
+                return 0.0, 0.0, 0.0, False
+            h = list(self._det_box_hist)
+            span = float(h[-1][0]) - float(h[0][0])
+            if span < 0.05:
+                return 0.0, 0.0, 0.0, False
+            trusted = (len(h) >= 4 and span >= float(self._det_vel_min_span_s))
+            pvx, pvy = [], []
+            for i, a in enumerate(h[:-1]):
+                for b in h[i + 1:]:
+                    dt = float(b[0]) - float(a[0])
+                    if dt >= 0.01:
+                        pvx.append((b[1] - a[1]) / dt)
+                        pvy.append((b[2] - a[2]) / dt)
+            if not pvx:
+                return 0.0, 0.0, 0.0, False
+            vx = float(np.median(pvx))
+            vy = float(np.median(pvy))
+            spd = float(np.hypot(vx, vy))
+            if not trusted and spd > float(self._det_early_v_max):
+                sc = float(self._det_early_v_max) / max(1e-6, spd)
+                vx *= sc; vy *= sc; spd = float(self._det_early_v_max)
+            return float(vx), float(vy), float(spd), trusted
+        except Exception:
+            return 0.0, 0.0, 0.0, False
+
+    def _det_track_innovation_limits(self, prior_vx, prior_vy, ref):
+        """One shared envelope for peak selection and the final output guard."""
+        rcx = float(ref[0]) + float(ref[2]) * 0.5
+        rbot = float(ref[1]) + float(ref[3])
+        gain = float(self._det_track_innov_vel_gain)
+        cap = float(self._det_track_innov_max)
+        base = float(self._det_track_innov_base)
+        step_x, step_y = self._det_track_predicted_step(prior_vx, prior_vy)
+        return (rcx + step_x, rbot + step_y,
+                min(cap, base + gain * abs(step_x)),
+                min(cap, base + gain * abs(step_y)))
+
+    def _det_track_innovation_allowed(self, prior_vx, prior_vy, ref, candidate,
+                                      limits=None):
+        """Return True when an NCC match is a plausible one-frame continuation.
+
+        This is intentionally position-only and cannot create detector authority.  It closes
+        the one-frame interval between a bad strong NCC match and the next frame's detector-snap
+        check.  Each axis gets a bounded allowance around its own velocity prediction so a fast
+        horizontal fade does not widen the vertical court-search budget (or vice versa).
+        """
+        try:
+            ccx = float(candidate[0]) + float(candidate[2]) * 0.5
+            cbot = float(candidate[1]) + float(candidate[3])
+            pred_x, pred_y, allow_x, allow_y = (
+                limits if limits is not None else self._det_track_innovation_limits(
+                    prior_vx, prior_vy, ref))
+            innov_x = ccx - pred_x
+            innov_y = cbot - pred_y
+            return abs(innov_x) <= allow_x and abs(innov_y) <= allow_y
+        except Exception:
+            # A malformed candidate is never evidence that earns a broad tracker move.
+            return False
+
+    def _det_hist_speed(self):
+        """Meter speed (px/s) for BUDGET-opening consumers: 0.0 until trusted -- an
+        untrusted estimate must never widen the tracker's deviation budget (that is how
+        onset jitter let the match wander to zero-fill distances)."""
+        v = self._det_hist_vel()
+        return v[2] if v[3] else 0.0
+
+    def _det_track_step(self, frame, held, now):
+        """Tracked-box CONTINUITY wrapper around the NCC primitive (2026-08-30; see the
+        ORION_METER_TRACK_CONTINUITY knob block in __init__ for the measured failure it
+        fixes -- the Left_Fade zero-fill dropout).
+
+        Contract per frame, `held` = the detector's held/extrapolated box:
+          1. Reference = LAST FRAME'S TRACKED BOX (a 1-frame-old, ~+-4px reference) instead
+             of the stale detector box -- unless the two disagree by more than the snap
+             gate, in which case the detector wins outright (teleport / drift bound) and
+             the position-anchored template dies with the old position.
+          2. NCC match with the OLD template (never seeded this frame at this position, so
+             a self-match can no longer pin the box to a stale spot).
+          3. On an accepted match: pull the result a small fraction toward the detector's
+             box (seed bias / template random-walk drift decays geometrically), persist it
+             as next frame's reference, and at DETECTOR CADENCE refresh the template from
+             the TRACKED position after matching so the next frame never self-matches a
+             delayed/jittery detector proposal.
+          4. On a weak match: fall back to the detector's box exactly as the shipped path
+             did; a template that stays weak past _det_tmpl_max_s re-bootstraps there.
+        A wrong box that reports a confident fill is worse than a dropout: nothing here
+        extends lock LIFETIME (presence/hold/coast/veto decide that upstream), it only
+        moves WHERE an already-held box sits between detector refreshes."""
+        if not self._det_track_cont:
+            self._det_track_scale_match = None
+            return self._track_box_ncc(frame, held)
+        try:
+            self._det_track_scale_match = None
+            source_now = float(now) if now is not None else None
+            self._det_track_sample_ts = (
+                source_now if source_now is not None and np.isfinite(source_now) else None)
+            # Missing source timing is a documented capture fallback, not a
+            # stream of frames captured at timestamp zero. Preserve nominal
+            # px/call motion there; use wall time ONLY for template lifetime.
+            now = (self._det_track_sample_ts if self._det_track_sample_ts is not None
+                   else _time.monotonic())
+            timed = self._det_track_sample_ts is not None
+            if (self._det_track_clock_timed is not None
+                    and self._det_track_clock_timed != timed):
+                # A helper caller switching between source and fallback clocks
+                # cannot compare template ages or differentiate across domains.
+                # Discard position/appearance only; detector lock authority and
+                # the fill ruler retain their own independent lifecycle rules.
+                self._det_tmpl = None
+                self._det_tmpl_size = None
+                self._det_tmpl_pos = None
+                self._det_tmpl_cx_offset = 0.0
+                self._det_tmpl_bottom_offset = 0.0
+                self._det_track_box = None
+                self._det_track_box_ts = None
+                self._det_track_last_match = None
+                self._det_track_last_match_ts = None
+                self._det_track_vx = self._det_track_vy = 0.0
+                self._det_track_velocity_dt_s = 1.0 / 60.0
+                self._det_scale_reference = None
+                self._det_scale_pending = None
+            if self._det_tmpl is None:
+                self._det_kalman_state = None
+            self._det_track_clock_timed = timed
+            held = tuple(int(v) for v in held)
+            ref = held
+            tb = self._det_track_box
+            # A genuine detector rescale is different from a momentary hidden
+            # notch. Use the existing scale-change criterion so preserving an
+            # old appearance cannot freeze the pre-rebase seed at shot onset.
+            geometry_rebased = bool(tb is not None and (
+                abs(float(held[2]) / max(1.0, float(tb[2])) - 1.0)
+                    > float(self._fill_denom_relatch)
+                or abs(float(held[3]) / max(1.0, float(tb[3])) - 1.0)
+                    > float(self._fill_denom_relatch)))
+            snap = float(self._det_track_snap_px) * max(1.0, float(self.W or 720.0) / 720.0)
+            if tb is not None:
+                dx = (tb[0] + tb[2] * 0.5) - (held[0] + held[2] * 0.5)
+                dy = (tb[1] + tb[3]) - (held[1] + held[3])
+                step_x, step_y = self._det_track_predicted_step(
+                    self._det_track_vx, self._det_track_vy)
+                if ((abs(dx) <= snap and abs(dy) <= snap)
+                        or (abs(dx + step_x) <= snap and abs(dy + step_y) <= snap)):
+                    # continuity reference: tracked position, detector's size (the size
+                    # feeds the fill denominator and the detector owns it).
+                    # Keep the position anchors when detector dimensions breathe.
+                    # Copying top-left with NEW width/height moves the implied centre
+                    # and bottom before NCC runs, so a stationary notch manufactures
+                    # -dw/2 and -dh velocity and can leave the local search window.
+                    # The detector still owns size; only the continuity reference is
+                    # rebuilt around the last tracked centre/bottom.
+                    ref = (int(round(tb[0] + tb[2] * 0.5 - held[2] * 0.5)),
+                           int(tb[1] + tb[3] - held[3]),
+                           int(held[2]), int(held[3]))
+                else:
+                    self._det_tmpl = None
+                    self._det_tmpl_size = None
+                    self._det_tmpl_cx_offset = 0.0
+                    self._det_tmpl_bottom_offset = 0.0
+                    self._det_tmpl_pos = None
+                    self._det_track_box = None
+                    self._det_track_vx = 0.0
+                    self._det_track_vy = 0.0
+                    self._det_track_last_match = None
+                    self._det_track_last_match_ts = None
+                    self._det_track_box_ts = None
+                    self._det_track_velocity_dt_s = 1.0 / 60.0
+                    self._det_scale_reference = None
+                    self._det_scale_pending = None
+            if self._det_tmpl is None:
+                self._det_kalman_state = None
+            refresh_template = bool(self._det_new_accept)
+            had_template = self._det_tmpl is not None
+            if self._det_tmpl is None:
+                # Bootstrap only.  Once a textured template exists, match it BEFORE
+                # refreshing: seeding from this frame at every new detector proposal
+                # creates an exact same-frame self-match and makes the supposedly 60fps
+                # tracker reproduce every delayed/jittery detector stride.  A successful
+                # old-template match is refreshed from its tracked position below.
+                self._seed_track_template(frame, held if refresh_template else ref)
+                self._det_tmpl_ts = float(now)
+                self._det_track_box_ts = self._det_track_sample_ts
+            # Clear at the wrapper boundary as well as inside the primitive, so
+            # instrumentation/adapter fall-throughs cannot carry a prior strong
+            # score into a frame that was never successfully localized.
+            self._det_track_score = 0.0
+            prior_vx = float(self._det_track_vx)
+            prior_vy = float(self._det_track_vy)
+            prior_velocity_dt = float(self._det_track_velocity_dt_s)
+            prior_innovation_limits = self._det_track_innovation_limits(
+                prior_vx, prior_vy, ref)
+            out = tuple(int(v) for v in self._track_box_ncc(frame, ref))
+            # TEXTURE FLOOR: a low-variance template normalizes to ~1.0 anywhere, so its
+            # argmax is noise (003937 e15: onset crop matched 26px off a static meter at
+            # score 1.00). Below the floor the match is unmatchable regardless of score ->
+            # take the weak path (the detector's box), which is exactly right at onset.
+            if float(getattr(self, "_det_tmpl_std", 0.0)) < float(self._det_tmpl_std_min):
+                self._det_track_score = 0.0
+            # A broad local search is necessary, but a broad DISPLACEMENT is not.  Reject a
+            # strong duplicate-scene match before it can reach the existing detector-deviation
+            # clamp: that clamp intentionally opens on moving shots and otherwise permits one
+            # bad 30-60px match to be served for a frame.  _track_box_ncc updates velocity when
+            # it finds a strong candidate, so restore the pre-match state on refusal as well.
+            if (float(self._det_track_score) >= float(self._det_track_min)
+                    and not self._det_track_innovation_allowed(
+                        prior_vx, prior_vy, ref, out, limits=prior_innovation_limits)):
+                self._det_track_vx = prior_vx
+                self._det_track_vy = prior_vy
+                self._det_track_velocity_dt_s = prior_velocity_dt
+                self._det_track_score = 0.0
+            if float(self._det_track_score) >= float(self._det_track_min):
+                matched = out
+                g = float(self._det_track_gain)
+                if g > 0.0:
+                    pull_x = g * ((held[0] + held[2] * 0.5)
+                                  - (out[0] + out[2] * 0.5))
+                    pull_y = g * ((held[1] + held[3]) - (out[1] + out[3]))
+                    # The trusted-motion history proves that a large detector/track gap
+                    # can be ordinary inference age, not template drift.  Cap the vector
+                    # impulse there; on a static/untrusted history keep the original gain
+                    # so detector evidence still arrests template random walk quickly.
+                    _motion_trusted = bool(self._det_hist_vel()[3])
+                    # This is expressed in pixels of the frame being tracked (the live
+                    # 1280x720 replay that established the 2px bound), unlike the older
+                    # deviation knob whose historical units are width-scaled.
+                    _pull_cap = float(self._det_track_reconcile_max_px)
+                    _pull_mag = float(np.hypot(pull_x, pull_y))
+                    if _motion_trusted and _pull_cap > 0.0 and _pull_mag > _pull_cap:
+                        _psc = _pull_cap / max(1.0e-6, _pull_mag)
+                        pull_x *= _psc
+                        pull_y *= _psc
+                    nx = out[0] + pull_x
+                    ny = out[1] + pull_y
+                    out = (int(round(nx)), int(round(ny)), int(out[2]), int(out[3]))
+                # DEVIATION BUDGET (see the DEV knob note): clamp the tracked box to within
+                # cap px of the detector's held box on BOTH axes -- the tracker may deviate
+                # only as far as detector staleness at the measured meter speed can explain.
+                cap = (float(self._det_track_dev_base) * max(1.0, float(self.W or 720.0) / 720.0)
+                       + self._det_hist_speed() * float(self._det_track_dev_s))
+                ddx = out[0] - held[0]
+                ddy = out[1] - held[1]
+                match_clipped = abs(ddx) > cap or abs(ddy) > cap
+                if match_clipped:
+                    # A clipped match may not become the next derivative origin
+                    # outside the detector's permitted deviation envelope.
+                    self._det_track_last_match = None
+                    self._det_track_last_match_ts = None
+                    self._det_track_vx = prior_vx
+                    self._det_track_vy = prior_vy
+                    self._det_track_velocity_dt_s = prior_velocity_dt
+                    self._det_track_scale_match = None
+                    self._det_scale_pending = None
+                    out = (int(held[0] + max(-cap, min(cap, ddx))),
+                           int(held[1] + max(-cap, min(cap, ddy))),
+                           int(out[2]), int(out[3]))
+                # Reconciliation changes the box-to-template anchor, not appearance.
+                # Previously every-frame reseeding accidentally accumulated this
+                # correction while also learning each transient fill edge/occluder.
+                # Preserve that geometric convergence between genuine source
+                # refreshes without touching the stable template pixels or the raw
+                # matched-anchor derivative used for physical velocity.
+                if not match_clipped:
+                    self._det_tmpl_cx_offset -= float(out[0] - matched[0])
+                    self._det_tmpl_bottom_offset -= float(out[1] - matched[1])
+                if self._det_kalman_search and not match_clipped and had_template:
+                    self._det_kalman_observe(matched, self._det_track_sample_ts)
+                self._det_track_box = out
+                self._det_track_box_ts = self._det_track_sample_ts
+                if not had_template:
+                    # A same-frame bootstrap cannot prove a camera transform.
+                    self._det_track_scale_match = None
+                    self._det_scale_pending = None
+                elif self._det_track_scale_match is not None:
+                    self._det_track_scale_match = (*self._det_track_scale_match, float(now))
+                    if self._det_track_scale_match[0]:
+                        self._det_scale_pending = None
+                    else:
+                        try:
+                            if self._det_cumulative_scale_match(frame, matched, now):
+                                self._det_track_scale_match = (
+                                    True, int(out[2]), int(out[3]), float(now))
+                        except Exception:
+                            # Optional scale corroboration must never discard
+                            # this frame's already-accepted primary position.
+                            self._det_scale_pending = None
+                # Refresh only at detector cadence, AFTER the old template localized this
+                # frame.  This preserves the proven no-per-frame-reseed rule (the low-fill
+                # transient otherwise compounds) while preventing a fresh detector box
+                # from self-pinning the output to its own stale/jittery location.
+                # A deviation-clipped output is deliberately NOT the location
+                # verified by NCC. Keep the prior appearance rather than learning
+                # the pixels between that refused match and the detector box.
+                if refresh_template and not match_clipped:
+                    self._seed_track_template(frame, out)
+                    self._det_tmpl_ts = float(now)
+                elif (match_clipped and float(now) - float(self._det_tmpl_ts)
+                        > float(self._det_tmpl_max_s)):
+                    # Keep the same expiry as weak matches; persistent appearance
+                    # change must still re-bootstrap from the detector geometry.
+                    self._seed_track_template(frame, held)
+                    self._det_tmpl_ts = float(now)
+                return out
+            # A rejected/low-texture match may have updated the primitive's motion
+            # state before its caller rejected it. Keep neither its velocity impulse
+            # nor an anchor that would join across this unobserved frame.
+            self._det_track_vx = prior_vx
+            self._det_track_vy = prior_vy
+            self._det_track_velocity_dt_s = prior_velocity_dt
+            self._det_track_last_match = None
+            self._det_track_last_match_ts = None
+            self._det_track_scale_match = None
+            self._det_scale_pending = None
+            # A fresh async detector rectangle is not evidence that its current
+            # notch pixels are visible. Replacing a usable template on a weak
+            # frame learned the occluder (even a flat/blank patch), so the first
+            # revealed moving frame could not match the old meter appearance.
+            # Keep that appearance through the existing bounded expiry. A
+            # low-texture bootstrap has no usable appearance to preserve. Fresh
+            # detector rescale evidence and the original expiry still re-bootstrap.
+            # Output/fill/presence authority remain on the detector-held box.
+            if ((refresh_template
+                    and (geometry_rebased
+                         or float(getattr(self, '_det_tmpl_std', 0.0))
+                            < float(self._det_tmpl_std_min)))
+                    or (float(now) - float(self._det_tmpl_ts)) > float(self._det_tmpl_max_s)):
+                self._seed_track_template(frame, held)
+                self._det_tmpl_ts = float(now)
+                self._det_track_box = held
+                self._det_track_box_ts = self._det_track_sample_ts
+            elif (self._det_tmpl is not None
+                    and float(getattr(self, '_det_tmpl_std', 0.0))
+                        >= float(self._det_tmpl_std_min)):
+                # Keep the search origin together with the preserved appearance.
+                # One hidden notch must not move next frame's NCC search from the
+                # last localized position back to the inference-old detector box:
+                # on a pan that otherwise loses the first visible frame despite
+                # retaining an exact-match template. `ref` carries detector-owned
+                # dimensions and already passed the existing detector snap bound.
+                # This is SEARCH state only: return the held box below, clear the
+                # derivative pair above, and require ordinary current-pixel NCC /
+                # innovation / deviation checks before serving any relocated box.
+                self._det_track_box = ref
+            else:
+                self._det_track_box = held
+                self._det_track_box_ts = self._det_track_sample_ts
+            return held
+        except Exception:
+            self._det_track_scale_match = None
+            self._det_scale_pending = None
+            return held
+
+    def _seed_track_template(self, frame, box) -> None:
+        """Store the meter's BOTTOM-NOTCH crop (grey) from a FRESH detector box.
+
+        The notch -- the bottom edge plus a little of the lower fill -- is the part of the meter
+        whose appearance does NOT change as the bar fills, which is why the retired detector
+        tracked it instead of the whole bar (see _track_box_ncc). Under TRACK CONTINUITY it is
+        refreshed from the TRACKED position at detector cadence, after the old template has
+        localized the current frame (see _det_track_step); with continuity off, it refreshes on
+        every fresh detection. Either way a zoom/scale change cannot leave a stale patch behind."""
+        try:
+            x, y, w, h = (int(v) for v in box)
+            if w <= 0 or h <= 0:
+                return
+            H, W = frame.shape[:2]
+            cx = x + w * 0.5
+            b = y + h                                   # bottom edge
+            half = max(16, w // 2 + 8)                  # a little wider than the bar
+            x0 = int(max(0, cx - half)); x1 = int(min(W, cx + half))
+            y0 = int(max(0, b - self._NOTCH_ABOVE)); y1 = int(min(H, b + self._NOTCH_BELOW))
+            if (x1 - x0) >= 12 and (y1 - y0) >= 6:
+                self._det_tmpl = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+                self._det_tmpl_size = (w, h)
+                self._det_tmpl_pos = (int(x), int(y))
+                # Texture of the seeded patch. A LOW-variance template makes
+                # TM_CCOEFF_NORMED meaningless -- tiny correlations normalize to ~1.0
+                # anywhere, and the argmax wanders (measured on 003937 e15: an onset
+                # notch crop, pre-fill, matched 26px left of a STATIC meter at score
+                # 1.00 and walked the box 78px off). The step treats a template below
+                # the std floor as unmatchable and serves the detector box instead.
+                self._det_tmpl_std = float(self._det_tmpl.std())
+                # A refreshed patch has a new coordinate origin; use its actual
+                # integer crop boundaries, not the odd-width box's implied centre.
+                self._det_tmpl_cx_offset = 0.5 * float(x0 + x1) - float(cx)
+                self._det_tmpl_bottom_offset = float(y0 + self._NOTCH_ABOVE) - float(b)
+                self._det_track_last_match = (
+                    0.5 * float(x0 + x1), float(y0 + self._NOTCH_ABOVE))
+                self._det_track_last_match_ts = self._det_track_sample_ts
+            else:
+                self._det_track_last_match = None
+                self._det_track_last_match_ts = None
+                self._det_tmpl = None
+                self._det_tmpl_size = None
+                self._det_tmpl_cx_offset = 0.0
+                self._det_tmpl_bottom_offset = 0.0
+                self._det_tmpl_pos = None
+                self._det_tmpl_std = 0.0
+        except Exception:
+            self._det_track_last_match = None
+            self._det_track_last_match_ts = None
+            self._det_tmpl = None
+            self._det_tmpl_size = None
+            self._det_tmpl_cx_offset = 0.0
+            self._det_tmpl_bottom_offset = 0.0
+            self._det_tmpl_pos = None
+            self._det_tmpl_std = 0.0
+
+    # ---------------------------------------------------------------------------------- #
+    #  LOCK LIFECYCLE (retired meter_detector.py port -- see the __init__ knob block for
+    #  the full design note and the retired-code landmarks each constant comes from).
+    # ---------------------------------------------------------------------------------- #
+    def _det_jump_gate(self) -> float:
+        """Position-jump tolerance in px, scaled with frame width exactly as the retired
+        _StabilityValidator._acq_jump_gate_px did (base 80px was tuned on a ~720-wide capture;
+        at 1280 it is ~142px)."""
+        try:
+            w = float(self.W or 0.0)
+        except Exception:
+            w = 0.0
+        return float(self._det_jump_base) * max(1.0, w / 720.0)
+
+    def _det_result_this_arm(self, result_ts) -> bool:
+        """Whether a detector result can describe the current physical-arm epoch.
+
+        An unlocked reader must fail closed when the locator omits its source timestamp:
+        without that clock there is no way to distinguish a current-frame meter from the
+        pre-press async result that produced the live court snaps.  An existing LOCKED
+        low/rising bridge is judged before this predicate in ``_det_on_found`` and remains
+        intentionally untouched.
+        """
+        if not self._shot_armed_hw or self._hw_arm_ts is None:
+            return True
+        try:
+            _rts = float(result_ts)
+            return bool(np.isfinite(_rts)
+                        and _rts + 1.0e-6 >= float(self._hw_arm_ts))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _reset_detfill_nogreen_evidence(self) -> None:
+        """Clear the detector-only capless-onset evidence window."""
+        self._df_nogreen_key = None
+        self._df_nogreen_samples = []
+
+    def _start_det_lock_generation(self) -> None:
+        """Mint a process-local identity for one lifecycle-approved lock."""
+        self._det_lock_generation = int(
+            getattr(self, "_det_lock_generation", 0) or 0) + 1
+        self._reset_detfill_nogreen_evidence()
+
+    def _detfill_nogreen_time_limits(self):
+        """Return (maximum adjacent gap, maximum three-frame span) in seconds.
+
+        At the shipped 33ms acquisition cadence, four opportunities (132ms) may
+        separate adjacent accepted results and six (198ms) may cover the whole
+        three-frame proof.  The detector TTL (200ms shipped) is a hard ceiling on
+        both, while the 60fps floors retain headroom when sync acquisition is
+        configured with a zero/smaller interval.  Evidence therefore represents
+        one onset burst and can never accumulate over a long held arm.
+        """
+        ttl = max(0.0, float(self._det_ttl_s))
+        cadence = max(1.0 / 60.0, float(self._det_acq_interval_s))
+        max_gap = min(ttl, max(6.0 / 60.0, 4.0 * cadence))
+        max_span = min(ttl, max(9.0 / 60.0, 6.0 * cadence))
+        return max_gap, max_span
+
+    @staticmethod
+    def _detfill_nogreen_box_continuous(previous, current) -> bool:
+        """Whether two locator boxes can be the same moving meter.
+
+        Compare horizontal centre and bottom edge because detector-height breathing
+        must not manufacture motion.  The 0.75-height allowance covers the measured
+        moving-shot stride while still treating a scene-object switch as a new run.
+        Lifecycle's stricter ownership identity remains the primary boundary.
+        """
+        try:
+            ax, ay, aw, ah = (float(v) for v in previous)
+            bx, by, bw, bh = (float(v) for v in current)
+            if min(aw, ah, bw, bh) <= 0.0:
+                return False
+            wr = max(aw, bw) / min(aw, bw)
+            hr = max(ah, bh) / min(ah, bh)
+            if wr > 1.60 or hr > 1.35:
+                return False
+            acx, bcx = ax + aw * 0.5, bx + bw * 0.5
+            abot, bbot = ay + ah, by + bh
+            motion = float(np.hypot(bcx - acx, bbot - abot))
+            return motion <= max(16.0, 0.75 * max(ah, bh))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _advance_detfill_nogreen_rise(
+            self, *, shot_epoch, lock_generation, source_ts, sample_ts,
+            coarse_fill, locator_box, white_ribbon, locator_fresh) -> bool:
+        """Latch structure after three fresh, low, capless rising meter frames.
+
+        This is deliberately detector-only and latch-only.  A frame advances the
+        window only when it carries a unique, fresh locator result accepted into the
+        current lifecycle lock.  Static, falling, high-fill, stale, re-seated, or
+        geometrically discontinuous evidence clears the window and cannot stamp.
+        """
+        if not locator_fresh:
+            # Repeated async slots are neutral: they may neither advance nor fake the
+            # three distinct source frames required by this proof.
+            return False
+        try:
+            epoch = int(shot_epoch)
+            generation = int(lock_generation)
+            src = float(source_ts)
+            now = float(sample_ts)
+            fill = float(coarse_fill)
+            box = tuple(float(v) for v in locator_box)
+        except (TypeError, ValueError, OverflowError):
+            self._reset_detfill_nogreen_evidence()
+            return False
+        current = bool(
+            self._detfill_green_latch and self._require_gameplay_eligibility
+            and self._det_lifecycle and self._det_state == 'locked'
+            and self._shot_armed_hw and epoch > 0
+            and epoch == int(self._physical_shot_epoch)
+            and generation > 0
+            and generation == int(getattr(self, "_det_lock_generation", 0) or 0)
+            and white_ribbon and len(box) == 4
+            and np.isfinite(src) and np.isfinite(now) and np.isfinite(fill)
+            and self._det_result_this_arm(src)
+            and -1.0e-6 <= now - src <= float(self._det_ttl_s) + 1.0e-6
+            and 0.0 <= fill <= 20.0)
+        if not current:
+            self._reset_detfill_nogreen_evidence()
+            return False
+
+        key = (epoch, generation)
+        if self._df_nogreen_key != key:
+            self._reset_detfill_nogreen_evidence()
+            self._df_nogreen_key = key
+
+        samples = self._df_nogreen_samples
+        if samples:
+            prev_src, prev_now, prev_fill, prev_box = samples[-1]
+            # Equal source stamps are one async detector result replayed across
+            # capture frames.  Older stamps are a source discontinuity.
+            if abs(src - prev_src) <= 1.0e-9:
+                return False
+            if src < prev_src or now <= prev_now:
+                self._reset_detfill_nogreen_evidence()
+                self._df_nogreen_key = key
+                self._df_nogreen_samples.append((src, now, fill, box))
+                return False
+            max_gap, max_span = self._detfill_nogreen_time_limits()
+            first_src, first_now = samples[0][0], samples[0][1]
+            if (src - prev_src > max_gap + 1.0e-6
+                    or now - prev_now > max_gap + 1.0e-6
+                    or src - first_src > max_span + 1.0e-6
+                    or now - first_now > max_span + 1.0e-6):
+                # A long-held arm can see unrelated low white objects seconds
+                # apart.  Start over at this frame; only one short detector burst
+                # may satisfy the three-sample proof.
+                self._reset_detfill_nogreen_evidence()
+                self._df_nogreen_key = key
+                self._df_nogreen_samples.append((src, now, fill, box))
+                return False
+            if not self._detfill_nogreen_box_continuous(prev_box, box):
+                self._reset_detfill_nogreen_evidence()
+                self._df_nogreen_key = key
+                self._df_nogreen_samples.append((src, now, fill, box))
+                return False
+            step = fill - prev_fill
+            dt_ms = (now - prev_now) * 1000.0
+            max_step = (float(self._press_step_margin_pp)
+                        + max(float(self._press_max_rate_pct_ms), 0.70) * dt_ms)
+            if not (float(self._press_pair_min_rise_pp) <= step <= max_step):
+                # Static/falling/non-physical evidence begins a new possible run at
+                # this frame, but can never count as the second or third frame.
+                self._reset_detfill_nogreen_evidence()
+                self._df_nogreen_key = key
+                self._df_nogreen_samples.append((src, now, fill, box))
+                return False
+
+        samples = self._df_nogreen_samples
+        samples.append((src, now, fill, box))
+        if len(samples) > 3:
+            del samples[:-3]
+        if len(samples) == 3 and samples[-1][2] - samples[0][2] >= 4.0:
+            self._latch_gameplay_structure_proof(epoch)
+            return True
+        return False
+
+    def _det_reset_lock_state(self) -> None:
+        """Clear every per-lock artefact so nothing stale can steer the next lock (the retired
+        reset() + the existing veto-clear discipline: 'stale motion must not extrapolate a new
+        lock')."""
+        self._det_state = 'idle'
+        self._det_streak = 0
+        self._det_pend_box = None
+        self._det_pend_ts = -1.0e9
+        self._det_nm_strikes = 0
+        self._det_strike_box = None
+        self._det_strike_n = 0
+        self._det_lock_fill0 = None
+        self._det_lock_fill_max = -1.0
+        self._det_lock_was_warm = False
+        self._det_lock_read_n = 0
+        self._det_last_presence = False
+        self._det_emit = None
+        self._det_kalman_state = None
+        self._det_pixel_geometry = None
+        self._det_pixel_ruler_reject = False
+        self._det_measurement_box = None
+        self._det_display_box = None
+        self._det_last_box = None
+        self._det_last_found_ts = -1.0e9
+        self._det_fill_hist.clear()
+        self._det_coarse_fill_hist.clear()
+        self._det_box_hist.clear()
+        self._det_tmpl = None
+        self._det_tmpl_size = None
+        self._det_tmpl_cx_offset = 0.0
+        self._det_tmpl_bottom_offset = 0.0
+        self._det_track_vx = 0.0
+        self._det_track_vy = 0.0
+        self._det_track_last_match = None
+        self._det_track_box = None
+        self._det_track_box_ts = None
+        self._det_track_last_match_ts = None
+        self._det_track_sample_ts = None
+        self._det_track_clock_timed = None
+        self._det_track_velocity_dt_s = 1.0 / 60.0
+        self._det_track_scale_match = None
+        self._subpx_camera_ref = None
+        self._subpx_camera_scale = 1.0
+        self._det_scale_reference = None
+        self._det_scale_pending = None
+        self._det_tmpl_ts = -1.0e9
+        self._det_tmpl_pos = None
+        self._det_rescue_request_ts = -1.0e9
+        self._df_green_streak = 0        # chevron streak dies with the lock
+        self._reset_detfill_nogreen_evidence()
+        # Sub-pixel per-shot constants are per-LOCK artefacts too: a new lock must re-seed
+        # its own scale/anchor rather than inherit the dead lock's (same discipline as the
+        # veto-clear below; the press reset covers the bridged-lock case).
+        self._subpx_D = None; self._subpx_provisional = False
+        self._subpx_off = None
+        self._subpx_seed = []
+        self._subpx_base_hist = []; self._subpx_last_base_rel = None
+        self._subpx_carry_pending = False
+        self._coarse_denom_ref = None
+        self._det_track_score = 0.0
+        self._det_occ_direct.clear()
+        self._det_occ_key = None
+        self._det_occ_locator_source_positive = False
+        self._det_occ_recovered = False
+        self._det_occ_support = 0.0
+        self._det_occ_kind = ""
+        self._det_occ_censored_reject = False
+        self._det_occ_current_full_negative = False
+        self._det_occ_current_source_age = float("inf")
+        self._det_occ_negative_bridge_used = False
+
+    def _ghost_press_flush_summary(self, reason: str) -> None:
+        """[ORION_READER_GHOST_PRESS_BREAK] Emit the one-per-press eviction summary.
+
+        Called when the guard stands down (real onset seen) and at the next press arm
+        (covers a window that simply expired). ERROR level so the native relay carries it
+        (WARNINGs are throttled); the per-frame lines it replaces are logged at DEBUG."""
+        _n_ev = int(getattr(self, "_press_ghost_evict_total", 0) or 0)
+        _n_sup = int(getattr(self, "_press_ghost_suppress_total", 0) or 0)
+        _n_imp = int(getattr(self, "_press_implausible_n", 0) or 0)
+        if _n_ev <= 0 and _n_sup <= 0 and _n_imp <= 0:
+            return
+        try:
+            _acq_logger.error(
+                "GHOST PRESS SUMMARY: epoch=%d evictions=%d zero_holds=%d implausible=%d "
+                "end=%s",
+                int(self._press_ghost_summary_epoch or 0), _n_ev, _n_sup, _n_imp, reason)
+        except Exception:
+            pass
+        self._press_ghost_evict_total = 0
+        self._press_ghost_suppress_total = 0
+        self._press_implausible_n = 0
+
+    def _press_fill_allowance(self, ts: float) -> float:
+        """[ORION_READER_PRESS_ONSET_PLAUSIBILITY] The ONSET-CLOCK bound alone: no real
+        meter can show fill F before the press clock allows it. Used by the ghost guard's
+        stand-down paths (a 'low' read the clock forbids is the fading leftover passing
+        down through the band, never this press's onset). The RISE-STEP bound is judged
+        separately in the serve veto (see there): it applies only to jumps landing at or
+        above the engine's 40%% anchor bound, because a GENUINE pop-in serve legitimately
+        out-steps the ribbon rate while the bar itself is still growing (measured
+        session_20260830_191051 epochs 25/26/40: 4.8 -> 16.0 in 19ms = 0.59 pct/ms, real
+        rise) -- but a genuine pop-in read is always LOW; only a leftover jump lands high."""
+        _age_ms = max(0.0, (float(ts) - float(self._hw_arm_ts)) * 1000.0)
+        return (self._press_first_margin_pp
+                + self._press_max_rate_pct_ms
+                * max(0.0, _age_ms - self._press_onset_floor_ms))
+
+    def _press_step_allowance(self, ts: float):
+        """[ORION_READER_PRESS_ONSET_PLAUSIBILITY] The RISE-STEP bound: how high a serve
+        may land given the last published serve of this press. None when no serve has
+        published yet (the onset clock alone judges the first sight)."""
+        if self._press_last_pub_fill is None or self._press_last_pub_ts is None:
+            return None
+        _dt_ms = max(0.0, (float(ts) - float(self._press_last_pub_ts)) * 1000.0)
+        return (float(self._press_last_pub_fill)
+                + self._press_step_margin_pp
+                + self._press_max_rate_pct_ms * _dt_ms)
+
+    def _press_onset_pair_advance(self, fill: float, ts: float) -> bool:
+        """[ORION_READER_PRESS_ONSET_PLAUSIBILITY] Sliding rising-pair check for the ghost
+        guard's stand-down paths: True when (previous candidate, this read) form a genuine
+        onset step -- rising by at least _press_pair_min_rise_pp and by no more than the
+        physical step allowance. A fading leftover DECLINES through the low band (measured
+        epochs 32/50/51/58) and can never satisfy the rise; a real onset always does
+        (measured genuine pairs rise 3-7pp per serve). The candidate always slides to the
+        current read so a later genuine pair is judged on fresh evidence."""
+        _cand = self._press_onset_cand
+        self._press_onset_cand = (float(fill), float(ts))
+        if _cand is None:
+            return False
+        if (self._hw_arm_ts is not None
+                and (float(ts) - float(self._hw_arm_ts)) * 1000.0
+                < self._press_onset_floor_ms):
+            # No press's meter can complete its first two reads before the onset floor
+            # (capture+render alone is ~230ms; earliest measured genuine ownership 226ms).
+            # The candidate still slides, so a real pair straddling the floor stands the
+            # guard down on its first read past it.
+            return False
+        _d = float(fill) - float(_cand[0])
+        _dt_ms = max(0.0, (float(ts) - float(_cand[1])) * 1000.0)
+        return (self._press_pair_min_rise_pp <= _d
+                <= self._press_step_margin_pp
+                + self._press_max_rate_pct_ms * _dt_ms)
+
+    def _press_bridge_has_fresh_rise(self) -> bool:
+        """Prove that a sub-40 lock crossing a new press is one continuing meter.
+
+        A pre-arm pixel lock is not ownership evidence by itself. Require the last two
+        canonical (coarse/native) fills to be a recent, physically plausible rise and the
+        detector locator to have corroborated the held box within its normal freshness
+        window. This preserves measured rapid 27->34% re-press continuity while rejecting
+        a static low court/player box such as live epoch 38's repeated 14.3% false lock.
+        """
+        if (getattr(self, "_det_state", "idle") != "locked"
+                or getattr(self, "_det_last_box", None) is None):
+            return False
+        try:
+            _hist = [(float(t), float(f)) for t, f in self._det_coarse_fill_hist
+                     if np.isfinite(float(t)) and np.isfinite(float(f)) and float(f) > 0.0]
+        except Exception:
+            return False
+        if len(_hist) < 2:
+            return False
+        (_t0, _f0), (_t1, _f1) = _hist[-2], _hist[-1]
+        _dt_s = _t1 - _t0
+        if not (0.0 < _dt_s <= 0.120):
+            return False
+        _rise = _f1 - _f0
+        # Low-fill pop-in steps are measured as fast as ~0.59 pp/ms and are explicitly
+        # allowed by the normal press gate while they remain below 40. Use the same safe
+        # class here with headroom; the lower rise bound and fresh locator identity do the
+        # static-false-lock rejection.
+        _max_rise = (self._press_step_margin_pp
+                     + max(self._press_max_rate_pct_ms, 0.70) * _dt_s * 1000.0)
+        if not (self._press_pair_min_rise_pp <= _rise <= _max_rise):
+            return False
+        try:
+            _locator_age = _t1 - float(self._det_last_found_ts)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return (-1e-6 <= _locator_age
+                <= max(0.0, float(self._det_ttl_s)) + 1e-6)
+
+    def _note_press_ghost_full_result(self, *, found: bool, fresh: bool,
+                                      scope: str, new_result: bool) -> None:
+        """Retire one quarantined meter identity after proven full-frame absence.
+
+        The zone is a visual identity guard, not a permanent location ban. Two unique
+        fresh FULL-frame nofinds prove the old meter disappeared; drop its coasted lock
+        without warm memory and let a newly rendered same-zone meter acquire normally.
+        A partial scan cannot prove absence and a full-frame find resets the run.
+        """
+        if self._press_ghost_zone is None or not fresh or not new_result:
+            return
+        if scope != "full":
+            return
+        if found:
+            self._press_ghost_full_nofind_n = 0
+            return
+        self._press_ghost_full_nofind_n += 1
+        if self._press_ghost_full_nofind_n < self._ghost_full_absence_results:
+            return
+
+        _count = self._press_ghost_full_nofind_n
+        self._press_ghost_zone = None
+        self._press_ghost_level = None
+        self._press_ghost_zone_low_n = 0
+        self._press_ghost_zero_n = 0
+        self._press_ghost_full_nofind_n = 0
+        self.conf = 0.0
+        self.box = None
+        self.tmpl = None
+        try:
+            self._det_reset_lock_state()
+            self._det_warm_pos = None
+            self._det_warm_ts = -1.0e9
+            self._det_active_box = None
+        except Exception:
+            pass
+        _acq_logger.error(
+            "GHOST IDENTITY RETIRED AFTER FULL ABSENCE: epoch=%d full_nofinds=%d "
+            "(same-zone next meter may acquire fresh)",
+            int(self._physical_shot_epoch or 0), int(_count))
+
+    def _det_next_acq_scan_region(self, shot_epoch: int) -> str:
+        """Return the next one-inference acquisition view for this physical epoch.
+
+        A remembered side is only written after the held detector box proves a real
+        fill rise. It is therefore a priority hint, never ownership evidence. Every
+        three opportunities still cover full + both overlapping edges.
+        """
+        if not self._det_phased_acquire:
+            self._det_acq_scan_last = 'full'
+            return 'full'
+        try:
+            epoch = int(shot_epoch or 0)
+        except (TypeError, ValueError, OverflowError):
+            epoch = 0
+        if self._det_acq_scan_epoch != epoch:
+            self._det_acq_scan_epoch = epoch
+            self._det_acq_scan_index = 0
+        side = self._det_acq_last_side
+        if side == 'left':
+            order = ('left', 'full', 'right')
+        elif side == 'right':
+            order = ('right', 'full', 'left')
+        else:
+            order = ('full', 'left', 'right')
+        region = order[int(self._det_acq_scan_index) % len(order)]
+        self._det_acq_scan_index = (int(self._det_acq_scan_index) + 1) % len(order)
+        self._det_acq_scan_last = region
+        return region
+
+    def _det_drop_lock(self, now: float, reason: str) -> None:
+        """Drop the lock and arm the WARM re-acquire memory at the spot it died (retired
+        _note_lock_loss -> _warm_pos: 'a candidate near where a corroborated lock was lost
+        moments ago is the same meter continuing its rise')."""
+        if self._det_emit is not None:
+            self._det_warm_pos = (float(self._det_emit[0]),
+                                  float(self._det_emit[1]) - float(self._det_emit[3]) * 0.5)
+        elif self._det_last_box is not None:
+            lb = self._det_last_box
+            self._det_warm_pos = (lb[0] + lb[2] * 0.5, lb[1] + lb[3] * 0.5)
+        self._det_warm_ts = float(now)
+        self._det_diag['drop'] += 1
+        try:
+            self.last_debug = dict(self.last_debug or {})
+            self.last_debug['det_drop'] = reason
+        except Exception:
+            pass
+        self._det_reset_lock_state()
+
+    def _det_on_found(self, box, conf: float, now: float, new_result: bool,
+                      result_ts=None) -> bool:
+        """Lifecycle decision for a FRESH detector proposal. Returns True when the proposal is
+        ACCEPTED into the lock (the caller then updates _det_last_box / history / template);
+        False = the proposal must not move anything this frame (pending warm-up, or a
+        teleport outlier accruing re-seed strikes)."""
+        if not self._det_lifecycle:
+            return True                      # pre-port behaviour: every fresh box is adopted
+        bx, by, bw, bh = (float(v) for v in box)
+        cx = bx + bw * 0.5
+        cy = by + bh * 0.5
+        gate = self._det_jump_gate()
+        if self._det_state == 'locked':
+            # Reference = where the lock IS now (smoothed emit tracks the meter through the
+            # coast; the raw last box can be a stale async result).
+            if self._det_emit is not None:
+                rcx = float(self._det_emit[0])
+                rcy = float(self._det_emit[1]) - float(self._det_emit[3]) * 0.5
+            elif self._det_last_box is not None:
+                lb = self._det_last_box
+                rcx = lb[0] + lb[2] * 0.5
+                rcy = lb[1] + lb[3] * 0.5
+            else:
+                rcx, rcy = cx, cy
+            jump = float(np.hypot(cx - rcx, cy - rcy))
+            if jump <= gate * max(1.0, float(self._det_track_scale)):
+                # KEEP: in-gate motion (a fade slides the meter ~9-13px/frame -- real motion,
+                # not instability). Fresh evidence heals every drop counter.
+                self._det_nm_strikes = 0
+                self._det_strike_box = None
+                self._det_strike_n = 0
+                return True
+            # TELEPORT outlier: never move the lock on one far proposal (the live 543px |dcx|
+            # snap). Count re-seed strikes on UNIQUE results only -- an async latest() repeat
+            # must not double-count -- and require them mutually consistent (retired
+            # MeterBoxKalman 3-strike re-seed).
+            if not new_result:
+                return False
+            self._det_diag['outlier'] += 1
+            if (self._det_strike_box is not None
+                    and float(np.hypot(cx - self._det_strike_box[0],
+                                       cy - self._det_strike_box[1])) <= gate):
+                self._det_strike_n += 1
+            else:
+                self._det_strike_box = (cx, cy)
+                self._det_strike_n = 1
+            if self._det_strike_n >= int(self._det_reseed_n):
+                # Genuine relocation (three consistent far proposals ~ a new shot elsewhere):
+                # adopt it as a FRESH lock -- full state reset so the old lock's motion/fill
+                # cannot bleed into the new one.
+                self._det_diag['reseed'] += 1
+                self._det_reset_lock_state()
+                self._det_state = 'locked'
+                self._start_det_lock_generation()
+                self._det_diag['lock'] += 1
+                return True
+            return False
+        # --- idle / pending: ACQUIRE hysteresis ---
+        # A detector result proves what was present in ITS SOURCE FRAME, not what is
+        # present in the physical-shot epoch active when latest() happens to be consumed.
+        # In async mode an inference submitted just before a press can complete after the
+        # press.  The press-time stale-lock breaker resets the lifecycle, and the old code's
+        # armed/strong shortcut then immediately re-installed that pre-press box.  Live
+        # session_20260831_210338 epoch 53 reproduced the consequence: the old meter box sat
+        # on bare court and measured a plausible 0->53% rise until the first post-press
+        # result arrived.  Fence every COLD acquisition to a source frame from this epoch;
+        # an already-locked low/rising bridge remains untouched above.
+        if self._shot_armed_hw and self._hw_arm_ts is not None:
+            # A pending acquire is evidence from its own consumption epoch.  Do not let
+            # one weak pre-press candidate combine with one post-press candidate to fake
+            # the two-result acquisition streak.  This is deliberately narrower than a
+            # lifecycle reset: a locked low/rising bridge already returned above.
+            if (self._det_state == 'pending'
+                    and float(self._det_pend_ts) + 1.0e-6 < float(self._hw_arm_ts)):
+                self._det_state = 'idle'
+                self._det_streak = 0
+                self._det_pend_box = None
+                self._det_pend_ts = -1.0e9
+            if not self._det_result_this_arm(result_ts):
+                return False
+        warm = (self._det_warm_pos is not None
+                and (now - self._det_warm_ts) <= float(self._det_warm_s)
+                and float(np.hypot(cx - self._det_warm_pos[0],
+                                   cy - self._det_warm_pos[1])) <= gate * 2.0)
+        # STRONG proposal paired with the PHYSICAL arm: the press is the behavioural evidence
+        # (retired T-a4 refused loc_strong standalone). This is what keeps first-detected fill
+        # at 0-10% -- the armed onset frame may latch immediately.
+        # Confidence + a physical press may waive the two-result acquire streak only for
+        # a UNIQUE result. latest() repeats one slot across frames; replaying the same box
+        # after a production-boundary ghost eviction is not new corroboration.
+        strong = (float(conf) >= float(self._det_acq_strong)
+                  and bool(self._shot_armed_hw) and bool(new_result))
+        if new_result:
+            if (self._det_pend_box is not None
+                    and (now - self._det_pend_ts) <= 0.5   # pend TTL = retired _RECENT_PROX_S
+                    and float(np.hypot(cx - self._det_pend_box[0],
+                                       cy - self._det_pend_box[1])) <= gate):
+                self._det_streak += 1
+            else:
+                self._det_streak = 1
+            self._det_pend_box = (cx, cy)
+            self._det_pend_ts = float(now)
+            self._det_state = 'pending'
+        if warm or strong or self._det_streak >= int(self._det_acq_frames):
+            self._det_state = 'locked'
+            self._start_det_lock_generation()
+            self._det_streak = 0
+            self._det_pend_box = None
+            self._det_lock_fill0 = None
+            self._det_lock_fill_max = -1.0
+            self._det_lock_was_warm = bool(warm)   # warm mid-rise re-locks skip the veto
+            self._det_lock_read_n = 0
+            self._det_last_presence = False
+            self._det_emit = None
+            self._det_nm_strikes = 0
+            self._det_strike_box = None
+            self._det_strike_n = 0
+            if warm:
+                self._det_warm_pos = None       # consumed -- a fresh loss must re-arm it
+                self._det_warm_ts = -1.0e9
+            self._det_diag['lock'] += 1
+            return True
+        return False
+
+    def _det_on_nofound(self, now: float, new_result: bool) -> bool:
+        """A FRESH confident 'no meter anywhere' verdict. Returns True when it dropped the
+        lock.
+
+        Hysteresis, exactly as the retired detector split it: a lock backed by INDEPENDENT
+        corroboration survives locator misses (its red-presence coast; ours = a PROVEN
+        >=_det_coast_rise_pp fill rise AND the white ribbon still measured at the tracked spot
+        last frame), bounded by the wall-clock coast; a lock with NO such corroboration -- the
+        decor false-lock case the veto exists for -- dies after _det_nm_drop consecutive UNIQUE
+        verdicts, which is ~50ms at sync cadence, FASTER than the old 0.35s hold expiry.
+
+        WHY not drop every lock at N strikes: measured on session_20260830_003937, YOLO goes
+        found=0 for 17-33 CONSECUTIVE frames inside real shot runs (motion blur / the green cap
+        VFX -- the exact cap-detection gap the retired _PEAK_HOLD existed for). Any small strike
+        cap would re-create the owner's on/off/on churn wholesale."""
+        if not self._det_lifecycle or self._det_state != 'locked':
+            return False
+        if not new_result:
+            return False
+        self._det_nm_strikes += 1
+        rise_ok = (self._det_lock_fill0 is not None
+                   and (self._det_lock_fill_max - self._det_lock_fill0)
+                   >= float(self._det_coast_rise_pp))
+        if self._det_nm_strikes >= int(self._det_nm_drop) and not (
+                rise_ok and self._det_last_presence):
+            self._det_drop_lock(now, 'nometer_strikes')
+            return True
+        return False
+
+    def _det_submit_priority(self, frame, now: float, region: str = 'full') -> int:
+        """Queue newest pixels on the locator worker, never call ORT on this thread.
+
+        AsyncMeterLocator exposes priority APIs.  The ordinary submit fallback keeps
+        duck-typed/legacy locators working, but live production always takes the
+        non-blocking priority path.
+        """
+        try:
+            if self._meter_detector is None:
+                return False
+            fn = getattr(self._meter_detector, 'submit_priority_region', None)
+            if callable(fn):
+                fn(frame, float(now), region)
+                return 2
+            fn = getattr(self._meter_detector, 'submit_priority', None)
+            if callable(fn):
+                fn(frame, float(now))
+                return 2
+            fn = getattr(self._meter_detector, 'submit', None)
+            if callable(fn):
+                fn(frame, float(now))
+                return 1
+        except Exception:
+            return False
+        return False
+
+    def _det_hard_reseat_serving(self, frame, box, now: float) -> None:
+        """Reset position-anchored serving state on an accepted rescue result."""
+        bb = tuple(int(v) for v in box)
+        self._det_tmpl = None
+        self._det_tmpl_size = None
+        self._det_tmpl_cx_offset = 0.0
+        self._det_tmpl_bottom_offset = 0.0
+        self._det_tmpl_pos = None
+        self._det_track_box = None
+        self._det_track_vx = 0.0
+        self._det_track_vy = 0.0
+        self._det_track_last_match = None
+        self._det_track_box_ts = None
+        self._det_track_last_match_ts = None
+        self._det_track_sample_ts = float(now)
+        self._det_track_clock_timed = True
+        self._det_track_velocity_dt_s = 1.0 / 60.0
+        self._det_scale_reference = None
+        self._det_scale_pending = None
+        self._seed_track_template(frame, bb)
+        self._det_tmpl_ts = float(now)
+        self._det_emit = [bb[0] + bb[2] * 0.5, float(bb[1] + bb[3]),
+                          float(bb[2]), float(bb[3])]
+
+    def _det_read_rescue(self, frame, now):
+        """Request a freshest-frame box after a held-box fill read fails.
+
+        The old implementation ran one full ORT inference inline here.  During the
+        real-game failure that meant repeated 44-70ms capture-callback stalls and a
+        60->31fps collapse.  The worker now receives a priority/latest-frame request;
+        the next unique full-frame result still passes the ordinary lifecycle/jump
+        policy, then earns the same hard serving-state reseat.  Until then the caller
+        keeps the held box and its honest zero -- no synthetic fill and no false lock.
+        """
+        try:
+            active = float(getattr(self, '_det_rescue_request_ts', -1.0e9))
+            if (active > -1.0e8
+                    and float(now) - active <= max(float(self._det_ttl_s), 0.20)):
+                return None
+            queued = self._det_submit_priority(frame, float(now), 'full')
+            if not queued:
+                return None
+            self._det_diag['rescue'] = self._det_diag.get('rescue', 0) + 1
+            # Only the priority API gives this request a worker-result identity. A
+            # legacy ordinary-submit fallback is useful as a wake, but a later normal
+            # result must not be mistaken for the requested hard-reseat response.
+            if queued >= 2:
+                self._det_rescue_request_ts = float(now)
+        except Exception:
+            return None
+        return None
+
+    def _det_kalman_observe(self, box, ts):
+        """Constant-velocity position filter; only independently accepted NCC updates it.
+
+        X uses the centre and Y uses the bottom anchor so detector height breathing
+        cannot masquerade as camera motion. Convert to centre-Y only for rendering.
+        No prediction changes visibility, lock lifetime, fill, or ownership.
+        """
+        if ts is None or not np.isfinite(ts):
+            self._det_kalman_state = None
+            return
+        x, y, w, h = (float(v) for v in box)
+        z = np.array([x + w * .5, y + h], dtype=np.float64)
+        k = self._det_kalman_state
+        dt = float(ts) - k['ts'] if k is not None else 0.0
+        if k is None or not (0.0 < dt <= float(self._subpx_bridge_max_s)):
+            # Repeated source frames are not independent measurements.
+            if k is not None and dt == 0.0:
+                return
+            self._det_kalman_state = dict(
+                x=np.array([z[0], z[1], 0., 0.]),
+                P=np.diag([4., 4., 40000., 40000.]), ts=float(ts), n=1)
+            return
+        F = np.eye(4)
+        F[0, 2] = F[1, 3] = dt
+        G = np.array([[.5 * dt * dt, 0.], [0., .5 * dt * dt],
+                      [dt, 0.], [0., dt]])
+        xp = F @ k['x']
+        P = F @ k['P'] @ F.T + (G @ G.T) * 250000.
+        K = np.linalg.solve(P[:2, :2] + np.eye(2) * 2.25, P[:2, :]).T
+        xnew = xp + K @ (z - xp[:2])
+        # Joseph form keeps covariance symmetric/positive under long sessions.
+        A = np.eye(4)
+        A[:, :2] -= K
+        Pnew = A @ P @ A.T + 2.25 * K @ K.T
+        self._det_kalman_state = dict(x=xnew, P=Pnew, ts=float(ts), n=k['n'] + 1)
+
+    def _det_bar_geometry(self, frame, box, ts=None):
+        """Find local cap + ribbon edges, never the brightest nearby column alone.
+
+        This is a bounded observation inside a lifecycle-accepted box neighbourhood,
+        not a locator. Both cap and narrow white base must exist in THIS frame.
+        Hidden pixels never inherit geometry from an earlier frame.
+        """
+        try:
+            x, y, w, h = (int(v) for v in box)
+            if w < 6 or h < 20:
+                return None
+            H, W = frame.shape[:2]
+            step = self._det_track_predicted_step(self._det_track_vx, self._det_track_vy)
+            padx = min(60, max(10, int(w), int(abs(step[0]) * 2.5 + 10)))
+            pady = min(35, max(8, int(h * .15), int(abs(step[1]) * 1.5 + 8)))
+            x0, x1 = max(0, x - padx), min(W, x + w + padx)
+            y0, y1 = max(0, y - pady), min(H, y + h + pady)
+            if x1 - x0 < 8 or y1 - y0 < 20:
+                return None
+            hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+            hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+            green = ((hue >= 40) & (hue <= 85) & (sat >= 90) & (val >= 90))
+            # Only the tip neighbourhood may propose a cap. Court logos below
+            # the expected tip cannot turn into a different full-track ruler.
+            green[max(0, min(green.shape[0], int(y - y0 + .30 * h))):] = False
+            n, _, stats, centers = cv2.connectedComponentsWithStats(green.astype(np.uint8), 8)
+            candidates = []
+            for i in range(1, n):
+                gx, gy, gw, gh, area = stats[i]
+                if (area < 8 or gw < 3 or gw > max(8, 1.5 * w)
+                        or gh > max(12, .18 * h) or gy <= 0):
+                    continue
+                cx = float(centers[i, 0]) + x0
+                if abs(cx - (x + w * .5)) > padx:
+                    continue
+                candidates.append((abs(cx - (x + w * .5)) + .2 * abs(y0 + gy - y), i))
+            white = ((val >= 200) & (sat <= 65))
+            for _, i in sorted(candidates):
+                gx, gy, gw, gh, area = (int(v) for v in stats[i])
+                ccx = float(centers[i, 0])
+                # Restrict to a cap-aligned ribbon; a larger white jersey outside
+                # it does not participate in either the profile or edge estimate.
+                lo = max(0, int(ccx - max(4., gw)))
+                hi = min(white.shape[1], int(ccx + max(4., gw)) + 1)
+                ribbon = white[:, lo:hi].copy()
+                ribbon[:gy + gh] = False
+                rn, _, rs, _ = cv2.connectedComponentsWithStats(ribbon.astype(np.uint8), 8)
+                pieces = []
+                for j in range(1, rn):
+                    bx, by, bw, bh, mass = (int(v) for v in rs[j])
+                    bot = by + bh
+                    if (bh < 4 or mass < 12 or bw < 3 or bw > max(6., 1.9 * gw)
+                            or bx <= 0 or bx + bw >= hi - lo
+                            or bot >= ribbon.shape[0] - 2
+                            or abs((lo + bx + .5 * bw) - ccx) > max(3., .6 * gw)
+                            or not (.55 * h <= bot - gy <= 1.25 * h)):
+                        continue
+                    pieces.append((abs((bot + y0) - (y + h - 8)), bx, by, bw, bh))
+                if not pieces:
+                    continue
+                _, bx, by, bw, bh = min(pieces)
+                cols = slice(lo + bx, lo + bx + bw)
+                rowprof = val[:, cols].mean(axis=1).astype(float)
+                body = float(np.median(rowprof[by:min(by + bh, by + 4)]))
+                upper = float(np.median(rowprof[max(0, by - 4):by]))
+                lower = float(np.median(rowprof[by + bh:by + bh + 3]))
+                if body - upper < 40. or body - lower < 40.:
+                    continue
+                def cross(a, b, level):
+                    return a + (level - rowprof[a]) / (rowprof[b] - rowprof[a])
+                top = cross(by - 1, by, .5 * (body + upper))
+                base = cross(by + bh - 1, by + bh, .5 * (body + lower))
+                xp = val[by:by + bh, :].mean(axis=0).astype(float)
+                lefti, righti = lo + bx, lo + bx + bw - 1
+                if (xp[lefti] - xp[lefti - 1] < 40.
+                        or xp[righti] - xp[righti + 1] < 40.):
+                    continue
+                # Half-height crossings of the actual local white edges.
+                left, right = lefti - .5, righti + .5
+                # Cap paint count has an antialiased edge; use its half-plateau
+                # crossing instead of the integer first-green row alone.
+                gp = green[:, gx:gx + gw].mean(axis=1)
+                peak = float(np.max(gp[gy:gy + gh]))
+                cap_top = gy - 1 + (.5 * peak - gp[gy - 1]) / max(1e-6, gp[gy] - gp[gy - 1])
+                cap_bottom = gy + gh - 1 + (gp[gy + gh - 1] - .5 * peak) / max(
+                    1e-6, gp[gy + gh - 1] - gp[gy + gh])
+                span = float(base - cap_top)
+                if not (.55 * h <= span <= 1.25 * h) or not (cap_top < top < base):
+                    continue
+                return dict(cx=x0 + .5 * (left + right), left=x0 + left,
+                    right=x0 + right, cap_top=y0 + cap_top, cap_bottom=y0 + cap_bottom,
+                    base=y0 + base, edge=y0 + top, coarse_edge=y0 + by,
+                    span=span, green_pixels=area, ts=ts)
+        except (ValueError, TypeError, IndexError, cv2.error, ZeroDivisionError):
+            return None
+        return None
+
+    def _reseat_x_dx(self, frame, box):
+        """[ORION_READER_RESEAT_X] Horizontal offset (px) that puts `box` on the white ribbon
+        visible in this frame, or None. Whiteness = min(B,G,R) >= 200 counted per column over
+        the box rows in a +-max window; exactly ONE contiguous run of ribbon width, whose
+        white rows form a single vertical run ending in the lower half of the box, and whose
+        centre is 3..max px from the box centre. Anything else fails closed. (Run width is
+        judged against the box width, 0.30..0.85 w; the ribbon core is ~half the box.)"""
+        try:
+            x, y, w, h = (int(v) for v in box)
+            H, W = frame.shape[:2]
+            pad = int(self._reseat_x_max)
+            x0, x1 = max(0, x - pad), min(W, x + w + pad)
+            y0, y1 = max(0, y), min(H, y + h)
+            if x1 - x0 < w + 6 or y1 - y0 < 20:
+                return None
+            Wn = frame[y0:y1, x0:x1].min(axis=2)
+            white = Wn >= 200
+            col = white.sum(axis=0)
+            hot = col >= 3
+            idx = np.flatnonzero(hot)
+            if idx.size < 8:
+                return None
+            # the ribbon core is ~half the detector box width (11-13 of 23 px @720p); a run
+            # narrower than 0.3 w is a court line, wider than 0.85 w is not a ribbon
+            w_lo, w_hi = max(4, int(round(0.30 * w))), max(6, int(round(0.85 * w)))
+            runs = [ru for ru in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1) if ru.size >= w_lo]
+            runs = [ru for ru in runs if ru.size <= w_hi]
+            if len(runs) != 1:
+                return None
+            ru = runs[0]
+            # the ribbon's white rows are one vertical run per column, ending in the lower half
+            core = white[:, ru[1]:ru[-1]]              # drop the run's edge columns
+            rows = np.flatnonzero(core.mean(axis=1) >= 0.6)
+            if rows.size < 3 or (rows[-1] - rows[0] + 1) != rows.size:
+                return None
+            if rows[-1] < 0.5 * (y1 - y0):
+                return None
+            cx_run = x0 + 0.5 * (float(ru[0]) + float(ru[-1]))
+            dx = cx_run - (x + 0.5 * w)
+            if not (3.0 <= abs(dx) <= float(pad)):
+                return None
+            return int(round(dx))
+        except Exception:
+            return None
+
+    def _det_measurement_boxes(self, frame, tracked, ts=None):
+        """Keep the old display contract; an opt-in pixel crop never sees its EMA."""
+        tracked = tuple(int(v) for v in tracked)
+        display = (tuple(int(v) for v in self._det_smooth_emit(tracked))
+                   if self._det_lifecycle else tracked)
+        self._det_display_box = display
+        self._det_pixel_geometry = None
+        measured = display
+        if self._det_measure_raw:
+            measured = tracked
+            geometry = self._det_bar_geometry(frame, tracked, ts)
+            self._det_pixel_geometry = geometry
+            if geometry is not None:
+                H, W = frame.shape[:2]
+                x0 = max(0, int(np.floor(geometry['left'])) - 3)
+                x1 = min(W, int(np.ceil(geometry['right'])) + 4)
+                y0 = max(0, int(np.floor(geometry['cap_top'])) - 4)
+                y1 = min(H, int(np.ceil(geometry['base'])) + 5)
+                measured = (x0, y0, x1 - x0, y1 - y0)
+        self._det_measurement_box = measured
+        return measured, display
+
+    def _measure_pixel_ruler(self, frame, box, ts, direct_top):
+        """An opt-in independent bar ruler. Never mix missing geometry with box scale."""
+        g = self._det_bar_geometry(frame, box, ts)
+        self._det_pixel_geometry = g
+        self._last_fill_coarse = 0.0
+        self._last_subpx_transform = None
+        self._dbg_subpx = dict(ok=0, gate='pixel_geometry_missing', ruler='pixel_bar')
+        if g is None or abs(g['coarse_edge'] - (box[1] + direct_top)) > 3.0:
+            self._det_pixel_ruler_reject = True
+            self._last_fill_estimator_mode = ""
+            self._last_fill_estimator_generation = 0
+            return 0.0, None, -1
+        D = g['span']
+        hist = self._det_pixel_span_hist
+        # Constant screen-space geometry: a camera pan never authorizes a new
+        # scale. The session median is only an outlier guard, not a substitute
+        # for this frame's directly observed cap-to-base denominator.
+        if len(hist) >= 3:
+            ref = float(np.median(hist))
+            if abs(D - ref) > max(3., ref * .08):
+                self._det_pixel_ruler_reject = True
+                self._dbg_subpx['gate'] = 'pixel_ruler_outlier'
+                self._last_fill_estimator_mode = ''
+                self._last_fill_estimator_generation = 0
+                return 0.0, None, -1
+        if not hist:
+            self._det_pixel_ruler_epoch += 1
+        hist.append(D)
+        coarse = np.clip((g['base'] - g['coarse_edge']) / D * 100., 0., 100.)
+        sub = np.clip((g['base'] - g['edge']) / D * 100., 0., 100.)
+        fill = float(sub if self._subpx_fill else coarse)
+        self._last_fill_coarse = round(float(coarse), 2)
+        mode = 'subpixel' if self._subpx_fill else 'coarse'
+        self._stamp_fill_estimator(mode, ('pixel_bar', self._det_pixel_ruler_epoch))
+        start = float(np.clip((g['base'] - g['cap_bottom']) / D * 100., 0., 100.))
+        green = (round(start, 2), 100., round((start + 100.) * .5, 2),
+                 round(100. - start, 2), round(min(1., g['green_pixels'] / 40.), 3),
+                 g['green_pixels'])
+        self._dbg_subpx = dict(ok=1, gate='', ruler='pixel_bar', anchor='pixel_base',
+            top_sub=g['edge'] - box[1], base_sub=g['base'] - box[1],
+            fill_sub=round(float(sub), 3), ruler_n=len(hist), measured_span=round(D, 4))
+        self._last_subpx_transform = (g['base'] - box[1], D)
+        return round(fill, 2), green, int(g['coarse_edge'] - box[1])
+
+    def _det_smooth_emit(self, box):
+        """Smoothed EMIT box (retired _Tk: responsive matching state, damped display state).
+        The NCC-matched centre writes through uncapped (the retired template match wrote
+        cx_emit directly -- 0.12px MAE beats any smoothing); everything else moves under a
+        +/-8px/frame slew with a 0.65/0.35 EMA on the dims, so a single jittery YOLO box can
+        no longer stride the served rectangle (live p90 |dcx| 10px, max 543px)."""
+        try:
+            x, y, w, h = (int(v) for v in box)
+            if w <= 0 or h <= 0:
+                return box
+            cx = x + w * 0.5
+            bot = float(y + h)
+            e = self._det_emit
+            if e is None:
+                self._det_emit = [float(cx), bot, float(w), float(h)]
+                return box
+            slew = float(self._det_emit_slew)
+            ncc_strong = (self._det_tmpl is not None
+                          and float(self._det_track_score) >= float(self._det_track_min))
+            if ncc_strong:
+                e[0] = float(cx)
+                # A strong match has already passed the same per-axis innovation gate
+                # that protects X.  Write the meter's bottom edge through as well: an
+                # unconditional 8px Y slew visibly trails diagonal/deep fades whose meter
+                # moves 9-13px/frame, even while NCC is locked on the correct pixels.
+                e[1] = bot
+            else:
+                e[0] += max(-slew, min(slew, cx - e[0]))
+                e[1] += max(-slew, min(slew, bot - e[1]))
+            e[2] = 0.65 * e[2] + 0.35 * float(w)
+            e[3] = 0.65 * e[3] + 0.35 * float(h)
+            scale_match = getattr(self, '_det_track_scale_match', None)
+            if ncc_strong and scale_match is not None and scale_match[0]:
+                # Current pixels matched the detector-proposed resize, not just
+                # its original appearance. A dimension EMA would crop the newly
+                # enlarged cap and turn camera zoom into apparent fill progress.
+                # Ordinary detector breathing still takes the original-template
+                # route and retains the dimension damping above.
+                e[2], e[3] = float(w), float(h)
+            nw = max(1, int(round(e[2])))
+            nh = max(1, int(round(e[3])))
+            nx = int(round(e[0] - nw * 0.5))
+            ny = int(round(e[1] - nh))
+            try:
+                W = int(self.W or 0)
+                H = int(self.H or 0)
+            except Exception:
+                W = H = 0
+            if W > 0:
+                nx = max(0, min(W - nw, nx))
+            if H > 0:
+                ny = max(0, min(H - nh, ny))
+            return (nx, ny, nw, nh)
+        except Exception:
+            return box
+
+    def _refine_box_local(self, frame, box):
+        """Re-centre the detector box on the ACTUAL meter column, every frame, on CPU.
+
+        DETECT-THEN-TRACK: the YOLO detector only updates at its own cadence (~72ms), so
+        between detections the box is a guess -- it drifts off a meter that moves with the
+        shooting player (visible live: the box sitting ~45px left of the white bar). Snapping
+        to the strongest bright-neutral COLUMN inside a padded window costs ~0.2ms and gives a
+        60fps position lock, so the box sticks to the meter instead of trailing it.
+
+        Returns a corrected (x, y, w, h), or the input box when no confident column is found
+        (fail-safe: never move the box on weak evidence)."""
+        try:
+            x, y, w, h = (int(v) for v in box)
+            if w <= 0 or h <= 0:
+                return box
+            H, W = frame.shape[:2]
+            padx = max(10, int(w * 1.6))       # search window: wide enough to catch the drift
+            x0 = max(0, x - padx); x1 = min(W, x + w + padx)
+            y0 = max(0, y); y1 = min(H, y + h)
+            if x1 - x0 < w + 2 or y1 - y0 < 10:
+                return box
+            hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+            bright = ((hsv[:, :, 2] >= 200) & (hsv[:, :, 1] <= 65)).astype(np.float32)
+            colsum = bright.sum(axis=0)        # per-column count of meter-white pixels
+            if colsum.max() < 3.0:
+                return box                     # no bright column here -> keep the detector box
+            # Best w-wide window (the meter is a narrow ribbon): boxcar over the column profile.
+            k = max(3, min(int(w), colsum.size))
+            csum = np.cumsum(np.concatenate(([0.0], colsum)))
+            win = csum[k:] - csum[:-k]
+            bi = int(np.argmax(win))
+            if win[bi] < 6.0:
+                return box                     # too weak to trust
+            nx = x0 + bi
+            nx = max(0, min(W - w, nx))
+            # Reject implausible jumps: a real meter does not teleport between frames.
+            if abs(nx - x) > padx:
+                return box
+            return (int(nx), y, w, h)
+        except Exception:
+            return box
+
+    def _stamp_fill_estimator(self, mode, identity):
+        """Publish a stable, process-monotonic identity for one emitted fill ruler.
+
+        ``mode`` is deliberately small on the wire (``coarse`` or ``subpixel``).
+        ``identity`` remains local and captures sub-pixel latch/anchor-family
+        changes which can alter the numerical ruler without changing that mode.
+        A new generation is issued only when the identity changes, so ordinary
+        consecutive samples remain eligible for sub-frame interpolation.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode not in ("coarse", "subpixel"):
+            self._last_fill_estimator_mode = ""
+            self._last_fill_estimator_generation = 0
+            return
+        key = (mode, identity)
+        if key != self._fill_estimator_identity:
+            self._fill_estimator_generation += 1
+            self._fill_estimator_identity = key
+        self._last_fill_estimator_mode = mode
+        self._last_fill_estimator_generation = int(self._fill_estimator_generation)
+
+    def _coarse_fill_ruler_identity(self, denom):
+        """Return a jitter-stable identity for the current coarse row-walk scale.
+
+        ``denom`` remains frame-local for the actual fill calculation.  This helper
+        only tells native which consecutive samples are safe to interpolate.  The
+        detector's measured +/-2 px height quantization stays one identity; a larger
+        change (or a shot/lock reset, which clears the reference) starts a new epoch
+        before this frame is published, so the crossing pair fails closed.
+        """
+        d = float(max(1.0, denom))
+        ref = self._coarse_denom_ref
+        if (ref is None
+                or abs(d - float(ref)) > float(self._coarse_denom_jitter_px)):
+            self._coarse_denom_ref = d
+            self._coarse_denom_epoch += 1
+        return ("row_walk", int(self._coarse_denom_epoch),
+                float(self._coarse_denom_ref))
+
+    def _predict_subpx_base_abs(self, ts):
+        """Predict the meter-base image row across a short measurement dropout.
+
+        The history contains measured base rows only.  A median of pairwise slopes is
+        used instead of the old first/last slope so one noisy base localization cannot
+        create a large moving-shot extrapolation.  This is intentionally short-lived;
+        after ``_subpx_bridge_max_s`` the caller must fall back and mint a new ruler.
+        """
+        try:
+            if ts is None or len(self._subpx_base_hist) < 2:
+                return None
+            now = float(ts)
+            hist = [(float(t), float(b)) for t, b in self._subpx_base_hist
+                    if np.isfinite(float(t)) and np.isfinite(float(b))]
+            if len(hist) < 2:
+                return None
+            t_last, b_last = hist[-1]
+            age = now - t_last
+            if not (0.0 <= age <= float(self._subpx_bridge_max_s)):
+                return None
+            slopes = []
+            for i in range(len(hist) - 1):
+                for j in range(i + 1, len(hist)):
+                    dt = hist[j][0] - hist[i][0]
+                    if dt > 1.0e-3:
+                        slopes.append((hist[j][1] - hist[i][1]) / dt)
+            if not slopes:
+                return None
+            vel = float(np.median(np.asarray(slopes, dtype=np.float64)))
+            return b_last + vel * age
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _subpixel_camera_scale(self, base, gfrac, bh, ts, measured):
+        """Map current pixels onto a canonical ruler only with independent scale proof.
+
+        A small camera zoom formerly left D latched while stretching the white
+        run, creating about 6.7pp of false progress at +10% zoom. A detector size
+        proposal alone is not enough: require an accepted current-frame notch,
+        a directly measured base, and a green-cap/base span which agrees with
+        that proposed scale within two endpoint-rasterization pixels. The span
+        never uses the moving fill edge. Canonical D/off and estimator identity
+        stay fixed; only the effective pixel transform changes.
+        """
+        scale = float(getattr(self, '_subpx_camera_scale', 1.0))
+        ruler = (self._subpx_D, self._subpx_off)
+        ref = getattr(self, '_subpx_camera_ref', None)
+        if ref is not None and ref[0] != ruler:
+            self._subpx_camera_ref = ref = None
+            self._subpx_camera_scale = scale = 1.0
+            self._det_scale_reference = None
+            self._det_scale_pending = None
+        if (ruler[0] is None or ruler[1] is None or self._subpx_provisional):
+            self._subpx_camera_ref = None
+            self._subpx_camera_scale = 1.0
+            self._det_scale_reference = None
+            self._det_scale_pending = None
+            return 1.0
+        if not measured or base is None:
+            return scale
+        grows = np.flatnonzero(gfrac >= .20)
+        if grows.size < 2:
+            return scale  # absent/tiny/censored cap cannot establish scale
+        span = float(base) - float(grows[0])
+        if not (.5 * float(ruler[0]) * scale <= span
+                <= 1.25 * float(ruler[0]) * scale):
+            return scale
+        if ref is None:
+            # The completed clean latch defines canonical box pixels. This
+            # reference dies on a new lock/press/source or a real ruler relatch.
+            # If the cap first becomes visible only AFTER a scale change, there
+            # is no measured canonical span to recover; do not invent one.
+            if abs(float(bh) - (float(ruler[0]) + 1.0)) > 2.0:
+                return scale
+            self._subpx_camera_ref = (ruler, span, float(ruler[0]) + 1.0)
+            self._remember_det_scale_reference(self._subpx_camera_ref, 1.0, bh, span, ts)
+            return 1.0
+        self._remember_det_scale_reference(ref, scale, bh, span, ts)
+        evidence = getattr(self, '_det_track_scale_match', None)
+        if (evidence is None or len(evidence) != 4 or ts is None
+                or not np.isfinite(float(ts)) or not np.isfinite(float(evidence[3]))
+                or abs(float(ts) - float(evidence[3])) > 1e-6):
+            return scale
+        resized, _w, height, _when = evidence
+        proposed = float(height) / ref[2]
+        if (not np.isfinite(proposed) or proposed <= 0.0
+                or abs(proposed / scale - 1.0) > min(.35, float(self._scale_step_max))
+                or abs(span - ref[1] * proposed) > 2.0):
+            return scale
+        pending = self._det_scale_pending
+        if (pending is not None and abs(pending[0] - float(ts)) <= 1e-6
+                and pending[1:3] == (int(_w), int(height))):
+            self._det_scale_pending = (*pending[:4], True)
+        # An original-template winner normally means detector breathing. After
+        # an established zoom it may also mean a return to the original pixels;
+        # the independent span must confirm that reversal as well.
+        if not resized and abs(scale - 1.0) < 1e-9:
+            return scale
+        # Do not turn one row of cap quantization into calibration movement.
+        # Constant-scale frames assign an absolute ratio, never multiply it.
+        if abs((proposed - scale) * ref[1]) <= 2.0:
+            return scale
+        self._subpx_camera_scale = proposed
+        self._remember_det_scale_reference(ref, proposed, bh, span, ts)
+        # Old absolute base positions mix camera motion/scale and may not bridge
+        # the first hidden frame correctly. Keep only this measured anchor.
+        self._subpx_base_hist = self._subpx_base_hist[-1:]
+        # Session seeds are pixel-valued; future locks must not adopt seeds from
+        # the old physical scale. The current lock's canonical ruler is retained.
+        self._subpx_ruler_hist = []
+        return proposed
+
+    def _bridge_subpixel_from_coarse(self, top, bh, y0, ts):
+        """Keep one base-anchored ruler through a transient edge-quality failure.
+
+        The coarse walk's first-white row is already parity-aligned with
+        ``ysub + _subpx_bias``.  Combining that row with the short-horizon predicted
+        physical base therefore loses sub-row edge precision for this frame, but does
+        *not* change coordinate systems.  Native can retain its earlier clean samples
+        instead of restarting ownership on a coarse/sub-pixel mode toggle.
+        """
+        try:
+            if (not self._subpx_fill or self._subpx_D is None
+                    or self._subpx_off is None):
+                return None
+            base_abs = self._predict_subpx_base_abs(ts)
+            if base_abs is None:
+                return None
+            base = float(base_abs) - float(y0)
+            # Reject a prediction that has left the tracked meter box.  A few pixels of
+            # tolerance cover ordinary detector quantization without accepting a stale
+            # base from another object/lock.
+            if not (-3.0 <= base <= float(bh) + 3.0):
+                return None
+            scale = float(getattr(self, '_subpx_camera_scale', 1.0))
+            D = float(self._subpx_D) * scale
+            anchor = base + float(self._subpx_off) * scale
+            fill_sub = (anchor - float(top)) / D * 100.0
+            if not (-3.0 <= fill_sub <= 103.0):
+                return None
+            fill_sub = min(100.0, max(0.0, fill_sub))
+            q = self._dbg_subpx if isinstance(self._dbg_subpx, dict) else {}
+            q.update({"ok": 1, "bridge": 1, "anchor": "base_bridge",
+                      "base_sub": round(base, 4),
+                      "fill_sub": round(fill_sub, 3)})
+            self._dbg_subpx = q
+            self._last_subpx_transform = (float(anchor), D)
+            return round(fill_sub, 3)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+    def _record_session_ruler_seed(self, d_shot, off_shot):
+        """Append a completed per-shot seed to the session history WITHOUT changing the
+        emitted ruler (the lock stays on the ruler it started on)."""
+        if not self._subpx_session_ruler:
+            return
+        hist = self._subpx_ruler_hist
+        if hist:
+            d_ref = float(np.median([d for d, _ in hist]))
+            if abs(float(d_shot) - d_ref) > max(6.0, d_ref * self._fill_denom_relatch):
+                hist.clear()
+        hist.append((float(d_shot), float(off_shot)))
+        while len(hist) > int(self._subpx_session_window):
+            hist.pop(0)
+
+    def _adopt_session_ruler(self):
+        """[ORION_METER_SUBPIXEL_SESSION_RULER] Fold the per-shot seed that was just latched
+        into the session history and, once enough seeds exist, replace the emitted (D, off)
+        with the session MEDIAN. See the __init__ note for the measurement behind it.
+
+        Called only at the moment a per-shot seed completes, so the estimator identity
+        changes exactly where it changes today (None -> latched); no extra generation churn
+        mid-rise. A seed whose D disagrees with the session median by the relatch margin
+        means a rescale happened while no ruler was latched: the history restarts from it.
+        Flag off, or fewer than the minimum seeds: the per-shot latch stands untouched."""
+        if self._subpx_D is None or self._subpx_off is None:
+            return
+        if not self._subpx_session_ruler:
+            self._subpx_ruler_kind = "shot"
+            return
+        d_shot = float(self._subpx_D)
+        off_shot = float(self._subpx_off)
+        hist = self._subpx_ruler_hist
+        if hist:
+            d_ref = float(np.median([d for d, _ in hist]))
+            if abs(d_shot - d_ref) > max(6.0, d_ref * self._fill_denom_relatch):
+                hist.clear()
+        hist.append((d_shot, off_shot))
+        while len(hist) > int(self._subpx_session_window):
+            hist.pop(0)
+        if len(hist) >= int(self._subpx_session_min):
+            self._subpx_D = max(1.0, float(np.median([d for d, _ in hist])))
+            self._subpx_off = float(np.median([o for _, o in hist]))
+            self._subpx_ruler_kind = "session"
+        else:
+            self._subpx_ruler_kind = "shot"
+
+    def _record_direct_occlusion_fill(self, ts, coarse_fill) -> None:
+        """Record one directly visible detector-box edge for a bounded occlusion bridge.
+
+        This history is shot- and lifecycle-generation-scoped.  It contains only
+        ordinary/rung measurements; recovered frames never enter it and therefore
+        cannot keep a stale prediction alive.  A material fall starts a new run so
+        a release/deflate tail cannot be extrapolated as another rise.
+        """
+        try:
+            now = float(ts)
+            fill = float(coarse_fill)
+            epoch = int(self._physical_shot_epoch or 0)
+            generation = int(getattr(self, "_det_lock_generation", 0) or 0)
+            current = bool(
+                self._det_occ_fill and np.isfinite(now) and np.isfinite(fill)
+                and 0.0 < fill <= 100.0 and epoch > 0 and generation > 0
+                and self._shot_armed_hw and self._det_lifecycle
+                and self._det_state == "locked"
+                and self._det_occ_locator_source_positive)
+            if not current:
+                self._det_occ_direct.clear()
+                self._det_occ_key = None
+                return
+            key = (epoch, generation)
+            if key != self._det_occ_key:
+                self._det_occ_direct.clear()
+                self._det_occ_key = key
+            hist = self._det_occ_direct
+            if hist:
+                prev_t, prev_f = hist[-1]
+                if now <= float(prev_t) + 1.0e-9:
+                    return
+                # Evidence must remain one short visual burst.  Do not combine
+                # sparse sightings across a long hold or a hidden shot boundary.
+                if now - float(prev_t) > max(0.20, 2.0 * self._det_occ_max_gap_s):
+                    hist.clear()
+                elif fill < float(prev_f) - 2.0:
+                    hist.clear()
+            hist.append((now, fill))
+            # Only a new directly visible measurement under a positive locator
+            # replenishes the one-frame negative bridge budget.
+            self._det_occ_negative_bridge_used = False
+        except (TypeError, ValueError, OverflowError):
+            self._det_occ_direct.clear()
+            self._det_occ_key = None
+
+    @staticmethod
+    def _bottom_connected_white_columns(white, gap_tol=2, bottom_gap_tol=3):
+        """Return ``(column, top, bottom, white_count)`` for base-reaching runs.
+
+        A short vertical gap is bridged for compression noise or a thin foreground
+        edge, but a run must still contain real white pixels and terminate within a
+        tightly bounded distance of the detector-box floor.  Merely entering the
+        lower fifth is not base connection: a jersey/highlight can float 10-20 rows
+        above the meter floor and must not become a recovered timing edge.
+        """
+        out = []
+        try:
+            bh, bw = white.shape[:2]
+            max_bottom_gap = max(0, min(
+                int(bottom_gap_tol), max(1, int(round(0.04 * bh)))))
+            base_lim = max(0, bh - 1 - max_bottom_gap)
+            for c in range(bw):
+                rows = np.flatnonzero(white[:, c])
+                if rows.size == 0:
+                    continue
+                # Start at the lowest visible white pixel.  It must reach the
+                # actual base tolerance; otherwise this is a floating fragment.
+                bottom = int(rows[-1])
+                if bottom < base_lim:
+                    continue
+                top = bottom
+                count = 1
+                last = bottom
+                for rr in rows[-2::-1]:
+                    r = int(rr)
+                    if last - r - 1 > int(gap_tol):
+                        break
+                    top = r
+                    count += 1
+                    last = r
+                if count >= 4 and bottom - top + 1 >= 6:
+                    out.append((c, top, bottom, count))
+        except Exception:
+            return []
+        return out
+
+    @staticmethod
+    def _top_occluder_visual_evidence(box_bgr, predicted_top, observed_top):
+        """Require a visible foreground band before treating a low edge as censored.
+
+        Trajectory lag alone is ambiguous: a fully visible meter that plateaus or
+        starts falling has exactly the same white mask as a higher fill whose top
+        was painted over.  Recovery is therefore allowed only when the would-be
+        hidden rows contain a broad appearance change relative to the immediately
+        preceding track rows.  This is direct evidence of a crossing foreground
+        object; an achromatic/indistinguishable mask remains an honest direct read.
+        """
+        try:
+            image = np.asarray(box_bgr)
+            if image.ndim != 3 or image.shape[2] < 3:
+                return False
+            bh, bw = image.shape[:2]
+            ptop = int(predicted_top)
+            otop = int(observed_top)
+            if not (2 <= ptop < otop <= bh - 1) or otop - ptop < 3 or bw < 8:
+                return False
+            xpad = max(2, int(round(0.08 * bw)))
+            if bw - 2 * xpad < 4:
+                return False
+            inner = image[:, xpad:bw - xpad, :3].astype(np.int16, copy=False)
+            # The foreground may begin a few rows before the trajectory's
+            # predicted edge (the prediction is deliberately approximate). Find
+            # a broad horizontal appearance edge in a short look-back, then prove
+            # that its changed material persists through the purported hidden
+            # rows. The observed white-fill boundary is excluded from the search.
+            search_lo = max(2, ptop - min(12, max(4, otop - ptop)))
+            search_hi = min(ptop + 1, otop - 2)
+            for edge in range(search_lo, search_hi + 1):
+                before = np.median(inner[edge - 2:edge], axis=0)
+                after = np.median(inner[edge:edge + 2], axis=0)
+                edge_delta = np.max(np.abs(after - before), axis=1)
+                if float(np.mean(edge_delta >= 24.0)) < 0.45:
+                    continue
+                band = inner[ptop:otop]
+                # Max-channel distance retains saturated/dark foreground evidence
+                # without letting ordinary codec speckle count as a mask.
+                delta = np.max(np.abs(band - before[None, :, :]), axis=2)
+                changed = delta >= 24.0
+                row_support = changed.mean(axis=1)
+                if (np.count_nonzero(row_support >= 0.45) >= 2
+                        and float(changed.mean()) >= 0.35):
+                    return True
+            return False
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return False
+
+    def _occlusion_rise_model(self, ts):
+        """Return the current lock's robust direct-rise model, or ``None``.
+
+        This establishes identity and motion only.  A caller that wants to emit
+        an inferred edge must separately require a still-positive/fresh locator
+        source and the short recovery deadline.  Keeping those decisions split
+        lets a newly negative source classify a truncated edge as censored and
+        reject it without ever authorizing a predicted fill.
+        """
+        try:
+            now = float(ts)
+            epoch = int(self._physical_shot_epoch or 0)
+            generation = int(getattr(self, "_det_lock_generation", 0) or 0)
+            key = (epoch, generation)
+            if not (
+                    self._det_occ_fill and np.isfinite(now)
+                    and epoch > 0 and generation > 0
+                    and self._shot_armed_hw and self._det_lifecycle
+                    and self._det_state == "locked"
+                    and self._det_occ_key == key
+                    and int(self._gameplay_structure_proof_epoch or 0) == epoch
+                    and len(self._det_occ_direct) >= int(self._det_occ_min_direct)):
+                return None
+            hist = list(self._det_occ_direct)
+            last_t, last_fill = float(hist[-1][0]), float(hist[-1][1])
+            age = now - last_t
+            if not (np.isfinite(last_t) and np.isfinite(last_fill) and age > 0.0):
+                return None
+
+            recent = [(float(t), float(f)) for t, f in hist
+                      if last_t - float(t) <= 0.25]
+            if len(recent) < int(self._det_occ_min_direct):
+                return None
+            fills = np.asarray([p[1] for p in recent], dtype=np.float64)
+            if np.any(np.diff(fills) < -1.5) or float(fills[-1] - fills[0]) < 4.0:
+                return None
+            slopes = []
+            for i, a in enumerate(recent[:-1]):
+                for b in recent[i + 1:]:
+                    dt = b[0] - a[0]
+                    if dt > 1.0e-3:
+                        slopes.append((b[1] - a[1]) / dt)
+            if not slopes:
+                return None
+            rate = float(np.median(np.asarray(slopes, dtype=np.float64)))
+            max_rate = max(350.0, float(self._press_max_rate_pct_ms) * 1000.0)
+            if not (20.0 <= rate <= max_rate):
+                return None
+            t0, f0 = recent[0]
+            residual = np.asarray(
+                [f - (f0 + rate * (t - t0)) for t, f in recent],
+                dtype=np.float64)
+            if float(np.max(np.abs(residual))) > 3.5:
+                return None
+            predicted = min(100.0, last_fill + rate * age)
+            loc_age = now - float(self._det_last_found_ts)
+            return now, last_t, last_fill, rate, predicted, age, loc_age
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+    def _partial_occlusion_fill_edge(self, white, bh, bw, denom, ts):
+        """Recover a white fill edge from the unoccluded meter columns.
+
+        The normal detector-box reader intentionally requires a wide row consensus.
+        During a side-on limb crossing, however, two thirds of the bar can disappear
+        while the remaining columns still carry a clean bottom-connected fill edge.
+        This path uses those columns only after the current shot has independently
+        established identity and a rising trajectory.  It returns ``(top, run_len,
+        support_fraction)`` or ``None`` and cannot acquire, stamp, or extend itself.
+        """
+        self._det_occ_recovered = False
+        self._det_occ_support = 0.0
+        self._det_occ_kind = ""
+        try:
+            if not self._det_occ_fill or ts is None or bw < 8 or bh < 20:
+                return None
+            model = self._occlusion_rise_model(ts)
+            if model is None or not self._det_occ_locator_source_positive:
+                return None
+            _, _, last_fill, _, predicted, age, loc_age = model
+            # The locator must also have corroborated this box recently.  A held
+            # negative frame cannot use old trajectory evidence from another scene.
+            if not (0.0 < age <= float(self._det_occ_max_gap_s)
+                    and 0.0 <= loc_age <= float(self._det_occ_max_gap_s)):
+                return None
+
+            # Ignore the detector box's outer two columns (outline/padding), then
+            # recover per-column base-connected runs.  The selected 20th-percentile
+            # top is definition-compatible with the existing robust colour reader:
+            # at least one fifth of surviving columns must agree on the leading edge.
+            xpad = max(2, int(round(0.08 * bw)))
+            if bw - 2 * xpad < int(self._det_occ_min_cols):
+                return None
+            cols = self._bottom_connected_white_columns(
+                white[:, xpad:bw - xpad], gap_tol=2)
+            if len(cols) < int(self._det_occ_min_cols):
+                return None
+            tops = sorted(int(v[1]) for v in cols)
+            qidx = int(np.floor(0.20 * max(0, len(tops) - 1)))
+            top = int(tops[qidx])
+            supporting = sorted(
+                int(v[0]) for v in cols if abs(int(v[1]) - top) <= 6)
+            longest = run = 0
+            prev = None
+            for c in supporting:
+                run = run + 1 if prev is not None and c == prev + 1 else 1
+                longest = max(longest, run)
+                prev = c
+            if longest < int(self._det_occ_min_cols):
+                return None
+
+            candidate = (float(denom) - float(top)) / float(denom) * 100.0
+            # A few rows of compression/occluder edge are expected; a large jump
+            # is an object switch or corrupted read and remains an honest miss.
+            tol = max(5.0, 6.0 * 100.0 / max(1.0, float(denom)))
+            if (candidate < last_fill - 2.0
+                    or abs(candidate - predicted) > tol
+                    or not (0.0 < candidate <= 100.0)):
+                return None
+            support_fraction = float(len(supporting)) / float(max(1, bw - 2 * xpad))
+            selected = [v for v in cols if abs(int(v[1]) - top) <= 6]
+            run_len = int(round(float(np.median(
+                [int(v[2]) - int(v[1]) + 1 for v in selected]))))
+            self._det_occ_recovered = True
+            self._det_occ_support = support_fraction
+            self._det_occ_kind = "partial_columns"
+            self._det_diag["occlusion_fill"] = int(
+                self._det_diag.get("occlusion_fill", 0)) + 1
+            return top, max(4, run_len), support_fraction
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+    def _top_censored_fill_edge(self, white, box_bgr, bh, bw, denom,
+                                best_top, best_len, ts):
+        """Recover, or explicitly reject, a trajectory-truncated top edge.
+
+        A horizontal foreground strip can hide the true leading edge while
+        leaving a wide, base-connected white remainder.  The ordinary row walk
+        then returns a perfectly plausible but too-low fill, which would delay a
+        release.  When that visible edge materially lags a proven current-shot
+        rise, it is a *censored lower bound*, not a new direct measurement.
+
+        A still-positive recent locator may bridge it for at most
+        ``_det_occ_max_gap_s``.  One fresh full-frame negative may bridge for at
+        most 45 ms only when at least half the inner meter width remains; that
+        one-shot budget is replenished solely by a new positive direct read.
+        Stale or subsequent negative slots can only cause an explicit rejection.
+        ``False`` is the rejection sentinel, ``None`` means an ordinary direct
+        edge, and a tuple is the bounded recovered edge.
+        """
+        try:
+            if best_top is None or bw < 8 or bh < 20:
+                return None
+            model = self._occlusion_rise_model(ts)
+            if model is None:
+                return None
+            _, _, last_fill, _, predicted, age, loc_age = model
+            observed = ((float(denom) - float(best_top))
+                        / float(denom) * 100.0)
+            # Require a multi-row disagreement.  Ordinary row quantization and
+            # detector-height jitter stay direct; only a timing-material lag is
+            # classified as a hidden leading edge.
+            lag_floor = max(4.0, 4.0 * 100.0 / max(1.0, float(denom)))
+            if (predicted - observed) < lag_floor:
+                return None
+
+            xpad = max(2, int(round(0.08 * bw)))
+            inner_w = bw - 2 * xpad
+            if inner_w < int(self._det_occ_min_cols):
+                return None
+            cols = self._bottom_connected_white_columns(
+                white[:, xpad:bw - xpad], gap_tol=2)
+            # The remaining lower block must be broad and base-connected.  This
+            # distinguishes a top censor from the two-column side bridge and from
+            # a floating jersey/highlight crossing the held box.
+            supporting = sorted(int(v[0]) for v in cols
+                                if abs(int(v[1]) - int(best_top)) <= 2)
+            longest = run = 0
+            prev = None
+            for c in supporting:
+                run = run + 1 if prev is not None and c == prev + 1 else 1
+                longest = max(longest, run)
+                prev = c
+            min_broad = max(int(self._det_occ_min_cols),
+                            int(np.ceil(0.20 * float(inner_w))))
+            if longest < min_broad or int(best_len) < 6:
+                return None
+
+            support_fraction = float(len(supporting)) / float(max(1, inner_w))
+            predicted_top = int(round(float(denom)
+                                      * (1.0 - predicted / 100.0)))
+            predicted_top = max(0, min(int(bh) - 1, predicted_top))
+            if int(best_top) - predicted_top < 3:
+                return None
+            # A plateau/fall and a top-painted rising fill are identical in the
+            # white mask.  Do not infer from trajectory alone: require the current
+            # pixels to show a broad foreground band in the purported hidden rows.
+            if not self._top_occluder_visual_evidence(
+                    box_bgr, predicted_top, int(best_top)):
+                return None
+            positive_live = bool(
+                self._det_occ_locator_source_positive
+                and 0.0 < age <= float(self._det_occ_max_gap_s)
+                and 0.0 <= loc_age <= float(self._det_occ_max_gap_s))
+            min_negative_broad = int(np.ceil(0.50 * float(inner_w)))
+            negative_once = bool(
+                not positive_live
+                and self._det_occ_current_full_negative
+                and not self._det_occ_negative_bridge_used
+                and longest >= min_negative_broad
+                and support_fraction >= 0.50
+                and 0.0 < age <= float(self._det_occ_negative_bridge_s)
+                and 0.0 <= loc_age <= float(self._det_occ_negative_bridge_s)
+                and 0.0 <= float(self._det_occ_current_source_age)
+                <= float(self._det_occ_negative_bridge_s))
+            if not positive_live and not negative_once:
+                # Classification is allowed to fail closed for only the current
+                # lock's ordinary coast horizon.  It never emits a fill and the
+                # lifecycle still owns the eventual drop/re-acquisition.
+                reject_horizon = min(0.40, max(
+                    float(self._det_occ_max_gap_s),
+                    float(getattr(self, "_det_hold_s", 0.35))))
+                if age <= reject_horizon:
+                    self._det_occ_censored_reject = True
+                    self._det_occ_kind = "top_censored_reject"
+                    self._det_diag["occlusion_reject"] = int(
+                        self._det_diag.get("occlusion_reject", 0)) + 1
+                    return False
+                return None
+
+            self._det_occ_recovered = True
+            self._det_occ_support = support_fraction
+            if negative_once:
+                self._det_occ_negative_bridge_used = True
+                self._det_occ_kind = "top_censored_negative_once"
+                self._det_diag["occlusion_negative"] = int(
+                    self._det_diag.get("occlusion_negative", 0)) + 1
+            else:
+                self._det_occ_kind = "top_censored"
+            self._det_diag["occlusion_fill"] = int(
+                self._det_diag.get("occlusion_fill", 0)) + 1
+            self._det_diag["occlusion_top"] = int(
+                self._det_diag.get("occlusion_top", 0)) + 1
+            recovered_len = max(4, int(best_len) + int(best_top) - predicted_top)
+            return predicted_top, recovered_len, support_fraction
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+    def _measure_fill_in_box(self, frame, box, ts=None):
+        self._det_pixel_ruler_reject = False
+        result = self._measure_fill_in_box_legacy(frame, box, ts)
+        if not self._det_pixel_ruler:
+            return result
+        # Physical geometry can only tighten the existing direct-read verdict.
+        # Never bypass rung/censor/occlusion checks or promote a recovered edge
+        # into independent current pixels for this experimental ruler.
+        if (result[2] < 0 or self._det_occ_censored_reject or self._det_occ_recovered):
+            self._det_pixel_ruler_reject = True
+            self._last_fill_estimator_mode = ""
+            self._last_fill_estimator_generation = 0
+            self._last_fill_coarse = 0.0
+            return 0.0, None, -1
+        return self._measure_pixel_ruler(frame, box, ts, direct_top=result[2])
+
+    def _measure_fill_in_box_legacy(self, frame, box, ts=None):
+        """Colour-AGNOSTIC white-meter fill + green make-window, measured directly in the
+        detector box. Returns (fill_pct, green_tuple_or_None, top_row) on the box 0-100 scale
+        (0 = box bottom, 100 = box top).
+
+        WHY NOT _read_fill: _read_fill masks the CONFIGURED bar colour (red rails), so on a 2K27
+        WHITE meter it finds nothing and returns 0 unless meter_color is exactly 'White' -- which
+        is not guaranteed live (settings drift; the White lock needs a rebuild). Rendered proof:
+        the meter was filling to 92% while _read_fill reported 0.00 every frame. A bright-neutral
+        row scan reads the fill regardless of the colour setting. The detector box already bounds
+        the meter tip-to-base, so a box-relative scale is the fill scale."""
+        # Invalid/no-fill measurements carry no timing provenance.  A successful
+        # measure below replaces these values before returning.
+        self._last_fill_estimator_mode = ""
+        self._last_fill_estimator_generation = 0
+        self._det_occ_recovered = False
+        self._det_occ_support = 0.0
+        self._det_occ_kind = ""
+        self._det_occ_censored_reject = False
+        try:
+            x, y, w, h = (int(v) for v in box)
+            H, W = frame.shape[:2]
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(W, x + w), min(H, y + h)
+            bh = y1 - y0
+            if x1 - x0 < 3 or bh < 10:
+                return 0.0, None, -1
+            box_bgr = frame[y0:y1, x0:x1]
+            hsv = cv2.cvtColor(box_bgr, cv2.COLOR_BGR2HSV)
+            V = hsv[:, :, 2]; S = hsv[:, :, 1]; Hh = hsv[:, :, 0]
+            white = ((V >= 200) & (S <= 65))
+            wfrac = white.mean(axis=1)
+            # denominator = this frame's box height. A per-shot LATCH here was tried and
+            # REFUTED by A/B (see the FILL-DENOMINATOR LATCH note in __init__): latching D
+            # re-anchors the numerator to the jittery box TOP edge and measured WORSE. The
+            # sub-pixel path carries the surviving idea (latched scale + base anchor).
+            denom = float(max(1, bh - 1))
+            # The first box after a physical press validates a carried ruler before any
+            # sample is published.  Adjacent detector heights in live telemetry vary by
+            # at most two pixels; anything beyond that is a real scale change (or an
+            # unsafe acquisition), so cold-seed rather than mixing coordinate systems.
+            if self._subpx_carry_pending:
+                self._subpx_carry_pending = False
+                if (self._subpx_D is None or self._subpx_off is None
+                        or abs(denom - float(self._subpx_D))
+                        > float(self._subpx_carry_jitter_px)):
+                    self._subpx_D = None; self._subpx_provisional = False
+                    self._subpx_off = None
+                    self._subpx_seed = []
+                    self._subpx_base_hist = []; self._subpx_last_base_rel = None
+            # [ORION_METER_SUBPIXEL_SESSION_PROVISIONAL] a fresh lock with no ruler yet takes
+            # the session median now, so the anchor-band frames are on the stable ruler.
+            if (self._subpx_D is None and self._subpx_session_ruler
+                    and self._subpx_session_provisional
+                    and len(self._subpx_ruler_hist) >= int(self._subpx_session_min)):
+                _d_s = float(np.median([d for d, _ in self._subpx_ruler_hist]))
+                if abs(denom - _d_s) <= float(self._subpx_carry_jitter_px):
+                    self._subpx_D = max(1.0, _d_s)
+                    self._subpx_off = float(np.median([o for _, o in self._subpx_ruler_hist]))
+                    self._subpx_provisional = True
+                    self._subpx_seed = []
+                    self._subpx_ruler_kind = "session_provisional"
+            # largest contiguous run of white rows = the fill block (ignores the meter's
+            # non-white rounded base at the very bottom, which broke a naive bottom-anchor).
+            best_top = None; best_len = 0; run_top = None
+            for r in range(bh):
+                if wfrac[r] >= 0.28:
+                    if run_top is None:
+                        run_top = r
+                else:
+                    if run_top is not None:
+                        if (r - run_top) > best_len:
+                            best_len = r - run_top; best_top = run_top
+                        run_top = None
+            if run_top is not None and (bh - run_top) > best_len:
+                best_len = bh - run_top; best_top = run_top
+            # ---- RUNG-TOLERANT LADDER RESCUE (see __init__ doc; ORION_METER_RUNG_FILL).
+            # On the Pill capsule the walk above finds nothing (wfrac ceiling 0.20-0.26
+            # vs the 0.28 floor) or an occasional 2-3-row scrap; the ladder block is the
+            # real fill. Selection is evidence-ranked, never additive:
+            #   * walk found nothing        -> the gated ladder block stands in;
+            #   * walk found a SCRAP inside a measured >=3-segment ladder -> the ladder
+            #     wins (the scrap is one segment of it);
+            #   * walk found a FLOATING run (not reaching the base region) while a
+            #     >=2-segment ladder does touch the base -> the ladder wins (kills the
+            #     one-frame 66%-fill occluder spike measured on clip 23af440b f642).
+            # A solid-ribbon (Arrow2) walk result that touches the base region is NEVER
+            # overridden -- the ladder block barely exists there (narrow-band gate).
+            self._dbg_rung = None
+            if self._rung_fill:
+                _bw = x1 - x0
+                _blim = bh - max(8, int(round(0.20 * bh)))
+                _rb = self._rung_fill_block(white, bh, _bw)
+                if (_rb is None and best_top is not None
+                        and (best_top + best_len - 1) < _blim):
+                    # The walk's run FLOATS above the base region -- a bright occluder
+                    # band / overlay, not fill. Such a band adds its own height to every
+                    # column's white fraction, which can defeat the flanking-dark gate
+                    # (the flanks look ~as bright as a short fill core). Re-measure the
+                    # ladder with the floating run's rows blanked: the occluder cannot
+                    # poison the geometry of a bar it is not part of.
+                    _wm = white.copy()
+                    _wm[best_top:best_top + best_len] = False
+                    _rb = self._rung_fill_block(_wm, bh, _bw)
+                if _rb is not None:
+                    _r_top, _r_len, _r_nseg = _rb
+                    _pick = ""
+                    if best_top is None:
+                        _pick = "no_solid"
+                    else:
+                        _a_bot = best_top + best_len - 1
+                        _ovl = not (_a_bot < _r_top or best_top > (_r_top + _r_len - 1))
+                        if (_ovl and _r_nseg >= 3 and _r_len >= 2 * best_len
+                                and _r_top < best_top):
+                            _pick = "scrap"
+                        elif ((not _ovl) and _a_bot < _blim
+                                and (_r_nseg >= 2 or best_len <= 2)):
+                            # a floating walk run loses to a base-touching ladder when
+                            # the ladder shows gap structure OR the run is a 1-2-row
+                            # scrap (weaker evidence than a gated >=6-row base block)
+                            _pick = "float"
+                    if _pick:
+                        best_top, best_len = _r_top, _r_len
+                        self._dbg_rung = {"why": _pick, "nseg": _r_nseg,
+                                          "top": _r_top, "len": _r_len}
+            # A slight side-on occlusion can leave several exact meter columns
+            # visible while reducing every row below the ordinary 28%-of-box
+            # consensus.  Recover only from those bottom-connected columns and
+            # only under the current-shot trajectory/lifecycle gates above.
+            _direct_edge = best_top is not None
+            if best_top is not None:
+                _top_occ = self._top_censored_fill_edge(
+                    white, box_bgr, bh, x1 - x0, denom,
+                    best_top, best_len, ts)
+                if _top_occ is False:
+                    self._last_fill_coarse = 0.0
+                    return 0.0, None, -1
+                if _top_occ is not None:
+                    best_top, best_len, _ = _top_occ
+                    _direct_edge = False
+            else:
+                _occ = self._partial_occlusion_fill_edge(
+                    white, bh, x1 - x0, denom, ts)
+                if _occ is not None:
+                    best_top, best_len, _ = _occ
+            fill = ((denom - float(best_top)) / denom * 100.0) if best_top is not None else 0.0
+            # green mask up-front: reused by the sub-pixel edge (green rows are excluded from
+            # its empty-plateau estimate so the make-window cap can never bias the fit) and by
+            # the green tuple below.
+            gmask = ((Hh >= 40) & (Hh <= 85) & (S >= 90) & (V >= 90))
+            gfrac = gmask.mean(axis=1)
+            # ---- SUB-PIXEL FILL EDGE (see __init__ doc). Always COMPUTED when a coarse edge
+            # exists so per-shot latches evolve identically whichever value is emitted (and so
+            # a single replay logs both estimators on the same frames); the flag only selects
+            # which value is EMITTED. Coarse always ships in fill_coarse/raw_fill_pct.
+            self._last_fill_coarse = round(fill, 2)
+            _fs = None
+            if best_top is not None and not self._det_occ_recovered:
+                _fs = self._subpixel_fill_edge(V, gfrac, int(best_top), int(best_len),
+                                               bh, y0, y1, ts=ts, box_bgr=box_bgr)
+                if _fs is None:
+                    _fs = self._bridge_subpixel_from_coarse(
+                        int(best_top), bh, y0, ts)
+                if _fs is not None and self._subpx_fill:
+                    fill = _fs
+            else:
+                self._dbg_subpx = None
+            if best_top is not None:
+                if _fs is not None and self._subpx_fill:
+                    # Base and base_held share the same latched ruler.  A box
+                    # fallback is a different ruler even when D remains latched.
+                    _anchor_kind = str((self._dbg_subpx or {}).get("anchor", "box"))
+                    _anchor_family = ("base" if _anchor_kind in
+                                      ("base", "base_held", "base_bridge", "base_int") else "box")
+                    _identity = (
+                        _anchor_family,
+                        None if self._subpx_D is None else float(self._subpx_D),
+                        None if self._subpx_off is None else float(self._subpx_off),
+                    )
+                    self._stamp_fill_estimator("subpixel", _identity)
+                else:
+                    self._stamp_fill_estimator(
+                        "coarse", self._coarse_fill_ruler_identity(denom))
+            # green make-window (the ~96-98% cap): topmost green run, on THE SAME RULER as
+            # the fill emitted THIS frame (see [ORION_GREEN_SCALE_UNIFY] below).
+            green = None
+            gpx = int(gmask.sum())
+            if gpx >= 8:      # measured: >=8 green px in the box = a real make-window cap
+                grows = np.flatnonzero(gfrac >= 0.20)
+                if grows.size:
+                    g_top_row = int(grows[0])
+                    g_bot_row = int(grows[-1])
+                    # [ORION_GREEN_APEX 2026-08-30] The rendered cap is a TRIANGLE that
+                    # narrows toward the meter tip: its top rows carry only 1-4 green px
+                    # of the ~24-col box, so the 20%-of-width row gate above clips them
+                    # and the emitted band top sat ~1-2pp below the real paint while the
+                    # band width read ~2x too narrow. Measured on 2514 plateau frames
+                    # across 5 framedump sessions (stateless pixel census, 2026-08-30):
+                    # row-gate top median 97.2 vs connected >=2px-paint top 98.1; width
+                    # 1.90pp vs 3.77pp. The band top is the aim policy's anchor (the tip
+                    # is the invariant point), so it must reflect the paint, not the
+                    # gate. Extend the TOP edge only (the census shows the bottom edge is
+                    # NOT clipped: row-gate bottom == paint bottom in every session)
+                    # along rows that stay green-connected (>=2 px, gap tolerance 1 row),
+                    # bounded to 8 rows so a detached fleck can never drag the band up.
+                    gcnt = gmask.sum(axis=1)
+                    _gap = 0
+                    _rr = g_top_row
+                    _lim = max(0, g_top_row - 8)
+                    while _rr - 1 >= _lim:
+                        _rr -= 1
+                        if int(gcnt[_rr]) >= 2:
+                            g_top_row = _rr
+                            _gap = 0
+                        else:
+                            _gap += 1
+                            if _gap > 1:
+                                break
+                    # [ORION_GREEN_SCALE_UNIFY 2026-08-30] Map the band rows through the
+                    # SAME transform that produced this frame's EMITTED fill, so a landing
+                    # grade's fill-vs-green comparison is always one ruler:
+                    #   * sub-pixel frame -> the base-anchored latched (anchor, D) the
+                    #     fill numerator used (box slide/jitter cancels out of the band
+                    #     exactly as it cancels out of the fill);
+                    #   * coarse frame (gates failed / flag off) -> the box-relative
+                    #     (denom, denom) mapping, byte-identical to the shipped one.
+                    # Before this, the fill switched rulers per frame (sub-pixel engages
+                    # on the rise, fails open to coarse at the plateau where the edge
+                    # meets the cap) while the band stayed box-ruled: at the plateau the
+                    # two rulers differ by a per-shot latch offset (measured IQR ~±2pp),
+                    # which is grade noise between peak_fill and green_start. The engine-
+                    # facing FILL scale itself is untouched -- only the band moves onto it.
+                    _tr = (self._last_subpx_transform
+                           if (self._subpx_fill and _fs is not None) else None)
+                    if _tr is not None:
+                        _anch, _D = float(_tr[0]), float(_tr[1])
+                        g_end = (_anch - float(g_top_row)) / _D * 100.0
+                        g_start = (_anch - float(g_bot_row)) / _D * 100.0
+                    else:
+                        g_end = (denom - float(g_top_row)) / denom * 100.0
+                        g_start = (denom - float(g_bot_row)) / denom * 100.0
+                    g_end = max(0.0, min(100.0, g_end))
+                    g_start = max(0.0, min(100.0, g_start))
+                    if g_end < g_start:
+                        g_start, g_end = g_end, g_start
+                    green = (round(g_start, 2), round(g_end, 2),
+                             round(0.5 * (g_start + g_end), 2), round(g_end - g_start, 2),
+                             round(min(1.0, gpx / 40.0), 3), gpx)
+            if _direct_edge and best_top is not None:
+                self._record_direct_occlusion_fill(ts, self._last_fill_coarse)
+            return round(fill, 2), green, (int(best_top) if best_top is not None else -1)
+        except Exception:
+            return 0.0, None, -1
+
+    def _rung_fill_block(self, white, bh, bw):
+        """Gap-tolerant fill block for LADDER-divided meters (2K27 Pill capsule).
+        Returns (top, length, nseg) on box rows, or None when the geometry gates fail
+        (caller keeps the solid-ribbon walk's verdict -- fail-closed to shipped).
+
+        MEASURED GEOMETRY (seven 1080p owner clips + 720p INTER_AREA downscales, vs the
+        green_window_probe.measure_pill ground truth):
+          * glossy fill core = ~6 contiguous columns of the ~30-col detector box @1080p
+            (~4 of ~20 @720p), flanked by the capsule's dark shell/track on BOTH sides;
+          * fill segments ~11 rows @1080p (~7 @720p) split by 1-3-row dark dividers
+            (pitch ~12.7 / ~8.4 rows);
+          * the EMPTY track carries 1-row bright rung ticks at the same pitch @1080p
+            (they alias away at 720p), so per-row brightness alone cannot separate
+            filled from empty -- vertical run STRUCTURE can.
+        GATES, each one measured:
+          * mass: >=4 white rows in the best column and >=12 white px in the box
+            (rejects speck noise; the smallest accepted real onset is ~6 rows);
+          * narrow core band, <=45% of box width (Arrow2's solid ribbon spans ~50%
+            with colw ~0.42-0.45 across it, so a ribbon can never qualify);
+          * >=2 mostly-dark columns flanking the band INSIDE the box (a neighbouring
+            meter poking into the box edge fails -- that is the off-box Arrow2 case
+            that must keep its measured honest-zero at >=12px box error: without this
+            gate 5.6% of censused Arrow2 frames flipped, with it 0.03%);
+          * the block must touch the base region (bottom ~20% of the box): fill grows
+            from the capsule base, decor blobs float;
+          * gap tolerance max(2, 0.025*bh) rows = 4 @1080p / 3 @720p sits between the
+            divider width (1-3) and the tick spacing (~8-12), so dividers bridge and
+            the empty track's ticks never chain into the block;
+          * block >=6 rows (the 5-row speck on session_20260829_123758 idx 2932 -- a
+            pan-lagged box beside the meter -- fails this; real onset blocks pass)."""
+        try:
+            colw = white.mean(axis=0)
+            cmax = float(colw.max()) if colw.size else 0.0
+            if cmax * bh < 4.0 or int(white.sum()) < 12:
+                return None
+            core = colw >= max(0.5 * cmax, 2.0 / bh)
+            bc0 = bc1 = None; c0 = None; bl = 0
+            for c in range(bw + 1):
+                on = (c < bw) and bool(core[c])
+                if on and c0 is None:
+                    c0 = c
+                elif not on and c0 is not None:
+                    if c - c0 > bl:
+                        bl = c - c0; bc0, bc1 = c0, c - 1
+                    c0 = None
+            if bc0 is None or bl < 3 or bl > 0.45 * bw:
+                return None
+            if bc0 < 2 or bc1 > bw - 3:
+                return None
+            if (float(colw[bc0 - 2:bc0].mean()) >= 0.25 * cmax
+                    or float(colw[bc1 + 1:bc1 + 3].mean()) >= 0.25 * cmax):
+                return None
+            bfr = white[:, bc0:bc1 + 1].mean(axis=1)
+            runs = []
+            rt = None
+            for r in range(bh):
+                if bfr[r] >= 0.5:
+                    if rt is None:
+                        rt = r
+                else:
+                    if rt is not None:
+                        runs.append((rt, r - 1)); rt = None
+            if rt is not None:
+                runs.append((rt, bh - 1))
+            if not runs:
+                return None
+            gap_tol = max(2, int(round(0.025 * bh)))
+            base_lim = bh - max(8, int(round(0.20 * bh)))
+            i = -1
+            for j in range(len(runs) - 1, -1, -1):
+                if runs[j][1] >= base_lim:
+                    i = j
+                    break
+            if i < 0:
+                return None
+            s, e = runs[i]
+            nseg = 1
+            j = i - 1
+            while j >= 0 and (s - runs[j][1] - 1) <= gap_tol:
+                s = runs[j][0]; nseg += 1; j -= 1
+            if (e - s + 1) < 6:
+                return None
+            return int(s), int(e - s + 1), int(nseg)
+        except Exception:
+            return None
+
+    def _notch_fallback(self, q, notch, top, bh, y0, y1, ts):
+        """[ORION_METER_SUBPIXEL_NOTCH] Edge gates failed on this frame but the notch was
+        measured: place the INTEGER coarse edge on the latched notch ruler (anchor 'base_int',
+        'base' identity family). <=0.5 px of edge error on a stable ruler beats a flip to the
+        coarse box ruler (a different origin AND denominator, plus a generation bump). Only when
+        (D, off) are latched; never seeds or relatches (an integer edge must not teach the ruler)."""
+        try:
+            if (notch is None or not self._subpx_fill or self._subpx_D is None
+                    or self._subpx_off is None):
+                return None
+            if ts is not None:
+                # the notch is a clean anchor measurement: keep the hold history warm
+                self._subpx_base_hist.append((float(ts), float(y0 + notch)))
+                if len(self._subpx_base_hist) > 6:
+                    self._subpx_base_hist.pop(0)
+                self._subpx_last_base_rel = float(notch) - float(bh - 1)
+                self._subpx_last_base_ts = float(ts)
+            scale = float(getattr(self, '_subpx_camera_scale', 1.0))
+            D = float(self._subpx_D) * scale
+            anchor = float(notch) + float(self._subpx_off) * scale
+            fill_sub = (anchor - float(top)) / D * 100.0
+            if not (-3.0 <= fill_sub <= 103.0):
+                return None
+            fill_sub = min(100.0, max(0.0, fill_sub))
+            q.update({"ok": 1, "anchor": "base_int", "anchor_src": "notch",
+                      "base_sub": round(float(notch), 4), "fill_sub": round(fill_sub, 3),
+                      "ruler": self._subpx_ruler_kind if self._subpx_D is not None else "",
+                      "ruler_n": len(self._subpx_ruler_hist)})
+            self._last_subpx_transform = (float(anchor), D)
+            return round(fill_sub, 3)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+    @staticmethod
+    def _subpixel_notch_anchor(Wn, core, top, bh):
+        """[ORION_METER_SUBPIXEL_NOTCH] Sub-pixel row (box-relative) of the chevron-notch apex,
+        or None. `Wn` is the box crop's whiteness image, `core` the bar-core column mask, `top`
+        the coarse fill-edge row. Fails closed: nothing is inferred from the box."""
+        try:
+            cols = np.flatnonzero(core)
+            if cols.size < 2:
+                return None
+            cx = 0.5 * (float(cols[0]) + float(cols[-1]))       # ribbon centre (pixel centres)
+            # the two columns straddling the centre (cx=11.5 -> 11,12; cx=11.0 -> 10,11)
+            n_lo = max(0, min(int(Wn.shape[1]) - 2, int(np.floor(cx + 0.5)) - 1))
+            nprof = Wn[:, n_lo:n_lo + 2].astype(np.float64).mean(axis=1)
+            nrow = int(nprof.shape[0])
+            r = top + 1
+            while r < bh and nprof[r] >= 200.0:
+                r += 1
+            if r - (top + 1) < 3 or r >= bh:
+                return None                                       # no white run / runs off the box
+            nrb = r                                               # first non-white centre row
+            b_lo = max(top, nrb - 5)
+            Bn = float(np.median(nprof[b_lo:nrb - 1])) if nrb - 1 - b_lo >= 2 else float(nprof[nrb - 1])
+            if Bn < 200.0 or nrb + 2 >= nrow:
+                return None
+            lvl = 0.8 * Bn
+            notch = None
+            for rr in range(max(top + 1, nrb - 2), min(nrow - 2, nrb + 3)):
+                if nprof[rr] < lvl <= nprof[rr - 1] and nprof[rr + 1] < lvl:
+                    notch = (rr - 1) + (nprof[rr - 1] - lvl) / max(1e-6, nprof[rr - 1] - nprof[rr])
+                    break
+            if notch is None:
+                return None
+            # the run must end INSIDE the box (a fill that runs off the box bottom is clipped or
+            # occluded, not a notch) and within the meter's foot zone: the box bottom is detector
+            # regression (6.5-8 rows below the notch on n3, 14 on n4), so the zone is loose
+            # (2..24 rows) -- it only refuses a white run cut mid-meter by an occluder
+            if not ((bh - 24.0) <= notch <= (bh - 2.0)):
+                return None
+            return float(notch)
+        except Exception:
+            return None
+
+    def _subpixel_fill_edge(self, V, gfrac, top, run_len, bh, y0, y1, ts=None, box_bgr=None):
+        """Sub-pixel fill measurement inside the detector box. Returns the fill percent on
+        the SAME 0-100 box-relative scale as the coarse walk (parity via _subpx_bias), or
+        None when quality gates fail (caller keeps the coarse value -- fail-open).
+
+        Method (constants are MEASURED on session_20260828_201813 idx 775/776/786 profiles
+        and validated by the synthetic sweep in the report):
+          1. BAR-CORE columns only: columns that are white in the rows just BELOW the edge.
+             The detector box also spans the meter's outline/shadow columns (measured wfrac
+             saturates at 0.50), and a mean over those halves the contrast; the core mask
+             is derived strictly below the already-found edge so it cannot bias the edge.
+          2. 1-D LUMA profile: mean of V over core columns per row. V only -- capture chroma
+             is 4:2:0 (vertically subsampled), the axis being localized.
+          3. Two plateaus per frame: empty track A (median over rows above the edge, green
+             cap rows excluded) and fill core B (median below). 50% point between them, NOT
+             a fixed threshold, so brightness/gamma drift and whatever sits above the edge
+             only matter through contrast.
+          4. Edge = the rising 50% crossing nearest the coarse edge, linear interpolation.
+          5. BASE anchor: falling 0.8*B crossing at the bottom of the white run = the
+             meter's own base furniture edge (see inline WHY). fill numerator = base - edge
+             (both pure image measurements): per-frame box-edge jitter (the measured
+             dominant sigma_y term) cancels; the box only sets per-shot latched constants.
+             When one frame's base measurement fails, the anchor is HELD by a short
+             constant-velocity extrapolation of recent base positions (<=120ms, the meter
+             translates smoothly with the shooter), so mid-run gaps do not fall back to
+             the jittery box anchor; the hold is dropped across longer gaps.
+             _subpx_D / _subpx_off (median of the first 3 clean frames; re-latched on a
+             >15% height jump = a genuine rescale, never on jitter).
+          6. Quality gates, all fail-open to coarse: >=5 core columns, contrast >= 40 luma
+             (measured real contrast ~117), edge width (25->75%) <= 3.0 rows, crossing
+             within +/-3 rows of the coarse edge, base >= 4 rows below the edge with a dark
+             tail. The gate verdict is stashed in _dbg_subpx as the per-frame
+             quality/outlier signal."""
+        try:
+            q = dict(ok=0, top_sub=-1.0, base_sub=-1.0, contrast=-1.0, width=-1.0,
+                     ncore=0, anchor="", fill_sub=-1.0, gate="")
+            self._dbg_subpx = q
+            self._last_subpx_transform = None    # set only on a successful measure below
+            bw = int(V.shape[1])
+            if bw < 10 or run_len < 4 or top + 4 > bh:
+                q["gate"] = "geom"
+                return None
+            # [ORION_METER_SUBPIXEL_NOTCH] whiteness = min(B,G,R). The opaque fill is >=237 in
+            # every channel; the semi-transparent track takes the background's colour, so over
+            # the red paint V reads 228 (no contrast) while whiteness reads 27.
+            _use_notch = bool(self._subpx_notch) and box_bgr is not None
+            Wn = box_bgr.min(axis=2) if _use_notch else None
+            Lum = Wn if _use_notch else V
+            # 1. bar-core columns from rows strictly below the edge
+            c_lo = min(bh - 1, top + 2)
+            c_hi = min(bh, top + 12, top + run_len)
+            if c_hi - c_lo < 2:
+                q["gate"] = "core_rows"
+                return None
+            core = (Lum[c_lo:c_hi] >= 200).mean(axis=0) >= 0.6
+            core[0] = False
+            core[-1] = False
+            ncore = int(core.sum())
+            q["ncore"] = ncore
+            if ncore < 5:
+                q["gate"] = "ncore"
+                return None
+            prof = Lum[:, core].mean(axis=1)   # float64 whiteness (or luma) profile
+            # [ORION_METER_SUBPIXEL_NOTCH] a notch measured on THIS frame lets an edge-gate
+            # failure below fall back to the integer edge on the same ruler instead of flipping
+            # to the coarse box ruler (see _notch_fallback).
+            _notch_now = self._subpixel_notch_anchor(Wn, core, top, bh) if _use_notch else None
+            # 3. plateaus. On whiteness the green cap is DARK (min(B,G,R) of green paint), so
+            # green rows are a valid empty plateau; on V they read ~200 and must stay excluded.
+            _a_all = list(range(max(0, top - 6), top - 1))
+            a_rows = _a_all if _use_notch else [r for r in _a_all if gfrac[r] < 0.20]
+            _cap_zone = bool(_a_all) and (sum(1 for r in _a_all if gfrac[r] >= 0.20) >= 0.5 * len(_a_all))
+            if len(a_rows) < 2:
+                q["gate"] = "a_rows"
+                return self._notch_fallback(q, _notch_now, top, bh, y0, y1, ts) if _use_notch else None
+            A = float(np.median(prof[a_rows]))
+            b_lo, b_hi = top + 2, min(bh, top + 5, top + run_len)
+            if b_hi - b_lo < 2:
+                q["gate"] = "b_rows"
+                return None
+            B = float(np.median(prof[b_lo:b_hi]))
+            contrast = B - A
+            q["contrast"] = round(contrast, 1)
+            if contrast < 40.0:
+                q["gate"] = "contrast"
+                return self._notch_fallback(q, _notch_now, top, bh, y0, y1, ts) if _use_notch else None
+            mid = 0.5 * (A + B)
+
+            def _rise_cross(level):
+                for r in range(max(1, top - 3), min(bh - 1, top + 2) + 1):
+                    if prof[r - 1] < level <= prof[r]:
+                        return (r - 1) + (level - prof[r - 1]) / max(1e-6, prof[r] - prof[r - 1])
+                return None
+            # 4. sub-pixel edge + width quality
+            ysub = _rise_cross(mid)
+            if ysub is None:
+                q["gate"] = "no_cross"
+                return self._notch_fallback(q, _notch_now, top, bh, y0, y1, ts) if _use_notch else None
+            w25 = _rise_cross(A + 0.25 * contrast)
+            w75 = _rise_cross(A + 0.75 * contrast)
+            width = (w75 - w25) if (w25 is not None and w75 is not None) else -1.0
+            q["width"] = round(width, 3)
+            # inside the green cap the green->white boundary is chroma-smeared (4:2:0) over
+            # ~3-4 rows; the crossing stays unbiased, only the sharpness test needs room
+            _w_max = 4.5 if (_use_notch and _cap_zone) else 3.0
+            if not (0.0 < width <= _w_max):
+                q["gate"] = "width"
+                return self._notch_fallback(q, _notch_now, top, bh, y0, y1, ts) if _use_notch else None
+            eb = ysub + self._subpx_bias      # parity with the coarse first-white-row scale
+            if abs(eb - float(top)) > 2.0:    # sub-pixel must refine the edge, not move it
+                q["gate"] = "edge_far"
+                return self._notch_fallback(q, _notch_now, top, bh, y0, y1, ts) if _use_notch else None
+            q["top_sub"] = round(ysub, 4)
+            # 5. base edge: FIRST falling crossing of 0.8x the bar's own local brightness at
+            # the bottom of the white run. ONE-SIDED relative threshold on purpose: the
+            # falloff below the bar steps 255 -> shelf(~170, meter furniture) -> court, and
+            # the court side varies with gameplay, so a two-plateau mid there is unstable
+            # (first attempt borrowed the FILL edge's mid level and was measured unstable:
+            # base wandered ~1-4px on low-contrast frames, e.g. sub_201813 idx 1593-1596/
+            # 1733). 0.8*B sits mid-falloff (255 -> ~204) with BOTH sides meter furniture,
+            # decoupled from the court and from the fill edge's plateaus.
+            base = None
+            if _use_notch:
+                # [ORION_METER_SUBPIXEL_NOTCH] chevron-notch apex on the 2 centre columns of the
+                # white ribbon: walk the CONTIGUOUS white run down from the edge (the ^ outline
+                # stroke 2-3 rows inside the notch is itself >=200, so a mask-based "last white
+                # row" would land on the stroke), then the falling 0.8*B crossing, one sustained
+                # row (the notch interior is ~2 rows deep before the stroke bounces the profile).
+                # Accepted only in the chevron zone, 2..12 rows above the box bottom (measured
+                # 6.5-8 rows). The core mean smeared this edge because the ^ arms extend lower
+                # on the outer columns; two centre columns see the apex itself.
+                base = _notch_now
+                if base is not None and (base - ysub) < 4.0:
+                    base = None
+                q["anchor_src"] = "notch" if base is not None else "none"
+            elif run_len >= 6:
+                rb = top + run_len                    # coarse run bottom (first non-white row)
+                s_lo = max(top + 4, rb - 6)
+                s_hi = min(bh - 2, rb + 3)
+                b_loc_lo = max(top + 2, s_lo - 5)
+                if s_hi - s_lo >= 2:
+                    B_loc = (float(np.median(prof[b_loc_lo:s_lo]))
+                             if s_lo - b_loc_lo >= 2 else B)
+                    lvl = 0.8 * B_loc
+                    if B_loc >= 200.0:
+                        for r in range(s_lo + 1, s_hi + 1):
+                            if prof[r] < lvl <= prof[r - 1]:
+                                # sustained falloff, not a one-row specular dip
+                                if prof[min(bh - 1, r + 2)] < lvl:
+                                    base = ((r - 1) + (prof[r - 1] - lvl)
+                                            / max(1e-6, prof[r - 1] - prof[r]))
+                                break
+                if base is not None and (base - ysub) < 4.0:
+                    base = None
+            held = False
+            if base is not None:
+                if ts is not None:
+                    self._subpx_base_hist.append((float(ts), float(y0 + base)))
+                    if len(self._subpx_base_hist) > 6:
+                        self._subpx_base_hist.pop(0)
+                    self._subpx_last_base_rel = float(base) - float(bh - 1)
+                    self._subpx_last_base_ts = float(ts)
+            elif ts is not None and len(self._subpx_base_hist) >= 2:
+                # BASE HOLD: extrapolate the anchor along its own recent velocity across a
+                # short measurement gap (measured anchor sd 0.4-0.5px vs box-edge 0.74px,
+                # so a briefly-held anchor still beats falling back to the box).
+                _pred_base_abs = self._predict_subpx_base_abs(ts)
+                if _pred_base_abs is not None:
+                    base = float(_pred_base_abs) - y0
+                    held = True
+            if (base is None and self._subpx_base_hold and ts is not None
+                    and self._subpx_last_base_rel is not None
+                    and 0.0 <= (float(ts) - self._subpx_last_base_ts) <= self._subpx_base_hold_max_s):
+                # BOX-RELATIVE BASE HOLD (see __init__): the box tracks the meter, so the last
+                # measured base-to-box offset of THIS lock places the base on this frame's box.
+                # Same ruler family as a measured base -- no estimator step for native.
+                base = float(bh - 1) + float(self._subpx_last_base_rel)
+                held = True
+                q["hold"] = "box_rel"
+            if base is not None:
+                q["base_sub"] = round(base, 4)
+                camera_scale = self._subpixel_camera_scale(
+                    base, gfrac, bh, ts, measured=not held)
+                # per-shot latch seeding / relatch (state advances on every clean MEASURED
+                # frame, independent of which value is emitted; held frames never latch)
+                off_now = float(y1 - 1 - (y0 + base))
+                if held:
+                    pass
+                elif (self._subpx_seed is not None
+                      and (self._subpx_D is None or self._subpx_provisional)):
+                    # a provisional lock keeps seeding under the session ruler; its own seed
+                    # still joins the history and re-adopts the median when complete
+                    self._subpx_seed.append((float(bh), off_now))
+                    if len(self._subpx_seed) >= 3:
+                        _seed_D = max(1.0, float(np.median(
+                            [b for b, _ in self._subpx_seed])) - 1.0)
+                        _seed_off = float(np.median(
+                            [o for _, o in self._subpx_seed]))
+                        self._subpx_seed = []
+                        if self._subpx_provisional and self._subpx_ruler_lock:
+                            # [ORION_METER_SUBPIXEL_RULER_LOCK] keep the provisional session
+                            # ruler for this shot; the seed only feeds the history (next shot).
+                            self._subpx_provisional = False
+                            self._record_session_ruler_seed(_seed_D, _seed_off)
+                        else:
+                            self._subpx_D = _seed_D
+                            self._subpx_off = _seed_off
+                            self._subpx_provisional = False
+                            # [ORION_METER_SUBPIXEL_SESSION_RULER] the completed per-shot seed
+                            # joins the session history; the emitted ruler becomes its median.
+                            self._adopt_session_ruler()
+                elif self._subpx_D is not None and abs((bh - 1.0) / camera_scale - self._subpx_D) > max(
+                        6.0, self._subpx_D * self._fill_denom_relatch):
+                    # genuine rescale (camera distance changed): re-seed, never jitter-track
+                    self._subpx_D = None; self._subpx_provisional = False
+                    self._subpx_off = None
+                    self._subpx_seed = [(float(bh), off_now)]
+                    self._subpx_base_hist = self._subpx_base_hist[-1:]
+                    self._subpx_carry_pending = False
+                    self._subpx_ruler_hist = []     # a rescale is a new session ruler too
+                    self._subpx_ruler_kind = ""
+            camera_scale = self._subpixel_camera_scale(
+                base, gfrac, bh, ts, measured=base is not None and not held)
+            D = (self._subpx_D * camera_scale if self._subpx_D is not None
+                 else float(max(1, bh - 1)))
+            if base is not None and (self._subpx_off is not None):
+                _anch = base + self._subpx_off * camera_scale
+                fill_sub = (_anch - eb) / D * 100.0
+                q["anchor"] = "base_held" if held else "base"
+            elif base is not None:
+                # latch still seeding: base-anchored with this frame's own alignment
+                _anch = base + (y1 - 1 - (y0 + base))
+                fill_sub = (_anch - eb) / D * 100.0
+                q["anchor"] = "box0"
+            else:
+                _anch = bh - 1.0
+                fill_sub = (_anch - eb) / D * 100.0
+                q["anchor"] = "box"
+            fill_sub = min(100.0, max(0.0, fill_sub))
+            q["ok"] = 1
+            q["fill_sub"] = round(fill_sub, 3)
+            q["ruler"] = self._subpx_ruler_kind if self._subpx_D is not None else ""
+            q["ruler_n"] = len(self._subpx_ruler_hist)
+            q["camera_scale"] = round(camera_scale, 6)
+            # [ORION_GREEN_SCALE_UNIFY] The exact (anchor, D) this frame's emitted fill
+            # was computed with, so the green make-window can be mapped onto the SAME
+            # ruler (see _measure_fill_in_box). Valid only for the frame this call
+            # measured -- the caller pairs it with this call's own return value.
+            self._last_subpx_transform = (float(_anch), float(D))
+            return round(fill_sub, 3)
+        except Exception:
+            return None
 
     def _redmask(self, bgr, bounds=None, hsv=None):
         """The BAR mask (named `_redmask` for history; it masks the CONFIGURED bar colour)."""
@@ -5499,6 +10003,17 @@ class SimpleMeterReader:
     def _fit_state(self, ts: float) -> Optional[dict]:
         """Latest registration-fit prediction at capture time ts (seconds) via the wired
         provider (RegistrationPredictor.predict_fill, epoch-ms domain). None when absent."""
+        if (self._meter_detector is not None
+                or self._fill_estimator_identity is not None):
+            # This hook belongs to CLASSICAL read(): its contour/green-cap ruler
+            # is not the direct-box ruler used to train the registration fit.
+            # detect() measures/stamps that direct ruler only AFTER read(), so
+            # comparing the previous stamp here cannot prove this frame matches.
+            # A detector miss must not leak its old fit into classical coast or
+            # trajectory gating either. Keep the boundary for the whole detector
+            # epoch, and for any stamped direct ruler until reset_tracking clears
+            # it. Classical pixel/rate checks and native direct-box fill remain.
+            return None
         if self._fit_provider is None:
             return None
         try:
@@ -5543,9 +10058,7 @@ class SimpleMeterReader:
     def read(self, frame, ts: Optional[float] = None) -> dict:
         if ts is None:
             ts = _time.perf_counter()
-        if not self.W or not self.H:
-            self.H, self.W = int(frame.shape[0]), int(frame.shape[1])
-            self._recompute_scale()
+        self._prepare_frame_geometry(frame)
         if self._perf:
             # S2: the band-mask memo is strictly per-frame (a stale mask from a previous
             # frame must never be served, e.g. when the probation cooldown skips the cold
@@ -6712,6 +11225,7 @@ class SimpleMeterReader:
         # interleaves later, this result remains stamped OLD (and native rejects it) instead of
         # laundering old pixels into the new epoch through the mutable reader global.
         _detect_shot_epoch = int(self._physical_shot_epoch) if self._shot_armed_hw else 0
+        self._prepare_frame_geometry(frame_bgr)
         # BOX-TIGHT: the per-frame fresh-column source must be cleared at the PRODUCTION
         # boundary, not only inside read() -- a subclass read() can return before the base
         # fresh path runs (CompressedMeterReader's stale hold does), and a stale source from
@@ -6722,6 +11236,384 @@ class SimpleMeterReader:
         self._note_hw_arm_edge(ts)
         # B7: capture this shot's arm-edge red reference (once per hardware epoch, at the press).
         self._note_arm_edge_reference(frame_bgr)
+        # DETECTOR-DRIVEN LOCATION (see __init__): submit this frame to the async YOLO locator
+        # and, when its freshest box disagrees with the colour lock, seat the lock on the
+        # detector's box so read()'s tight relocate + _read_fill refine within the CORRECT
+        # column. When the detector is fresh and sees NO meter, latch a veto applied to the
+        # colour reader's output below. All guarded so a missing detector is inert.
+        self._det_no_meter = False
+        self._det_region = None       # per-frame: constrains read()'s search to the detector box
+        self._det_occ_current_full_negative = False
+        self._det_occ_current_source_age = float("inf")
+        # Captured identity for the capless detector-fill proof below.  Only a
+        # unique, fresh locator result accepted into this exact lifecycle generation
+        # may advance its evidence window; repeated async slots are inert.
+        _df_nogreen_locator_fresh = False
+        _df_nogreen_locator_ts = None
+        _df_nogreen_locator_box = None
+        _df_nogreen_locator_generation = 0
+        # Template cadence belongs to unique accepted detector SOURCE results, not
+        # capture callbacks. latest() repeats its slot between worker completions.
+        # Reset before lookup so a missing/failed locator cannot replay refresh intent.
+        self._det_new_accept = False
+        if self._meter_detector is not None:
+            try:
+                # PRIORITY-ON-ACQUIRE decision (legacy knob name, see __init__): enqueue the
+                # freshest frame with a worker-priority wake. Expensive preprocessing/ORT must
+                # never execute on this capture callback.
+                _pre_now = ts if ts is not None else 0.0
+                # Lifecycle mode: "acquiring" == not LOCKED (a pending candidate still needs the
+                # next unique worker result so its second corroborating look is not starved).
+                _acquiring = ((self._det_state != 'locked') if self._det_lifecycle
+                              else (self._det_last_box is None
+                                    or (_pre_now - self._det_last_found_ts) > self._det_hold_s))
+                _priority_epoch = int(_detect_shot_epoch or 0)
+                _new_arm_event = (bool(self._shot_armed_hw)
+                                  and self._det_priority_epoch != _priority_epoch)
+                _new_pending_event = (
+                    self._det_lifecycle and self._det_state == 'pending'
+                    and float(self._det_pend_ts)
+                    > float(self._det_priority_pending_ts) + 1.0e-6)
+                _phase_repeat = (
+                    self._det_phased_acquire
+                    and (_pre_now - self._det_last_sync_acq)
+                    >= self._det_phased_priority_s)
+                _priority_event = (self._det_sync_acq_always or _new_arm_event
+                                   or _new_pending_event or _phase_repeat)
+                _priority_due = (self._det_sync_acquire
+                                 and (self._det_sync_acq_always or self._shot_armed_hw)
+                                 and _acquiring and _priority_event
+                                 and (_pre_now - self._det_last_sync_acq)
+                                 >= self._det_acq_interval_s)
+                _queued_priority = False
+                _scan_region = 'full'
+                if _priority_due:
+                    if self._det_phased_acquire:
+                        _scan_region = self._det_next_acq_scan_region(
+                            _detect_shot_epoch)
+                    else:
+                        self._det_acq_scan_last = 'full'
+                    _queued_priority = self._det_submit_priority(
+                        frame_bgr, _pre_now, _scan_region)
+                    if _queued_priority:
+                        self._det_last_sync_acq = _pre_now
+                        if _new_arm_event:
+                            self._det_priority_epoch = _priority_epoch
+                        if _new_pending_event:
+                            self._det_priority_pending_ts = float(self._det_pend_ts)
+                        self._det_diag['priority_acq'] = (
+                            self._det_diag.get('priority_acq', 0) + 1)
+                        self._det_diag['scan_' + _scan_region] += 1
+                if not _queued_priority:
+                    _hot = False
+                    if self._det_armed_hot and self._shot_armed_hw:
+                        if self._det_hot_epoch != _priority_epoch:
+                            self._det_hot_epoch = _priority_epoch
+                            self._det_hot_open_ts = _pre_now
+                        _hot = (_pre_now - self._det_hot_open_ts) <= self._det_armed_hot_max_s
+                    _hot_fn = getattr(self._meter_detector, 'submit_priority', None) if _hot else None
+                    if callable(_hot_fn):
+                        _hot_fn(frame_bgr, ts if ts is not None else 0.0)
+                        self._det_diag['hot_submit'] = self._det_diag.get('hot_submit', 0) + 1
+                    else:
+                        self._meter_detector.submit(frame_bgr, ts if ts is not None else 0.0)
+                # New locators expose scope atomically. Legacy/fake locators retain
+                # the four-tuple latest() contract and are necessarily full-frame.
+                _latest_details = getattr(self._meter_detector, 'latest_details', None)
+                if callable(_latest_details):
+                    _dfound, _dbox, _dconf, _dts, _dscope = _latest_details()
+                else:
+                    _dfound, _dbox, _dconf, _dts = self._meter_detector.latest()
+                    _dscope = 'full'
+                if _dscope not in ('full', 'left', 'right'):
+                    _dscope = 'full'
+                try:
+                    _dts_f = float(_dts)
+                    _dts_valid = bool(np.isfinite(_dts_f) and _dts_f >= 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    _dts_f = -1.0
+                    _dts_valid = False
+                try:
+                    _dts_age = float(ts) - _dts_f
+                    _dts_ordered = bool(
+                        ts is not None and np.isfinite(float(ts))
+                        and _dts_valid and np.isfinite(_dts_age)
+                        and _dts_age >= -1.0e-6)
+                except (TypeError, ValueError, OverflowError):
+                    _dts_age = float("inf")
+                    _dts_ordered = False
+                # Freshness is two-sided.  A source frame cannot originate after
+                # the callback consuming it; accepting such a stamp both grants an
+                # unbounded hold (now-source stays negative) and can poison the
+                # monotonic unique-result clock ahead of every legitimate result.
+                _dfresh = bool(
+                    _dts_ordered and _dts_age <= float(self._det_ttl_s))
+                _source_this_arm = self._det_result_this_arm(_dts)
+                _dg = self._det_diag
+                _dg["calls"] += 1
+                self._det_fresh_accept = False   # per-frame: set below on an accepted proposal
+                if _dfound:
+                    _dg["found"] += 1
+                if _dfresh:
+                    _dg["fresh"] += 1
+                elif _dfound:
+                    _dg["stale"] += 1              # a box existed but was older than the TTL
+                _now = ts if ts is not None else 0.0
+                # UNIQUE-result guard for the lifecycle: in async mode latest() repeats one
+                # result across many frames, and streaks/strikes must count detector RESULTS,
+                # not frames (a single async box must not fake a 2-frame acquire streak).
+                # Do not advance the unique-result high-water mark for a future
+                # stamp.  If the producer clock recovers on the next callback, its
+                # legitimate source must still be able to acquire immediately.
+                _new_res = bool(
+                    _dts_ordered and _dts_f > self._det_seen_dts)
+                if _new_res:
+                    self._det_seen_dts = float(_dts)
+                    # A unique result revokes recovery authority until this same
+                    # result proves to be a fresh, accepted, current-arm positive.
+                    # The exceptional one-frame negative bridge is authorized
+                    # separately by its <=45 ms + broad-body gates; this positive-
+                    # source flag never grants it implicitly.
+                    self._det_occ_locator_source_positive = False
+                if not _dfresh or not _dfound:
+                    # Repetition does not make an async slot immortal: once its
+                    # source timestamp exceeds the detector TTL it loses recovery
+                    # authority even though it is not a new result.
+                    self._det_occ_locator_source_positive = False
+                # A read-rescue result is ordinary timestamped detector evidence.  It
+                # cannot bypass lifecycle/teleport/no-meter policy; this flag only says
+                # that an accepted result should reset the stale position-serving state.
+                _rescue_reseat = False
+                _rescue_source_ready = False
+                _rrts = float(getattr(self, '_det_rescue_request_ts', -1.0e9))
+                if _rrts > -1.0e8:
+                    if (_now - _rrts) > max(float(self._det_ttl_s), 0.20):
+                        self._det_rescue_request_ts = -1.0e9
+                    elif (_new_res and _dts_valid and _dscope == 'full'
+                          and _dts_f + 1.0e-6 >= _rrts):
+                        _rescue_source_ready = True
+                self._note_press_ghost_full_result(
+                    found=bool(_dfound), fresh=bool(_dfresh), scope=str(_dscope),
+                    new_result=bool(_new_res))
+                if _dfresh and _dfound and _dbox is not None:
+                    _bb = tuple(int(v) for v in _dbox)
+                    # LIFECYCLE gate (pass-through when ORION_METER_LIFECYCLE=0): the proposal
+                    # may be refused -- a pending candidate still warming up its acquire streak,
+                    # or a teleport outlier accruing re-seed strikes -- and then NOTHING moves
+                    # this frame (the retired MeterBoxKalman served the coasted prediction on
+                    # 'reject', never the raw jump).
+                    if self._det_on_found(_bb, float(_dconf or 0.0), _now, _new_res,
+                                          result_ts=_dts):
+                        self._det_fresh_accept = True
+                        # KEEP may accept the same still-fresh async slot repeatedly
+                        # for presence/width checks. It must not reseed NCC from every
+                        # intervening frame: fill-edge/occluder changes would compound
+                        # into template drift instead of tracking one stable reference.
+                        self._det_new_accept = bool(_new_res)
+                        if _new_res and _source_this_arm:
+                            self._det_occ_locator_source_positive = True
+                        _rescue_reseat = bool(_rescue_source_ready)
+                        if _dfresh and _new_res and _source_this_arm:
+                            _df_nogreen_locator_fresh = True
+                            _df_nogreen_locator_ts = float(_dts)
+                            _df_nogreen_locator_box = _bb
+                            _df_nogreen_locator_generation = int(
+                                getattr(self, "_det_lock_generation", 0) or 0)
+                        self._det_last_box = _bb
+                        if _new_res:
+                            # Hold authority is evidence-clocked.  latest() repeats
+                            # one async slot on every capture callback; consumption
+                            # time must not renew a source frame's lifetime forever.
+                            self._det_last_found_ts = float(_dts_f)
+                        # History is keyed on the FRAME the box was computed from (_dts), not now --
+                        # otherwise the velocity is measured against the wrong clock.
+                        _bx0, _by0, _bw0, _bh0 = self._det_last_box
+                        _hts = float(_dts) if (_dts is not None and _dts >= 0.0) else _now
+                        if not self._det_box_hist or _hts > self._det_box_hist[-1][0]:
+                            self._det_box_hist.append((_hts, _bx0 + _bw0 * 0.5,
+                                                       _by0 + _bh0, _bw0, _bh0))
+                        # Re-seed the tracker template from every fresh detection: the meter's
+                        # appearance changes as it fills, so a stale template would decay.
+                        # CONTINUITY mode owns its own template lifecycle in _det_track_step --
+                        # seeding here from the CURRENT frame at the detection's (stale) box is
+                        # exactly the bias that pinned the box behind a panning meter.
+                        if self._det_track and not self._det_track_cont:
+                            self._seed_track_template(frame_bgr, self._det_last_box)
+                elif (self._det_lifecycle and _dfresh and not _dfound
+                      and _dscope == 'full'):
+                    # No-meter STRIKE accounting (locked only). May force-drop the lock, after
+                    # which the veto branch below fires on the now-empty hold.
+                    self._det_occ_current_full_negative = True
+                    self._det_occ_current_source_age = (
+                        float(_now) - float(_dts_f))
+                    self._det_on_nofound(_now, _new_res)
+                if _rescue_source_ready:
+                    # One unique full-frame result consumes one rescue request whether
+                    # found, refused by lifecycle, or no-find. A continued read failure
+                    # may schedule another bounded request after RESCUE_GAP_MS.
+                    self._det_rescue_request_ts = -1.0e9
+                # HELD box: keep the last-found meter box across brief async found=False gaps
+                # (the detector runs on its own thread and can miss a cycle mid-shot; without this
+                # the region/seed vanish for a frame and read() re-locks décor).
+                _held = None
+                _lock_ok = (self._det_state == 'locked') if self._det_lifecycle else True
+                _hold_allow = self._det_hold_s
+                if self._det_lifecycle and _lock_ok:
+                    # EXTENDED COAST (retired peak-hold, _PEAK_HOLD_S=0.6 wall-clock bound): a
+                    # lock that PROVED a >=_det_coast_rise_pp rise and still measured a white
+                    # ribbon at the tracked spot last frame bridges the locator's cap blindness
+                    # -- measured on session_20260830_003937, YOLO returns found=0 for 17-33
+                    # CONSECUTIVE frames inside real shot runs, which is what expired the old
+                    # 0.35s hold mid-shot and produced the owner's on/off/on churn.
+                    _rise_ok = (self._det_lock_fill0 is not None
+                                and (self._det_lock_fill_max - self._det_lock_fill0)
+                                >= float(self._det_coast_rise_pp))
+                    if _rise_ok and self._det_last_presence:
+                        _hold_allow = max(_hold_allow, self._det_coast_max_s)
+                if self._det_last_box is not None and ts is not None and _lock_ok:
+                    if (_now - self._det_last_found_ts) > _hold_allow:
+                        if self._det_lifecycle:
+                            # Explicit DROP (not a silent fade): arms the warm re-acquire
+                            # memory so a find moments later re-latches instantly.
+                            self._det_drop_lock(_now, 'coast_expired')
+                    else:
+                        _held = self._det_last_box
+                        # EXTRAPOLATE to now: the newest box was computed from a frame that is
+                        # already tens of ms old. Advance it along its measured velocity so it
+                        # sits where the meter IS, not where it was. Size is held (the meter does
+                        # not resize while it translates); horizontal centre and bottom edge move.
+                        # Bottom-edge geometry is load-bearing: detector height jitter must not
+                        # manufacture vertical translation. Bounded by
+                        # _det_extrap_max_s.
+                        if self._det_extrap and len(self._det_box_hist) >= 2:
+                            _h0 = self._det_box_hist[0]; _h1 = self._det_box_hist[-1]
+                            _span = _h1[0] - _h0[0]
+                            _age = _now - _h1[0]
+                            if _span > 1e-3 and 0.0 < _age <= self._det_extrap_max_s:
+                                # ROBUST velocity (see _det_hist_vel): a Theil-Sen median
+                                # over every pairwise slope, so one in-gate acquisition hop
+                                # cannot sling the served box off a static meter. Shipped code carried a
+                                # bare first-last fit and was only shielded by the NCC
+                                # stale-box pin the continuity fix removed. While the
+                                # estimate is UNTRUSTED (short history) the total shift
+                                # is additionally capped to a few px -- bounded onset
+                                # correction on a real fade, bounded onset damage on a
+                                # static meter (both failure modes measured; see knobs).
+                                _vx, _vy, _spd, _vtr = self._det_hist_vel()
+                                if not _vtr:
+                                    _sh = float(np.hypot(_vx * _age, _vy * _age))
+                                    _shc = float(self._det_early_shift_max)
+                                    if _sh > _shc > 0.0:
+                                        _vsc = _shc / _sh
+                                        _vx *= _vsc; _vy *= _vsc
+                                _cx = _h1[1] + _vx * _age
+                                _bot = _h1[2] + _vy * _age
+                                _w, _h = int(_h1[3]), int(_h1[4])
+                                _nx = int(round(_cx - _w * 0.5)); _ny = int(round(_bot - _h))
+                                _nx = max(0, min(int(self.W) - _w, _nx))
+                                _ny = max(0, min(int(self.H) - _h, _ny))
+                                _held = (_nx, _ny, _w, _h)
+                if _rescue_reseat and _held is not None:
+                    # _held is the accepted source box advanced to this callback's clock,
+                    # so a moving meter is not snapped backward to inference-old pixels.
+                    self._det_hard_reseat_serving(frame_bgr, _held, _now)
+                    self._det_diag['rescue_seat'] = (
+                        self._det_diag.get('rescue_seat', 0) + 1)
+                self._det_active_box = _held
+                if _held is not None:
+                    # CONSTRAIN read()'s search to the meter box AND seed the lock there, so read()'s
+                    # own machinery (velocity/breakers/state) tracks the right column. The direct-fill
+                    # override below is the guarantee; this keeps read() coherent.
+                    bx, by, bw, bh = _held
+                    _px = max(16, int(bw * 0.75)); _py = max(24, int(bh * 0.25))
+                    self._det_region = (max(0, bx - _px), max(0, by - _py),
+                                        min(int(self.W), bx + bw + _px),
+                                        min(int(self.H), by + bh + _py))
+                    _seat = True
+                    if self.box is not None and self.conf >= self.CONF_MIN:
+                        ax, ay, aw, ah = self.box
+                        _ix = max(ax, bx); _iy = max(ay, by)
+                        _ix2 = min(ax + aw, bx + bw); _iy2 = min(ay + ah, by + bh)
+                        _inter = max(0, _ix2 - _ix) * max(0, _iy2 - _iy)
+                        _iou = (_inter / float(aw * ah + bw * bh - _inter + 1e-9)
+                                if aw > 0 and bw > 0 else 0.0)
+                        if _iou >= self._det_seat_iou:
+                            _seat = False
+                    if _seat:
+                        self.box = (bx, by, bw, bh)
+                        self.conf = self.CONF_INIT
+                        self._det_seeded = True
+                        _dg["seeded"] += 1
+                elif _dfresh and not _dfound and _dscope == 'full':
+                    # No held box either -> the detector is confident there is no meter -> veto.
+                    self._det_no_meter = True
+                    self._det_fill_hist.clear()
+                    self._det_coarse_fill_hist.clear()
+                    self._det_box_hist.clear()   # stale motion must not extrapolate a new lock
+                    self._det_tmpl = None        # and no stale template may track a new lock
+                    self._det_tmpl_size = None
+                    self._det_tmpl_cx_offset = 0.0
+                    self._det_tmpl_bottom_offset = 0.0
+                    self._subpx_D = None; self._subpx_provisional = False         # and no stale per-shot scale/anchor may
+                    #                                measure a new meter
+                    self._subpx_off = None
+                    self._subpx_seed = []
+                    self._subpx_base_hist = []; self._subpx_last_base_rel = None
+                    self._subpx_carry_pending = False
+                    self._coarse_denom_ref = None  # a later detector lock is a new ruler identity
+                    self._subpx_camera_ref = None
+                    self._subpx_camera_scale = 1.0
+                    self._det_scale_reference = None
+                    self._det_scale_pending = None
+                    self._det_track_scale_match = None
+                    self._det_track_vx = 0.0     # a new lock starts with no inherited motion
+                    self._det_track_vy = 0.0
+                    self._det_track_last_match = None
+                    self._det_track_box = None   # and no stale tracked position either
+                    self._det_track_box_ts = None
+                    self._det_track_last_match_ts = None
+                    self._det_track_sample_ts = None
+                    self._det_track_clock_timed = None
+                    self._det_track_velocity_dt_s = 1.0 / 60.0
+                    self._det_tmpl_ts = -1.0e9
+                    self._det_tmpl_pos = None
+                    _dg["nofound"] += 1
+                # THROTTLED HEALTH (ERROR level -> not throttled by the native relay). One line
+                # every ~2s so a live run reveals whether the detector is finding the meter,
+                # whether results are fresh (not stale/CPU-starved), and whether it is seeding.
+                if ts is not None and (ts - self._det_diag_last) >= 2.0:
+                    self._det_diag_last = ts
+                    _acq_logger.error(
+                        "DETECTOR HEALTH provider=%s infer=%.0fms calls=%d found=%d fresh=%d "
+                        "stale=%d seeded=%d nofound_veto=%d last=(found=%s fresh=%s box=%s age=%.2fs)"
+                        " lifecycle(state=" + str(self._det_state)
+                        + " locks=" + str(_dg["lock"]) + " drops=" + str(_dg["drop"])
+                        + " reseeds=" + str(_dg["reseed"])
+                        + " outliers=" + str(_dg["outlier"])
+                        + " rescues=" + str(_dg.get("rescue", 0))
+                        + "/" + str(_dg.get("rescue_seat", 0))
+                        + " occl_fill=" + str(_dg.get("occlusion_fill", 0))
+                        + " top=" + str(_dg.get("occlusion_top", 0))
+                        + " neg=" + str(_dg.get("occlusion_negative", 0))
+                        + " reject=" + str(_dg.get("occlusion_reject", 0)) + ")"
+                        + " hot_submit=" + str(_dg.get("hot_submit", 0))
+                        + " reseat_x=" + str(_dg.get("reseat_x", 0))
+                        + " scan(enabled=%s scope=%s last_side=%s"
+                        + " full=%d/%d left=%d/%d right=%d/%d partial_miss=%d)",
+                        getattr(self._meter_detector, "provider", "?"),
+                        float(getattr(self._meter_detector, "infer_ms", 0.0)),
+                        _dg["calls"], _dg["found"], _dg["fresh"], _dg["stale"],
+                        _dg["seeded"], _dg["nofound"], _dfound, _dfresh,
+                        ([int(v) for v in _dbox] if _dbox else None),
+                        (float(ts - _dts) if (_dts is not None and _dts >= 0.0) else -1.0),
+                        self._det_phased_acquire, _dscope,
+                        self._det_acq_last_side or '-',
+                        _dg['scan_full_hit'], _dg['scan_full'],
+                        _dg['scan_left_hit'], _dg['scan_left'],
+                        _dg['scan_right_hit'], _dg['scan_right'],
+                        _dg['scan_partial_miss'])
+            except Exception:
+                self._det_no_meter = False
         if self._require_gameplay_eligibility and not self._shot_armed_hw:
             s = self._close_gameplay_gate()
         else:
@@ -6730,6 +11622,304 @@ class SimpleMeterReader:
             s = self.read(frame_bgr, ts)
             if self._require_gameplay_eligibility:
                 s = self._qualify_gameplay_sample(s, _detect_shot_epoch)
+        # DETECTOR-AUTHORITATIVE FILL. read()'s white-blind colour acquire wanders onto décor even
+        # when the box is seeded (rendered live proof: detector dead-on the meter, reader on the
+        # player at 0% fill), AND _read_fill masks the configured colour so it reads 0 on a white
+        # meter unless meter_color=='White' (rendered proof: meter filling to 92% while the reader
+        # reported 0.00). So whenever the detector holds a meter, measure fill DIRECTLY in its box
+        # with a COLOUR-AGNOSTIC white scan and emit THAT -- authoritative regardless of what read()
+        # locked or how meter_color is set. It runs after the gate too, so a gameplay-ineligible
+        # frame during the fill is no longer dropped: the detector's meter presence is the proof.
+        # [ORION_READER_BOX_WIDTH_GATE 2026-09-03] Judge the box BEFORE it is measured, on the
+        # detector's RAW candidate width (the smoothed emit ramps a 38 px box in as 29/32/34 and
+        # would let two frames through) as well as the served width; wide only (legitimate narrow
+        # boxes exist: width 17 after a 23 median in archived sessions). A hit is a REJECTED
+        # frame (detected False, coarse 0, explicit reason) -- native treats an empty reason as
+        # accepted and strict ownership consumes the coarse fill -- and three hits in a row retire
+        # the lock so a persistent false box cannot starve re-acquisition.
+        _bw_gate_hit = False
+        if (self._det_active_box is not None and self._box_w_gate
+                and len(self._box_w_hist) >= self._box_w_min_n):
+            try:
+                _bw_served = float(self._det_active_box[2])
+                _bw_served_h = max(1.0, float(self._det_active_box[3]))
+                _bw_raw = _bw_served
+                _bw_raw_h = _bw_served_h
+                # The raw candidate is the lifecycle-ACCEPTED fresh proposal only: a refused
+                # teleport proposal in the async slot must not be able to reject or retire the
+                # good lock it was refused against (Sol, review #57).
+                if bool(getattr(self, "_det_fresh_accept", False)) and self._det_last_box:
+                    _bw_raw = float(self._det_last_box[2])
+                    _bw_raw_h = max(1.0, float(self._det_last_box[3]))
+                _bw_key = max(_bw_served / _bw_served_h, _bw_raw / _bw_raw_h)
+                _bw_med = float(np.median(list(self._box_w_hist)))
+                if _bw_med > 0.0 and _bw_key > _bw_med * self._box_w_ratio:
+                    _bw_gate_hit = True
+            except Exception:
+                _bw_gate_hit = False
+        if _bw_gate_hit:
+            self._box_w_gate_hits += 1
+            self._box_w_consec += 1
+            self._last_fill_estimator_mode = ""
+            self._last_fill_estimator_generation = 0
+            self._last_fill_coarse = 0.0
+            self.last_fill = 0.0
+            self.last_coarse = 0.0
+            _bw_retire = (self._box_w_consec % self._box_w_retire_n) == 0
+            if ts is not None and (float(ts) - self._box_w_log_ts) >= 1.0:
+                self._box_w_log_ts = float(ts)
+                _acq_logger.error(
+                    "BOX WIDTH IMPLAUSIBLE: served_w=%d raw_w=%d key=%.3f session_median_ratio=%.3f "
+                    "limit=%.2f consecutive=%d%s -> frame rejected",
+                    int(_bw_served), int(_bw_raw), _bw_key, _bw_med, self._box_w_ratio,
+                    int(self._box_w_consec), " (lock retired)" if _bw_retire else "")
+            s = {"detected": False, "meter_present": False, "fill": 0.0,
+                 "fill_coarse": 0.0, "bbox": [0, 0, 0, 0],
+                 "stage": "box_width_implausible", "confidence": 0.0,
+                 "velocity_pct_s": 0.0,
+                 "rejection_reason": "box_width_implausible", "rise_state": ""}
+            try:
+                self.last_debug = {"stage": "box_width_implausible",
+                                   "served_w": int(_bw_served), "raw_w": int(_bw_raw),
+                                   "median_w": round(_bw_med, 1)}
+            except Exception:
+                pass
+            if _bw_retire:
+                self._box_w_retired += 1
+                self.conf = 0.0; self.box = None; self.tmpl = None
+                try:
+                    self._det_reset_lock_state()
+                    self._det_warm_pos = None
+                    self._det_warm_ts = -1.0e9
+                    self._det_active_box = None
+                except Exception:
+                    pass
+        else:
+            self._box_w_consec = 0
+        if self._det_active_box is not None and not _bw_gate_hit:
+            try:
+                _ab = tuple(int(v) for v in self._det_active_box)
+                # DETECT-THEN-TRACK: the detector only refreshes every ~45ms; track the meter on
+                # EVERY frame with a cheap NCC match so the box stays ON it between detections.
+                if self._det_track:
+                    _ab = tuple(int(v) for v in self._det_track_step(
+                        frame_bgr, _ab, ts))
+                    self._det_active_box = _ab
+                _tracked_ab = _ab
+                _ab, _display_ab = self._det_measurement_boxes(frame_bgr, _ab, ts)
+                # The active box remains the detector/tracker authority's box;
+                # pixel-crop dimensions cannot dilute the original width gate.
+                self._det_active_box = _tracked_ab if self._det_measure_raw else _ab
+                _sp, _grn, _tr = self._measure_fill_in_box(frame_bgr, _ab, ts=ts)
+                if (self._reseat_x and _tr is not None and int(_tr) < 0
+                        and not self._det_occ_current_full_negative):
+                    # [ORION_READER_RESEAT_X] the served box may simply be beside the meter
+                    _dx = self._reseat_x_dx(frame_bgr, _ab)
+                    if _dx is not None:
+                        _ab2 = (int(_ab[0]) + int(_dx), int(_ab[1]), int(_ab[2]), int(_ab[3]))
+                        _sp2, _grn2, _tr2 = self._measure_fill_in_box(frame_bgr, _ab2, ts=ts)
+                        if _tr2 is not None and int(_tr2) >= 0 and float(_sp2) > 0.0:
+                            _sp, _grn, _tr, _ab = _sp2, _grn2, _tr2, _ab2
+                            _display_ab = (int(_display_ab[0]) + int(_dx), int(_display_ab[1]),
+                                           int(_display_ab[2]), int(_display_ab[3]))
+                            _tracked_ab = (int(_tracked_ab[0]) + int(_dx), int(_tracked_ab[1]),
+                                           int(_tracked_ab[2]), int(_tracked_ab[3]))
+                            self._det_active_box = _tracked_ab if self._det_measure_raw else _ab
+                            if getattr(self, '_det_track_box', None) is not None:
+                                _tb = tuple(int(v) for v in self._det_track_box)
+                                self._det_track_box = (_tb[0] + int(_dx), _tb[1], _tb[2], _tb[3])
+                            self._reseat_x_n += 1
+                            self._det_diag['reseat_x'] = self._det_diag.get('reseat_x', 0) + 1
+                        else:
+                            # a shifted box that still reads nothing teaches the tracker nothing
+                            self._measure_fill_in_box(frame_bgr, _ab, ts=ts)
+                if self._det_occ_current_full_negative:
+                    # One detector-negative callback consumes the budget whether
+                    # it recovered, rejected, or was fully hidden.  Only a later
+                    # positive *direct* read can replenish it.
+                    self._det_occ_negative_bridge_used = True
+                if _tr is not None and int(_tr) >= 0 and float(_sp) > 0.0 and int(_ab[3]) > 0:
+                    _width_box = _tracked_ab if self._det_measure_raw else _ab
+                    self._box_w_hist.append(float(_width_box[2]) / float(_width_box[3]))
+                # READ-RESCUE (see the __init__ knob block): a failed held-box read queues
+                # one priority/latest-frame worker result.  It never runs YOLO/ORT inline;
+                # the accepted result hard-reseats serving on a later callback while this
+                # frame remains an honest zero.
+                if (self._read_rescue and _tr is not None and int(_tr) < 0
+                        and ts is not None
+                        and (float(ts) - self._det_last_rescue) >= self._rescue_gap_s):
+                    self._det_last_rescue = float(ts)
+                    self._det_read_rescue(frame_bgr, float(ts))
+                # fill_coarse/raw_fill_pct always carries the COARSE row-walk value, so live
+                # telemetry keeps a permanent sub-pixel-vs-coarse A/B breadcrumb per frame.
+                _sp = float(_sp); _co = float(getattr(self, "_last_fill_coarse", _sp) or 0.0)
+                if self._det_lifecycle:
+                    # Per-lock fill bookkeeping: the PROVEN-rise latch that earns the extended
+                    # coast (retired peak-hold demanded a real rise) + the white-ribbon presence
+                    # that stands in for the retired red-presence survival corroboration.
+                    self._det_last_presence = bool(_tr is not None and int(_tr) >= 0)
+                    self._det_lock_read_n = int(getattr(self, "_det_lock_read_n", 0)) + 1
+                    if self._det_lock_fill0 is None:
+                        self._det_lock_fill0 = _sp
+                    if _sp > self._det_lock_fill_max:
+                        self._det_lock_fill_max = _sp
+                    # A lifecycle-approved box becomes a side-priority hint only
+                    # after its measured meter fill proves a real rise. A static
+                    # one-frame proposal can therefore never steer the next scan;
+                    # even a bad hint merely changes order because all three views
+                    # remain in the cycle.
+                    if (self._shot_armed_hw and self._det_lock_fill0 is not None
+                            and (self._det_lock_fill_max - self._det_lock_fill0)
+                            >= float(self._det_coast_rise_pp)):
+                        _acx = float(_ab[0]) + float(_ab[2]) * 0.5
+                        self._det_acq_last_side = (
+                            'left' if _acx < float(self.W) * 0.5 else 'right')
+                self.box = _ab
+                self.conf = self.CONF_INIT
+                self.last_fill = _sp
+                self.last_coarse = _co
+                # Independent detector-fill velocity (read()'s _vel_hist is décor-polluted).
+                if ts is not None:
+                    self._det_fill_hist.append((float(ts), _sp))
+                    self._det_coarse_fill_hist.append((float(ts), _co))
+                    _cut = float(ts) - 0.5
+                    while self._det_fill_hist and self._det_fill_hist[0][0] < _cut:
+                        self._det_fill_hist.popleft()
+                    while (self._det_coarse_fill_hist
+                           and self._det_coarse_fill_hist[0][0] < _cut):
+                        self._det_coarse_fill_hist.popleft()
+                _dvel = 0.0
+                if len(self._det_fill_hist) >= 3:
+                    _tt = np.array([p[0] for p in self._det_fill_hist], dtype=np.float64)
+                    _ff = np.array([p[1] for p in self._det_fill_hist], dtype=np.float64)
+                    if _tt[-1] > _tt[0]:
+                        _dvel = float(np.polyfit(_tt - _tt[0], _ff, 1)[0])   # pct/s
+                _obox = _display_ab
+                if self._det_occ_recovered:
+                    if self._det_occ_kind == "top_censored_negative_once":
+                        _occ_conf = min(0.75, max(
+                            0.65, 0.65 + 0.10 * float(self._det_occ_support)))
+                    else:
+                        _occ_conf = min(0.90, max(
+                            0.65, 0.65 + float(self._det_occ_support)))
+                else:
+                    _occ_conf = 1.0
+                s = {"detected": True, "meter_present": True,
+                     "fill": _sp, "fill_coarse": _co, "bbox": _obox,
+                     "fill_estimator_mode": self._last_fill_estimator_mode,
+                     "fill_estimator_generation": self._last_fill_estimator_generation,
+                     "confidence": _occ_conf, "velocity_pct_s": _dvel,
+                     "top_row": int(_tr) if _tr is not None else -1, "green": _grn,
+                     "rejection_reason": "", "rise_state": self._rise_state(_sp),
+                     "stage": "detector_fill"}
+                if self._det_occ_censored_reject or self._det_pixel_ruler_reject:
+                    _pixel_reject_reason = ("detector_pixel_geometry_missing"
+                        if self._det_pixel_ruler_reject else "detector_fill_top_occluded")
+                    # The normal row walk saw only a trajectory-truncated lower
+                    # remainder and the locator was negative/stale (or the bridge
+                    # deadline elapsed).  Preserve the held box for lifecycle
+                    # hysteresis, but publish no fill: a false low value would turn
+                    # an occlusion into a late shot.  Remove this frame's zero from
+                    # the velocity histories so the censor cannot create a false
+                    # falling edge either.
+                    if (ts is not None and self._det_fill_hist
+                            and abs(float(self._det_fill_hist[-1][0])
+                                    - float(ts)) <= 1.0e-9):
+                        self._det_fill_hist.pop()
+                    if (ts is not None and self._det_coarse_fill_hist
+                            and abs(float(self._det_coarse_fill_hist[-1][0])
+                                    - float(ts)) <= 1.0e-9):
+                        self._det_coarse_fill_hist.pop()
+                    self.last_fill = 0.0
+                    self.last_coarse = 0.0
+                    s = {"detected": False, "meter_present": False,
+                         "fill": 0.0, "fill_coarse": 0.0,
+                         "bbox": [0, 0, 0, 0],
+                         "fill_estimator_mode": "",
+                         "fill_estimator_generation": 0,
+                         "confidence": 0.0, "velocity_pct_s": 0.0,
+                         "top_row": -1, "green": None,
+                         "rejection_reason": _pixel_reject_reason,
+                         "rise_state": "", "stage": _pixel_reject_reason}
+                # DETECTOR-FILL STRUCTURE LATCH (see the __init__ knob block: the live
+                # silent-shot chain was read()'s COLOUR-masked sample starving
+                # _qualify_gameplay_sample under a meter_color drift, while this
+                # colour-agnostic sample -- the one actually emitted -- carried the
+                # green chevron on 91% of early rise frames). A low-fill frame inside
+                # the CURRENT hardware epoch may stamp immediately when it contains
+                # both the meter's green chevron and a measured white ribbon. That is
+                # the strongest onset signature available and lets native ownership
+                # consume the next rising frame instead of losing 2-4 frames while the
+                # lifecycle box transitions acquiring -> locked. High/static boxes keep
+                # the stricter two-consecutive-LOCKED-frame rule, preserving the green-
+                # ball-VFX false-lock defence. Latch-only: publication/authorization
+                # remains with the existing qualify and native two-frame rise gates.
+                _df_same_epoch = (
+                    _detect_shot_epoch > 0 and self._shot_armed_hw
+                    and self._physical_shot_epoch == _detect_shot_epoch)
+                _df_has_structure = (
+                    _grn is not None and _tr is not None and int(_tr) >= 0)
+                _df_low_rise = (
+                    np.isfinite(_co) and 0.0 < float(_co) <= self._ghost_press_low_pct)
+                _df_locked = not self._det_lifecycle or self._det_state == 'locked'
+                if self._detfill_green_latch and self._require_gameplay_eligibility:
+                    if _df_same_epoch and _df_has_structure and _df_low_rise:
+                        self._df_green_streak = max(1, self._df_green_streak)
+                        self._latch_gameplay_structure_proof(_detect_shot_epoch)
+                    elif _df_locked:
+                        # At high fill, require repeated same-box evidence. A coasting
+                        # box crossed once by a green-ball VFX cannot build this streak.
+                        if _df_has_structure:
+                            self._df_green_streak += 1
+                        else:
+                            self._df_green_streak = 0
+                        if self._df_green_streak >= 2 and _df_same_epoch:
+                            self._latch_gameplay_structure_proof(_detect_shot_epoch)
+                    else:
+                        self._df_green_streak = 0
+                else:
+                    self._df_green_streak = 0
+                # EARLY CAPLESS RISE PROOF.  Difficult/deep meters may not render a
+                # green chevron until after the 20/25% ownership rung, even though the
+                # detector already owns a real white ribbon rising from zero.  Three
+                # distinct fresh locator frames on one lifecycle generation, all in
+                # the evidence-backed 0..20% onset band and rising >=4pp end-to-end,
+                # may stamp the existing structure bit.  This changes no publication,
+                # ownership, confidence, or timing rule.
+                if _df_nogreen_locator_fresh:
+                    if _grn is None:
+                        self._advance_detfill_nogreen_rise(
+                            shot_epoch=_detect_shot_epoch,
+                            lock_generation=_df_nogreen_locator_generation,
+                            source_ts=_df_nogreen_locator_ts,
+                            sample_ts=ts,
+                            coarse_fill=_co,
+                            locator_box=_df_nogreen_locator_box,
+                            white_ribbon=bool(_tr is not None and int(_tr) >= 0),
+                            locator_fresh=True)
+                    else:
+                        self._reset_detfill_nogreen_evidence()
+            except Exception:
+                pass
+        else:
+            self._det_fill_hist.clear()
+            self._det_coarse_fill_hist.clear()
+            self._df_green_streak = 0    # the chevron streak is a property of a HELD box
+            self._reset_detfill_nogreen_evidence()
+        # DETECTOR IS THE SOLE GATE: when the detector is active but holds NO meter (none found
+        # within the hold window), suppress ANY colour-reader lock this frame. read()'s white-blind
+        # path otherwise flickers onto décor -- the white backboard/goal post, a jersey, a court
+        # line -- exactly the "locks onto the goal post" the owner saw. With the detector present it
+        # is the only authority: meter held -> the direct-fill override above already emitted it;
+        # no meter held -> nothing is a valid lock, so drop read()'s output. (Detector absent ->
+        # this is inert and the shipped colour reader stands unchanged.)
+        if (self._meter_detector is not None and self._det_active_box is None
+                and bool(s.get("detected"))):
+            self.conf = 0.0; self.box = None; self.tmpl = None
+            s = {"detected": False, "meter_present": False, "fill": 0.0,
+                 "fill_coarse": 0.0, "bbox": [0, 0, 0, 0], "stage": "detector_no_meter",
+                 "confidence": 0.0, "velocity_pct_s": 0.0,
+                 "rejection_reason": "detector_no_meter", "rise_state": ""}
         # FAKE-LOCK / DEAD-HOLD BREAKER (path-complete: applied at the production boundary so it
         # covers BOTH a real static-red re-lock AND the coast / meter-memory hold that an
         # intermittent dÃ©cor re-lock keeps alive by resetting the coast cap). A live shot meter's
@@ -6744,7 +11934,19 @@ class SimpleMeterReader:
         # near-tip hold (>=85%, a real peak / green make-window) gets a looser cap so a real ~0.8 s
         # peak survives. Guarded on fill>0.5 so a legit run of true-zero reads never trips it.
         _bk_det = bool(s.get("detected"))
-        _bk_fill = float(s.get("fill", 0.0) or 0.0)
+        # On the detector-fill path the breakers judge the COARSE fill on purpose: the
+        # static/fake-lock breaker's identity test is "byte-identical fill frame after
+        # frame", which is exactly what static decor produces under the row-quantized walk.
+        # The sub-pixel fill carries ~0.05-0.3pp of honest per-frame measurement noise,
+        # which would defeat that identity test and quietly disarm the false-lock defense;
+        # the coarse value preserves the breaker's shipped semantics bit-for-bit. Every
+        # other stage keeps judging "fill" exactly as before (their "fill_coarse" is the
+        # raw pre-EMA value, a different quantity).  Every detector-fill press guard below
+        # must use this SAME canonical value too.  Mixing the sub-pixel ruler into the 40%
+        # ownership boundary can turn one physical sample into 41.5% here while native sees
+        # 38.7%: the reader then quarantines a sample the engine is explicitly able to own.
+        _bk_fill = float((s.get("fill_coarse") if s.get("stage") == "detector_fill"
+                          else s.get("fill", 0.0)) or 0.0)
         # CAPLESS-LOCK BREAKER (WHITE ONLY). The static breaker above catches a
         # BYTE-FROZEN fill; it cannot catch a false lock whose fill wobbles. On a
         # WHITE meter that gap is wide open, because bright neutral pixels are the
@@ -6764,6 +11966,376 @@ class SimpleMeterReader:
         # loss rather than forbidding it. Deliberately NOT gated on arm grace: the
         # owner was physically arming throughout, which is exactly what suppresses
         # the static breaker, and a capless lock is invalid whatever the arm says.
+        # [ORION_READER_GHOST_PRESS_BREAK] POST-PRESS LEFTOVER-METER BREAKER (see the __init__
+        # knob block for the measured mechanism and the fail-closed argument). Runs at the
+        # production boundary like the breakers below, but INSIDE the armed press window on
+        # purpose -- the grace machinery that shields mid-shot coasted peaks from the static
+        # breaker is exactly what let the leftover meter bridge every press. The guard is
+        # narrower than any grace: it exists only between a press and that press's OWN first
+        # low-fill sighting, only against locks reading at/above the engine's first-sight
+        # bound (which the engine can never own), and only when their nonzero reads hold a
+        # static spread no real rise can produce. detector_fill-stage only: the colour path's
+        # synthetic/test frames never carry this stage, and live serving is detector-owned.
+        if (self._ghost_press_break and _bk_det
+                and s.get("stage") == "detector_fill"
+                and self._shot_armed_hw and ts is not None
+                and self._hw_arm_ts is not None
+                and int(getattr(self, "_hw_arm_grace_epoch", 0) or 0)
+                == int(self._physical_shot_epoch or 0)
+                and (float(ts) - float(self._hw_arm_ts)) <= self._ghost_press_window_s
+                and not self._press_low_seen):
+            _gf = _bk_fill
+            _gbb = s.get("bbox") or [0, 0, 0, 0]
+            _gcx = float(_gbb[0]) + float(_gbb[2]) * 0.5
+            _gcy = float(_gbb[1]) + float(_gbb[3]) * 0.5
+            _gr = max(32.0, self._ghost_zone_radius_scale * max(8.0, float(_gbb[2])))
+            _in_zone = (self._press_ghost_zone is not None
+                        and abs(_gcx - self._press_ghost_zone[0]) <= _gr
+                        and abs(_gcy - self._press_ghost_zone[1]) <= _gr * 2.0)
+            _evict = False
+            _suppress_hold = False
+            _plaus_on = bool(self._press_onset_plaus)
+            if _in_zone:
+                # LEVEL-AWARE zone test (see __init__): only reads near the ghost's own
+                # remembered fill level are the ghost; a read far below it is a meter
+                # rendering inside the zone (measured epoch 18: real onset read 25.5/31.1
+                # under a ~93% leftover -- above any fixed low threshold, far below the
+                # level). The band floor never sinks below the low exemption, so a
+                # low-level ghost cannot swallow genuine onset reads.
+                _gz_level = (float(self._press_ghost_level)
+                             if self._press_ghost_level is not None else 100.0)
+                _gz_band_lo = max(_gz_level - self._ghost_zone_band_pp,
+                                  self._ghost_zone_low_pct + 1.0)
+                if (0.0 < _gf < _gz_band_lo
+                        and (not _plaus_on
+                             or _gf < self._stale_press_drop_pct)):
+                    # Real-onset candidate: publish (a single frame is harmless to the
+                    # engine); two CONSECUTIVE candidates stand the guard down -- one
+                    # blurred partial read of the ghost cannot make two in a row.
+                    # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] a sub-band read AT/ABOVE the
+                    # engine's 40% anchor bound has no publish value (a first sight >=40
+                    # is refused, burning the episode) -- it is the leftover draining
+                    # through the band; follow-evict it below instead. And the pair must
+                    # RISE like an onset: two sub-band reads of a fading leftover decline
+                    # (measured epoch 51: the fade walked 12.7 down through the band and
+                    # stood the guard down for a 51.4 re-lock the engine then owned).
+                    self._press_ghost_zone_low_n += 1
+                    self._press_ghost_zero_n = 0
+                    _pair_ok = ((not _plaus_on)
+                                or self._press_onset_pair_advance(_gf, float(ts)))
+                    if self._press_ghost_zone_low_n >= 2 and _pair_ok:
+                        self._press_low_seen = True
+                        self._press_ghost_zone = None
+                        self._press_ghost_level = None
+                        self._press_ghost_zone_low_n = 0
+                        self._press_ghost_full_nofind_n = 0
+                        self._press_ghost_reads.clear()
+                        self._ghost_press_flush_summary("real_onset_in_zone")
+                elif _gf > 0.0:
+                    # The quarantined leftover meter re-locked (or was still held): follow
+                    # its drift and level, suppress the read, evict the lock again.
+                    self._press_ghost_zone = (_gcx, _gcy)
+                    if self._press_ghost_level is not None:
+                        self._press_ghost_level = (self._press_ghost_level * 0.8
+                                                   + _gf * 0.2)
+                    else:
+                        self._press_ghost_level = _gf
+                    self._press_ghost_zone_low_n = 0
+                    self._press_ghost_zero_n = 0
+                    self._press_ghost_full_nofind_n = 0
+                    self._press_onset_cand = None   # an in-band read breaks the onset pair
+                    _evict = True
+                else:
+                    # Zero read on the quarantined box: the fading/blurred leftover OR the
+                    # real onset's first EMPTY frame rendering in-zone (see the zero-read
+                    # hold knob in __init__: 51/336 live evictions were fill=0.0 and the
+                    # late cluster sat exactly where the real meter renders). Suppress the
+                    # publish either way, but only evict after _ghost_zero_evict_n
+                    # CONSECUTIVE zeros -- an empty real meter reads nonzero within a frame
+                    # or two and is then classified by the level band above, while a held
+                    # zero on the fading ghost still dies, ~2 frames later than before.
+                    # The candidate pair is left alone: a blur frame between two genuine
+                    # onset reads must not reset the escape.
+                    self._press_ghost_zero_n += 1
+                    if self._press_ghost_zero_n >= self._ghost_zero_evict_n:
+                        _evict = True
+                    else:
+                        _suppress_hold = True
+            elif 0.0 < _gf <= self._ghost_press_low_pct:
+                # This press's meter has been seen low outside any quarantine: every later
+                # high fill is the real rise (or its settle plateau, which the release
+                # grading needs). Guard stands down.
+                # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] STRENGTHENED 2026-08-31: a single
+                # low read is no longer enough -- all four live authority losses (epochs
+                # 32/50/51/58) were one garbage-low read (a pan-blurred/fading leftover, at
+                # press ages where NO real meter can render) standing the guard down for
+                # the very next high re-lock. The stand-down now needs a RISING pair, the
+                # same evidence a real onset always produces; the first low read still
+                # publishes unchanged (a single low frame is harmless to the engine).
+                if (not _plaus_on) or self._press_onset_pair_advance(_gf, float(ts)):
+                    self._press_low_seen = True
+                    self._press_ghost_zone = None
+                    self._press_ghost_zone_low_n = 0
+                    self._press_ghost_full_nofind_n = 0
+                    self._press_ghost_reads.clear()
+                    self._ghost_press_flush_summary("real_onset_low")
+            elif _gf > self._ghost_press_low_pct:
+                # Rolling-window identification: _ghost_press_frames nonzero reads whose
+                # spread stays inside _ghost_press_spread_pp. A real rise crosses this band
+                # at ~6pp/frame (30ms cadence; ~3pp at 60fps) and cannot hold the spread;
+                # zero reads (pan blur) neither feed nor reset the window, so the ghost's
+                # own flicker cannot shield it.
+                self._press_ghost_reads.append(_gf)
+                if (len(self._press_ghost_reads) >= self._ghost_press_frames
+                        and (max(self._press_ghost_reads) - min(self._press_ghost_reads))
+                        <= self._ghost_press_spread_pp):
+                    self._press_ghost_zone = (_gcx, _gcy)
+                    self._press_ghost_level = (sum(self._press_ghost_reads)
+                                               / len(self._press_ghost_reads))
+                    self._press_ghost_zone_low_n = 0
+                    self._press_ghost_full_nofind_n = 0
+                    self._press_ghost_reads.clear()
+                    _evict = True
+            if _evict or _suppress_hold:
+                if _evict:
+                    # LOG IDEMPOTENCE (see __init__): the eviction itself stays per-frame
+                    # (it is what frees the single locker), but the ERROR line is emitted
+                    # only for a NEW ghost (first eviction of the press, or the zone centre
+                    # moved >64px -- a different object) or after 0.5s; repeats go to DEBUG
+                    # and the per-press summary carries the totals.
+                    self._press_ghost_evict_total += 1
+                    _glog_new = (self._press_ghost_log_zone is None
+                                 or abs(_gcx - self._press_ghost_log_zone[0]) > 64.0
+                                 or abs(_gcy - self._press_ghost_log_zone[1]) > 64.0)
+                    if _glog_new or (float(ts) - self._press_ghost_log_ts) >= 0.5:
+                        _acq_logger.error(
+                            "GHOST LOCK DROPPED POST-PRESS: epoch=%d fill=%.1f%% "
+                            "zone=(%d,%d) (static/no-low-sighting leftover meter "
+                            "quarantined so the real onset can be acquired)",
+                            int(self._physical_shot_epoch or 0), _gf,
+                            int(_gcx), int(_gcy))
+                        self._press_ghost_log_ts = float(ts)
+                        self._press_ghost_log_zone = (_gcx, _gcy)
+                    else:
+                        _acq_logger.debug(
+                            "GHOST LOCK DROPPED POST-PRESS (repeat): epoch=%d fill=%.1f%% "
+                            "zone=(%d,%d)",
+                            int(self._physical_shot_epoch or 0), _gf,
+                            int(_gcx), int(_gcy))
+                else:
+                    self._press_ghost_suppress_total += 1
+                    _acq_logger.debug(
+                        "GHOST ZERO-READ HELD POST-PRESS: epoch=%d zone=(%d,%d) run=%d",
+                        int(self._physical_shot_epoch or 0), int(_gcx), int(_gcy),
+                        int(self._press_ghost_zero_n))
+                s = {"detected": False, "meter_present": False, "fill": 0.0,
+                     "fill_coarse": 0.0, "bbox": [0, 0, 0, 0],
+                     "stage": "ghost_press_suppressed", "confidence": 0.0,
+                     "velocity_pct_s": 0.0,
+                     "rejection_reason": "ghost_static_press", "rise_state": ""}
+                try:
+                    self.last_debug = {"stage": "ghost_press_suppressed",
+                                       "ghost_fill": round(_gf, 2)}
+                except Exception:
+                    pass
+                if _evict:
+                    self.conf = 0.0; self.box = None; self.tmpl = None
+                    try:
+                        self._det_reset_lock_state()
+                        self._det_warm_pos = None
+                        self._det_warm_ts = -1.0e9
+                        self._det_active_box = None
+                    except Exception:
+                        pass
+                _bk_det = False; _bk_fill = 0.0
+        # [ORION_READER_COLD_FIRST_READ_VETO] (see the __init__ knob block for the measured
+        # live failure). Runs AFTER the ghost breaker on purpose: the breaker must see every
+        # read at full cadence (zone-following and eviction cadence unchanged), and a frame
+        # the breaker already suppressed never reaches here (_bk_det is False). What is left
+        # is exactly the class the breaker does not cover: an OUT-OF-ZONE cold lock whose
+        # first 1-2 reads measure garbage-high on the raw proposal box -- the stick-shot
+        # first-sight poison and the second-leftover 2-frame pre-identification race. The
+        # lock is KEPT (no reset, no warm clear): the very next read publishes if sane.
+        # PRESS-SCOPED like the ghost guard (same gate, same fail-closed shape): it exists
+        # only between a physical press and that press's own first low-fill sighting,
+        # bounded by the same window. Outside a press -- idle relocks, the post-release
+        # settle plateau (whose press saw the rise's low fills), mid-shot rescue relocks
+        # after the onset published -- it is inert, so established lifecycle behaviour
+        # (and its pinned tests) are untouched.
+        if (self._cold_first_read_veto and _bk_det
+                and s.get("stage") == "detector_fill"
+                and self._det_lifecycle
+                and self._shot_armed_hw and ts is not None
+                and self._hw_arm_ts is not None
+                and int(getattr(self, "_hw_arm_grace_epoch", 0) or 0)
+                == int(self._physical_shot_epoch or 0)
+                and (float(ts) - float(self._hw_arm_ts)) <= self._ghost_press_window_s
+                and not self._press_low_seen
+                and not bool(getattr(self, "_det_lock_was_warm", False))
+                and int(getattr(self, "_det_lock_read_n", 0)) <= self._cold_first_read_n
+                and _bk_fill >= self._cold_first_read_pct):
+            _vf = _bk_fill
+            _acq_logger.debug(
+                "COLD FIRST-READ VETOED: read#%d fill=%.1f%% >= %.1f%% (unproven cold-lock "
+                "read withheld; the engine could never anchor on it)",
+                int(getattr(self, "_det_lock_read_n", 0)), _vf, self._cold_first_read_pct)
+            s = {"detected": False, "meter_present": False, "fill": 0.0,
+                 "fill_coarse": 0.0, "bbox": [0, 0, 0, 0],
+                 "stage": "cold_first_read_veto", "confidence": 0.0,
+                 "velocity_pct_s": 0.0,
+                 "rejection_reason": "cold_first_read_unproven", "rise_state": ""}
+            try:
+                self.last_debug = {"stage": "cold_first_read_veto",
+                                   "vetoed_fill": round(_vf, 2)}
+            except Exception:
+                pass
+            # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] a withheld read is not evidence:
+            # the garbage 72.9 measured on press 15's cold lock sat in _det_fill_hist and
+            # made the NEXT press's stale drop kill a genuine 27->34 RISING lock (measured
+            # session_20260830_191051 press 16). What the veto refuses to publish, the
+            # held-fill judgment must not trust either.
+            try:
+                if self._det_fill_hist and self._det_fill_hist[-1][0] == float(ts):
+                    self._det_fill_hist.pop()
+                if (self._det_coarse_fill_hist
+                        and self._det_coarse_fill_hist[-1][0] == float(ts)):
+                    self._det_coarse_fill_hist.pop()
+            except Exception:
+                pass
+            _bk_det = False; _bk_fill = 0.0
+        # [ORION_READER_PRESS_ONSET_PLAUSIBILITY] PRESS-CLOCK SERVE VETO (see the __init__
+        # knob block for the live failure and the two invariants). Runs AFTER the ghost
+        # breaker and the cold veto on purpose: the breaker keeps full-cadence sight of
+        # every read (zone-following, rolling-window identification and eviction cadence
+        # unchanged), and what reaches here is exactly the read the engine would otherwise
+        # anchor on. Same press-scoped fail-closed gate as the guards above: it exists only
+        # between a physical press and that press's own genuine low sighting, and it only
+        # ever WITHHOLDS a read no real meter could have produced at this press age / after
+        # the last published serve. On a veto the lock is evicted (it is holding the single
+        # locker the real onset needs -- measured, the fading leftover holds it for 100s of
+        # ms) and the quarantine zone is armed at the read's box, so the same object's next
+        # reads are handled by the level-band machinery instead of re-racing this veto.
+        if (self._press_onset_plaus and _bk_det
+                and s.get("stage") == "detector_fill"
+                and self._shot_armed_hw and ts is not None
+                and self._hw_arm_ts is not None
+                and int(getattr(self, "_hw_arm_grace_epoch", 0) or 0)
+                == int(self._physical_shot_epoch or 0)
+                and (float(ts) - float(self._hw_arm_ts)) <= self._ghost_press_window_s
+                and not self._press_low_seen):
+            _pf = _bk_fill
+            if _pf > 0.0:
+                _age_allow = self._press_fill_allowance(float(ts))
+                _step_allow = self._press_step_allowance(float(ts))
+                # BOTH rules judge only reads AT/ABOVE the engine's 40% anchor bound: a
+                # sub-40 read is never withheld (harmless alone -- the engine cannot
+                # complete ownership on it without a plausible rise, and a genuine
+                # POP-IN/carried-over serve is often sub-40 at ages/steps the clocks
+                # would refuse; clamping those benched real shots in the replay A/B).
+                # ONSET CLOCK: no genuine meter can read >=40 before the press clock
+                # allows it (the envelope leads any real rise by >=2x).
+                _age_veto = (_pf >= self._stale_press_drop_pct and _pf > _age_allow)
+                # RISE STEP: a jump landing >=40 faster than the ribbon can rise from the
+                # last published serve is a tracker OBJECT SWITCH, never the same meter
+                # (the live failures jumped +38.7..+89.2pp in <=85ms, landing 51-94).
+                _step_veto = (not _age_veto
+                              and _pf >= self._stale_press_drop_pct
+                              and _step_allow is not None and _pf > _step_allow)
+                if _age_veto or _step_veto:
+                    self._press_implausible_n += 1
+                    _pbb = s.get("bbox") or [0, 0, 0, 0]
+                    _pcx = float(_pbb[0]) + float(_pbb[2]) * 0.5
+                    _pcy = float(_pbb[1]) + float(_pbb[3]) * 0.5
+                    _page_ms = (float(ts) - float(self._hw_arm_ts)) * 1000.0
+                    _pallow = _age_allow if _age_veto else float(_step_allow)
+                    _kind = "onset_clock" if _age_veto else "rise_step"
+                    if not self._press_implausible_logged:
+                        _acq_logger.error(
+                            "PRESS-IMPLAUSIBLE SERVE VETOED: epoch=%d kind=%s fill=%.1f%% "
+                            "allow=%.1f%% press_age_ms=%d zone=(%d,%d) (no real meter can "
+                            "read this here on this press's clock)",
+                            int(self._physical_shot_epoch or 0), _kind, _pf, _pallow,
+                            int(_page_ms), int(_pcx), int(_pcy))
+                        self._press_implausible_logged = True
+                    else:
+                        _acq_logger.debug(
+                            "PRESS-IMPLAUSIBLE SERVE VETOED (repeat): epoch=%d kind=%s "
+                            "fill=%.1f%% allow=%.1f%% press_age_ms=%d",
+                            int(self._physical_shot_epoch or 0), _kind, _pf, _pallow,
+                            int(_page_ms))
+                    # A read at/above the engine's anchor bound is CERTAINLY not this
+                    # press's onset (the envelope leads any genuine rise): evict the lock
+                    # (it is holding the single locker the real onset needs), and on the
+                    # onset-clock veto also arm the quarantine at its box so the leftover's
+                    # follow-up reads are owned by the level-band machinery.
+                    if (_age_veto and self._ghost_press_break
+                            and float(_pbb[2]) > 0.0):
+                        self._press_ghost_zone = (_pcx, _pcy)
+                        self._press_ghost_level = _pf
+                        self._press_ghost_zone_low_n = 0
+                        self._press_ghost_zero_n = 0
+                        self._press_ghost_full_nofind_n = 0
+                    self.conf = 0.0; self.box = None; self.tmpl = None
+                    try:
+                        self._det_reset_lock_state()
+                        self._det_warm_pos = None
+                        self._det_warm_ts = -1.0e9
+                        self._det_active_box = None
+                    except Exception:
+                        pass
+                    # A withheld read is not held-fill evidence for the next press either.
+                    try:
+                        if (self._det_fill_hist
+                                and self._det_fill_hist[-1][0] == float(ts)):
+                            self._det_fill_hist.pop()
+                        if (self._det_coarse_fill_hist
+                                and self._det_coarse_fill_hist[-1][0] == float(ts)):
+                            self._det_coarse_fill_hist.pop()
+                    except Exception:
+                        pass
+                    s = {"detected": False, "meter_present": False, "fill": 0.0,
+                         "fill_coarse": 0.0, "bbox": [0, 0, 0, 0],
+                         "stage": "press_onset_veto", "confidence": 0.0,
+                         "velocity_pct_s": 0.0,
+                         "rejection_reason": "press_onset_implausible", "rise_state": ""}
+                    try:
+                        self.last_debug = {"stage": "press_onset_veto",
+                                           "veto_kind": _kind,
+                                           "vetoed_fill": round(_pf, 2),
+                                           "allow": round(_pallow, 2)}
+                    except Exception:
+                        pass
+                    _bk_det = False; _bk_fill = 0.0
+                else:
+                    # The serve stands: it becomes the press's step-clamp reference --
+                    # and a SUSTAINED plausible rise is onset proof in its own right.
+                    # A mid-rise catch may never dip <= the low threshold (measured epoch
+                    # 52: first sight 31.4), so the low-pair path alone would leave the
+                    # guard up through the settle, where the static-spread identification
+                    # would then wrongly evict the shot's own plateau. Three consecutive
+                    # published steps rising within the physical cap are something no
+                    # fade, drain or static leftover can produce.
+                    if (self._press_last_pub_fill is not None
+                            and self._press_last_pub_ts is not None
+                            and self._press_pair_min_rise_pp
+                            <= _pf - float(self._press_last_pub_fill)
+                            <= self._press_step_margin_pp
+                            + self._press_max_rate_pct_ms
+                            * max(0.0, (float(ts) - float(self._press_last_pub_ts))
+                                  * 1000.0)):
+                        self._press_rise_run += 1
+                    else:
+                        self._press_rise_run = 0
+                    self._press_last_pub_fill = _pf
+                    self._press_last_pub_ts = float(ts)
+                    if self._press_rise_run >= 3 and not self._press_low_seen:
+                        self._press_low_seen = True
+                        self._press_ghost_zone = None
+                        self._press_ghost_level = None
+                        self._press_ghost_zone_low_n = 0
+                        self._press_ghost_full_nofind_n = 0
+                        self._press_ghost_reads.clear()
+                        self._ghost_press_flush_summary("real_onset_rise")
         if self._meter_color == "White":
             # MEASURE THE CAP DIRECTLY, do not trust `s["green"]`.
             #
@@ -7018,8 +12590,16 @@ class SimpleMeterReader:
             self.last_debug["det_box"] = (
                 [int(v) for v in _raw_bbox] if _raw_bbox and len(_raw_bbox) >= 4
                 else [0, 0, 0, 0])
+            # DETECTOR-FILL frames already serve the meter's full tip-to-base box, so
+            # the display transform's vertical extent is capped at 1.6x of it (see the
+            # clamp in _tight_display_box: a colour-drift-poisoned _tight_src stretched
+            # the engine-facing rectangle to 5x meter height on 227 live frames).
+            _hcap = 0
+            if (str(s.get("stage", "")) == "detector_fill"
+                    and _raw_bbox and len(_raw_bbox) >= 4 and int(_raw_bbox[3]) > 0):
+                _hcap = int(round(1.6 * int(_raw_bbox[3])))
             s["bbox"] = self._tight_display_box(
-                _raw_bbox, int(_trow) if _trow is not None else -1)
+                _raw_bbox, int(_trow) if _trow is not None else -1, h_cap=_hcap)
         style = str(getattr(self._cfg, "meter_style", "Arrow2") or "Arrow2") if self._cfg else "Arrow2"
         color = str(getattr(self._cfg, "meter_color", "Red") or "Red") if self._cfg else "Red"
         detected = bool(s["detected"])
@@ -7046,6 +12626,11 @@ class SimpleMeterReader:
             and self._physical_shot_epoch == _detect_shot_epoch
             and self._gameplay_structure_verified
             and self._gameplay_structure_proof_epoch == _detect_shot_epoch)
+        # STRUCTURE NECROPSY bookkeeping (see __init__): what this frame actually
+        # EMITTED for the press epoch, the engine-facing half of the census.
+        if (detected and _detect_shot_epoch > 0
+                and self._ep_census.get("epoch") == _detect_shot_epoch):
+            self._ep_census["emit_det"] += 1
         kwargs = dict(
             detected=detected,
             style=style,
@@ -7056,6 +12641,8 @@ class SimpleMeterReader:
             consecutive_frames=int(self._consec),
             raw_fill_pct=float(s.get("fill_coarse", 0.0) or 0.0),
             smoothed_fill_pct=fill,
+            fill_estimator_mode=str(s.get("fill_estimator_mode", "") or ""),
+            fill_estimator_generation=int(s.get("fill_estimator_generation", 0) or 0),
             fill_velocity_pct_s=vel,
             fill_acceleration_pct_s2=float(self._accel),
             eta_ms=eta_ms,
@@ -7069,6 +12656,7 @@ class SimpleMeterReader:
             eta_to_green_center_ms=eta_green_ms,
             rejection_reason=str(s.get("rejection_reason", "")),
             rise_state=str(s.get("rise_state", "")),
+            gameplay_sample_epoch=_detect_shot_epoch,
             gameplay_structure_verified=_structure_verified,
             gameplay_structure_epoch=(
                 _detect_shot_epoch if _structure_verified else 0),
@@ -7082,11 +12670,16 @@ class SimpleMeterReader:
     #  MeterDetector-compatible shims (orch calls these via getattr/hasattr)
     # ------------------------------------------------------------------ #
     def set_active_style(self, style):
+        style_key = str(style or "").strip().casefold()
+        changed = style_key != self._tracking_meter_style
         if self._cfg is not None:
             try:
                 self._cfg.meter_style = str(style)
             except Exception:
                 pass
+        if changed:
+            self.reset_tracking()
+        self._tracking_meter_style = style_key
 
     def reload_config(self, cfg=None):
         if cfg is not None:

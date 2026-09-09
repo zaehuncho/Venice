@@ -72,12 +72,31 @@ def test_detect_emits_full_detectresult_contract():
                  "eta_to_green_center_ms", "green_window_center_pct", "green_window_confidence",
                  "green_window_start_pct", "green_window_end_pct", "green_window_width_pct",
                  "rejection_reason", "rise_state", "top_pixel_row",
+                 "raw_fill_pct", "fill_estimator_mode", "fill_estimator_generation",
                  "gameplay_structure_verified", "gameplay_structure_epoch"):
         assert hasattr(res, attr), f"missing contract field: {attr}"
     assert res.detected is True
     assert res.bbox[2] > 0 and res.bbox[3] > 0
     assert 0.0 <= res.fill_pct <= 100.0
     assert res.fill_pct > 90.0
+
+
+def test_tracking_wire_uses_canonical_estimator_generation_string():
+    """The generation must not cross JSON as an IEEE-754 number."""
+    from dataclasses import asdict
+    from remote_play_orchestrator import _MeterTrackPayload
+
+    payload = asdict(_MeterTrackPayload(
+        fill_pct=31.25,
+        coarse_fill_pct=31.13,
+        fill_estimator_mode="subpixel",
+        fill_estimator_generation="9007199254740993",
+        confidence=0.91,
+    ))
+    assert payload["fill_estimator_mode"] == "subpixel"
+    assert payload["fill_estimator_generation"] == "9007199254740993"
+    assert isinstance(payload["fill_estimator_generation"], str)
+    assert payload["coarse_fill_pct"] == pytest.approx(31.13)
 
 
 def test_detect_result_is_the_real_dataclass():
