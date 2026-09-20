@@ -12,4 +12,5 @@
 *.jpeg binary
 *.png binary
 *.pt binary
+*.onnx binary
 *.sys binary

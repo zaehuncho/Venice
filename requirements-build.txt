@@ -3,5 +3,12 @@
 # Production sidecar compiler. Keep pinned so release artifacts are reproducible.
 Nuitka==4.1.3
 
+# Production meter locator runtime. Nuitka embeds this provider and the
+# source-bound ONNX model; customer installs never resolve a dev-tree model.
+onnxruntime-directml==1.22.0; platform_system == "Windows"
+
 # Detached Ed25519 signing for release_manifest.json and update_manifest.json.
 cryptography==50.0.0
+
+# Xbox external-client capture; pin the SDK used by the WGC lifecycle tests.
+windows-capture==2.0.0; platform_system == "Windows"

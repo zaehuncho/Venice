@@ -66,20 +66,20 @@ def test_live_metric_toggle_is_persisted_default_on() -> None:
 def test_live_page_removes_redundant_status_and_timing_cards() -> None:
     qml = live_page()
 
-    # DELIBERATE CONTRACT CHANGE 2026-08-06: this test used to ban StatusPill
-    # (and label: "Timing") from the Live page outright — the old cleanup that
-    # removed the redundant Video/Controller/Timing status cards. The
-    # cold-install audit reversed it for TIMING ONLY: the engine fails closed
-    # until measured-lead authority exists, every press passes through
-    # silently, and the only readiness surface was on the Setup page — so a
-    # warming-up bot on the Live page read as a broken product. Exactly ONE
-    # pill is now allowed back: the display-only Timing readiness pill
-    # (objectName liveTimingStatus, bound to latencyCalibrationReady only).
-    # Everything else this test removed stays removed, and the pill count is
-    # pinned to 1 so the old status-card sprawl cannot quietly regrow.
-    assert qml.count("StatusPill {") == 1
-    assert 'objectName: "liveTimingStatus"' in qml
-    assert 'label: "Timing"' in qml
+    # This test originally banned StatusPill (and label: "Timing") from the Live
+    # page outright — the cleanup that removed the redundant Video / Controller /
+    # Timing status cards. 2026-08-06 let exactly ONE back in: a display-only
+    # Timing readiness pill (objectName liveTimingStatus), because a cold install
+    # fails closed and the only readiness surface was on the Setup page.
+    # [2026-09-14 owner] That exception is withdrawn and the original ban is back.
+    # Its partner warm-up banner went on 2026-09-12, leaving the pill pointing at
+    # nothing but its own internal wording; the Setup page's mirror
+    # (passiveTimingStatus) was deleted in the same change. orion.latencyCalibration-
+    # Ready is untouched engine-side — this is a chrome removal, not a behaviour
+    # change. The count is pinned to 0 so the status-card sprawl cannot regrow.
+    assert qml.count("StatusPill {") == 0
+    assert 'objectName: "liveTimingStatus"' not in qml
+    assert 'label: "Timing"' not in qml
     for removed_status in (
         'label: "Video"',
         'label: "Controller"',

@@ -84,6 +84,37 @@ TICK_WAIT_SD_MS = 4.8
 # Console input-sampling tick period (60Hz).
 TICK_PERIOD_MS = 1000.0 / 60.0
 
+# --- 2026-09-15 RETRACTION ARTEFACT -----------------------------------------------------------
+# 2K27 snaps the shot bar BACK 4-14px after it tops out on a missed shot (the "RELEASE ORACLE"
+# finding, docs/HANDOFF_2026-09-14_UI_POLISH.md). The trailing settled run of such a trace is the
+# retraction's rest point, NOT the release freeze, so dating t* at that settled onset adds the
+# whole retraction animation to the label. Measured on 111 banner-graded releases: onset-dated
+# rows n=20 p50 269.7ms against crossing-dated rows n=91 p50 217.0ms -- a +46ms split that is
+# REVERSE-CAUSAL (the miss causes the retraction, the latency did not change), and each such
+# observation moved the posterior by 30-47ms.
+#
+# The deflate gate that exists to catch exactly this was scale-bound at `peak >= 97.0`, which is
+# unreachable on 2K27's reader scale (live peaks read 88-92), so every retraction trace fell
+# through the rise_ok tolerance (peak - f_stop <= 8.0) and was labelled freeze=rise with an
+# inflated total. The scale-free statement of the same rule: a peak sitting more than this many
+# percentage points above the settled F_stop is a retraction, whatever the absolute ceiling is.
+# 1.5pp is the plateau-jitter band (1.0pp censor, ~3 sigma) plus a margin -- it is reader noise
+# geometry, not a machine constant. Env ORION_LATENCY_RETRACTION_TOL_PCT overrides it.
+RETRACTION_TOL_PCT = 1.5
+
+
+def _retraction_tol_pct() -> float:
+    """Retraction tolerance in pp: RETRACTION_TOL_PCT unless the env knob overrides it."""
+    raw = str(os.environ.get("ORION_LATENCY_RETRACTION_TOL_PCT", "") or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if np.isfinite(value) and value > 0.0:
+                return float(value)
+        except (TypeError, ValueError):
+            pass
+    return float(RETRACTION_TOL_PCT)
+
 # The first clean controlled release establishes telemetry only. A distinct second release must
 # use L1 to predict an in-green non-cap stop, then visibly land within its slope/SD-derived target
 # residual before provisional authority exists. Ordinary observations may refine that validated
@@ -1204,6 +1235,17 @@ class LatencyEstimator:
             if native_seq is not None:
                 self._last_native_release_seq = native_seq
             self._frozen_captured = False
+            # Each shot owns its own rise buffer. The buffer was previously only cleared after the
+            # meter had been ABSENT for >250ms (update(), the not-present branch) or on a route
+            # revoke, so a rapid-fire release taken while the previous shot's meter was still on
+            # screen inherited that shot's samples -- and, worse, its _rise_peak, which is what the
+            # deflate/rise_ok gates and the onset search are judged against. Arming a marker is the
+            # unambiguous start of a new shot's observation window: everything visible from here to
+            # the freeze belongs to THIS release (our view is delayed by the very latency being
+            # measured, so ~L ms of this shot's rise is still to come -- ~13 frames at 60Hz on a
+            # ~220ms route). The absence-based reset above is kept as-is for the idle path.
+            self._rise.clear()
+            self._rise_peak = 0.0
             self._releases_since_label += 1
             self._last_status = "calibration_pending" if calibration else "release_pending"
             return self._pending_release_seq
@@ -1950,7 +1992,14 @@ class LatencyEstimator:
         self._last_freeze_f_stop = float(f_stop)
         self._last_freeze_peak = peak
 
-        deflate = peak >= 97.0 and (approach_slope < 0.0 or f_stop < peak - 1.5)
+        # 2026-09-15: the recede test is now SCALE-RELATIVE. `peak >= 97.0` only ever fired on a
+        # reader whose ceiling really is 100; on 2K27 the meter tops out at 88-92 and every
+        # post-top-out retraction slipped past this gate into rise_ok. The shape test
+        # (`approach_slope < 0` or a settle below the peak) is unchanged; what changed is that a
+        # retraction-sized drop qualifies as a recede on its own scale, not only at the 97 ceiling.
+        retraction_tol = _retraction_tol_pct()
+        retraction = (peak - f_stop) > retraction_tol
+        deflate = (approach_slope < 0.0 or f_stop < peak - 1.5) and (peak >= 97.0 or retraction)
         # Slope gate 0.08 pct/ms (M5 recommended gate: pre-freeze tail slope >= 8pp/100ms —
         # below it the extrapolation to F_stop is ill-conditioned and the label is junk).
         # 2026-08-04: accept a SUB-CAP overshoot instead of demanding the meter freeze exactly at
@@ -1972,7 +2021,9 @@ class LatencyEstimator:
         if deflate:
             self._last_freeze_kind = "deflate"
             self._last_status = "rejected_deflate"
-            self._last_rejection = "deflate"
+            # Name the branch in the forensic line: "deflate" is the legacy cap+recede at the
+            # reader ceiling, "deflate_retraction" is the scale-relative 2K27 snap-back.
+            self._last_rejection = "deflate" if peak >= 97.0 else "deflate_retraction"
             self._reset_unvalidated_controlled_epoch("deflate")
             self._log_release_observation(False)
             self._frozen_captured = True
@@ -2031,7 +2082,11 @@ class LatencyEstimator:
                 if abs(rise[i][1] - f_stop) > 1.0:   # same plateau-jitter band as the censor
                     break
                 onset_idx = i
-            if 0 < onset_idx < len(rise) and peak > f_stop + 1.0:
+            # [ORION_LATENCY_RETRACTION 2026-09-16] Onset-dating is reserved for a genuine
+            # retraction; below RETRACTION_TOL_PCT the trace is a clean crossing and is dated
+            # by the crossing (the deflate gate above rejects anything at/above it), so the
+            # two thresholds agree and no accepted label is ever onset-dated.
+            if 0 < onset_idx < len(rise) and peak > f_stop + retraction_tol:
                 t_pre = float(rise[onset_idx - 1][0])
                 t_on = float(rise[onset_idx][0])
                 t_star = 0.5 * (t_pre + t_on)

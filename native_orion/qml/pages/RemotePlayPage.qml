@@ -1,4 +1,4 @@
-﻿import QtQuick
+import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import OrionNative
@@ -48,6 +48,25 @@ Item {
                                             ? "" : String(orion.noMeterUnavailableReason)
     // The dangerous state: the mode is switched ON but cannot possibly run.
     readonly property bool noMeterBroken: orion.noMeterEnabled && !root.noMeterSupported
+
+    // [ORION_NO_METER_SHELVED 2026-09-15] `noMeterMode` is gone with the switch that set it.
+    // orion.inputTimedEnabled is forced false on every load and save, so a binding on it would
+    // read as a live choice the customer does not have. The three orion.noMeterEnabled bindings
+    // that remain below (the skeleton overlay and the two unavailable-sidecar warnings) are
+    // harmless: they are false on every shipped install for exactly the same reason.
+
+    // ===== [ORION_INPUT_DEAD_UX 2026-08-30] dead-input overlay bindings =========================
+    // In capture-card mode the HDMI video keeps playing whatever the Chiaki INPUT session does,
+    // so a failed promotion / dropped session leaves the game looking alive while every button is
+    // dead. The controller computes the verdict from the SAME predicate that writes the per-press
+    // "PRESS UNDELIVERABLE" log line (one source of truth); this page only renders it. Undefined
+    // coercion mirrors the noMeterSupported pattern so an unwired build renders nothing new.
+    readonly property bool inputDead: orion.inputDeadOverlayActive === true
+    readonly property bool inputDeadCritical: orion.inputDeadCritical === true
+    readonly property string inputDeadHeadline: orion.inputDeadHeadline === undefined
+                                                ? "" : String(orion.inputDeadHeadline)
+    readonly property string inputDeadDetail: orion.inputDeadDetail === undefined
+                                              ? "" : String(orion.inputDeadDetail)
 
     // Debounced status text: the orchestrator's remoteStatus can churn rapidly
     // (connect/capture-health transitions). Only surface a value once it's held
@@ -131,7 +150,14 @@ Item {
     // one remove + one append, not destruction/recreation of the whole log.
     // ListView then lays out only its visible delegates.
     function syncCaptureLogModel() {
-        var next = root.filterLogLines(orion.logText)
+        // [ORION_ACTIVITY_FEED 2026-09-14 owner] Source the CUSTOMER ring
+        // (orion.activityText), not the raw one: the native rule
+        // (ui_notifications::shouldEnterActivityRing) has already removed the
+        // engineering telemetry that used to age every real event out of a
+        // 1000-line ring within minutes. The QML filter below stays as the
+        // Live-page-specific pass (licence/security/court-IP belong on Profile
+        // and Debug, not over the video).
+        var next = root.filterLogLines(orion.activityText)
         var current = []
         for (var i = 0; i < captureLogModel.count; ++i)
             current.push(captureLogModel.get(i).line)
@@ -344,39 +370,18 @@ Item {
                             }
                             Text {
                                 Layout.alignment: Qt.AlignHCenter
-                                text: "Press Enable Bot + Controller to connect to your PS5"
+                                text: "Press Connect to start"
                                 color: Theme.textMuted
                                 font.family: Theme.fontUi
                                 font.pixelSize: 12
                             }
                         }
 
-                        // Explicit passive-preview badge: seeing HDMI video does not imply that
-                        // Orion owns a controller route or has permission to release a shot.
-                        Rectangle {
-                            anchors.left: parent.left
-                            anchors.top: parent.top
-                            anchors.margins: 16
-                            width: previewOnlyLabel.implicitWidth + 18
-                            height: 24
-                            radius: 12
-                            color: "#E605080D"
-                            border.color: "#E0B341"
-                            border.width: 1
-                            visible: root.previewActive && !root.streamLive
-                            z: 10
-
-                            Text {
-                                id: previewOnlyLabel
-                                anchors.centerIn: parent
-                                text: "PREVIEW ONLY — BOT + CONTROLLER OFF"
-                                color: "#F3C969"
-                                font.family: Theme.fontUi
-                                font.pixelSize: 10
-                                font.weight: Font.Bold
-                                font.letterSpacing: 0.8
-                            }
-                        }
+                        // [PREVIEW-ONLY BADGE REMOVED 2026-09-14 owner] The amber
+                        // passive-preview chip over the pre-connect capture is gone (it
+                        // read PREVIEW·ONLY, previewOnlyLabel). The Connect button beside
+                        // it already says the session is not up, so the badge only ever
+                        // restated its neighbour.
 
                         // LIVE badge — pinned to the capture's top-left while streaming.
                         Rectangle {
@@ -467,61 +472,199 @@ Item {
                             }
                         }
 
-                        // ===== TIMING WARM-UP BANNER =============================================
-                        // The benched state, surfaced. The engine fails closed until measured-lead
-                        // authority exists (measuredLeadAuthoritative): every press passes through
-                        // UNTOUCHED and the log line that says so (waiting_for_latency_calibration)
-                        // renders nowhere a customer can see. Before this banner the only readiness
-                        // surface was the Timing pill on the SETUP page — a cold install looked like
-                        // a product that silently does nothing. This banner is the difference between
-                        // "warming up" and "broken".
-                        //
-                        // Bound to orion.latencyCalibrationReady — the controller's mirror of the
-                        // engine's truth-only authority state — NOT to any displayed number. Visible
-                        // only while the stream is actually live: in passive preview the bot never
-                        // arms anyway and the PREVIEW ONLY badge already owns that message.
-                        //
-                        // NOTE deliberately NOT wired to the shoot-to-train overlay (calibrateLayer,
-                        // below): that layer belongs to meter-COLOUR training, which is a different,
-                        // independent subsystem (see the "independent from meter-colour training"
-                        // comment in OrionAppController.cpp). Timing readiness gets its own surface.
+                        // ===== TIMING WARM-UP BANNER: REMOVED (2026-09-12, owner) ================
+                        // "TIMING WARMING UP — SHOTS STAY MANUAL" sat top-centre over the preview
+                        // while orion.latencyCalibrationReady was false. With the user lead
+                        // authoritative from the first press (user_lead_satisfies_authority) the
+                        // state is momentary and the banner read as a fault. UI removal only: the
+                        // readiness state, the Setup page's Timing pill and the
+                        // waiting_for_latency_calibration log line are untouched. The dead-input
+                        // overlay below keeps the top-centre slot to itself now.
+
+                        // ===== [ORION_MOTD 2026-09-14] SERVER NOTICE (MOTD) BANNER ==============
+                        // docs/ADMIN_PANEL_V2_CONTRACT.md §5: the owner's message of the day
+                        // rides the /api/license/check heartbeat (and /api/version). It takes
+                        // the top-centre slot the timing warm-up banner used and yields to the
+                        // dead-input banner below (input not reaching the console outranks a
+                        // notice). Level colours: info=accent, warn=warning, maint=danger.
+                        // Dismiss is in-memory only (orion.dismissMotd()); a changed text
+                        // re-shows it and the controller hides it once `until` passes.
                         Rectangle {
-                            objectName: "timingWarmupBanner"
+                            id: motdBanner
+                            objectName: "motdBanner"
+                            readonly property string level: orion.motdLevel || "info"
+                            readonly property color tone: level === "maint" ? Theme.danger
+                                                        : (level === "warn" ? Theme.warning : Theme.accent)
+                            readonly property string tag: level === "maint" ? "MAINTENANCE"
+                                                        : (level === "warn" ? "WARNING" : "NOTICE")
+                            // Wrap the text before the banner would overflow the preview.
+                            readonly property real textMaxWidth: Math.max(80,
+                                parent.width - 32 - 28 - motdTagPill.width - motdClose.width - 2 * motdRow.spacing)
                             anchors.horizontalCenter: parent.horizontalCenter
                             anchors.top: parent.top
                             anchors.topMargin: 16
-                            width: Math.min(parent.width - 32, warmupCol.implicitWidth + 28)
-                            height: warmupCol.implicitHeight + 16
+                            width: motdRow.implicitWidth + 28
+                            height: motdRow.implicitHeight + 16
                             radius: 12
-                            color: "#E605080D"
-                            border.color: "#E0B341"
-                            border.width: 1
-                            visible: root.streamLive && !orion.latencyCalibrationReady
-                            z: 10
+                            color: "#F005080D"
+                            border.color: tone
+                            border.width: level === "maint" ? 2 : 1
+                            visible: orion.motdVisible === true && !root.inputDead
+                            z: 12
+
+                            // Unwrapped width of the notice, measured outside the wrapping Text so
+                            // the width binding cannot loop on its own implicitWidth.
+                            TextMetrics {
+                                id: motdMetrics
+                                font: motdText.font
+                                text: orion.motdText
+                            }
+
+                            Row {
+                                id: motdRow
+                                anchors.centerIn: parent
+                                spacing: 10
+
+                                Rectangle {
+                                    id: motdTagPill
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: motdTagText.implicitWidth + 12
+                                    height: 18
+                                    radius: 9
+                                    color: Qt.rgba(motdBanner.tone.r, motdBanner.tone.g, motdBanner.tone.b, 0.18)
+                                    border.color: motdBanner.tone
+                                    border.width: 1
+                                    Text {
+                                        id: motdTagText
+                                        anchors.centerIn: parent
+                                        text: motdBanner.tag
+                                        color: motdBanner.tone
+                                        font.family: Theme.fontUi; font.pixelSize: 9; font.weight: Font.Bold
+                                        font.letterSpacing: 0.8
+                                    }
+                                }
+
+                                Text {
+                                    id: motdText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: orion.motdText
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontUi; font.pixelSize: 12; font.weight: Font.DemiBold
+                                    wrapMode: Text.WordWrap
+                                    width: Math.min(motdMetrics.advanceWidth + 2, motdBanner.textMaxWidth)
+                                }
+
+                                Rectangle {
+                                    id: motdClose
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: 20; height: 20; radius: 10
+                                    color: motdCloseArea.containsMouse ? Qt.rgba(1, 1, 1, 0.12) : "transparent"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "×"
+                                        color: motdCloseArea.containsMouse ? Theme.textPrimary : Theme.textSecondary
+                                        font.family: Theme.fontUi; font.pixelSize: 14; font.weight: Font.Bold
+                                    }
+                                    MouseArea {
+                                        id: motdCloseArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: orion.dismissMotd()
+                                    }
+                                }
+                            }
+                        }
+
+                        // ===== [ORION_INPUT_DEAD_UX 2026-08-30] DEAD-INPUT OVERLAY ==============
+                        // The one trap this page must never allow: the game looks perfectly
+                        // alive (capture-card HDMI keeps flowing) while every button press is
+                        // dead. Driven entirely by controller verdicts computed from the same
+                        // pressUndeliverable() predicate as the "PRESS UNDELIVERABLE" log line.
+                        //
+                        // Two pieces, neither of which covers gameplay or fire-critical UI:
+                        //   1. a pulsing border around the whole preview (border only — zero
+                        //      pixels of video obscured; peripheral motion is what makes it
+                        //      unmissable while the player watches the GAME, not the app);
+                        //   2. a top-center banner (same slot/family as the timing warm-up
+                        //      banner, which yields while this is up) stating plainly that
+                        //      input is NOT reaching the console and what is happening
+                        //      (retrying / press Connect / console waking / recovering).
+                        // The meter overlay, PRESSED badge (bottom-center) and corner chips all
+                        // keep their surfaces.
+                        Rectangle {
+                            id: inputDeadFrame
+                            anchors.fill: parent
+                            anchors.margins: 4
+                            color: "transparent"
+                            radius: 10
+                            border.width: 3
+                            border.color: root.inputDeadCritical ? Theme.danger : Theme.warning
+                            visible: root.inputDead
+                            z: 11
+                            // Pulse only in the terminal dead state; steady while merely
+                            // Connecting. The pulsing flag snaps opacity back when the pulse
+                            // ends mid-cycle so the frame can never park half-faded.
+                            readonly property bool pulsing: root.inputDead && root.inputDeadCritical
+                            onPulsingChanged: if (!pulsing) opacity = 1.0
+                            SequentialAnimation on opacity {
+                                running: inputDeadFrame.pulsing
+                                loops: Animation.Infinite
+                                NumberAnimation { to: 0.25; duration: 450; easing.type: Easing.InOutQuad }
+                                NumberAnimation { to: 1.0; duration: 450; easing.type: Easing.InOutQuad }
+                            }
+                        }
+
+                        Rectangle {
+                            objectName: "inputDeadBanner"
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.top: parent.top
+                            anchors.topMargin: 16
+                            width: Math.min(parent.width - 32, inputDeadCol.implicitWidth + 32)
+                            height: inputDeadCol.implicitHeight + 18
+                            radius: 12
+                            color: "#F005080D"
+                            border.color: root.inputDeadCritical ? Theme.danger : Theme.warning
+                            border.width: root.inputDeadCritical ? 2 : 1
+                            visible: root.inputDead
+                            z: 12
 
                             Column {
-                                id: warmupCol
+                                id: inputDeadCol
                                 anchors.centerIn: parent
-                                width: parent.width - 28
-                                spacing: 3
-                                Text {
-                                    width: parent.width
-                                    horizontalAlignment: Text.AlignHCenter
-                                    text: "TIMING WARMING UP — SHOTS STAY MANUAL"
-                                    color: "#F3C969"
-                                    font.family: Theme.fontUi
-                                    font.pixelSize: 10
-                                    font.weight: Font.Bold
-                                    font.letterSpacing: 0.8
+                                width: parent.width - 32
+                                spacing: 4
+                                Row {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    spacing: 7
+                                    Rectangle {
+                                        width: 9; height: 9; radius: 4.5
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        color: root.inputDeadCritical ? Theme.danger : Theme.warning
+                                        SequentialAnimation on opacity {
+                                            running: root.inputDead
+                                            loops: Animation.Infinite
+                                            NumberAnimation { to: 0.3; duration: 500 }
+                                            NumberAnimation { to: 1.0; duration: 500 }
+                                        }
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: root.inputDeadHeadline
+                                        color: root.inputDeadCritical ? "#FF9B9B" : "#F3C969"
+                                        font.family: Theme.fontUi
+                                        font.pixelSize: 12
+                                        font.weight: Font.Bold
+                                        font.letterSpacing: 1.0
+                                    }
                                 }
                                 Text {
                                     width: parent.width
                                     horizontalAlignment: Text.AlignHCenter
-                                    text: "Venice is measuring your setup. Your own presses go through"
-                                          + " untouched until Timing shows Ready."
+                                    text: root.inputDeadDetail
                                     color: Theme.textSecondary
                                     font.family: Theme.fontUi
-                                    font.pixelSize: 10
+                                    font.pixelSize: 11
                                     wrapMode: Text.WordWrap
                                 }
                             }
@@ -662,7 +805,7 @@ Item {
                             // detector's aspect ratio even for a distant meter.
                             readonly property real boxW: orion.meterBoxWidth * drawScale
                             readonly property real boxH: orion.meterBoxHeight * drawScale
-                            // Lock treatment: a bright blue outline (the 2026-08-06 default;
+                            // Lock treatment: a vivid magenta outline;
                             // the hue itself is data — orion.meterOverlayDrawColor) that traces the
                             // meter's own silhouette — including its arrow caps — with no slack,
                             // no fill and no rounding. Square corners are deliberate: a radius
@@ -687,11 +830,19 @@ Item {
                                 width: meterDebugLayer.boxW
                                 height: meterDebugLayer.boxH
                                 // Hairline is the whole point of that style: a single thin
-                                // line instead of a confident stroke. The keylines stay,
-                                // because a 1px line is exactly the case that needs them.
+                                // line instead of a confident stroke. One quiet outer keyline
+                                // preserves contrast without turning the mark into three
+                                // competing rectangles.
+                                // Clean (2026-09-10, owner reference): ONE thin line a few pixels
+                                // off the meter and nothing else -- no second keyline, no weight.
+                                readonly property bool cleanStyle:
+                                    meterDebugLayer.overlayStyle === "Clean"
                                 readonly property real strokeW:
-                                    meterDebugLayer.overlayStyle === "Hairline" ? 1 : 2
-                                readonly property real airGap: Math.max(1, Math.ceil(meterDebugLayer.drawScale))
+                                    (meterDebugLayer.overlayStyle === "Hairline" || lockBox.cleanStyle) ? 1 : 2
+                                // A fixed one-screen-pixel gap is visually stable as the game
+                                // camera zooms. Scaling this gap with the preview made the mark
+                                // breathe even when the joined detector box did not.
+                                readonly property real airGap: lockBox.cleanStyle ? 3 : 1
                                 // Distance from the raw bbox edge out to the OUTERMOST drawn
                                 // pixel. Published so anything that has to sit beside the lock
                                 // measures its gap from the mark the user can actually see
@@ -701,17 +852,14 @@ Item {
                                 // Every stroke lives wholly outside the raw bbox, so the lock can
                                 // never paint over a meter pixel the detector is reading.
                                 //
-                                // Three rings, outside-in: dark keyline, lock colour, dark keyline.
-                                // The lock stroke stays a crisp 2px — the keylines are 1px each and
-                                // exist only to give it an edge. Without the OUTER one the stroke
-                                // dissolves into a blown-out white court; without the INNER one it
-                                // goes muddy where it runs alongside the red bar. All three are
-                                // static Rectangles whose geometry re-evaluates on the same
-                                // meterBoxChanged notification the box already used.
+                                // Two rings, outside-in: a restrained dark keyline and the 2px
+                                // lock colour. Both live wholly outside the raw bbox, leaving the
+                                // meter pixels and its tip unobscured. Removing the redundant inner
+                                // keyline makes the lock read as one clean mark instead of a stack.
                                 //
-                                // The three rings are the Solid and Hairline styles. In
+                                // The two rings are the Solid and Hairline styles. In
                                 // Brackets they are hidden rather than destroyed: toggling
-                                // `visible` on three existing Rectangles is cheaper and more
+                                // `visible` on two existing Rectangles is cheaper and more
                                 // predictable than tearing down and rebuilding scene nodes,
                                 // and the style is changed by hand from a settings page, not
                                 // by anything on the shot path.
@@ -719,14 +867,14 @@ Item {
                                     meterDebugLayer.overlayStyle !== "Brackets"
                                 Rectangle {
                                     objectName: "meterLockOuterFrame"
-                                    visible: lockBox.ringsVisible
+                                    visible: lockBox.ringsVisible && !lockBox.cleanStyle
                                     anchors.fill: parent
                                     anchors.margins: -lockBox.frameInset
                                     radius: 0
                                     color: "transparent"
                                     border.color: Theme.meterLockKeyline
                                     border.width: 1
-                                    opacity: 0.85
+                                    opacity: 0.68
                                 }
                                 Rectangle {
                                     objectName: "meterLockFrame"
@@ -737,17 +885,7 @@ Item {
                                     color: "transparent"
                                     border.color: meterDebugLayer.lockColor
                                     border.width: lockBox.strokeW
-                                }
-                                Rectangle {
-                                    objectName: "meterLockInnerFrame"
-                                    visible: lockBox.ringsVisible
-                                    anchors.fill: parent
-                                    anchors.margins: -lockBox.airGap
-                                    radius: 0
-                                    color: "transparent"
-                                    border.color: Theme.meterLockKeyline
-                                    border.width: 1
-                                    opacity: 0.85
+                                    opacity: 0.96
                                 }
 
                                 // BRACKETS style: four corner marks on the same rectangle the
@@ -760,7 +898,9 @@ Item {
                                 Loader {
                                     objectName: "meterLockBracketLoader"
                                     anchors.fill: parent
-                                    anchors.margins: -(lockBox.airGap + lockBox.strokeW)
+                                    // The bracket thickness ends exactly at the raw bbox edge;
+                                    // no corner arm can paint over the meter or its tip.
+                                    anchors.margins: -lockBox.frameInset
                                     active: meterDebugLayer.overlayStyle === "Brackets"
                                     sourceComponent: Component {
                                         Item {
@@ -820,7 +960,7 @@ Item {
                             }
                         }
 
-                        // Three-value live readout. Deliberately a SIBLING of
+                        // Three-value unboxed live readout. Deliberately a SIBLING of
                         // meterDebugLayer, not a child of it, so its own clamping is
                         // computed in the same coordinate space as the preview rather
                         // than inside a box that moves under it.
@@ -856,7 +996,7 @@ Item {
                         // The fix was on the native side and it was to POPULATE ON
                         // DETECTION, not to re-narrow this gate back to the shot:
                         // FILL is a camera reading and is now published for exactly
-                        // as long as this box is drawn. TIP/FIRE remain shot-scoped
+                        // as long as this lock is drawn. TIP/FIRE remain shot-scoped
                         // because they do not exist outside one.
                         MeterTelemetryHud {
                             id: meterTelemetryHud
@@ -878,13 +1018,12 @@ Item {
                             // place that decides what the overlay colour is.
                             accentColor: meterDebugLayer.lockColor
 
-                            // The box is part of the lock mark, not a nearby label, so
-                            // the gap is small and it is measured from the OUTERMOST DRAWN
-                            // pixel of the frame rather than from the raw detector bbox.
-                            // Measuring from the bbox made the visible gap shrink as the
-                            // meter got closer (the stroke grows outward with drawScale),
-                            // which read as the box drifting into the frame.
-                            readonly property real gap: 6
+                            // Compact unboxed telemetry prefers the open space above
+                            // the lock, like a lightweight instrument label. Near an
+                            // edge it flips right, left, then below. Every branch is a
+                            // direct binding to the same exact joined box: no Behavior,
+                            // animation, low-pass or independent motion clock exists.
+                            readonly property real gap: 4
                             // Drawn edges of the lock, in this item's coordinate space.
                             // These bindings re-evaluate on meterBoxChanged, exactly as
                             // the lock box itself does — no new signal, no new cadence.
@@ -897,27 +1036,44 @@ Item {
                                 meterDebugLayer.x + lockBox.x + lockBox.width + lockBox.frameInset
                             readonly property real lockTop:
                                 meterDebugLayer.y + lockBox.y - lockBox.frameInset
-                            // Prefer the right of the meter; flip left when the box
-                            // would overhang. Both sides are then clamped into the
-                            // preview so a corner meter can never push it off-screen.
-                            x: lockRight + gap + width
-                                       > meterDebugLayer.x + meterDebugLayer.width
-                               ? Math.max(0, lockLeft - gap - width)
-                               : Math.min(meterDebugLayer.x + meterDebugLayer.width - width,
-                                          lockRight + gap)
-                            // Top-aligned with the lock, as in the reference: the box
-                            // and the frame start on the same scan line, so the pair
-                            // reads as one mark. Clamped so a meter at the very bottom
-                            // of the frame slides the box up instead of off the preview.
-                            y: Math.max(0, Math.min(meterDebugLayer.y + meterDebugLayer.height - height,
-                                                    lockTop))
+                            readonly property real lockBottom:
+                                meterDebugLayer.y + lockBox.y + lockBox.height + lockBox.frameInset
+                            readonly property real layerLeft: meterDebugLayer.x
+                            readonly property real layerRight:
+                                meterDebugLayer.x + meterDebugLayer.width
+                            readonly property real layerTop: meterDebugLayer.y
+                            readonly property real layerBottom:
+                                meterDebugLayer.y + meterDebugLayer.height
+                            readonly property bool fitsAbove:
+                                lockTop - gap - height >= layerTop
+                            readonly property bool fitsRight:
+                                lockRight + gap + width <= layerRight
+                            readonly property bool fitsLeft:
+                                lockLeft - gap - width >= layerLeft
+                            readonly property real centeredX: Math.max(
+                                layerLeft, Math.min(layerRight - width,
+                                    (lockLeft + lockRight - width) * 0.5))
+
+                            x: fitsAbove ? centeredX
+                               : fitsRight ? lockRight + gap
+                               : fitsLeft ? lockLeft - gap - width
+                               : centeredX
+                            y: fitsAbove ? lockTop - gap - height
+                               : (fitsRight || fitsLeft)
+                                   ? Math.max(layerTop, Math.min(layerBottom - height,
+                                                                 lockTop))
+                                   : Math.max(layerTop, Math.min(layerBottom - height,
+                                                                 lockBottom + gap))
                         }
 
                         // Optional truth-only shot telemetry. Keep it in a fixed capture corner
                         // instead of attaching chrome to the moving detector box: distant/go-to
-                        // meters remain completely unobstructed. Native returns negative values
-                        // whenever current arm-token/freshness proof is absent, so no placeholder
-                        // or decorative number is ever shown.
+                        // meters remain completely unobstructed. While the primary attached
+                        // FILL/TIP/FIRE instrument is visible this secondary ETA/HOLD readout
+                        // yields, avoiding two simultaneous telemetry clusters. It can take over
+                        // after the meter lock leaves so a still-current HOLD result is not lost.
+                        // Native returns negative values whenever current arm-token/freshness
+                        // proof is absent, so no placeholder or decorative number is ever shown.
                         Column {
                             id: liveMeterMetrics
                             objectName: "liveMeterMetricsOverlay"
@@ -933,6 +1089,7 @@ Item {
                             readonly property bool holdAvailable: holdMs >= 0
                             visible: orion.showLiveMeterMetrics
                                      && (root.streamLive || root.previewActive)
+                                     && !meterDebugLayer.visible
                                      && (etaAvailable || holdAvailable)
 
                             Text {
@@ -1185,14 +1342,13 @@ Item {
                         Layout.preferredHeight: 50
                         Layout.minimumHeight: 50
                         Layout.maximumHeight: 50
-                        Layout.topMargin: 6
+                        Layout.topMargin: 2
                         spacing: 12
 
                         PrimaryButton {
                             id: startStreamBtn
-                            text: root.connecting ? "Enabling Bot + Controller…"
-                                  : (root.streamLive ? "Bot + Controller Enabled"
-                                                     : "Enable Bot + Controller")
+                            text: root.connecting ? "Connecting…"
+                                  : (root.streamLive ? "Connected" : "Connect")
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             Layout.preferredWidth: 1
@@ -1346,7 +1502,7 @@ Item {
                                     text: root.captureLogLines + (root.captureLogLines === 1 ? " event" : " events")
                                     color: Theme.textFaint
                                     font.family: Theme.fontMono
-                                    font.pixelSize: 9
+                                    font.pixelSize: 10
                                 }
                                 // One-click copy of the on-disk engineer log's
                                 // bounded tail (native side; far more history than
@@ -1358,15 +1514,19 @@ Item {
                                 Text {
                                     id: activityCopyLabel
                                     text: activityCopyArea.copied ? "Copied" : "Copy"
-                                    color: activityCopyArea.copied ? Theme.success : Theme.textMuted
+                                    color: activityCopyArea.copied ? Theme.success
+                                           : (activityCopyArea.containsMouse ? Theme.accentHover : Theme.textMuted)
                                     font.family: Theme.fontUi
-                                    font.pixelSize: 10
+                                    font.pixelSize: 11
                                     font.weight: Font.DemiBold
+                                    font.underline: activityCopyArea.containsMouse && !activityCopyArea.copied
                                     MouseArea {
                                         id: activityCopyArea
                                         property bool copied: false
                                         anchors.fill: parent
                                         anchors.margins: -6
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
                                         onClicked: {
                                             orion.copyActivityLog()
                                             copied = true
@@ -1384,13 +1544,17 @@ Item {
                                 // orion_native.log can be attached to a report.
                                 Text {
                                     text: "Logs"
-                                    color: Theme.textMuted
+                                    color: activityLogsArea.containsMouse ? Theme.accentHover : Theme.textMuted
                                     font.family: Theme.fontUi
-                                    font.pixelSize: 10
+                                    font.pixelSize: 11
                                     font.weight: Font.DemiBold
+                                    font.underline: activityLogsArea.containsMouse
                                     MouseArea {
+                                        id: activityLogsArea
                                         anchors.fill: parent
                                         anchors.margins: -6
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
                                         onClicked: orion.openLogsFolder()
                                     }
                                 }
@@ -1440,12 +1604,15 @@ Item {
                                             color: root.activityTone(parent.line)
                                             opacity: 0.9
                                         }
-                                        Text {
+                                        TextEdit {
                                             width: parent.width - 13
                                             anchors.verticalCenter: parent.verticalCenter
                                             text: parent.line
-                                            elide: Text.ElideRight
-                                            textFormat: Text.PlainText
+                                            readOnly: true
+                                            selectByMouse: true
+                                            selectedTextColor: Theme.textPrimary
+                                            selectionColor: Theme.accentMuted
+                                            textFormat: TextEdit.PlainText
                                             color: Theme.textSecondary
                                             font.family: Theme.fontMono
                                             font.pixelSize: 10
@@ -1511,14 +1678,33 @@ Item {
                 width: meterScroll.availableWidth
                 spacing: 12
 
+                // [ORION_NO_METER_SHELVED 2026-09-15] The METER / NO METER switch, the
+                // NoMeterCard and its RhythmCard are OUT of the customer's reach (owner: "shelve
+                // the no meter path, we'll beef that up for a later update"). Nothing is deleted
+                // and nothing is compiled out: the blind engine (NO METER v2, the hybrid, the
+                // frame quantiser, the hold learner) is still built and still tested, and the
+                // meter path's own blind backstop still uses it -- the mode simply has no way in
+                // from the UI, and AppConfig forces input_timed_enabled false on load and save.
+                // Re-shipping it means restoring this block and lifting that fence; the QML
+                // contract test pins BOTH halves so neither can drift back on its own.
+
                 MeterConfigPanel {
                     id: meterPanel
+                    // [ORION_NO_METER_SHELVED 2026-09-15] Unconditional: there is one timing path
+                    // on this page now, so a `visible` binding on the mode would be a switch that
+                    // can never be thrown.
                     Layout.fillWidth: true
                     streamLive: root.streamLive
                     // First-run tour spotlight anchor (meter Style/Color).
                     Component.onCompleted: TourRegistry.register("rp:meter", meterPanel)
                     Component.onDestruction: TourRegistry.unregister("rp:meter", meterPanel)
                 }
+
+                // [ORION_NO_METER_SHELVED 2026-09-15] The NO METER side of the panel -- the
+                // NoMeterCard hold slider and the input-timed variant of RhythmCard -- is unmounted
+                // with the switch that selected it. NoMeterCard.qml and RhythmCard.qml both stay
+                // in the tree (RhythmCard's meter variant is still mounted inside
+                // MeterConfigPanel), so re-shipping the mode is a remount, not a rewrite.
 
                 // ===== moved from the Setup page, 2026-08-04 =====================
                 // User: "detection box and lead should be in the live tab under
@@ -1537,116 +1723,48 @@ Item {
                 // any more.
                 // ================================================================
 
-                // TIMING READINESS, on the page where it matters. Mirrors the Setup
-                // page's Timing pill (DashboardPage.qml) — same bindings, same
-                // wording — because the warm-up banner over the capture points the
-                // user at "Timing", and the answer must be visible WITHOUT leaving
-                // the stream. Readiness, not a control: the pill is display-only,
-                // and it deliberately binds ONLY latencyCalibrationReady — the
-                // passive-timing contract (test_latency_calibration_ui_contract)
-                // bans the calibration status/sample internals from this page so
-                // no manual-calibration workflow can grow back here.
-                // EXCEPTION-ONLY 2026-08-06 (owner: "remove the ugly timing ready
-                // bubble"). A green "Timing: Ready" pill sitting there permanently is
-                // pure chrome — it repeats the steady state on every frame of a normal
-                // session and tells a working user nothing.
-                //
-                // It is HIDDEN WHEN READY rather than deleted, because the not-ready
-                // states are load-bearing: the warm-up banner over the capture points
-                // the user at "Timing", and on a cold install every press passes through
-                // silently until authority exists. Deleting the pill outright would
-                // leave that banner pointing at nothing and take the only in-stream
-                // answer away from the exact user who needs it. The owner sees it gone
-                // because his rig is ready; a first-run customer still gets the signal,
-                // and it disappears by itself the moment it stops being news.
-                StatusPill {
-                    objectName: "liveTimingStatus"
-                    visible: !orion.latencyCalibrationReady
-                    label: "Timing"
-                    statusText: orion.remoteState === "Running"
-                                ? "Adapting" : "Route unavailable"
-                    tone: orion.remoteState === "Running" ? "accent" : "warning"
-                    animated: true
-                    Layout.fillWidth: true
-                }
+                // [LIVE TIMING PILL REMOVED 2026-09-14 owner] The Timing readiness pill
+                // (objectName liveTimingStatus) is deleted. Its warm-up banner partner
+                // went on 2026-09-12, so it pointed at nothing, and its not-ready wording
+                // was internal vocabulary parked permanently beside the stream.
+                // orion.latencyCalibrationReady stays engine-side and unread by QML.
 
                 // [ORION_USER_LEAD] The one timing control a customer tunes.
                 // Self-contained on purpose (see ShotLeadCard.qml).
                 ShotLeadCard {
                     objectName: "shotLeadCard"
+                    // [ORION_NO_METER_V2 2026-09-14] METER only. Shot Lead is how far AHEAD of a
+                    // predicted tip the vision path fires; the blind path has no prediction and
+                    // subtracts no lead, so leaving this on screen in NO METER would be a dial
+                    // that changes nothing — the exact failure that wasted the owner's tuning
+                    // session under the old law.
+                    // [ORION_NO_METER_SHELVED 2026-09-15] With NO METER shelved the meter path is
+                    // the only path, so the card is unconditional.
                     Layout.fillWidth: true
                 }
 
-                // [ORION_RHYTHM 2026-08-13] Directly under Shot Lead by request: Shot Lead sets
-                // WHEN the release flick starts, Rhythm sets how long the stick is held up for
-                // it. Previously buried in Tempo Remap's Tuning expander. See RhythmCard.qml.
-                RhythmCard {
-                    objectName: "rhythmCard"
-                    Layout.fillWidth: true
-                }
 
-                // [ORION_USER_TIP] The OTHER user-facing timing quantity — the
-                // jumpshot's animation length (the aim), as distinct from the
-                // rig's latency (the lead, above). See TipTimingCard.qml.
-                TipTimingCard {
-                    objectName: "tipTimingCard"
-                    Layout.fillWidth: true
-                }
+                // [ORION_RHYTHM 2026-08-27] Retired by owner request (Tempo was off, so no stick
+                // flick was generated and the control was inert).
+                // [ORION_RHYTHM_RESTORED 2026-09-11] Back by owner request, and mounted inside
+                // MeterConfigPanel directly ABOVE Meter Delay (owner placement), not here.
 
-                // [ORION_FINE_TUNE 2026-08-08] Exact-value entry for Tip Timing,
-                // supplied HERE because TipTimingCard.qml is pinned untouched
-                // (untracked-but-live). The card already carries −5/−1/+1/+5 nudge
-                // buttons; this row adds the direct typed input the other timing
-                // cards got, using the same writable orion.tipTimingMs property the
-                // card itself binds. Clamped to the learner's plausibility band
-                // (tipTimingMinMs..tipTimingMaxMs) on commit.
-                RowLayout {
-                    objectName: "tipTimingExactRow"
-                    Layout.fillWidth: true
-                    spacing: 8
-                    Text {
-                        text: "Tip Timing exact"
-                        color: Theme.textMuted
-                        font.family: Theme.fontUi
-                        font.pixelSize: 11
-                    }
-                    Item { Layout.fillWidth: true }
-                    TextField {
-                        id: tipTimingField
-                        objectName: "tipTimingValueField"
-                        Layout.preferredWidth: 54
-                        implicitHeight: 28
-                        horizontalAlignment: TextInput.AlignRight
-                        color: Theme.textPrimary
-                        font.family: Theme.fontMono
-                        font.pixelSize: 12
-                        validator: IntValidator {
-                            bottom: Math.round(orion.tipTimingMinMs)
-                            top: Math.round(orion.tipTimingMaxMs)
-                        }
-                        text: orion.tipTimingMs.toFixed(0)
-                        onEditingFinished: {
-                            var v = parseInt(text)
-                            if (!isNaN(v)) {
-                                orion.tipTimingMs = Math.max(orion.tipTimingMinMs,
-                                                             Math.min(orion.tipTimingMaxMs, v))
-                            }
-                            text = Qt.binding(function() { return orion.tipTimingMs.toFixed(0) })
-                        }
-                        background: Rectangle {
-                            radius: Theme.radiusControl
-                            color: Theme.bgField
-                            border.width: 1
-                            border.color: tipTimingField.activeFocus ? Theme.borderStrong : Theme.borderSoft
-                        }
-                    }
-                    Text {
-                        text: "ms"
-                        color: Theme.textMuted
-                        font.family: Theme.fontMono
-                        font.pixelSize: 11
-                    }
-                }
+                // [ORION_TIP_FOLDED 2026-08-28] Tip Timing was RETIRED from the customer view
+                // (owner request: combine timing into one control), on the premise that the engine
+                // auto-aims the tip well enough to never need touching.
+                //
+                // [ORION_TIP_RESTORED 2026-09-11] Briefly unretired to stop the learner walking the
+                // aim (measured 388.4 -> 369.5 ms DURING one 98-shot session). The FREEZE works and
+                // STAYS ON -- settings.tip_phase_aim_frozen = true with learning.json
+                // learned_phase_physical_ms = 287.7, verified holding at 361.7 ms across a full
+                // n=20 window whose raw samples swung 326-393 ms.
+                //
+                // [ORION_TIP_REFOLDED 2026-09-11 owner] The CARD is retired again: with the aim
+                // pinned, owner reports the control makes no timing difference, so it is one more
+                // dial that does nothing. The freeze is config, not UI -- it needs no card. The
+                // residual early/late spread is therefore NOT the aim constant; it is downstream,
+                // and the card would only hide that. orion.tipTimingMs stays live and
+                // engine-managed; TipTimingCard.qml stays in the tree, just not shown.
             }
         }
     }

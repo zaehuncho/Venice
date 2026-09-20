@@ -479,8 +479,10 @@ def test_buffer_cap_default_is_bounded():
     (165.0, 165.0),
     (250.0, 250.0),
     (300.0, 300.0),
-    (301.0, 300.0),
-    (100000.0, 300.0),
+    (301.0, 301.0),
+    (600.0, 600.0),
+    (601.0, 600.0),
+    (100000.0, 600.0),
     ("165", 165.0),
 ])
 def test_delay_is_clamped_to_the_hard_safety_range(buf, requested, expected):

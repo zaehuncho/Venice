@@ -373,3 +373,38 @@ def test_strong_ncc_bottom_writes_through_emit_slew(monkeypatch):
     out = r._det_smooth_emit((613, 320, 24, 110))   # centre=625, bottom=430
     assert out[0] + out[2] * 0.5 == pytest.approx(625.0, abs=0.5)
     assert out[1] + out[3] == 430
+
+
+@pytest.mark.parametrize("fill", [float("nan"), float("inf"), -1.0, 101.0])
+def test_armed_publish_never_promotes_invalid_fill(monkeypatch, fill):
+    r = _mk_reader(monkeypatch)
+    r._shot_armed_hw = True
+    assert not r._idle_publish_ok(True, (600, 300, 26, 107), fill, 1.0)
+
+
+def test_publish_gate_error_is_not_meter_evidence(monkeypatch):
+    r = _mk_reader(monkeypatch)
+    r._shot_armed_hw = True
+    r._idle_pub_fills = None  # controlled broken state; never manufacture a valid sample
+    assert not r._idle_publish_ok(True, (600, 300, 26, 107), 20.0, 1.0)
+
+
+@pytest.mark.parametrize("bbox,ts", [
+    (None, 1.0), ((600, 300, 0, 107), 1.0),
+    ((float("nan"), 300, 26, 107), 1.0),
+    ((600, 300, float("inf"), 107), 1.0),
+    ((600, 300, 26, 107), float("nan")),
+    ((600, 300, 26, 107), float("inf")),
+])
+def test_armed_publish_never_promotes_invalid_geometry_or_time(monkeypatch, bbox, ts):
+    r = _mk_reader(monkeypatch)
+    r._shot_armed_hw = True
+    assert not r._idle_publish_ok(True, bbox, 20.0, ts)
+    assert r._idle_pub_box is None
+
+
+@pytest.mark.parametrize("ts", [None, 1.0])
+def test_armed_publish_keeps_valid_measurements(monkeypatch, ts):
+    r = _mk_reader(monkeypatch)
+    r._shot_armed_hw = True
+    assert r._idle_publish_ok(True, (600, 300, 26, 107), 20.0, ts)

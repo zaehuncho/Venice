@@ -34,10 +34,16 @@ def test_timing_adapts_passively_and_has_no_manual_customer_workflow():
     assert "orion.shotEtaToTargetMs" in live_qml
     assert "orion.shotHoldMs" in live_qml
 
-    assert 'objectName: "passiveTimingStatus"' in setup_qml
-    assert 'statusText: orion.latencyCalibrationReady' in setup_qml
-    assert '"Adapting"' in setup_qml
-    assert '"Route unavailable"' in setup_qml
+    # [2026-09-14 owner] The readiness PILLS are gone from both customer pages: the
+    # Setup page's "Production Setup" status card (objectName passiveTimingStatus) and
+    # the Live page's mirror (liveTimingStatus). Timing adaptation stays passive and
+    # engine-side — orion.latencyCalibrationReady is unchanged, it simply has no QML
+    # consumer — and the ban below on a manual calibration WORKFLOW is the part of this
+    # contract that matters; it is asserted for both pages.
+    assert 'objectName: "passiveTimingStatus"' not in setup_qml
+    assert 'objectName: "liveTimingStatus"' not in live_qml
+    assert "Route unavailable" not in setup_qml
+    assert "Route unavailable" not in live_qml
     for removed in (
         'objectName: "timingSetupCard"',
         'objectName: "timingSetupAction"',

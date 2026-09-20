@@ -33,6 +33,19 @@ struct PreciseFireAuthorityRefresh final {
     double remainingMs = -1.0;
 };
 
+// Pure mailbox gate for an in-place deadline refinement.  A retarget is deliberately
+// stricter than a fresh arm: it may only update the exact token that is still waiting in
+// the worker.  Once the worker has claimed the token for its final spin (`armed == false`),
+// or while a completion/failure outcome occupies the one-slot mailbox, the old deadline
+// owns the shot and the refinement must leave it untouched.
+enum class PreciseFireRetargetGate {
+    Allowed,
+    InvalidToken,
+    WrongToken,
+    NotWaiting,
+    OutcomePending,
+};
+
 // A direct-pipe send distinguishes a real write from a de-dup hit and from a
 // route failure. The legacy bool OrionInputClient::send API keeps its historical
 // "true only when bytes were written" contract; the precise worker uses this
@@ -117,6 +130,36 @@ struct PreciseFireDeliveryDecision final {
 };
 
 struct PreciseFirePolicy final {
+    // The worker cannot make a release punctual when its token reaches the
+    // mailbox inside the route's bounded submit window.  Treating a past (or
+    // almost-past) deadline as delay=0 used to turn scheduling lateness into an
+    // authorised immediate input edge.  The direct-input transaction's measured
+    // upper budget is 3 ms; a token must retain strictly more runway than that
+    // when the handoff locks have finally been acquired.
+    static constexpr double kMinimumDispatchMarginMs = 3.0;
+
+    [[nodiscard]] static constexpr PreciseFireRetargetGate evaluateRetargetMailbox(
+        std::uint64_t requestedToken,
+        std::uint64_t workerToken,
+        bool armed,
+        bool fired,
+        bool failed) noexcept
+    {
+        if (requestedToken == 0 || workerToken == 0) {
+            return PreciseFireRetargetGate::InvalidToken;
+        }
+        if (requestedToken != workerToken) {
+            return PreciseFireRetargetGate::WrongToken;
+        }
+        if (fired || failed) {
+            return PreciseFireRetargetGate::OutcomePending;
+        }
+        if (!armed) {
+            return PreciseFireRetargetGate::NotWaiting;
+        }
+        return PreciseFireRetargetGate::Allowed;
+    }
+
     [[nodiscard]] static constexpr LatencyControllerRoute liveControllerRoute(
         bool sessionRunning, bool inputHookEnabled, bool inputHookConnected,
         bool virtualControllerConnected, bool virtualControllerIsDs4) noexcept
@@ -170,15 +213,19 @@ struct PreciseFirePolicy final {
 
     // An immediate engine-tick release needs the same exact local delivery
     // acknowledgement as a sub-tick worker release. Ordinary mirror frames may
-    // use latest-wins/de-dup semantics, but a pending release or recovery proof
-    // must force a distinct transaction that can be paired to its release seq.
+    // use latest-wins/de-dup semantics, but a pending release, recovery proof, or
+    // debounced physical Square-down edge must force a distinct transaction. The
+    // latter lets one physical epoch be paired with the exact state/sequence that
+    // the active local route accepted instead of inferring delivery from a later
+    // steady-state mirror tick.
     [[nodiscard]] static constexpr bool requiresExactDeliveryAck(
         bool pendingRelease,
         bool preciseReleaseAlreadyDelivered,
-        bool routeRecoveryProbe) noexcept
+        bool routeRecoveryProbe,
+        bool physicalSquareDownEdge) noexcept
     {
         return (pendingRelease && !preciseReleaseAlreadyDelivered)
-            || routeRecoveryProbe;
+            || routeRecoveryProbe || physicalSquareDownEdge;
     }
 
     // Critical releases and route-recovery probes must bypass the ordinary
@@ -208,13 +255,18 @@ struct PreciseFirePolicy final {
             return out;
         }
 
-        out.delayMs = absoluteDeadlineMs > engineNowMs
-            ? absoluteDeadlineMs - engineNowMs : 0.0;
-        if (absoluteAuthorityExpiryMs < 0.0) {
-            out.allowed = true;
+        const double delayMs = absoluteDeadlineMs - engineNowMs;
+        if (!std::isfinite(delayMs) || delayMs <= kMinimumDispatchMarginMs) {
             return out;
         }
+        out.delayMs = delayMs;
+        // The negative sentinel is meaningful only for a finite value. In particular,
+        // -infinity must not be promoted to an unbounded lease before this check.
         if (!std::isfinite(absoluteAuthorityExpiryMs)) {
+            return out;
+        }
+        if (absoluteAuthorityExpiryMs < 0.0) {
+            out.allowed = true;
             return out;
         }
 

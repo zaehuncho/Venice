@@ -1,0 +1,258 @@
+VENICE STOREFRONT + TRITON DEPLOYMENT VERIFICATION
+Generated: 2026-09-15 America/Chicago
+
+DECISION
+needs changes
+
+BRANCH / CHANGED FIELDS
+Branch: fix/timing-input-and-remoteplay-blockers
+Fields:
+- website.hero/storefront: dark starfield, blue V brand mark, one $25/month checkout CTA.
+- Triton./purchase: ephemeral Venice checkout response, storefront link button, Venice presence.
+- Gumroad.profile/receipt: Venice branding; private key delivery; support routed to a Discord ticket; no personal contact in the customer-facing copy.
+- gumroad_webhook.retry/Discord REST: releases both idempotency claims after transient provisioning failure and sends an explicit Discord User-Agent.
+- backend.Discord IDs/audit: decrypts SecureString guild/role IDs, sends an explicit Discord User-Agent, and writes bot provisioning events to the new orion-audit table.
+- AWS.orion-activate-lambda-role: orion-dynamodb-access now grants only dynamodb:PutItem on arn:aws:dynamodb:us-east-1:987622176566:table/orion-audit.
+
+FOUR TRANSACTION ARTIFACTS
+MODIFIED_FILE=C:\Users\aaron\Desktop\NexusVision\website\public\index.html
+DIFF_FILE=C:\Users\aaron\Desktop\NexusVision\website\DIFF_FILE.patch
+VERIFICATION=C:\Users\aaron\Desktop\NexusVision\website\VERIFICATION.txt
+ROLLBACK=C:\Users\aaron\Desktop\NexusVision\website\ROLLBACK.sh
+
+SOURCE PRESERVATION
+Original website copy: C:\Users\aaron\Desktop\NexusVision\.codex_artifacts\venice-site-20260915\index.ORIGINAL.html
+Original SHA256: BABED9C8D946C1E0E8EFB97CAA2A7113EAF53276C16031850E26CF8BFCC35EC4
+Modified SHA256: 10516AEC45BA299553BCECFC9266E29FD634F501444A659A222301B2C59808F3
+The original remains preserved and MODIFIED_FILE remains changed.
+
+BASELINE
+Command:
+& '.\.venv\Scripts\python.exe' website/tests/verify_site.py .codex_artifacts/venice-site-20260915/index.ORIGINAL.html
+Input: preserved pre-change index.ORIGINAL.html
+Literal output/result:
+VERIFY_FAIL=missing_venice_brand
+BASELINE_EXIT=1
+
+MODIFIED
+Command:
+& '.\.venv\Scripts\python.exe' website/tests/verify_site.py website/public/index.html
+Input: website/public/index.html
+Literal output/result:
+VERIFY_OK=single_plan_25_month,starfield,blue_logo,security_headers,assets,legal,index_sha256:10516AEC45BA299553BCECFC9266E29FD634F501444A659A222301B2C59808F3
+MODIFIED_EXIT=0
+
+ROLLBACK
+Command:
+& 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x website/ROLLBACK.sh && test -x website/ROLLBACK.sh && ./website/ROLLBACK.sh --copy '/c/Users/aaron/Desktop/NexusVision/.codex_artifacts/venice-site-20260915/rollback-probe-final2'"
+Input: a separate rollback-probe-final2 directory; the live MODIFIED_FILE was not rolled back.
+Literal output/result:
+ROLLBACK_FILES_OK=website_backend_webhook_bot_originals_restored
+ROLLBACK_EXIT=0
+Restored verification:
+website/public/index.html_RESTORED=True SHA256=BABED9C8D946C1E0E8EFB97CAA2A7113EAF53276C16031850E26CF8BFCC35EC4
+backend/lambda_function.py_RESTORED=True SHA256=A4B9DB2DAA09DF7545E3F9D1D84E42D214D2865D09E01128702195B5555A69FF
+discord_launch/gumroad_webhook/lambda_function.py_RESTORED=True SHA256=103F449F98384DB6EA18D5DB9974D1C3B7A22964E5AD5A026E6D0D1B0974B9C1
+discord_launch/orion_bot.py_RESTORED=True SHA256=B54B3BD8E892BE1AA40648FDC1C2236119AC70988F54A95A8827075F61769B07
+Restored behavior/status: the copied website returns to the pre-Venice landing page, and copied backend/webhook/bot files return byte-for-byte to their preserved originals; the production website stays on the modified Venice build.
+
+FOCUSED AUTOMATED TESTS
+Command:
+& '.\.venv\Scripts\python.exe' -m pytest -q tests/discord/test_orion_bot_admin_v2.py tests/discord/test_gumroad_membership.py tests/discord/test_gumroad_webhook_admin_v2.py tests/discord/test_discord_user_agent.py tests/discord/test_orion_worker_purchase.py
+Literal output/result:
+........................................................................ [ 64%]
+........................................                                 [100%]
+============================== warnings summary ===============================
+.venv\Lib\site-packages\discord\player.py:30
+  C:\Users\aaron\Desktop\NexusVision\.venv\Lib\site-packages\discord\player.py:30: DeprecationWarning: 'audioop' is deprecated and slated for removal in Python 3.13
+    import audioop
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+112 passed, 1 warning in 19.97s
+FOCUSED_EXIT=0
+
+LIVE WEBSITE
+ROOT_STATUS=200
+VENICE=True
+BLUE_LOGO=True
+STARFIELD=True
+CSP=True
+HSTS=True
+HEALTH_STATUS=200 BODY={"ok":true,"service":"venice-site"}
+https://zaeorion.com/buy STATUS=302 LOCATION=https://jacksonia66.gumroad.com/l/orion-monthly?wanted=true
+https://zaeorion.com/discord STATUS=302 LOCATION=https://discord.gg/yTuekgdgEN
+Cloudflare Worker: venice-site-production
+Worker version: f42eef80-a322-44d1-bcc2-451a2a8df699
+Routes: zaeorion.com/* and www.zaeorion.com/*
+
+LIVE PURCHASE / AUDIT TEST
+Synthetic input: test=true, plan=month, product_permalink=orion-monthly, email=test@invalid.example, the owner Discord ID, and a unique non-production order ID. No real charge was created.
+Literal invocation result:
+LAMBDA_STATUS=200
+FUNCTION_ERROR=
+SUCCESS=True
+DM_STATUS=delivered
+PLAN=month
+RENEWED=False
+CloudWatch result: license-less membership verified; license provisioned; private Discord DM delivered; gumroad_issue_ok recorded with dm_status=delivered.
+Audit result: DynamoDB table orion-audit is Active with partition key event_id and GSI day-ts-index (day String + ts Number). The AWS item explorer returned one matching bot_provision row with result=ok and the synthetic order ID. No key is reproduced in this record.
+IAM result: AWS displayed "Success Policy orion-dynamodb-access updated." after adding exact PutItem permission for orion-audit. The previous AccessDenied failure changed to a successful write.
+
+DEPLOYED SERVICES
+- Gumroad webhook package: C:\Users\aaron\Desktop\NexusVision\.codex_artifacts\venice-site-20260915\deploy\webhook-20260915182201.zip
+  SHA256=283055AA6ACEA442270D9B3FC484F5D156C32EBC2F4F53052A59D8057BB279FD
+- Backend package: C:\Users\aaron\Desktop\NexusVision\.codex_artifacts\venice-site-20260915\deploy\backend-20260915182549.zip
+  SHA256=70D88DA4D67A21FE7C75D57242DEE86BE27EB3ACF3BF025B3BAC6F52484130CF
+- Triton host: i-0ba45335427155bb7
+  Service: triton.service active, enabled, NRestarts=0
+  Live bot SHA256=5AE647D51EB63648D898119B12023CFB13564AD30577325C34B4F62870C7BF11
+  Presence: Venice - /purchase
+
+DISCORD COMMAND PERMISSIONS
+- /deliver: Admin and Staff allowed, #staff-chat allowed, @everyone denied, all channels denied.
+- /keygen: Admin allowed, #staff-chat allowed, @everyone denied, all channels denied.
+- Keys are delivered only by ephemeral response or DM.
+- Triton position=11; Lifetime=4, Customer=3, Trial=2. TRITON_ABOVE_CUSTOMER_LIFETIME_TRIAL=True.
+
+HANDBACK IDS
+Guild ID: 1483836452776316970
+Customer: 1549488662192857188
+Lifetime: 1549488660049829908
+Trial: 1549488662935380101
+Staff: 1520815228697448528
+Admin: 1485348271638450449
+Verified: 1485354805680541977
+Muted: 1549488663736483882
+Required exact channel names: #staff-chat, #sales-log, #audit-log, #mod-log, #ticket-log
+Channel IDs:
+- staff-chat: 1549499814834610331
+- sales-log: 1549499825190600875
+- audit-log: 1549499828390727732
+- mod-log: 1549499818362015785
+- ticket-log: 1549499821939757156
+Gumroad product link: https://jacksonia66.gumroad.com/l/orion-monthly
+
+STRICT SECURITY
+Command:
+$strictTmp='C:\Users\aaron\Desktop\NexusVision\.codex_artifacts\venice-site-20260915\strict-temp-final'; New-Item -ItemType Directory -Force -Path $strictTmp | Out-Null; $env:TEMP=$strictTmp; $env:TMP=$strictTmp; powershell -ExecutionPolicy Bypass -File scripts\verify_orion.ps1 -Python C:\Users\aaron\AppData\Local\Programs\Python\Python312\python.exe -StrictSecurity
+Result summary:
+- Python: 1342 passed, 2 skipped, 1 xfailed, 1 xpassed in 63.87s.
+- Standard native: 100% tests passed, 21/21.
+- Production native: failed because native_orion/build_prod_codex/Release/OrionShotVerdictTallyTests.exe does not exist although CTest registers it.
+Literal failure tail:
+10/21 Test #10: OrionShotVerdictTallyTests .......***Failed    0.37 sec
+[orion-qtest] Cannot find path 'C:/Users/aaron/Desktop/NexusVision/native_orion/build_prod_codex/Release/OrionShotVerdictTallyTests.exe' because it does not exist.
+[orion-qtest] status=harness_error child_exit= exit=125
+CTest exit=-1
+[orion] Production native tests failed with exit code -1
+STRICT_EXIT=1
+
+OPEN RELEASE BLOCKERS
+1. The live Admin and Co-Owner Discord roles still have Administrator. The user requested that existing roles remain unchanged, so this record does not alter them; however, this conflicts with the original owner-only Administrator requirement.
+2. orion-activate-lambda-role can write audit rows but cannot Query the day-ts-index or Scan the audit table. The public purchase path is functional and audited, but /api/admin/audit cannot read those rows until least-privilege read access is separately approved and added. The same role also logs missing access for orion-config GetItem and orion-ratelimit UpdateItem on admin routes.
+3. The production StrictSecurity run remains blocked by the missing OrionShotVerdictTallyTests production executable/target.
+
+REQUIRED NEXT TEST/FIX
+- Remove Administrator from every role except Owner if the role layout is allowed to change.
+- Add only the exact DynamoDB read/index permissions and existing admin-route config/rate-limit permissions required by orion-activate-lambda-role, then verify /api/admin/audit returns the recorded row without fallback errors.
+- Build/register OrionShotVerdictTallyTests in build_prod_codex, or remove the stale CTest registration only if the production test is intentionally excluded, then rerun StrictSecurity to exit 0.
+
+================================================================
+STRIPE EMBEDDED CHECKOUT COMPATIBILITY FIX — 2026-09-16 America/Chicago
+
+DECISION
+needs changes (checkout form repaired and the approved Stripe test subscription completed; unrelated StrictSecurity release blocker remains)
+
+BRANCH / CHANGED FIELD
+Branch: fix/timing-input-and-remoteplay-blockers
+Field: website.checkout.ui_mode changed from embedded to embedded_page; regression test added.
+
+FOUR TRANSACTION ARTIFACTS
+MODIFIED_FILE=C:\Users\aaron\Desktop\NexusVision\website\src\worker.js
+DIFF_FILE=C:\Users\aaron\Desktop\NexusVision\website\DIFF_FILE.patch
+VERIFICATION=C:\Users\aaron\Desktop\NexusVision\website\VERIFICATION.txt
+ROLLBACK=C:\Users\aaron\Desktop\NexusVision\website\ROLLBACK.sh
+
+SOURCE PRESERVATION
+Original Worker copy: C:\Users\aaron\Desktop\NexusVision\.codex_artifacts\stripe-embedded-page-20260916\worker.ORIGINAL.js
+Original Worker SHA256: D1E0AB85982CFF61C38F97E85A15FC4C30B0C63A315F4794DD30DDB802806366
+Modified Worker SHA256: D92F69DE4F02F9E3A963EDA7D8550790A4FD364B821EC9DD5416D830CB296C98
+Original test copy: C:\Users\aaron\Desktop\NexusVision\.codex_artifacts\stripe-embedded-page-20260916\worker.test.ORIGINAL.mjs
+Original test SHA256: 7712948E5368B6A1F84A79CF0AA33B976C1ABEDA36763843C1853FDAE8DA2C74
+Modified test SHA256: D5EEEDE1D24A1072E9D9FFA8CD822F628E60E84D0E57385166B21B11B26C34F4
+The preserved originals remain unchanged and MODIFIED_FILE remains changed.
+
+BASELINE
+Command: npm run check
+Input: preserved pre-fix website source using ui_mode=embedded
+Literal output/result summary:
+VERIFY_OK=single_plan_25_month,editorial_layout,no_synthetic_preview,30fps_canvas,optimized_logo,tab_favicon,stripe_test_checkout,discord_identity,security_headers,assets,legal,index_sha256:C74C2B33F3793103E2E9E59A8E3595235CDAF688B779C59A1B4E21B7744C0E24
+9 tests passed; 0 failed; duration_ms 103.9281
+BASELINE_EXIT=0
+Live baseline result: POST /v1/checkout/sessions returned HTTP 400. Stripe response: The ui_mode value `embedded` is no longer supported. Use `embedded_page` instead.
+
+MODIFIED
+Command: npm run check
+Input: current website source using ui_mode=embedded_page plus regression test
+Literal output/result summary:
+VERIFY_OK=single_plan_25_month,editorial_layout,no_synthetic_preview,30fps_canvas,optimized_logo,tab_favicon,stripe_test_checkout,discord_identity,security_headers,assets,legal,index_sha256:C74C2B33F3793103E2E9E59A8E3595235CDAF688B779C59A1B4E21B7744C0E24
+10 tests passed; 0 failed; duration_ms 110.4668
+MODIFIED_EXIT=0
+Live modified result: Discord OAuth completed, the authenticated session displayed Connected as Dr. Zae, and Stripe TEST MODE rendered Subscribe to Venice Monthly at $25.00 per month with the Subscribe button available.
+Deployment command: npm run deploy:production
+Deployment result: Uploaded venice-site-production; routes zaeorion.com/* and www.zaeorion.com/*; Current Version ID c9428cb0-24ee-43ef-9e23-9da31310d9ad; DEPLOY_EXIT=0.
+
+ROLLBACK
+Command: & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x website/ROLLBACK.sh && test -x website/ROLLBACK.sh && ./website/ROLLBACK.sh --stripe-fix-copy '/c/Users/aaron/Desktop/NexusVision/.codex_artifacts/stripe-embedded-page-20260916/rollback-probe-2'"
+Input: separate rollback-probe-2 directory containing copies of the modified Worker and test; production files were not rolled back.
+Literal output/result:
+ROLLBACK_STRIPE_FIX_OK=worker_and_test_originals_restored
+WORKER_RESTORED=True SHA256=D1E0AB85982CFF61C38F97E85A15FC4C30B0C63A315F4794DD30DDB802806366
+TEST_RESTORED=True SHA256=7712948E5368B6A1F84A79CF0AA33B976C1ABEDA36763843C1853FDAE8DA2C74
+ROLLBACK_EXIT=0
+Restored behavior/status: the probe copy returns to Stripe's obsolete ui_mode=embedded baseline and its original nine-test suite; the production MODIFIED_FILE remains on ui_mode=embedded_page.
+
+STRICT SECURITY
+Command: powershell -ExecutionPolicy Bypass -File scripts\verify_orion.ps1 -Python C:\Python314\python.exe -StrictSecurity
+Result summary: Python 1343 passed, 2 skipped, 1 xfailed, 1 xpassed; standard native 21/21 passed; production native 20/21 passed.
+Literal failure: OrionShotVerdictTallyTests could not start because native_orion/build_prod_codex/Release/OrionShotVerdictTallyTests.exe does not exist.
+STRICT_EXIT=1 (pre-existing unrelated release blocker)
+
+SECRET HANDLING
+Cloudflare encrypted secret DISCORD_CLIENT_SECRET was replaced from the approved current Triton client secret and the clipboard was cleared. `wrangler secret list --env production` confirmed the secret name exists; no secret value is recorded here.
+
+FINAL LIVE CHECKOUT RESULT — 2026-09-16 America/Chicago
+Action-time confirmation: received immediately before the final Subscribe action.
+Input: Stripe test-mode synthetic checkout data; no real card or real charge.
+Literal UI result: the embedded checkout entered processing and displayed Stripe's green success check.
+Webhook evidence: Cloudflare tail received invoice.paid with result=initial_invoice_ignored, followed by checkout.session.completed with result=provisioned, then GET /checkout/complete.
+Backend evidence: CloudWatch /aws/lambda/orion-activate contained one fresh AUDIT bot_provision marker at 2026-09-16T06:38:37.615Z.
+Discord evidence: live Discord API member lookup returned HTTP 200 and CUSTOMER_ROLE_ASSIGNED=True.
+Entitlement result: the paid monthly Discord-bound entitlement provision path completed; the private license value is not reproduced in this file.
+Production Worker: venice-site-production, current 100% version 84fc3f4e-5b4a-4973-8ab5-495eb397c8ce (secret deletion produced the final metadata-only version after stable code deploy).
+
+FINAL MODIFIED TEST
+Command: npm run check
+Input: current website source, ui_mode=embedded_page.
+Literal output/result summary:
+VERIFY_OK=single_plan_25_month,editorial_layout,no_synthetic_preview,30fps_canvas,optimized_logo,tab_favicon,stripe_test_checkout,discord_identity,security_headers,assets,legal,index_sha256:C74C2B33F3793103E2E9E59A8E3595235CDAF688B779C59A1B4E21B7744C0E24
+tests=10 pass=10 fail=0 duration_ms=98.9885
+MODIFIED_FINAL_EXIT=0
+
+TEMPORARY HARNESS CLEANUP
+Local HTTP server: stopped.
+Cloudflare internal test route: removed from local and production source; production POST probe returned HTTP_STATUS=405 with an empty body.
+Cloudflare INTERNAL_TEST_TOKEN: deleted; the final production secret-name list contains DISCORD_CLIENT_SECRET, ORION_BOT_SECRET, ORION_EDGE_AUTH, SESSION_SECRET, STRIPE_SECRET_KEY, and STRIPE_WEBHOOK_SECRET only.
+Local internal-test-token.tmp: zero bytes.
+Local checkout-harness/index.html: zero bytes.
+MODIFIED_FILE remains changed with SHA256 D92F69DE4F02F9E3A963EDA7D8550790A4FD364B821EC9DD5416D830CB296C98.
+
+FINAL ROLLBACK RECHECK
+Command: & 'C:\Program Files\Git\bin\bash.exe' -lc "chmod +x website/ROLLBACK.sh && test -x website/ROLLBACK.sh && ./website/ROLLBACK.sh --stripe-fix-copy '/c/Users/aaron/Desktop/NexusVision/.codex_artifacts/stripe-embedded-page-20260916/rollback-probe-confirmed'"
+Input: separate rollback-probe-confirmed copies of the modified Worker and regression test; the production files were not rolled back.
+Literal output/result:
+ROLLBACK_STRIPE_FIX_OK=worker_and_test_originals_restored
+WORKER_RESTORED=True SHA256=D1E0AB85982CFF61C38F97E85A15FC4C30B0C63A315F4794DD30DDB802806366
+TEST_RESTORED=True SHA256=7712948E5368B6A1F84A79CF0AA33B976C1ABEDA36763843C1853FDAE8DA2C74
+ROLLBACK_EXIT=0
+Restored behavior/status: the copied Worker is back on the pre-fix embedded mode and the copied test is back to the original suite; the live MODIFIED_FILE remains on embedded_page.

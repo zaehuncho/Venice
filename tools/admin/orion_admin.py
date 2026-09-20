@@ -6,28 +6,31 @@ license backend. It talks to the same HTTPS API the launcher uses
 (https://api.zaeorion.com by default) and is intentionally kept *out* of the
 customer gameplay UI.
 
+It is the scriptable twin of OrionOwner.exe / OrionStaff.exe and speaks the same
+contract: docs/ADMIN_PANEL_V2_CONTRACT.md. Every endpoint, body field and error
+code below comes from that document (§2-§6).
+
 Security model
 --------------
 * No admin secret or token is ever hardcoded. Credentials come from (in order):
-  the environment (ORION_ADMIN_SECRET / ORION_ADMIN_TOKEN / ORION_ADMIN_DISCORD_ID),
-  or an ignored local config at ~/.orion/admin_config.json (written 0600 by
-  ``login``). The config lives outside the repo and is never committed.
+  the environment (ORION_ADMIN_SECRET / ORION_ADMIN_TOKEN / ORION_ADMIN_DISCORD_ID
+  / ORION_ADMIN_TOTP), or an ignored local config at ~/.orion/admin_config.json
+  (written 0600 by ``login``). The config lives outside the repo and is never
+  committed.
 * Secrets are never printed or logged. ``config`` redacts them.
+* Staff requests are machine-bound: the bearer token is sent with ``X-Machine-Id``
+  (``require_staff`` refuses a bound token without it) and ``X-Orion-Discord-Id``.
+* Owner requests send ``X-Orion-Admin-Secret`` plus ``X-Orion-Admin-TOTP`` when a
+  code is available (mandatory once ``owner_totp_required`` is on, contract §5).
 * Full license keys are shown only when a key is first created (``license create``)
   or explicitly requested with ``--reveal``. Everywhere else keys are masked.
-* Destructive actions (revoke, reset-hwid, deactivate, staff disable) require a
-  non-empty ``--reason`` and an interactive confirmation (skippable with ``--yes``
-  for scripted use, but ``--reason`` is still mandatory).
+* Every mutation requires ``--reason`` (≤200 chars); destructive ones additionally
+  require an interactive confirmation (skippable with ``--yes`` for scripted use).
 * Only HTTPS endpoints are allowed.
 
-Roles (server-enforced; the CLI gates are advisory):
-  owner   : everything, including staff management
-  admin   : license create / revoke / reset / extend / plan
-  support : lookup + limited HWID reset / deactivate
-
-Staff-management, search, whoami, and audit endpoints are part of the planned
-staff backend. When they are not yet deployed the CLI degrades gracefully with a
-clear message instead of failing hard. See docs/ADMIN_TOOL.md for the contract.
+Roles are server-enforced by ``require_capability``. ``ROLE_CAPABILITIES`` here is
+display-only (``orion-admin caps``): it never blocks a call, because the server is
+the only gate that counts.
 """
 
 from __future__ import annotations
@@ -50,12 +53,61 @@ from typing import Callable, Optional
 
 DEFAULT_BASE_URL = "https://api.zaeorion.com"
 CONFIG_PATH = Path.home() / ".orion" / "admin_config.json"
-DESTRUCTIVE_COMMANDS = {"revoke", "reset-hwid", "deactivate", "staff-disable", "delete", "killswitch-engage"}
+REASON_MAX_CHARS = 200
+
+# Mirrors backend/lambda_function.py (owner rule 2026-09-15). `month` is the only
+# plan sold — a free 3-day trial, then a recurring monthly subscription — and a
+# HWID reset past the 3 free ones costs one day off that subscription.
+SELLABLE_PLAN = "month"
+RESET_FREE_DEFAULT = 3
+RESET_PENALTY_DAYS = 1
+
+# Actions that get an extra "type yes" confirmation on top of --reason.
+DESTRUCTIVE_COMMANDS = {
+    "revoke",
+    "reset-machine",
+    "freeze",
+    "transfer",
+    "blacklist",
+    "staff-disable",
+    "staff-reset-machine",
+    "staff-reissue-enrollment",
+    "killswitch-engage",
+    "rotate-secret",
+}
+
+# Contract §1 capability matrix. DISPLAY ONLY - printed by `caps`, never a gate.
 ROLE_CAPABILITIES = {
     "owner": {"*"},
-    "admin": {"create", "revoke", "unrevoke", "reset-hwid", "deactivate", "extend", "set-plan", "lookup", "search", "audit"},
-    "support": {"lookup", "search", "reset-hwid", "deactivate"},
+    "admin": {
+        "license.lookup",
+        "license.create",
+        "license.reset_machine",
+        "license.extend",
+        "license.revoke",
+        "license.unrevoke",
+        "license.freeze",
+        "license.unfreeze",
+        "license.set_plan",
+        "license.transfer",
+        "audit.read_own",
+    },
+    "support": {
+        "license.lookup",
+        "license.reset_machine",
+        "audit.read_own",
+    },
 }
+
+OWNER_ONLY_CAPABILITIES = (
+    "license.reset_machine force",
+    "license.set_reset_policy",
+    "blacklist",
+    "staff.*",
+    "config.*",
+    "audit.read_all",
+    "metrics",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -72,20 +124,16 @@ def mask_key(key: str) -> str:
     return "ORION-…-" + key[-4:]
 
 
-def compute_extend_expiry(current_expiry: int, now: int, add_days: int) -> int:
-    """New expiry when extending by add_days. Extends from the later of now or the
-    current expiry, so extending a not-yet-expired key never shortens it."""
-    base = max(int(current_expiry or 0), int(now))
-    return base + int(add_days) * 86400
-
-
 def redact_config(config: "AdminConfig") -> dict:
     """A dict view of the config safe to print: secrets reduced to presence flags."""
     return {
         "base_url": config.base_url,
         "role": config.role or "(unknown)",
+        "staff_id": config.staff_id or "(none)",
         "discord_user_id": config.discord_user_id or "(none)",
+        "machine_id": config.machine_id_suffix,
         "admin_secret": "set" if config.admin_secret else "unset",
+        "admin_totp": "set" if config.admin_totp else "unset",
         "staff_token": "set" if config.staff_token else "unset",
     }
 
@@ -95,39 +143,111 @@ def is_destructive(command: str) -> bool:
 
 
 def role_can(role: Optional[str], capability: str) -> bool:
-    """Advisory client-side gate. The server is the source of truth."""
+    """Display-only view of the contract matrix. The server is the source of truth
+    and this function never blocks a request."""
     if not role:
         return True  # unknown role: let the server decide
     caps = ROLE_CAPABILITIES.get(role, set())
     return "*" in caps or capability in caps
 
 
+def validate_reason(reason: str) -> str:
+    """Normalise a reason, or raise CommandError. Contract: required, ≤200 chars."""
+    text = (reason or "").strip()
+    if not text:
+        raise CommandError('This action requires --reason "...".')
+    if len(text) > REASON_MAX_CHARS:
+        raise CommandError(f"--reason must be {REASON_MAX_CHARS} characters or fewer (got {len(text)}).")
+    return text
+
+
 def build_auth_headers(config: "AdminConfig") -> dict:
-    """Auth headers for an admin request. Owner uses the admin secret; staff uses a
-    bearer token plus their Discord identity."""
+    """Auth headers for an admin request (contract §1).
+
+    Owner: the admin secret, plus the TOTP code when one is configured.
+    Staff: a bearer token, the machine it is bound to (``X-Machine-Id`` - the
+    Lambda's ``require_staff`` refuses a bound token without it), and the Discord
+    identity used for the audit actor.
+    """
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if config.admin_secret:
         headers["X-Orion-Admin-Secret"] = config.admin_secret
+        if config.admin_totp:
+            headers["X-Orion-Admin-TOTP"] = config.admin_totp
     if config.staff_token:
         headers["Authorization"] = "Bearer " + config.staff_token
+        headers["X-Machine-Id"] = config.machine_id
     if config.discord_user_id:
         headers["X-Orion-Discord-Id"] = config.discord_user_id
     return headers
 
 
 def format_audit_row(event: dict) -> str:
-    """One audit line, key suffix only, never a full key."""
-    ts = event.get("timestamp") or event.get("time") or ""
+    """One audit line from a contract §4 row, key suffix only, never a full key."""
+    ts = event.get("ts") or event.get("timestamp") or event.get("time") or ""
     if isinstance(ts, (int, float)):
         ts = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(int(ts)))
-    actor = event.get("actor_discord_user_id") or event.get("actor_discord_id") or event.get("actor_staff_id") or event.get("actor") or "?"
+    actor_type = event.get("actor_type") or ""
+    actor_id = (
+        event.get("actor_id")
+        or event.get("actor_staff_id")
+        or event.get("actor_discord_user_id")
+        or event.get("actor_discord_id")
+        or event.get("actor")
+        or "?"
+    )
+    actor = f"{actor_type}:{actor_id}" if actor_type else str(actor_id)
     action = event.get("action") or "?"
-    suffix = event.get("key_suffix") or event.get("target_id")
-    if not suffix and event.get("license_key"):
-        suffix = mask_key(event["license_key"])
-    target = event.get("target_email") or event.get("target_discord") or event.get("target_type") or ""
+    target = event.get("target") or event.get("key_suffix") or event.get("target_id")
+    if not target and event.get("license_key"):
+        target = mask_key(event["license_key"])
+    target_type = event.get("target_type") or ""
+    result = event.get("result") or "ok"
     reason = event.get("reason") or ""
-    return f"{ts}  {actor:<20}  {action:<16}  {suffix or '-':<14}  {target:<28}  {reason}"
+    return (
+        f"{ts}  {actor:<26}  {action:<22}  {target_type:<8} {str(target or '-'):<14}  "
+        f"{result:<10}  {reason}"
+    )
+
+
+def format_license(lic: dict, reveal: bool) -> list:
+    """Human-readable license block (contract §2 lookup / §3 policy fields)."""
+    key = lic.get("license_key") or lic.get("key") or ""
+    machine = lic.get("machine_id") or ""
+    lines = [
+        f"  key:      {key if reveal else mask_key(key)}",
+        f"  status:   {lic.get('status', '?')}  plan={lic.get('plan', '?')}",
+        f"  email:    {lic.get('email', '-')}",
+        f"  discord:  {lic.get('discord_user_id', '-')}",
+        f"  machine:  {machine[-8:] if machine else '(unbound)'}",
+    ]
+    expiry = lic.get("expiry")
+    if expiry is not None:
+        lines.append(
+            "  expiry:   lifetime" if int(expiry or 0) == 0
+            else "  expiry:   " + time.strftime("%Y-%m-%d", time.gmtime(int(expiry)))
+        )
+    if lic.get("frozen_at"):
+        lines.append("  frozen:   " + time.strftime("%Y-%m-%d", time.gmtime(int(lic["frozen_at"]))))
+    lines.append(
+        "  hwid:     free {used}/{free}  paid_credits={paid}  locked={locked}".format(
+            used=lic.get("hwid_resets_used", 0),
+            free=lic.get("hwid_free_resets", "?"),
+            paid=lic.get("hwid_paid_credits", 0),
+            locked=bool(lic.get("hwid_reset_locked")),
+        )
+    )
+    flags = lic.get("flags") or {}
+    if flags:
+        lines.append(f"  flags:    {json.dumps(flags, sort_keys=True)}")
+    for entry in (lic.get("reset_history") or [])[-5:]:
+        when = entry.get("ts")
+        when = time.strftime("%Y-%m-%d", time.gmtime(int(when))) if when else "?"
+        lines.append(
+            f"    reset {when}  mode={entry.get('mode', '?')}  by={entry.get('by', '?')}"
+            f"  was=...{entry.get('machine_before_suffix', '?')}"
+        )
+    return lines
 
 
 def local_machine_id() -> str:
@@ -146,10 +266,28 @@ def local_machine_id() -> str:
 
 
 def request_freshness_fields() -> dict:
+    """Contract §2 / handle_staff_enroll: replay protection on the enrol/login bodies."""
     return {
-        "request_nonce": uuid.uuid4().hex,
-        "request_timestamp": int(time.time()),
+        "nonce": uuid.uuid4().hex,
+        "timestamp": int(time.time()),
     }
+
+
+def parse_list(text: str) -> list:
+    """"a, b ,c" -> ["a", "b", "c"]; empty string -> []."""
+    return [part.strip() for part in str(text or "").split(",") if part.strip()]
+
+
+def parse_caps(args) -> dict:
+    """Staff caps from --keys-per-day/--resets-per-day/--extend-max-days."""
+    caps = {}
+    if getattr(args, "keys_per_day", None) is not None:
+        caps["keys_per_day"] = int(args.keys_per_day)
+    if getattr(args, "resets_per_day", None) is not None:
+        caps["resets_per_day"] = int(args.resets_per_day)
+    if getattr(args, "extend_max_days", None) is not None:
+        caps["extend_max_days"] = int(args.extend_max_days)
+    return caps
 
 
 # --------------------------------------------------------------------------- #
@@ -160,13 +298,28 @@ def request_freshness_fields() -> dict:
 class AdminConfig:
     base_url: str = DEFAULT_BASE_URL
     admin_secret: str = ""
+    admin_totp: str = ""
     staff_token: str = ""
+    staff_id: str = ""
     discord_user_id: str = ""
     role: str = ""
 
     @property
     def has_auth(self) -> bool:
         return bool(self.admin_secret or self.staff_token)
+
+    @property
+    def machine_id(self) -> str:
+        return local_machine_id()
+
+    @property
+    def machine_id_suffix(self) -> str:
+        return "..." + self.machine_id[-10:]
+
+    @property
+    def uses_owner_routes(self) -> bool:
+        """Owner routes (/api/admin/*) accept the admin secret or an owner-role token."""
+        return bool(self.admin_secret) or self.role == "owner"
 
 
 def load_config(path: Path = CONFIG_PATH, env: Optional[dict] = None) -> AdminConfig:
@@ -179,13 +332,17 @@ def load_config(path: Path = CONFIG_PATH, env: Optional[dict] = None) -> AdminCo
             config.base_url = data.get("base_url", config.base_url) or config.base_url
             config.admin_secret = data.get("admin_secret", "") or ""
             config.staff_token = data.get("staff_token", "") or ""
+            config.staff_id = data.get("staff_id", "") or ""
             config.discord_user_id = data.get("discord_user_id", "") or ""
             config.role = data.get("role", "") or ""
         except (json.JSONDecodeError, OSError):
             pass
     config.base_url = env.get("ORION_API_BASE", config.base_url) or config.base_url
     config.admin_secret = env.get("ORION_ADMIN_SECRET", config.admin_secret) or config.admin_secret
+    # The TOTP code is short-lived: environment only, never written to disk.
+    config.admin_totp = env.get("ORION_ADMIN_TOTP", "") or ""
     config.staff_token = env.get("ORION_ADMIN_TOKEN", config.staff_token) or config.staff_token
+    config.staff_id = env.get("ORION_ADMIN_STAFF_ID", config.staff_id) or config.staff_id
     config.discord_user_id = env.get("ORION_ADMIN_DISCORD_ID", config.discord_user_id) or config.discord_user_id
     config.role = env.get("ORION_ADMIN_ROLE", config.role) or config.role
     return config
@@ -197,6 +354,7 @@ def save_config(config: AdminConfig, path: Path = CONFIG_PATH) -> None:
         "base_url": config.base_url,
         "admin_secret": config.admin_secret,
         "staff_token": config.staff_token,
+        "staff_id": config.staff_id,
         "discord_user_id": config.discord_user_id,
         "role": config.role,
     }
@@ -254,71 +412,82 @@ class UrllibTransport(Transport):
 
 
 class OrionAdminClient:
+    """Thin contract-shaped wrapper. One method per endpoint in §2-§6."""
+
     def __init__(self, config: AdminConfig, transport: Transport) -> None:
         self.config = config
         self.transport = transport
 
+    # -- plumbing ----------------------------------------------------------
     def _url(self, path: str, query: Optional[dict] = None) -> str:
         url = self.config.base_url.rstrip("/") + path
         if query:
-            url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v})
+            url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v not in (None, "")})
         return url
 
+    def _get(self, path: str, query: Optional[dict] = None) -> ApiResult:
+        return self.transport.request("GET", self._url(path, query), build_auth_headers(self.config), None)
+
+    def _post(self, path: str, body: dict) -> ApiResult:
+        return self.transport.request("POST", self._url(path), build_auth_headers(self.config), body)
+
+    @property
+    def license_path(self) -> str:
+        return "/api/admin/license" if self.config.uses_owner_routes else "/api/staff/license"
+
+    @property
+    def audit_path(self) -> str:
+        return "/api/admin/audit" if self.config.uses_owner_routes else "/api/staff/audit"
+
+    # -- endpoints ---------------------------------------------------------
     def get_version(self) -> ApiResult:
         return self.transport.request("GET", self._url("/api/version"), {"Accept": "application/json"}, None)
 
-    def provision(self, body: dict) -> ApiResult:
-        return self.transport.request("POST", self._url("/api/provision"), build_auth_headers(self.config), body)
-
-    def get_license(self, key: str) -> ApiResult:
-        path = "/api/staff/license" if self.config.staff_token and not self.config.admin_secret else "/api/admin/license"
-        return self.transport.request("GET", self._url(path, {"key": key}),
-                                      build_auth_headers(self.config), None)
-
-    def update_license(self, body: dict) -> ApiResult:
-        path = "/api/staff/license" if self.config.staff_token and not self.config.admin_secret else "/api/admin/license"
-        return self.transport.request("POST", self._url(path), build_auth_headers(self.config), body)
-
-    def search(self, by: str, value: str) -> ApiResult:
-        return self.transport.request("GET", self._url("/api/admin/search", {by: value}),
-                                      build_auth_headers(self.config), None)
-
     def whoami(self) -> ApiResult:
-        path = "/api/staff/whoami" if self.config.staff_token and not self.config.admin_secret else "/api/admin/whoami"
-        return self.transport.request("GET", self._url(path), build_auth_headers(self.config), None)
+        path = "/api/admin/whoami" if self.config.uses_owner_routes else "/api/staff/whoami"
+        return self._get(path)
 
-    def staff(self, method: str, body: Optional[dict] = None) -> ApiResult:
-        return self.transport.request(method, self._url("/api/admin/staff"), build_auth_headers(self.config), body)
+    def metrics(self) -> ApiResult:
+        return self._get("/api/admin/metrics")
 
-    def audit(self, limit: int) -> ApiResult:
-        return self.transport.request("GET", self._url("/api/admin/staff/audit", {"limit": str(limit)}),
-                                      build_auth_headers(self.config), None)
+    def license(self, body: dict) -> ApiResult:
+        """POST /api/admin/license or /api/staff/license, body {action, reason, ...}."""
+        return self._post(self.license_path, body)
 
-    def kill(self, body: dict) -> ApiResult:
-        return self.transport.request("POST", self._url("/api/admin/kill"), build_auth_headers(self.config), body)
+    def license_owner(self, body: dict) -> ApiResult:
+        """Owner-only license actions (blacklist, set_reset_policy)."""
+        return self._post("/api/admin/license", body)
 
-    def unkill(self, body: dict) -> ApiResult:
-        return self.transport.request("POST", self._url("/api/admin/unkill"), build_auth_headers(self.config), body)
+    def staff_list(self) -> ApiResult:
+        return self._get("/api/admin/staff")
 
-    def kill_status(self) -> ApiResult:
-        return self.transport.request("GET", self._url("/api/admin/status"), build_auth_headers(self.config), None)
+    def staff(self, body: dict) -> ApiResult:
+        return self._post("/api/admin/staff", body)
 
-    def staff_enroll(self, discord_id: str, enrollment_key: str, display_name: str = "") -> ApiResult:
+    def audit(self, query: dict) -> ApiResult:
+        return self._get(self.audit_path, query)
+
+    def server_config(self) -> ApiResult:
+        return self._get("/api/admin/config")
+
+    def server_config_update(self, body: dict) -> ApiResult:
+        return self._post("/api/admin/config", body)
+
+    def staff_enroll(self, staff_id: str, enroll_key: str) -> ApiResult:
+        # Contract §2: {enroll_key, staff_id, machine_id, nonce, timestamp}.
         body = {
-            "discord_user_id": discord_id,
-            "enrollment_key": enrollment_key,
-            "machine_id": local_machine_id(),
+            "staff_id": staff_id,
+            "enroll_key": enroll_key,
+            "machine_id": self.config.machine_id,
             **request_freshness_fields(),
         }
-        if display_name:
-            body["display_name"] = display_name
         return self.transport.request("POST", self._url("/api/staff/enroll"),
                                       {"Content-Type": "application/json", "Accept": "application/json"}, body)
 
-    def staff_login(self, discord_id: str) -> ApiResult:
+    def staff_login(self, staff_id: str) -> ApiResult:
         body = {
-            "discord_user_id": discord_id,
-            "machine_id": local_machine_id(),
+            "staff_id": staff_id,
+            "machine_id": self.config.machine_id,
             **request_freshness_fields(),
         }
         return self.transport.request("POST", self._url("/api/staff/login"),
@@ -333,13 +502,6 @@ class CommandError(Exception):
     """Raised for user-facing failures (bad args, refused confirmation, API errors)."""
 
 
-def _require_reason(args) -> str:
-    reason = (getattr(args, "reason", "") or "").strip()
-    if not reason:
-        raise CommandError("This action is destructive and requires --reason \"...\".")
-    return reason
-
-
 def _confirm_destructive(args, summary: str, confirmer: Callable[[str], bool]) -> None:
     if getattr(args, "yes", False):
         return
@@ -348,11 +510,35 @@ def _confirm_destructive(args, summary: str, confirmer: Callable[[str], bool]) -
 
 
 def _unwrap(result: ApiResult, not_deployed_hint: str = "") -> dict:
-    if result.ok:
+    if result.ok and result.data.get("ok", True):
         return result.data
     if result.status == 404 and not_deployed_hint:
         raise CommandError(not_deployed_hint)
-    raise CommandError(result.error or f"request failed (status {result.status})")
+    error = result.data.get("error") if isinstance(result.data, dict) else ""
+    message = result.data.get("message") if isinstance(result.data, dict) else ""
+    detail = " - ".join([part for part in (error, message) if part])
+    raise CommandError(detail or result.error or f"request failed (status {result.status})")
+
+
+def _license_target(args) -> dict:
+    """The {key | email | discord_user_id | machine_id} selector shared by §2 bodies."""
+    target = {}
+    if getattr(args, "key", ""):
+        target["key"] = args.key.strip().upper()
+    if getattr(args, "email", ""):
+        target["email"] = args.email.strip()
+    if getattr(args, "discord", ""):
+        target["discord_user_id"] = args.discord.strip()
+    if getattr(args, "machine", ""):
+        target["machine_id"] = args.machine.strip()
+    return target
+
+
+def _require_key(args) -> str:
+    key = (getattr(args, "key", "") or "").strip().upper()
+    if not key:
+        raise CommandError("--key is required.")
+    return key
 
 
 def cmd_version(client: OrionAdminClient, args, out, confirmer) -> dict:
@@ -364,274 +550,416 @@ def cmd_version(client: OrionAdminClient, args, out, confirmer) -> dict:
 def cmd_whoami(client: OrionAdminClient, args, out, confirmer) -> dict:
     result = client.whoami()
     if result.ok:
-        out(f"role: {result.data.get('role', '?')}  discord: {result.data.get('discord_user_id', '?')}")
+        staff = result.data.get("staff", result.data)
+        out(f"role: {staff.get('role', '?')}  staff_id: {staff.get('staff_id', '-')}  "
+            f"discord: {staff.get('discord_user_id', '-')}")
+        caps = staff.get("caps") or {}
+        usage = staff.get("usage") or {}
+        if caps or usage:
+            out(f"caps: {json.dumps(caps, sort_keys=True)}")
+            out(f"usage today: {json.dumps(usage, sort_keys=True)}")
         return result.data
     # Degrade: report what the local config believes.
     out(f"(server whoami unavailable: {result.error or result.status}) local role: {client.config.role or 'unknown'}")
     return {"role": client.config.role}
 
 
-def cmd_license_create(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if not args.email:
-        raise CommandError("--email is required to create a license.")
-    body = {"email": args.email, "plan": args.plan, "days": args.days}
-    if args.discord:
-        body["discord_user_id"] = args.discord
-    if args.key:
-        body["license_key"] = args.key
-    if client.config.discord_user_id:
-        body["actor_discord_id"] = client.config.discord_user_id
-    data = _unwrap(client.provision(body))
-    # The full key is shown exactly once, here, at creation time.
-    out("License created (store the key now; it will not be shown in full again):")
-    out(f"  key:    {data.get('license_key', '(missing)')}")
-    out(f"  email:  {data.get('email', args.email)}")
-    out(f"  plan:   {data.get('plan', args.plan)}")
-    if data.get("expiry_date"):
-        out(f"  expiry: {time.strftime('%Y-%m-%d', time.gmtime(int(data['expiry_date'])))}")
+def cmd_caps(client: OrionAdminClient, args, out, confirmer) -> dict:
+    out("Capability matrix (display only - the server's require_capability decides):")
+    for role in ("owner", "admin", "support"):
+        caps = ROLE_CAPABILITIES[role]
+        out(f"  {role:<8} {'everything' if '*' in caps else ', '.join(sorted(caps))}")
+    out("  owner-only extras: " + ", ".join(OWNER_ONLY_CAPABILITIES))
+    return {"roles": {role: sorted(ROLE_CAPABILITIES[role]) for role in ROLE_CAPABILITIES}}
+
+
+def cmd_metrics(client: OrionAdminClient, args, out, confirmer) -> dict:
+    data = _unwrap(client.metrics(), not_deployed_hint="Metrics need the owner backend (not deployed yet).")
+    metrics = data.get("metrics", data)
+    for section in ("licenses", "trials", "activations", "resets", "staff", "versions"):
+        if section in metrics:
+            out(f"  {section}: {json.dumps(metrics[section], sort_keys=True)}")
+    for scalar in ("online_now", "fraud_flagged"):
+        if scalar in metrics:
+            out(f"  {scalar}: {metrics[scalar]}")
     return data
 
 
-def _print_license(out, lic: dict, reveal: bool) -> None:
-    key = lic.get("license_key", "")
-    out(f"  key:     {key if reveal else mask_key(key)}")
-    out(f"  email:   {lic.get('email', '?')}")
-    out(f"  plan:    {lic.get('plan', '?')}")
-    out(f"  status:  {lic.get('status', '?')}  revoked={lic.get('revoked', '?')}")
-    machine = lic.get("machine_id") or ""
-    out(f"  machine: {'(unbound)' if not machine else machine[-8:]}")
-    if lic.get("expiry"):
-        out(f"  expiry:  {time.strftime('%Y-%m-%d', time.gmtime(int(lic['expiry'])))}")
-    if lic.get("discord_user_id"):
-        out(f"  discord: {lic['discord_user_id']}")
-
+# ---- licenses -------------------------------------------------------------- #
 
 def cmd_license_lookup(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if args.key:
-        data = _unwrap(client.get_license(args.key))
-        lic = data.get("license", data)
-        out("License:")
-        _print_license(out, lic, args.reveal)
-        return data
-    if args.email or args.discord:
-        by, value = ("email", args.email) if args.email else ("discord", args.discord)
-        data = _unwrap(client.search(by, value),
-                       not_deployed_hint="Search by email/discord needs the staff backend (not deployed yet). Look up by --key for now.")
-        licenses = data.get("licenses", [])
-        out(f"{len(licenses)} match(es):")
-        for lic in licenses:
-            _print_license(out, lic, args.reveal)
-            out("  -")
-        return data
-    raise CommandError("Provide --key, --email, or --discord to look up a license.")
-
-
-def cmd_license_revoke(client: OrionAdminClient, args, out, confirmer, revoke: bool) -> dict:
-    if not args.key:
-        raise CommandError("--key is required.")
-    if revoke:
-        reason = _require_reason(args)
-        _confirm_destructive(args, f"revoke {mask_key(args.key)} ({reason})", confirmer)
-    body = {"license_key": args.key, "action": "revoke" if revoke else "unrevoke"}
-    if revoke:
-        body["reason"] = args.reason
-    if client.config.discord_user_id:
-        body["actor_discord_id"] = client.config.discord_user_id
-    data = _unwrap(client.update_license(body))
-    out(f"{'Revoked' if revoke else 'Unrevoked'} {mask_key(args.key)}.")
+    target = _license_target(args)
+    if not target:
+        raise CommandError("Provide --key, --email, --discord, or --machine to look up a license.")
+    body = {"action": "lookup"}
+    body.update(target)
+    data = _unwrap(client.license(body))
+    licenses = data.get("licenses")
+    if licenses is None:
+        licenses = [data["license"]] if isinstance(data.get("license"), dict) else []
+    if data.get("lookup_mode"):
+        out(f"lookup_mode: {data['lookup_mode']}")
+    out(f"{len(licenses)} match(es):")
+    for lic in licenses:
+        for line in format_license(lic, args.reveal):
+            out(line)
+        out("  -")
     return data
 
 
-def cmd_license_reset_hwid(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if not args.key:
-        raise CommandError("--key is required.")
-    reason = _require_reason(args)
-    _confirm_destructive(args, f"reset HWID for {mask_key(args.key)} ({reason})", confirmer)
-    body = {"license_key": args.key, "action": "reset_machine", "reason": reason}
-    if client.config.discord_user_id:
-        body["actor_discord_id"] = client.config.discord_user_id
-    data = _unwrap(client.update_license(body))
-    out(f"Cleared machine binding for {mask_key(args.key)}.")
+def cmd_license_create(client: OrionAdminClient, args, out, confirmer) -> dict:
+    reason = validate_reason(args.reason)
+    if args.count < 1 or args.count > 25:
+        raise CommandError("--count must be between 1 and 25 per call.")
+    body = {
+        "action": "create",
+        "reason": reason,
+        "plan": args.plan,
+        "days": args.days,
+        "count": args.count,
+    }
+    if args.discord:
+        body["discord_user_id"] = args.discord
+    if args.email:
+        body["email"] = args.email
+    if args.note:
+        body["note"] = args.note[:REASON_MAX_CHARS]
+    data = _unwrap(client.license(body))
+    keys = data.get("keys") or ([data["license_key"]] if data.get("license_key") else [])
+    out("License(s) created (store the keys now; they are not shown in full again):")
+    for key in keys:
+        out(f"  {key}")
     return data
 
 
-def cmd_license_deactivate(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if not args.key:
-        raise CommandError("--key is required.")
-    reason = _require_reason(args)
-    _confirm_destructive(args, f"deactivate machine binding for {mask_key(args.key)} ({reason})", confirmer)
-    body = {"license_key": args.key, "action": "deactivate", "machine_id": "", "reason": reason}
-    if client.config.discord_user_id:
-        body["actor_discord_id"] = client.config.discord_user_id
-    data = _unwrap(client.update_license(body))
-    out(f"Deactivated machine binding for {mask_key(args.key)}.")
+def cmd_license_simple(client: OrionAdminClient, args, out, confirmer, action: str) -> dict:
+    """revoke / unrevoke / freeze / unfreeze - body {action, key, reason}."""
+    key = _require_key(args)
+    reason = validate_reason(args.reason)
+    if is_destructive(action):
+        _confirm_destructive(args, f"{action} {mask_key(key)} ({reason})", confirmer)
+    data = _unwrap(client.license({"action": action, "key": key, "reason": reason}))
+    out(f"{action} applied to {mask_key(key)}.")
+    return data
+
+
+def cmd_license_reset_machine(client: OrionAdminClient, args, out, confirmer) -> dict:
+    key = _require_key(args)
+    reason = validate_reason(args.reason)
+    _confirm_destructive(args, f"reset the machine binding for {mask_key(key)} ({reason})", confirmer)
+    body = {"action": "reset_machine", "key": key, "reason": reason}
+    if args.force:
+        body["force"] = True
+    data = _unwrap(client.license(body))
+    out(f"Machine binding reset for {mask_key(key)}"
+        + (" (forced, policy bypassed)." if args.force else f" (mode={data.get('mode', 'staff')})."))
     return data
 
 
 def cmd_license_extend(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if not args.key:
-        raise CommandError("--key is required.")
-    if args.expiry is None and args.days is None:
-        raise CommandError("Provide --days N (extend) or --expiry <unix-ts> (absolute).")
-    if args.expiry is not None:
-        new_expiry = int(args.expiry)
+    key = _require_key(args)
+    reason = validate_reason(args.reason)
+    if args.days is None or args.days <= 0:
+        raise CommandError("--days must be a positive number of days.")
+    data = _unwrap(client.license({"action": "extend", "key": key, "days": int(args.days), "reason": reason}))
+    lic = data.get("license") or {}
+    if lic.get("expiry"):
+        out(f"Extended {mask_key(key)} to {time.strftime('%Y-%m-%d', time.gmtime(int(lic['expiry'])))}.")
     else:
-        current = _unwrap(client.get_license(args.key)).get("license", {})
-        new_expiry = compute_extend_expiry(int(current.get("expiry", 0) or 0), int(time.time()), int(args.days))
-    body = {"license_key": args.key, "action": "extend_expiry", "expiry": new_expiry}
-    if client.config.discord_user_id:
-        body["actor_discord_id"] = client.config.discord_user_id
-    _unwrap(client.update_license(body))
-    out(f"Extended {mask_key(args.key)} to {time.strftime('%Y-%m-%d', time.gmtime(new_expiry))}.")
-    return {"expiry": new_expiry}
+        out(f"Extended {mask_key(key)} by {args.days} day(s).")
+    return data
 
 
 def cmd_license_set_plan(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if not args.key or not args.plan:
-        raise CommandError("--key and --plan are required.")
-    body = {"license_key": args.key, "action": "change_plan", "plan": args.plan}
-    if client.config.discord_user_id:
-        body["actor_discord_id"] = client.config.discord_user_id
-    _unwrap(client.update_license(body))
-    out(f"Set plan for {mask_key(args.key)} to {args.plan}.")
-    return {"plan": args.plan}
+    key = _require_key(args)
+    reason = validate_reason(args.reason)
+    data = _unwrap(client.license({"action": "set_plan", "key": key, "plan": args.plan, "reason": reason}))
+    out(f"Set plan for {mask_key(key)} to {args.plan}.")
+    return data
 
 
-def cmd_staff(client: OrionAdminClient, args, out, confirmer) -> dict:
-    hint = "Staff management endpoint is unavailable on this backend."
-    if args.staff_command == "list":
-        data = _unwrap(client.staff("GET"), not_deployed_hint=hint)
-        for member in data.get("staff", []):
-            status = "enabled" if member.get("enabled", False) else "disabled"
-            out(f"  {member.get('staff_id', '?'):<18} {member.get('discord_user_id', '?'):<22} {member.get('role', '?'):<10} {status}")
-        return data
-    if args.staff_command == "create":
-        if not args.discord or not args.role:
-            raise CommandError("--discord and --role are required to create staff.")
-        body = {
-            "action": "create",
-            "discord_user_id": args.discord,
-            "display_name": args.name or args.discord,
-            "role": args.role,
-            "reason": args.reason or "staff create",
-        }
-        if client.config.discord_user_id:
-            body["actor_discord_id"] = client.config.discord_user_id
-        data = _unwrap(client.staff("POST", body), not_deployed_hint=hint)
-        out(f"Created staff {args.discord} ({args.role}).")
-        if data.get("enrollment_key"):
-            out("Enrollment key (shown once; give it only to that staff member):")
-            out(f"  {data['enrollment_key']}")
-        return data
-    if args.staff_command == "reissue-enrollment":
-        if not args.discord and not args.staff_id:
-            raise CommandError("--discord or --staff-id is required.")
-        reason = _require_reason(args)
-        _confirm_destructive(args, f"reissue staff enrollment ({reason})", confirmer)
-        body = {"action": "reissue_enrollment", "reason": reason}
-        if args.discord:
-            body["discord_user_id"] = args.discord
-        if args.staff_id:
-            body["staff_id"] = args.staff_id
-        data = _unwrap(client.staff("POST", body), not_deployed_hint=hint)
+def cmd_license_transfer(client: OrionAdminClient, args, out, confirmer) -> dict:
+    key = _require_key(args)
+    reason = validate_reason(args.reason)
+    if not args.discord and not args.email:
+        raise CommandError("--discord or --email is required to transfer a license.")
+    _confirm_destructive(args, f"transfer {mask_key(key)} ({reason})", confirmer)
+    body = {"action": "transfer", "key": key, "reason": reason}
+    if args.discord:
+        body["discord_user_id"] = args.discord
+    if args.email:
+        body["email"] = args.email
+    data = _unwrap(client.license(body))
+    out(f"Transferred {mask_key(key)} (machine binding cleared; reset counters travel with the key).")
+    return data
+
+
+def cmd_license_set_reset_policy(client: OrionAdminClient, args, out, confirmer) -> dict:
+    key = _require_key(args)
+    reason = validate_reason(args.reason)
+    body = {"action": "set_reset_policy", "key": key, "reason": reason}
+    if args.free_resets is not None:
+        body["free_resets"] = int(args.free_resets)
+    if args.penalty_days is not None:
+        body["penalty_days"] = int(args.penalty_days)
+    if args.locked is not None:
+        body["locked"] = args.locked == "true"
+    if len(body) == 3:
+        raise CommandError("Nothing to set: pass --free-resets, --penalty-days, or --locked.")
+    data = _unwrap(client.license_owner(body))
+    out(f"Reset policy updated for {mask_key(key)}.")
+    return data
+
+
+def cmd_license_blacklist(client: OrionAdminClient, args, out, confirmer, add: bool) -> dict:
+    reason = validate_reason(args.reason)
+    if not args.machine and not args.discord:
+        raise CommandError("--machine or --discord is required.")
+    action = "blacklist" if add else "unblacklist"
+    if add:
+        _confirm_destructive(args, f"{action} {args.machine or args.discord} ({reason})", confirmer)
+    body = {"action": action, "reason": reason}
+    if args.machine:
+        body["machine_id"] = args.machine
+    if args.discord:
+        body["discord_user_id"] = args.discord
+    data = _unwrap(client.license_owner(body))
+    out(f"{action} applied.")
+    return data
+
+
+# ---- staff ----------------------------------------------------------------- #
+
+def cmd_staff_list(client: OrionAdminClient, args, out, confirmer) -> dict:
+    hint = "Staff management needs the owner backend (not deployed yet)."
+    data = _unwrap(client.staff_list(), not_deployed_hint=hint)
+    members = data.get("staff", [])
+    out(f"{len(members)} staff row(s):")
+    for member in members:
+        caps = member.get("caps") or {}
+        usage = member.get("usage") or {}
+        state = "disabled" if member.get("disabled") else "enabled"
+        out(f"  {member.get('staff_id', '?'):<20} {member.get('discord_user_id', '?'):<22} "
+            f"{member.get('role', '?'):<8} {state:<9} "
+            f"keys {usage.get('keys', 0)}/{caps.get('keys_per_day', 0)} "
+            f"resets {usage.get('resets', 0)}/{caps.get('resets_per_day', 0)} "
+            f"extend<= {caps.get('extend_max_days', 0)}d")
+    return data
+
+
+def cmd_staff_create(client: OrionAdminClient, args, out, confirmer) -> dict:
+    reason = validate_reason(args.reason)
+    body = {"action": "create", "discord_user_id": args.discord, "role": args.role, "reason": reason}
+    caps = parse_caps(args)
+    if caps:
+        body["caps"] = caps
+    data = _unwrap(client.staff(body), not_deployed_hint="Staff management needs the owner backend.")
+    out(f"Created staff {data.get('staff_id', '?')} ({args.role}).")
+    if data.get("enroll_key"):
+        out("Enrollment key (shown once; only its salted hash is stored):")
+        out(f"  {data['enroll_key']}")
+    return data
+
+
+def cmd_staff_action(client: OrionAdminClient, args, out, confirmer, action: str) -> dict:
+    reason = validate_reason(args.reason)
+    if not args.staff_id:
+        raise CommandError("--staff-id is required.")
+    if is_destructive("staff-" + action.replace("_", "-")):
+        _confirm_destructive(args, f"{action} for {args.staff_id} ({reason})", confirmer)
+    body = {"action": action, "staff_id": args.staff_id, "reason": reason}
+    if action == "set_role":
+        body["role"] = args.role
+    if action == "set_caps":
+        caps = parse_caps(args)
+        if not caps:
+            raise CommandError("Pass at least one of --keys-per-day / --resets-per-day / --extend-max-days.")
+        body["caps"] = caps
+    data = _unwrap(client.staff(body), not_deployed_hint="Staff management needs the owner backend.")
+    if action == "reissue_enrollment" and data.get("enroll_key"):
         out("Enrollment key reissued (shown once):")
-        out(f"  {data.get('enrollment_key', '(missing)')}")
-        return data
-    if args.staff_command == "reset-machine":
-        if not args.discord and not args.staff_id:
-            raise CommandError("--discord or --staff-id is required.")
-        reason = _require_reason(args)
-        _confirm_destructive(args, f"reset staff machine binding ({reason})", confirmer)
-        body = {"action": "reset_machine", "reason": reason}
-        if args.discord:
-            body["discord_user_id"] = args.discord
-        if args.staff_id:
-            body["staff_id"] = args.staff_id
-        data = _unwrap(client.staff("POST", body), not_deployed_hint=hint)
-        out("Staff machine binding reset.")
-        return data
-    if args.staff_command == "disable":
-        if not args.discord:
-            raise CommandError("--discord is required.")
-        reason = _require_reason(args)
-        _confirm_destructive(args, f"disable staff {args.discord} ({reason})", confirmer)
-        body = {"action": "disable", "discord_user_id": args.discord, "reason": reason}
-        if client.config.discord_user_id:
-            body["actor_discord_id"] = client.config.discord_user_id
-        data = _unwrap(client.staff("POST", body), not_deployed_hint=hint)
-        out(f"Disabled staff {args.discord}.")
-        return data
-    raise CommandError("Unknown staff command.")
-
-
-def cmd_killswitch(client: OrionAdminClient, args, out, confirmer) -> dict:
-    if args.killswitch_command == "status":
-        data = _unwrap(client.kill_status())
-        state = "ENGAGED" if data.get("global_kill") else "released"
-        out(f"killswitch: {state}" + (f"  reason={data['kill_reason']}" if data.get("kill_reason") else ""))
-        return data
-    if args.killswitch_command == "engage":
-        reason = _require_reason(args)
-        _confirm_destructive(args, f"engage the GLOBAL killswitch ({reason}) — this disables the live service", confirmer)
-        data = _unwrap(client.kill({"target_type": "global", "reason": reason}))
-        out(f"Killswitch engaged. reason={reason}")
-        return data
-    if args.killswitch_command == "release":
-        data = _unwrap(client.unkill({"target_type": "global"}))
-        out("Killswitch released.")
-        return data
-    raise CommandError("Unknown killswitch command.")
+        out(f"  {data['enroll_key']}")
+    else:
+        out(f"staff {action} applied to {args.staff_id}.")
+    return data
 
 
 def cmd_staff_enroll(client: OrionAdminClient, args, out, confirmer) -> dict:
-    data = _unwrap(client.staff_enroll(args.discord, args.enrollment_key, args.name))
+    data = _unwrap(client.staff_enroll(args.staff_id, args.enroll_key))
     token = data.get("token", "")
     if not token:
         raise CommandError("Enrollment succeeded but backend did not return a staff token.")
-    config = load_config()
+    staff = data.get("staff", {})
+    config = load_config(CONFIG_PATH)
     if args.base_url:
         config.base_url = args.base_url
-    staff = data.get("staff", {})
     config.admin_secret = ""
     config.staff_token = token
-    config.discord_user_id = args.discord
+    config.staff_id = staff.get("staff_id", args.staff_id)
+    config.discord_user_id = staff.get("discord_user_id", config.discord_user_id)
     config.role = staff.get("role", "support")
-    save_config(config)
-    out(f"Staff enrolled and credentials saved to {CONFIG_PATH}. Token not displayed.")
+    save_config(config, CONFIG_PATH)
+    out(f"Enrolled on this machine ({config.machine_id_suffix}); credentials saved to {CONFIG_PATH}. "
+        "Token not displayed.")
     return data
 
 
 def cmd_staff_login(client: OrionAdminClient, args, out, confirmer) -> dict:
-    data = _unwrap(client.staff_login(args.discord))
+    data = _unwrap(client.staff_login(args.staff_id))
     token = data.get("token", "")
     if not token:
         raise CommandError("Login succeeded but backend did not return a staff token.")
-    config = load_config()
+    staff = data.get("staff", {})
+    config = load_config(CONFIG_PATH)
     if args.base_url:
         config.base_url = args.base_url
-    staff = data.get("staff", {})
     config.admin_secret = ""
     config.staff_token = token
-    config.discord_user_id = args.discord
+    config.staff_id = staff.get("staff_id", args.staff_id)
+    config.discord_user_id = staff.get("discord_user_id", config.discord_user_id)
     config.role = staff.get("role", "support")
-    save_config(config)
+    save_config(config, CONFIG_PATH)
     out(f"Staff login saved to {CONFIG_PATH}. Token not displayed.")
     return data
 
 
+# ---- audit ----------------------------------------------------------------- #
+
 def cmd_audit(client: OrionAdminClient, args, out, confirmer) -> dict:
-    data = _unwrap(client.audit(args.limit),
-                   not_deployed_hint="Audit log needs the staff backend (not deployed yet).")
-    events = data.get("events", [])
-    out(f"{len(events)} audit event(s) (newest first):")
-    for event in events:
-        out("  " + format_audit_row(event))
+    query = {"limit": str(max(1, min(200, args.limit)))}
+    for name in ("since", "until", "actor", "action", "target", "cursor"):
+        value = getattr(args, name, "")
+        if value:
+            query[name] = str(value)
+    data = _unwrap(client.audit(query), not_deployed_hint="Audit log needs the v2 backend (not deployed yet).")
+    rows = data.get("audit", [])
+    out(f"{len(rows)} audit row(s):")
+    for row in rows:
+        out("  " + format_audit_row(row))
+    if data.get("next_cursor"):
+        out(f"next cursor: {data['next_cursor']}")
+    return data
+
+
+# ---- config / killswitch --------------------------------------------------- #
+
+def cmd_server_config_show(client: OrionAdminClient, args, out, confirmer) -> dict:
+    data = _unwrap(client.server_config(), not_deployed_hint="Config endpoint needs the owner backend.")
+    config = data.get("config", data)
+    for key in sorted(config.keys()):
+        if key == "ok":
+            continue
+        out(f"  {key}: {json.dumps(config[key], sort_keys=True)}")
+    return data
+
+
+def cmd_server_config_set(client: OrionAdminClient, args, out, confirmer) -> dict:
+    reason = validate_reason(args.reason)
+    body = {"reason": reason}
+    if args.min_client_version:
+        body["min_client_version"] = args.min_client_version
+    if args.blocked_versions is not None:
+        body["blocked_versions"] = parse_list(args.blocked_versions)
+    if args.motd_text is not None:
+        body["motd"] = {
+            "text": args.motd_text,
+            "level": args.motd_level,
+            "until": int(args.motd_until or 0),
+        }
+    policy = {}
+    for arg_name, field in (("free_resets", "free_resets"), ("penalty_days", "penalty_days"),
+                            ("cooldown_s", "cooldown_s")):
+        value = getattr(args, arg_name)
+        if value is not None:
+            policy[field] = int(value)
+    if args.self_service is not None:
+        policy["self_service"] = args.self_service == "true"
+    if policy:
+        body["reset_policy_defaults"] = policy
+    fraud = {}
+    if args.machines_30d is not None:
+        fraud["machines_30d"] = int(args.machines_30d)
+    if args.resets_30d is not None:
+        fraud["resets_30d"] = int(args.resets_30d)
+    if fraud:
+        body["fraud_thresholds"] = fraud
+    alerts = {}
+    if args.alert_owner:
+        alerts["owner_discord_user_id"] = args.alert_owner
+    if args.alert_events is not None:
+        alerts["events"] = parse_list(args.alert_events)
+    if alerts:
+        body["alerts"] = alerts
+    if args.owner_totp_required is not None:
+        body["owner_totp_required"] = args.owner_totp_required == "true"
+    if args.ip_allowlist is not None:
+        body["owner_ip_allowlist"] = parse_list(args.ip_allowlist)
+    if len(body) == 1:
+        raise CommandError("Nothing to set. See 'orion-admin server-config set --help'.")
+    data = _unwrap(client.server_config_update(body))
+    out("Config updated: " + ", ".join(sorted(k for k in body if k != "reason")))
+    return data
+
+
+def cmd_totp_enroll(client: OrionAdminClient, args, out, confirmer) -> dict:
+    reason = validate_reason(args.reason)
+    data = _unwrap(client.server_config_update({"action": "totp_enroll", "reason": reason}))
+    out("TOTP enrollment (shown once):")
+    out(f"  otpauth: {data.get('otpauth_uri', '(missing)')}")
+    if data.get("secret"):
+        out(f"  secret:  {data['secret']}")
+    out("Confirm a code with 'orion-admin server-config totp-confirm --code ...' to turn the requirement on.")
+    return data
+
+
+def cmd_totp_confirm(client: OrionAdminClient, args, out, confirmer) -> dict:
+    reason = validate_reason(args.reason)
+    if not args.code:
+        raise CommandError("--code is required.")
+    data = _unwrap(client.server_config_update({"action": "totp_confirm", "code": args.code, "reason": reason}))
+    out("TOTP confirmed. Owner-secret requests now require a code (send it with ORION_ADMIN_TOTP).")
+    return data
+
+
+def cmd_rotate_secret(client: OrionAdminClient, args, out, confirmer) -> dict:
+    reason = validate_reason(args.reason)
+    _confirm_destructive(args, f"rotate the owner admin secret ({reason})", confirmer)
+    data = _unwrap(client.server_config_update({"action": "rotate_admin_secret", "reason": reason}))
+    secret = data.get("admin_secret") or data.get("new_secret") or data.get("secret")
+    if not secret:
+        raise CommandError("Rotation succeeded but the backend returned no secret.")
+    out("New admin secret (shown once; store it now, the old one is dead):")
+    out(f"  {secret}")
+    return data
+
+
+def cmd_killswitch(client: OrionAdminClient, args, out, confirmer) -> dict:
+    # Contract §5: global kill lives in the owner config; the bot route is read-only.
+    if args.killswitch_command == "status":
+        data = _unwrap(client.server_config())
+        config = data.get("config", data)
+        state = "ENGAGED" if config.get("global_kill") else "released"
+        reason = config.get("kill_reason") or config.get("global_kill_reason") or ""
+        out(f"killswitch: {state}" + (f"  reason={reason}" if reason else ""))
+        return data
+    reason = validate_reason(args.reason)
+    engage = args.killswitch_command == "engage"
+    if engage:
+        _confirm_destructive(args, f"engage the GLOBAL killswitch ({reason}) - this disables the live service",
+                             confirmer)
+    data = _unwrap(client.server_config_update({"global_kill": engage, "reason": reason}))
+    out(f"Killswitch {'engaged' if engage else 'released'}. reason={reason}")
     return data
 
 
 # --------------------------------------------------------------------------- #
 # Parser + dispatch
 # --------------------------------------------------------------------------- #
+
+def _add_reason(parser, default: str = "") -> None:
+    parser.add_argument("--reason", default=default,
+                        help=f"Required audit reason (≤{REASON_MAX_CHARS} chars).")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="orion-admin", description="Orion owner/staff admin CLI.")
@@ -640,90 +968,178 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("version", help="Show backend version.")
-    sub.add_parser("whoami", help="Show the authenticated identity/role.")
+    sub.add_parser("whoami", help="Show the authenticated identity, role, caps and usage.")
+    sub.add_parser("caps", help="Print the capability matrix (display only).")
+    sub.add_parser("metrics", help="Owner dashboard metrics.")
 
     login = sub.add_parser("login", help="Store admin/staff credentials locally (prompted, never echoed).")
     login.add_argument("--mode", choices=["owner", "staff"], default="owner")
-    login.add_argument("--discord", default="", help="Discord user id (required for staff).")
-    login.add_argument("--role", default="", help="Local role label for advisory gating.")
+    login.add_argument("--staff-id", default="", help="Staff id (required for staff).")
+    login.add_argument("--discord", default="", help="Discord user id (staff actor identity).")
+    login.add_argument("--role", default="", help="Local role label for display.")
     sub.add_parser("logout", help="Remove the local credential file.")
-    sub.add_parser("config", help="Show the (redacted) effective config.")
+    sub.add_parser("config", help="Show the (redacted) effective local config.")
 
-    p = sub.add_parser("staff-enroll", help="Enroll this machine with a one-time staff key.")
-    p.add_argument("--discord", required=True, help="Discord user id registered by the owner.")
-    p.add_argument("--enrollment-key", required=True, help="One-time enrollment key from the owner.")
-    p.add_argument("--name", default="", help="Optional local display name.")
+    p = sub.add_parser("staff-enroll", help="Enrol this machine with the one-time enroll key.")
+    p.add_argument("--staff-id", required=True, help="Staff id issued by the owner.")
+    p.add_argument("--enroll-key", required=True, help="One-time enroll key from the owner.")
 
     p = sub.add_parser("staff-login", help="Refresh a staff bearer token for this machine.")
-    p.add_argument("--discord", required=True, help="Discord user id registered by the owner.")
+    p.add_argument("--staff-id", required=True, help="Staff id issued by the owner.")
 
-    lic = sub.add_parser("license", help="License operations.")
+    # ---- licenses ------------------------------------------------------
+    lic = sub.add_parser("license", help="License operations (contract §2).")
     lic_sub = lic.add_subparsers(dest="license_command", required=True)
 
-    p = lic_sub.add_parser("create", help="Provision a new license (key shown once).")
-    p.add_argument("--email", required=True)
-    p.add_argument("--plan", default="standard")
-    p.add_argument("--days", type=int, default=365)
-    p.add_argument("--discord", default="")
-    p.add_argument("--key", default="", help="Optional custom key; auto-generated if omitted.")
-
-    p = lic_sub.add_parser("lookup", help="Look up a license by key/email/discord.")
+    p = lic_sub.add_parser("lookup", help="Look up by key / email / discord / machine.")
     p.add_argument("--key", default="")
     p.add_argument("--email", default="")
     p.add_argument("--discord", default="")
+    p.add_argument("--machine", default="")
     p.add_argument("--reveal", action="store_true", help="Show the full key (off by default).")
 
-    for name, help_text in (("revoke", "Revoke a license."), ("unrevoke", "Un-revoke a license.")):
+    p = lic_sub.add_parser("create", help="Create licenses (keys shown once).")
+    # Owner rule 2026-09-15: `month` is the only plan sold (free 3-day trial, then
+    # $25/month recurring). `lifetime`/`week`/`day` are still ACCEPTED so staff can
+    # mint a comp and so keys already sold keep resolving — they are not sold.
+    p.add_argument("--plan", default=SELLABLE_PLAN,
+                   help=f"Plan tier. Default {SELLABLE_PLAN!r} — the only plan sold. "
+                        "Legacy values (week/day/lifetime) still mint, for staff comps.")
+    p.add_argument("--days", type=int, default=30, help="0 = lifetime (staff comp only).")
+    p.add_argument("--count", type=int, default=1, help="1-25 per call.")
+    p.add_argument("--discord", default="")
+    p.add_argument("--email", default="")
+    p.add_argument("--note", default="")
+    _add_reason(p)
+
+    for name, help_text in (("revoke", "Revoke a license."),
+                            ("unrevoke", "Un-revoke a license."),
+                            ("freeze", "Freeze a license (the clock stops)."),
+                            ("unfreeze", "Unfreeze a license (expiry moves by the frozen span).")):
         p = lic_sub.add_parser(name, help=help_text)
         p.add_argument("--key", required=True)
-        p.add_argument("--reason", default="")
+        _add_reason(p)
 
-    p = lic_sub.add_parser("reset-hwid", help="Clear the machine binding (HWID reset).")
+    p = lic_sub.add_parser("reset-machine", help="Clear the machine binding (HWID reset).")
     p.add_argument("--key", required=True)
-    p.add_argument("--reason", default="")
+    p.add_argument("--force", action="store_true", help="Owner only: ignore cooldown, lock and counters.")
+    _add_reason(p)
 
-    p = lic_sub.add_parser("deactivate", help="Deactivate the current machine binding.")
+    p = lic_sub.add_parser("extend", help="Extend expiry by N days (the server computes the new expiry).")
     p.add_argument("--key", required=True)
-    p.add_argument("--reason", default="")
+    p.add_argument("--days", type=int, default=None)
+    _add_reason(p)
 
-    p = lic_sub.add_parser("extend", help="Extend or set expiry.")
-    p.add_argument("--key", required=True)
-    p.add_argument("--days", type=int, default=None, help="Add N days from the later of now/current expiry.")
-    p.add_argument("--expiry", type=int, default=None, help="Absolute expiry as a unix timestamp.")
-
-    p = lic_sub.add_parser("set-plan", help="Change the plan tier.")
+    p = lic_sub.add_parser("set-plan", help=f"Change the plan tier (sold: {SELLABLE_PLAN}).")
     p.add_argument("--key", required=True)
     p.add_argument("--plan", required=True)
+    _add_reason(p)
 
-    staff = sub.add_parser("staff", help="Owner-only staff management.")
+    p = lic_sub.add_parser("transfer", help="Transfer a key to another owner (clears the machine binding).")
+    p.add_argument("--key", required=True)
+    p.add_argument("--discord", default="")
+    p.add_argument("--email", default="")
+    _add_reason(p)
+
+    p = lic_sub.add_parser("set-reset-policy", help="Owner: per-key HWID reset policy.")
+    p.add_argument("--key", required=True)
+    p.add_argument("--free-resets", type=int, default=None)
+    p.add_argument("--penalty-days", "--deduct-days", type=int, default=None, dest="penalty_days")
+    p.add_argument("--locked", choices=["true", "false"], default=None)
+    _add_reason(p)
+
+    for name, help_text in (("blacklist", "Owner: block a machine or Discord id."),
+                            ("unblacklist", "Owner: remove a blacklist entry.")):
+        p = lic_sub.add_parser(name, help=help_text)
+        p.add_argument("--machine", default="")
+        p.add_argument("--discord", default="")
+        _add_reason(p)
+
+    # ---- staff ---------------------------------------------------------
+    staff = sub.add_parser("staff", help="Owner-only staff management (contract §2).")
     staff_sub = staff.add_subparsers(dest="staff_command", required=True)
-    staff_sub.add_parser("list", help="List staff.")
-    p = staff_sub.add_parser("create", help="Create a staff member.")
-    p.add_argument("--discord", required=True)
-    p.add_argument("--name", default="", help="Staff display name.")
-    p.add_argument("--role", required=True, choices=["owner", "admin", "support"])
-    p.add_argument("--reason", default="staff create")
-    p = staff_sub.add_parser("disable", help="Disable a staff member.")
-    p.add_argument("--discord", required=True)
-    p.add_argument("--reason", default="")
-    p = staff_sub.add_parser("reset-machine", help="Clear a staff member's tool machine binding.")
-    p.add_argument("--discord", default="")
-    p.add_argument("--staff-id", default="")
-    p.add_argument("--reason", default="")
-    p = staff_sub.add_parser("reissue-enrollment", help="Issue a new one-time enrollment key.")
-    p.add_argument("--discord", default="")
-    p.add_argument("--staff-id", default="")
-    p.add_argument("--reason", default="")
+    staff_sub.add_parser("list", help="List staff with role, caps and usage.")
 
-    kill = sub.add_parser("killswitch", help="Owner-only global killswitch (disables the live service).")
+    p = staff_sub.add_parser("create", help="Create a staff row; returns the one-time enroll key.")
+    p.add_argument("--discord", required=True)
+    p.add_argument("--role", required=True, choices=["owner", "admin", "support"])
+    p.add_argument("--keys-per-day", type=int, default=None)
+    p.add_argument("--resets-per-day", type=int, default=None)
+    p.add_argument("--extend-max-days", type=int, default=None)
+    _add_reason(p)
+
+    for name, help_text in (("disable", "Disable a staff member."),
+                            ("enable", "Re-enable a staff member."),
+                            ("reset-machine", "Clear the machine binding and revoke tokens."),
+                            ("reissue-enrollment", "Issue a new one-time enroll key.")):
+        p = staff_sub.add_parser(name, help=help_text)
+        p.add_argument("--staff-id", required=True)
+        _add_reason(p)
+
+    p = staff_sub.add_parser("set-role", help="Change a staff member's role.")
+    p.add_argument("--staff-id", required=True)
+    p.add_argument("--role", required=True, choices=["owner", "admin", "support"])
+    _add_reason(p)
+
+    p = staff_sub.add_parser("set-caps", help="Change a staff member's daily caps.")
+    p.add_argument("--staff-id", required=True)
+    p.add_argument("--keys-per-day", type=int, default=None)
+    p.add_argument("--resets-per-day", type=int, default=None)
+    p.add_argument("--extend-max-days", type=int, default=None)
+    _add_reason(p)
+
+    # ---- audit ---------------------------------------------------------
+    p = sub.add_parser("audit", help="Audit rows (owner: everything; staff: own rows).")
+    p.add_argument("--since", default="", help="Unix seconds.")
+    p.add_argument("--until", default="", help="Unix seconds.")
+    p.add_argument("--actor", default="")
+    p.add_argument("--action", default="")
+    p.add_argument("--target", default="")
+    p.add_argument("--cursor", default="", help="Continue a previous page.")
+    p.add_argument("--limit", type=int, default=50, help="Max 200.")
+
+    # ---- server config -------------------------------------------------
+    cfg = sub.add_parser("server-config", help="Owner config: version gate, MOTD, policy, alerts, TOTP (contract §5).")
+    cfg_sub = cfg.add_subparsers(dest="config_command", required=True)
+    cfg_sub.add_parser("show", help="Print the current server config.")
+
+    p = cfg_sub.add_parser("set", help="Update config keys.")
+    p.add_argument("--min-client-version", default="")
+    p.add_argument("--blocked-versions", default=None, help="Comma separated; empty string clears.")
+    p.add_argument("--motd-text", default=None, help="Empty string clears the MOTD.")
+    p.add_argument("--motd-level", choices=["info", "warn", "maint"], default="info")
+    p.add_argument("--motd-until", type=int, default=None, help="Unix seconds.")
+    p.add_argument("--free-resets", type=int, default=None,
+                   help=f"Free HWID resets per key (default {RESET_FREE_DEFAULT}).")
+    p.add_argument("--penalty-days", "--deduct-days", type=int, default=None, dest="penalty_days",
+                   help=f"Days deducted per reset once the free ones are used "
+                        f"(default {RESET_PENALTY_DAYS}).")
+    p.add_argument("--cooldown-s", type=int, default=None)
+    p.add_argument("--self-service", choices=["true", "false"], default=None)
+    p.add_argument("--machines-30d", type=int, default=None)
+    p.add_argument("--resets-30d", type=int, default=None)
+    p.add_argument("--alert-owner", default="", help="alerts.owner_discord_user_id")
+    p.add_argument("--alert-events", default=None, help="Comma separated event names.")
+    p.add_argument("--owner-totp-required", choices=["true", "false"], default=None)
+    p.add_argument("--ip-allowlist", default=None, help="Comma separated CIDRs; empty string clears.")
+    _add_reason(p)
+
+    p = cfg_sub.add_parser("totp-enroll", help="Start owner TOTP enrollment (URI shown once).")
+    _add_reason(p)
+    p = cfg_sub.add_parser("totp-confirm", help="Confirm a TOTP code and turn the requirement on.")
+    p.add_argument("--code", required=True)
+    _add_reason(p)
+    p = cfg_sub.add_parser("rotate-secret", help="Rotate the owner admin secret (new secret shown once).")
+    _add_reason(p)
+
+    # ---- killswitch ----------------------------------------------------
+    kill = sub.add_parser("killswitch", help="Owner-only global killswitch (config.global_kill).")
     kill_sub = kill.add_subparsers(dest="killswitch_command", required=True)
     kill_sub.add_parser("status", help="Show whether the global killswitch is engaged.")
-    p = kill_sub.add_parser("engage", help="Engage the global killswitch (disables new activations + running sessions).")
-    p.add_argument("--reason", default="")
-    kill_sub.add_parser("release", help="Release the global killswitch.")
-
-    p = sub.add_parser("audit", help="Show recent admin/audit events.")
-    p.add_argument("--limit", type=int, default=50)
+    p = kill_sub.add_parser("engage", help="Engage the global killswitch.")
+    _add_reason(p)
+    p = kill_sub.add_parser("release", help="Release the global killswitch.")
+    _add_reason(p)
 
     return parser
 
@@ -740,19 +1156,48 @@ def _handle_login(args, out, prompter: Callable[[str], str], path: Path = CONFIG
         config.admin_secret = secret.strip()
         config.role = args.role or "owner"
     else:
-        if not args.discord:
-            out("Staff login requires --discord <id>.")
+        if not args.staff_id:
+            out("Staff login requires --staff-id <id>.")
             return 1
         token = prompter("Staff token: ")
         if not token:
             out("No token entered; nothing saved.")
             return 1
         config.staff_token = token.strip()
-        config.discord_user_id = args.discord
+        config.staff_id = args.staff_id
+        config.discord_user_id = args.discord or config.discord_user_id
         config.role = args.role or "support"
     save_config(config, path)
     out(f"Credentials saved to {path} (role={config.role}). Secret not displayed.")
     return 0
+
+
+LICENSE_DISPATCH = {
+    "lookup": cmd_license_lookup,
+    "create": cmd_license_create,
+    "reset-machine": cmd_license_reset_machine,
+    "extend": cmd_license_extend,
+    "set-plan": cmd_license_set_plan,
+    "transfer": cmd_license_transfer,
+    "set-reset-policy": cmd_license_set_reset_policy,
+}
+
+STAFF_ACTION_DISPATCH = {
+    "disable": "disable",
+    "enable": "enable",
+    "reset-machine": "reset_machine",
+    "reissue-enrollment": "reissue_enrollment",
+    "set-role": "set_role",
+    "set-caps": "set_caps",
+}
+
+CONFIG_DISPATCH = {
+    "show": cmd_server_config_show,
+    "set": cmd_server_config_set,
+    "totp-enroll": cmd_totp_enroll,
+    "totp-confirm": cmd_totp_confirm,
+    "rotate-secret": cmd_rotate_secret,
+}
 
 
 def run(args, client: OrionAdminClient, out: Callable[[str], None], confirmer: Callable[[str], bool]) -> int:
@@ -762,6 +1207,8 @@ def run(args, client: OrionAdminClient, out: Callable[[str], None], confirmer: C
             cmd_version(client, args, out, confirmer)
         elif args.command == "whoami":
             cmd_whoami(client, args, out, confirmer)
+        elif args.command == "caps":
+            cmd_caps(client, args, out, confirmer)
         elif args.command == "config":
             for key, value in redact_config(client.config).items():
                 out(f"  {key}: {value}")
@@ -769,37 +1216,45 @@ def run(args, client: OrionAdminClient, out: Callable[[str], None], confirmer: C
             cmd_staff_enroll(client, args, out, confirmer)
         elif args.command == "staff-login":
             cmd_staff_login(client, args, out, confirmer)
+        elif args.command == "metrics":
+            _require_auth(client)
+            cmd_metrics(client, args, out, confirmer)
         elif args.command == "license":
-            if not client.config.has_auth:
-                raise CommandError("Not authenticated. Run 'orion-admin login' or set ORION_ADMIN_SECRET.")
-            dispatch = {
-                "create": cmd_license_create,
-                "lookup": cmd_license_lookup,
-                "reset-hwid": cmd_license_reset_hwid,
-                "deactivate": cmd_license_deactivate,
-                "extend": cmd_license_extend,
-                "set-plan": cmd_license_set_plan,
-            }
-            if args.license_command in ("revoke", "unrevoke"):
-                cmd_license_revoke(client, args, out, confirmer, revoke=(args.license_command == "revoke"))
+            _require_auth(client)
+            if args.license_command in ("revoke", "unrevoke", "freeze", "unfreeze"):
+                cmd_license_simple(client, args, out, confirmer, action=args.license_command)
+            elif args.license_command in ("blacklist", "unblacklist"):
+                cmd_license_blacklist(client, args, out, confirmer, add=(args.license_command == "blacklist"))
             else:
-                dispatch[args.license_command](client, args, out, confirmer)
+                LICENSE_DISPATCH[args.license_command](client, args, out, confirmer)
         elif args.command == "staff":
-            if not client.config.has_auth:
-                raise CommandError("Not authenticated.")
-            cmd_staff(client, args, out, confirmer)
-        elif args.command == "killswitch":
-            if not client.config.has_auth:
-                raise CommandError("Not authenticated.")
-            cmd_killswitch(client, args, out, confirmer)
+            _require_auth(client)
+            if args.staff_command == "list":
+                cmd_staff_list(client, args, out, confirmer)
+            elif args.staff_command == "create":
+                cmd_staff_create(client, args, out, confirmer)
+            else:
+                cmd_staff_action(client, args, out, confirmer, action=STAFF_ACTION_DISPATCH[args.staff_command])
         elif args.command == "audit":
+            _require_auth(client)
             cmd_audit(client, args, out, confirmer)
+        elif args.command == "server-config":
+            _require_auth(client)
+            CONFIG_DISPATCH[args.config_command](client, args, out, confirmer)
+        elif args.command == "killswitch":
+            _require_auth(client)
+            cmd_killswitch(client, args, out, confirmer)
         else:
             raise CommandError(f"Unknown command: {args.command}")
         return 0
     except CommandError as exc:
         out(f"error: {exc}")
         return 1
+
+
+def _require_auth(client: OrionAdminClient) -> None:
+    if not client.config.has_auth:
+        raise CommandError("Not authenticated. Run 'orion-admin login' or set ORION_ADMIN_SECRET.")
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -820,6 +1275,14 @@ def main(argv: Optional[list] = None) -> int:
     config = load_config()
     if args.base_url:
         config.base_url = args.base_url
+    if (config.admin_secret and not config.admin_totp and sys.stdin.isatty()
+            and args.command not in ("version", "caps", "config")):
+        # Contract §5: an owner-secret request needs a TOTP once the owner has
+        # enrolled. Prompted per invocation, never stored; blank stays blank so
+        # a not-yet-enrolled owner just presses enter. Scripts (no tty) use
+        # ORION_ADMIN_TOTP instead.
+        code = input("TOTP code (blank if not enrolled): ").strip()
+        config.admin_totp = "".join(ch for ch in code if ch.isdigit())
     client = OrionAdminClient(config, UrllibTransport())
 
     def interactive_confirm(prompt: str) -> bool:

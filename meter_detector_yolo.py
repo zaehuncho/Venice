@@ -556,10 +556,12 @@ class AsyncMeterLocator:
         self._stop = False
         self._thread = None
         self.infer_ms = 0.0
-        # Min gap between inferences (GIL breathing room for the preview; see _loop). 40ms=25fps
-        # default: enough headroom to stop the stutter while the box-hold keeps tracking smooth.
+        # Min gap between inferences. For pure-CV (provider=="cv-contour"), inference takes ~0.5ms
+        # with zero GIL stall, so min interval defaults to 0ms (zero artificial lag). For YOLO,
+        # it defaults to 15ms.
+        _default_interval = "0" if getattr(self._base, "provider", "") == "cv-contour" else "15"
         self._min_interval_s = max(0.0, float(
-            os.environ.get("ORION_METER_DETECTOR_MIN_INTERVAL_MS", "15")) / 1000.0)
+            os.environ.get("ORION_METER_DETECTOR_MIN_INTERVAL_MS", _default_interval)) / 1000.0)
         self._last_infer_end = 0.0
         # SYNC mode (offline replay/eval only): submit() runs inference inline so latest()
         # always reflects the frame just submitted -- decouples the seed/veto CORRECTNESS test
@@ -663,6 +665,18 @@ class AsyncMeterLocator:
             raise ValueError("region must be 'full', 'left', or 'right'")
         return self._detect_now_scoped(frame, ts, _region)
 
+    def _base_detect(self, frame, ts):
+        # [ORION_METER_PROPOSER=cv] the CV locator keeps per-frame temporal state (ROI hold,
+        # one-frame confirmation) on the FRAME clock; the ONNX locator is stateless.
+        if getattr(self._base, "accepts_ts", False):
+            return self._base.detect_box(frame, ts=ts)
+        return self._base.detect_box(frame)
+
+    def _base_detect_tile(self, frame, side, ts):
+        if getattr(self._base, "accepts_ts", False):
+            return self._base.detect_box_tile(frame, side, 0.55, ts=ts)
+        return self._base.detect_box_tile(frame, side, 0.55)
+
     def _detect_now_scoped(self, frame, ts: float, region: str):
         if not self.ok or frame is None:
             return (False, None, 0.0, float(ts))
@@ -673,9 +687,9 @@ class AsyncMeterLocator:
             generation = self._generation
         t0 = time.perf_counter()
         if region == "full":
-            b = self._base.detect_box(frame)
+            b = self._base_detect(frame, ts)
         else:
-            b = self._base.detect_box_tile(frame, region, 0.55)
+            b = self._base_detect_tile(frame, region, ts)
         dt = (time.perf_counter() - t0) * 1000.0
         with self._lock:
             if self._stop or generation != self._generation:
@@ -692,6 +706,12 @@ class AsyncMeterLocator:
         return res
 
     def _invalidate_locked(self) -> None:
+        _reset = getattr(self._base, "reset", None)
+        if callable(_reset):
+            try:
+                _reset()                      # the CV locator keeps temporal state on the frame clock
+            except Exception:
+                pass
         """Drop old evidence/work while holding _lock; never wait for inference."""
         self._generation += 1
         self._pending = None
@@ -718,6 +738,43 @@ class AsyncMeterLocator:
         with self._cv:
             self._invalidate_locked()
             self._cv.notify_all()
+
+    def forget_position(self, box=None):
+        """Ask the base locator to forget WHERE it last saw a meter (nothing else).
+
+        [ORION_READER_GHOST_FORGET_LOCATOR 2026-09-15] The reader calls this when it evicts or
+        retires a leftover meter, so the retired object's position can no longer bridge the
+        base locator's own acceptance gates.  Unlike ``reset()`` this does NOT bump the
+        generation, drop the pending frame or clear the published result: a legitimately
+        in-flight inference of the REAL meter must survive.  Inert for a stateless proposer.
+
+        [box= 2026-09-16] ``box`` names the GHOST being evicted so the base locator can keep
+        the first-sight pairs that belong to a different column (see
+        ``MeterContourLocator.forget_position``).  Forwarded positionally only when given, so
+        a base locator predating the argument still works.  Returns the kept pair names.
+        """
+        fn = getattr(self._base, "forget_position", None)
+        if not callable(fn):
+            return ()
+        try:
+            return fn(box) if box is not None else fn()
+        except TypeError:
+            try:                       # a base that never learned the argument
+                return fn()
+            except Exception:
+                return ()
+        except Exception:
+            return ()
+
+    def pending_pairs(self, now=None):
+        """[ORION_READER_FORGET_RATE_LIMIT] Forward the base locator's live first-sight pairs."""
+        fn = getattr(self._base, "pending_pairs", None)
+        if not callable(fn):
+            return ()
+        try:
+            return tuple(fn(now) or ())
+        except Exception:
+            return ()
 
     def stop(self) -> None:
         with self._cv:
@@ -766,9 +823,9 @@ class AsyncMeterLocator:
                     self._cv.wait(timeout=gap)
             t0 = time.perf_counter()
             if scope == "full":
-                b = self._base.detect_box(frame)
+                b = self._base_detect(frame, ts)
             else:
-                b = self._base.detect_box_tile(frame, scope, 0.55)
+                b = self._base_detect_tile(frame, scope, ts)
             dt = (time.perf_counter() - t0) * 1000.0
             with self._lock:
                 if self._stop or generation != self._generation:
@@ -805,7 +862,16 @@ def get_locator() -> Optional[MeterYoloLocator]:
                     _conf = _v
         except Exception:
             _conf = 0.35
-        _SINGLETON = MeterYoloLocator(conf_thres=_conf)
+        # [ORION_METER_PROPOSER=cv] owner A/B 2026-09-10: swap ONLY the box proposer for the
+        # pure-CV landmark locator (meter_locator_cv.py); the async wrapper and the reader's
+        # in-box fill measurement are unchanged. Unset / "yolo" = the shipped ONNX detector.
+        # Explicit on purpose: the dev launcher pins it; the shipped profile does not.
+        _which = os.environ.get("ORION_METER_PROPOSER", "").strip().lower()
+        if _which == "cv":
+            import meter_locator_cv as _mlc
+            _SINGLETON = _mlc.MeterContourLocator()
+        else:
+            _SINGLETON = MeterYoloLocator(conf_thres=_conf)
     return _SINGLETON if _SINGLETON.ok else None
 
 

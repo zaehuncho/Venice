@@ -1,7 +1,10 @@
+#include "NativeCrashDiagnostics.h"
 #include "OrionAppController.h"
+#include "SidecarReaderProfile.h"
 
 #include <QtCore/QAbstractNativeEventFilter>
 #include <QtCore/QDir>
+#include <QtCore/QDebug>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QSettings>
@@ -16,6 +19,7 @@
 #include <QtQml/QQmlError>
 #include <QtQuick/QQuickWindow>
 #include <QtQuickControls2/QQuickStyle>
+#include <QtCore/QEventLoop>
 #include <QtWidgets/QApplication>
 
 #ifdef Q_OS_WIN
@@ -249,6 +253,19 @@ int main(int argc, char* argv[])
     QApplication::setOrganizationName(QStringLiteral("NexusVision"));
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
+    // Resolve the native scheduler half of the same profile applied to the
+    // sidecar later by RemotePlaySession. This must happen before controller
+    // construction because AutomationEngine reads these values while applying
+    // its initial configuration.
+#ifdef ORION_PRODUCTION_BUILD
+    constexpr bool preserveTimingOverrides = false;
+#else
+    constexpr bool preserveTimingOverrides = true;
+#endif
+    const QString nativeTimingProfile =
+        orion::applyShippedNativeTimingProfile(preserveTimingOverrides);
+    qInfo().noquote() << "Native shipped timing profile:" << nativeTimingProfile;
+
     // orion://activate?key=... deep link (zero-typing activation). The OS hands the
     // URI as a plain argv entry when the registered protocol handler launches us.
     QString deepLinkUri;
@@ -286,32 +303,38 @@ int main(int argc, char* argv[])
 
     const QString appDir = QCoreApplication::applicationDirPath();
     QString rootDir = appDir;
+#ifndef ORION_PRODUCTION_BUILD
     const QString desktopNexus = QDir::homePath() + QStringLiteral("/Desktop/NexusVision");
     const QString appDirNative = QDir::fromNativeSeparators(appDir).toLower();
-    [[maybe_unused]] const bool devBuildDir = appDirNative.contains(QStringLiteral("/native_orion/build/"))
+    const bool devBuildDir = appDirNative.contains(QStringLiteral("/native_orion/build/"))
         || appDirNative.contains(QStringLiteral("/native_orion\\build\\"));
     // Root-dir redirection is a DEV convenience (run the build-dir exe against the source-tree
     // settings/models). In production it is an integrity hole: an env var + a planted
     // ~/Desktop/NexusVision/settings.json would repoint the app at an attacker-controlled root,
     // sidestepping the install-dir the release manifest validates. Compiled out entirely in prod.
-#ifdef ORION_PRODUCTION_BUILD
-    const bool allowDevRootFallback = false;
-#else
     const bool allowDevRootFallback = devBuildDir || qEnvironmentVariableIntValue("ORION_DEV_ROOT_FALLBACK") > 0;
-#endif
     if (allowDevRootFallback && QFileInfo::exists(desktopNexus + QStringLiteral("/settings.json"))) {
         rootDir = desktopNexus;
     }
+#endif
     const QString iconPath = rootDir + QStringLiteral("/assets/orion.ico");
     if (QFileInfo::exists(iconPath)) {
         QApplication::setWindowIcon(QIcon(iconPath));
     }
 
+    // [2026-09-11] The controller is constructed BEFORE the QML engine so it is destroyed AFTER
+    // it. Crash dump 15:19 (OrionNative.exe.23976.dmp, Release PDB): with the old order the
+    // controller's ~QObject ran while the engine, its windows and the scene-graph render thread
+    // were still alive, and removePostedEvents tore down a blocking meta-call event whose sender
+    // thread had already gone -> QSemaphore::release on a dead semaphore -> 0xc0000409. QML holds
+    // the controller only as a context property, so the engine must go first anyway.
+    QDir().mkpath(rootDir + QStringLiteral("/logs"));
+    orion::native_crash_diagnostics::install(rootDir + QStringLiteral("/logs/launcher_crash.log"));
+    orion::OrionAppController controller(rootDir);
     QQmlApplicationEngine engine;
     auto* frameProvider = new orion::RemoteFrameProvider;
     engine.addImageProvider(QStringLiteral("remote"), frameProvider);
 
-    orion::OrionAppController controller(rootDir);
     controller.setFrameProvider(frameProvider);
     if (!deepLinkUri.isEmpty()) {
         // Launched via orion://activate?key=... — stage the key BEFORE the QML loads
@@ -405,5 +428,12 @@ int main(int argc, char* argv[])
     // stack-owned controller while local destructors unwind after exec().
     framelessFilter.setShutdownTarget(nullptr, nullptr);
 #endif
+    // Drain what is still queued for the GUI thread while every sender is alive: a blocking
+    // cross-thread call left in the queue is satisfied here instead of being destroyed later
+    // against a sender that no longer exists (see the controller/engine order note above).
+    for (int pass = 0; pass < 3; ++pass) {
+        QCoreApplication::sendPostedEvents();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    }
     return exitCode;
 }

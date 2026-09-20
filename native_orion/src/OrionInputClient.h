@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 
 #ifdef _WIN32
@@ -73,6 +74,98 @@ static_assert(sizeof(OrionInputAck) == 12, "OrionInputAck wire size must stay 12
     return ownedPacket ? stage == OrionInputAckStage::LocalUdpAccepted
                        : stage == OrionInputAckStage::OwnershipReleased;
 }
+
+// Checked conversion shared by the real QPC diagnostics and unit tests.  Keep
+// the counter values signed until ordering has been proven: casting a negative
+// QPC delta directly to uint64_t produced 18446744073709...us samples and
+// permanently poisoned the max telemetry.  Invalid samples are explicitly
+// distinguishable from a legitimate sub-microsecond measurement of zero.
+struct CheckedElapsedMicros final {
+    bool valid = false;
+    std::uint64_t value = 0;
+};
+
+[[nodiscard]] constexpr CheckedElapsedMicros checkedElapsedMicros(
+    bool startClockOk,
+    bool endClockOk,
+    std::int64_t startTicks,
+    std::int64_t endTicks,
+    std::int64_t ticksPerSecond) noexcept
+{
+    if (!startClockOk || !endClockOk || ticksPerSecond <= 0 || endTicks < startTicks) {
+        return {};
+    }
+
+    // Use floating-point only for the scale conversion.  Subtraction is done
+    // unsigned after signed ordering validation, avoiding signed overflow even
+    // for synthetic boundary-value tests.
+    const std::uint64_t deltaTicks = static_cast<std::uint64_t>(endTicks)
+        - static_cast<std::uint64_t>(startTicks);
+    const std::uint64_t frequency = static_cast<std::uint64_t>(ticksPerSecond);
+    const std::uint64_t wholeSeconds = deltaTicks / frequency;
+    constexpr std::uint64_t kMicrosPerSecond = 1'000'000;
+    if (wholeSeconds > std::numeric_limits<std::uint64_t>::max() / kMicrosPerSecond) {
+        return {};
+    }
+    const std::uint64_t remainderTicks = deltaTicks % frequency;
+    // The fractional result is strictly below one second, so this conversion
+    // cannot overflow even on MSVC where long double has double precision.
+    const auto fractionalMicros = static_cast<std::uint64_t>(
+        static_cast<long double>(remainderTicks) * static_cast<long double>(kMicrosPerSecond)
+        / static_cast<long double>(frequency));
+    const std::uint64_t wholeMicros = wholeSeconds * kMicrosPerSecond;
+    if (fractionalMicros > std::numeric_limits<std::uint64_t>::max() - wholeMicros) {
+        return {};
+    }
+    return {true, wholeMicros + fractionalMicros};
+}
+
+// One immutable timing record per transmitted packet.  The source sequence is
+// the join key: a caller never has to combine the current packet identity with
+// a process-global "last latency" value that may belong to an earlier packet.
+// Attempted and valid are separate so a real 0 us sample is distinguishable
+// from both "not measured" and "clock failed/regressed".
+struct OrionInputTransactionTiming final {
+    std::uint32_t sourceSeq = 0;
+    bool writeAttempted = false;
+    bool writeSampleValid = false;
+    std::uint64_t writeUs = 0;
+    bool ackAttempted = false;
+    bool ackSampleValid = false;
+    std::uint64_t ackWaitUs = 0;
+
+    void begin(std::uint32_t seq) noexcept
+    {
+        *this = {};
+        sourceSeq = seq;
+    }
+
+    void recordWrite(CheckedElapsedMicros sample) noexcept
+    {
+        writeAttempted = true;
+        writeSampleValid = sample.valid;
+        writeUs = sample.valid ? sample.value : 0;
+    }
+
+    void beginAck() noexcept
+    {
+        ackAttempted = true;
+        ackSampleValid = false;
+        ackWaitUs = 0;
+    }
+
+    void recordAck(CheckedElapsedMicros sample) noexcept
+    {
+        ackAttempted = true;
+        ackSampleValid = sample.valid;
+        ackWaitUs = sample.valid ? sample.value : 0;
+    }
+
+    [[nodiscard]] bool matches(std::uint32_t seq) const noexcept
+    {
+        return seq != 0 && sourceSeq == seq;
+    }
+};
 
 // Generated stick shots use full-scale, vertical right-stick states. Preserve
 // transitions into, out of, or across those bands as ordered edges while
@@ -141,6 +234,10 @@ static_assert(sizeof(OrionInputAck) == 12, "OrionInputAck wire size must stay 12
 
 class OrionInputClient {
 public:
+    struct SquareWatchdogReleaseResult {
+        int attempted = 0;
+        int accepted = 0;
+    };
     explicit OrionInputClient(QString pipeName = QStringLiteral("\\\\.\\pipe\\orion_input"));
     ~OrionInputClient();
 
@@ -156,6 +253,10 @@ public:
     // DIAGNOSTIC: the last packet actually written to the pipe (drift debugging).
     [[nodiscard]] OrionInputPacket lastSent() const;
     [[nodiscard]] bool haveSent() const;
+    // Coherent copy of the most recent actual pipe transaction. Unlike the
+    // compatibility scalar getters below, validity and source sequence travel
+    // with the durations under ioMutex_.
+    [[nodiscard]] OrionInputTransactionTiming lastTransactionTiming() const;
     [[nodiscard]] uint64_t writeCount() const { return writeCount_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t writeFailures() const { return writeFailures_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t lastWriteUs() const { return lastWriteUs_.load(std::memory_order_relaxed); }
@@ -182,6 +283,9 @@ public:
     [[nodiscard]] uint64_t lastAckWaitUs() const {
         return lastAckWaitUs_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] uint64_t clockSampleFailures() const {
+        return clockSampleFailures_.load(std::memory_order_relaxed);
+    }
 
     // Map `state` (XInput-style) -> chiaki PS ControllerState and write it to the pipe. own=true means
     // Orion is driving (chiaki uses this state); own=false relinquishes to chiaki's normal input.
@@ -193,13 +297,32 @@ public:
     // distinguish an already-latched state from a broken route. send() remains
     // the compatibility wrapper whose return value means bytes were written.
     InputRouteWriteResult sendDetailed(
-        const ControllerState& state, bool own, bool forceWrite = false);
+        const ControllerState& state, bool own, bool forceWrite = false,
+        OrionInputTransactionTiming* transactionTiming = nullptr);
+    // Idle-route liveness proof + divergence self-heal. Re-sends the exact last
+    // CONFIRMED owned state as a fresh MustDeliver transaction over the already
+    // established pipe (never connects/seeds). Idempotent for the console; the
+    // value is the ACK round-trip: success bounds any client<->OrionStream
+    // de-dup divergence to one call interval, failure closes the pipe at an
+    // idle moment so recovery repairs the route BEFORE the player's next press.
+    // Returns Unchanged when there is no confirmed owned state to re-assert,
+    // Failed when disabled/disconnected. Call cadence is the caller's budget
+    // decision (production: 1 Hz from the hook heartbeat, engine Idle only).
+    InputRouteWriteResult reassertLastState();
+    // Two fresh-sequence Square-up transactions on the ESTABLISHED owned pipe
+    // only. Preserve other controls, bypass de-dup, require exact ACKs, and
+    // stop on ambiguity without reconnecting or switching routes.
+    SquareWatchdogReleaseResult releaseSquareForWatchdog();
 
 private:
     bool ensureConnected();
     void closePipe();
 #ifdef _WIN32
     InputRouteWriteResult waitForDeliveryAck(uint32_t sourceSeq, bool ownedPacket);
+    // Sequence-stamp + bounded overlapped write + exact ACK wait for one packet.
+    // Fails closed (closes the pipe) on any failure/ambiguity. Never advances
+    // the de-dup snapshot — that is the caller's decision. ioMutex_ must be held.
+    InputRouteWriteResult transmitLocked(OrionInputPacket& p, bool own, bool routeWasOwned);
 #endif
 
     QString pipeName_;
@@ -211,6 +334,7 @@ private:
     uint32_t seq_ = 0;
     bool haveLast_ = false;
     OrionInputPacket last_{};
+    OrionInputTransactionTiming lastTransactionTiming_{};
     std::atomic<uint64_t> writeCount_{0};
     std::atomic<uint64_t> writeFailures_{0};
     std::atomic<uint64_t> lastWriteUs_{0};
@@ -223,6 +347,9 @@ private:
     std::atomic<uint32_t> lastAckStage_{0};
     std::atomic<uint32_t> lastAckProtocolError_{0};
     std::atomic<uint64_t> lastAckWaitUs_{0};
+    // QPC failure/regression samples are excluded from latency values and
+    // counted here so telemetry can distinguish "zero us" from "no sample".
+    std::atomic<uint64_t> clockSampleFailures_{0};
 #ifdef _WIN32
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
     HANDLE writeEvent_ = nullptr;   // overlapped-write completion event (P4: bounded, non-blocking write)

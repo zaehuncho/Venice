@@ -59,6 +59,41 @@ constexpr double kAnchorBase20ShiftMs = 58.3;
 struct AnchorBase20RungOffset { double levelPct; double offsetMs; };
 constexpr AnchorBase20RungOffset kAnchorBase20RungOffsets[] = {
     {20.0, 0.0}, {25.0, 29.42}, {30.0, 58.30}, {35.0, 86.22}, {40.0, 112.58}};
+// [ORION_TIP_PHASE_FIRST_SIGHT] Highest first-accept fill the first-sight anchor will speak for.
+// Above this the shot falls onto the sampler exactly as it does today. 60 is chosen where the
+// two independent rulers still agree closely: the rung secant table extrapolated to 60 disagrees
+// with the measured curve table (kCurveOffsets, n=48 shots) by 6.6 ms under anchorBase20 (4.0 ms
+// under base-30), and past that the gap -- which is pure model error, not measurement -- grows
+// faster than the shrinking runway can absorb. Every term of phaseFirstSightSigmaMs carries that
+// disagreement explicitly, so the cap is the point where the sigma stops being worth paying, not
+// a cliff. It is also past every observed first-accept fill: the owner's court acquires at ~18 %,
+// other courts/lighting at ~22 %, and tonight's worst case was 46.41 %.
+constexpr double kPhaseFirstSightMaxFillPct = 60.0;
+// Fill-measurement sigma (pp) charged to a first-sight anchor, whose level is ONE sample's
+// measured fill rather than an exact rung. The meter box is 110 px tall in every graded session
+// and the reader's fill denominator IS that box, so one pixel of box wobble is ~0.9 pp; 1.0 pp is
+// that, rounded up. Divided by the meter's local rate it becomes the time term in
+// phaseFirstSightSigmaMs -- ~5 ms at fill 46, and smaller higher up because the meter accelerates.
+constexpr double kPhaseFirstSightFillSigmaPct = 1.0;
+// A fill DROP this large retracts a held first-sight candidate: it is the same discriminator the
+// reader's anchor-episode machinery uses for the carryover -> real transition (a spent ~100 meter
+// preempted by a fresh low one). The fresh episode is low, so the ordinary ladder owns it.
+constexpr double kPhaseFirstSightDropBreakPct = 8.0;
+// [ORION_OWNERSHIP_PROOF_LENIENCY 2026-09-14] How close to the command deadline the arming
+// horizon must be before a geometry-break-restarted ownership proof is accepted on the samples
+// in hand. 60 ms is ~3.5 capture frames at 60 fps: past that there is still time for the restart
+// to re-accumulate a full proof, so the strict path is left alone and nothing is relaxed. Inside
+// it there is not, and the choice is between a lenient owner and no shot.
+constexpr double kProofLeniencyHorizonMs = 60.0;
+// ms of predictor sigma charged per geometry break. A break means the detector box moved enough
+// to fail a 1.5x dimension / 1.25x aspect bound, and the fill denominator IS that box (one pixel
+// of a 110 px box is ~0.9 pp, ~4 ms of clock at the meter's mid-rise rate), so one break is worth
+// about one of those.
+constexpr double kProofLeniencySigmaPerBreakMs = 4.0;
+// Fewest consecutive post-break frames a lenient acceptance will ever run on. Two unique,
+// structure-verified, geometry-continuous, rising frames is the same floor the runway-aware
+// relaxation already uses; leniency lowers the RISE requirement, never this.
+constexpr int kProofLeniencyMinSamples = 2;
 // [ORION_LEAD_CONFLICT] Decision-latency margin between the tip constant and the largest lead
 // the phase member can still schedule. The phase estimate is born tip_eta = constant - (fill
 // advance past the anchor + frame age): measured on the 2026-08-08 production log, first-valid
@@ -344,6 +379,7 @@ void TemporalSampler::reset()
     kf_.position = 0.0;
     kf_.velocity = 0.0;
     kf_.P00 = 100.0;
+    kf_.P01 = 0.0;
     kf_.P11 = 100.0;
     kf_.lastTs = -1.0;
 }
@@ -356,6 +392,7 @@ void TemporalSampler::updateKalman(double fillPct, double timestampMs)
         kf_.position = fillPct;
         kf_.velocity = 0.0;
         kf_.P00 = 100.0;
+        kf_.P01 = 0.0;
         kf_.P11 = 100.0;
         kf_.lastTs = timestampMs;
         kf_.initialized = true;
@@ -367,6 +404,7 @@ void TemporalSampler::updateKalman(double fillPct, double timestampMs)
         kf_.position = fillPct;
         kf_.velocity = 0.0;
         kf_.P00 = 100.0;
+        kf_.P01 = 0.0;
         kf_.P11 = 100.0;
         kf_.lastTs = timestampMs;
         return;
@@ -385,9 +423,13 @@ void TemporalSampler::updateKalman(double fillPct, double timestampMs)
     const double K1 = kf_.P01 / S;
     kf_.position += K0 * y;
     kf_.velocity += K1 * y;
+    // All posterior entries use the same predicted covariance. Updating
+    // P01 first made P11 subtract the posterior cross term, not the prior,
+    // so velocity uncertainty barely contracted after an observation.
+    const double predictedP01 = kf_.P01;
     kf_.P00 -= K0 * kf_.P00;
-    kf_.P01 -= K0 * kf_.P01;
-    kf_.P11 -= K1 * kf_.P01;
+    kf_.P01 -= K0 * predictedP01;
+    kf_.P11 -= K1 * predictedP01;
     kf_.lastTs = timestampMs;
 }
 
@@ -411,7 +453,9 @@ void TemporalSampler::addSample(double fillPct, double timestampMs)
             return;
         }
         if (dt > 42.0) {
-            samples_.clear();
+            // The accepted evidence starts a new episode after this gap;
+            // the auxiliary filter must not retain the retired trajectory.
+            reset();
         } else if (fillPct < last.fillPct - 4.0) {
             // Outlier rejection: within a single shot the meter only RISES. A fill
             // that drops meaningfully (and the gap isn't large enough to be a new
@@ -438,6 +482,80 @@ double TemporalSampler::predictCrossingMs(double targetPct) const
     return predictCrossing(targetPct).crossingMs;
 }
 
+double TemporalSampler::referenceClockRate(
+    double (*referenceTimeMs)(double fillPct)) const noexcept
+{
+    return referenceClockFit(referenceTimeMs).rate;
+}
+
+TemporalSampler::ReferenceClockFit TemporalSampler::referenceClockFit(
+    double (*referenceTimeMs)(double fillPct)) const noexcept
+{
+    ReferenceClockFit out;
+    const auto n = samples_.size();
+    if (n < 3 || referenceTimeMs == nullptr) {
+        return out;
+    }
+    const auto& last = samples_.back();
+    out.latestCaptureMs = last.timestampMs;
+    // Center both clocks; neither the rate nor its uncertainty depends on epoch.
+    const double referenceLastMs = referenceTimeMs(last.fillPct);
+    if (!std::isfinite(referenceLastMs)) {
+        return out;
+    }
+    double sw = 0.0, sw2 = 0.0, xm = 0.0, ym = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double y = referenceTimeMs(samples_[i].fillPct) - referenceLastMs;
+        if (!std::isfinite(y)) {
+            return out;
+        }
+        const double w = std::exp(-fitLambda_ * static_cast<double>(n - 1U - i));
+        sw += w;
+        sw2 += w * w;
+        xm += w * (samples_[i].timestampMs - last.timestampMs);
+        ym += w * y;
+    }
+    if (!std::isfinite(sw) || sw <= 1e-9) {
+        return out;
+    }
+    xm /= sw;
+    ym /= sw;
+    double num = 0.0, den = 0.0, w2xx = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double w = std::exp(-fitLambda_ * static_cast<double>(n - 1U - i));
+        const double x = samples_[i].timestampMs - last.timestampMs - xm;
+        const double y = referenceTimeMs(samples_[i].fillPct) - referenceLastMs - ym;
+        num += w * x * y;
+        den += w * x * x;
+        w2xx += w * w * x * x;
+    }
+    if (!std::isfinite(num) || !std::isfinite(den) || den < 1e-9) {
+        return out;
+    }
+    out.rate = num / den;
+    double wrss = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double w = std::exp(-fitLambda_ * static_cast<double>(n - 1U - i));
+        const double x = samples_[i].timestampMs - last.timestampMs - xm;
+        const double y = referenceTimeMs(samples_[i].fillPct) - referenceLastMs - ym;
+        const double residual = y - out.rate * x;
+        wrss += w * residual * residual;
+    }
+    // With centered X, A=X'WX is diagonal. Under equal-variance residual noise,
+    // E[WRSS]/sigma^2 = tr(W)-tr(A^-1 X'W^2X), while the slope covariance is
+    // sigma^2 * (A^-1 X'W^2X A^-1)[slope,slope]. Unlike WRSS/(n-2)/Sxx,
+    // this remains invariant to rescaling weights and does not pretend that
+    // exponentially downweighted history has the precision of current samples.
+    const double residualDof = sw - w2xx / den - sw2 / sw;
+    const double variance = residualDof > 1e-9
+        ? (wrss / residualDof) * w2xx / (den * den)
+        : std::numeric_limits<double>::quiet_NaN();
+    if (std::isfinite(variance) && variance >= 0.0) {
+        out.slopeStdError = std::sqrt(variance);
+    }
+    return out;
+}
+
 TemporalSampler::CrossingFit TemporalSampler::predictCrossing(double targetPct) const
 {
     CrossingFit out;
@@ -456,7 +574,10 @@ TemporalSampler::CrossingFit TemporalSampler::predictCrossing(double targetPct) 
 
     // Single weighting scheme for BOTH fits (matches the Python predictor). x is
     // centred at the latest sample (x<=0 for history) for conditioning.
-    constexpr double lambda = 0.5;
+    // [ORION_SAMPLER_WEIGHTING] The decay constant is now a member (default 0.5, the value
+    // this line always carried) so the replay harness can A/B weighting schemes through the
+    // REAL predictor. See setFitDecayLambda for the measured verdict on changing it.
+    const double lambda = fitLambda_;
 
     // ---- Weighted linear fit f = slope*x + intercept, with residual --------
     double sw = 0.0, xm = 0.0, fm = 0.0;
@@ -788,6 +909,7 @@ void GreenWindowTracker::reset()
     starts_.clear();
     ends_.clear();
     stableFrames_ = 0;
+    missingGreenFrames_ = 0;
     confirmed_ = false;
     bestStartPct_ = -1.0;
     bestEndPct_ = -1.0;
@@ -798,16 +920,53 @@ void GreenWindowTracker::reset()
 
 void GreenWindowTracker::update(double startPct, double endPct, double confidence)
 {
-    if (startPct < 0.0 || endPct < 0.0 || endPct <= startPct) {
+    // Numeric fallback bounds are not an observed green window. Meter confidence
+    // must never stand in for the green scan's own confidence.
+    if (!std::isfinite(startPct) || !std::isfinite(endPct)
+        || !std::isfinite(confidence) || confidence <= 0.0
+        || startPct < 0.0 || endPct > 100.0 || endPct <= startPct) {
+        // A fresh meter with no observed green is not a fresh green sample.
+        // Break the evidence pair immediately; tolerate one segmentation miss
+        // for display continuity, then retire the old confirmed bounds.
+        starts_.clear();
+        ends_.clear();
         stableFrames_ = std::max(0, stableFrames_ - 1);
+        if (++missingGreenFrames_ >= 2) reset();
         return;
     }
+    missingGreenFrames_ = 0;
 
     starts_.push_back(startPct);
     ends_.push_back(endPct);
     while (starts_.size() > 12) {
         starts_.pop_front();
         ends_.pop_front();
+    }
+
+    // A confirmed window may change abruptly during the same shot. Two
+    // consecutive, agreeing observations of the new geometry replace it;
+    // one outlier must not move it, and initial acquisition still needs three.
+    if (confirmed_ && !fastPath_ && starts_.size() >= 2) {
+        const auto n = starts_.size();
+        const double priorStart = starts_[n - 2], priorEnd = ends_[n - 2];
+        const bool agrees = std::abs(startPct - priorStart) <= 1.0
+            && std::abs(endPct - priorEnd) <= 1.0
+            && std::abs((endPct - startPct) - (priorEnd - priorStart)) <= 0.5;
+        const auto changed = [this](double start, double end) {
+            return std::abs(start - bestStartPct_) >= 3.0
+                || std::abs(end - bestEndPct_) >= 3.0;
+        };
+        if (agrees && changed(priorStart, priorEnd) && changed(startPct, endPct)) {
+            starts_ = {priorStart, startPct};
+            ends_ = {priorEnd, endPct};
+            bestStartPct_ = (priorStart + startPct) * 0.5;
+            bestEndPct_ = (priorEnd + endPct) * 0.5;
+            bestCenterPct_ = (bestStartPct_ + bestEndPct_) * 0.5;
+            widthPct_ = bestEndPct_ - bestStartPct_;
+            confidence_ = confidence;
+            stableFrames_ = 1;
+            return;
+        }
     }
 
     if (starts_.size() < 3 && !fastPath_) {
@@ -841,8 +1000,8 @@ void GreenWindowTracker::update(double startPct, double endPct, double confidenc
     // green_confirmed-vs-meter_full split = the live "late / didn't time it" shots).
     // One stable window confirms now. A roi_not_found dropout never calls update(), so
     // it can't decrement the streak — the 3 readings may span a single missed frame and
-    // still confirm. confirmed_ is sticky-true (the else/invalid branches only decrement
-    // stableFrames_), so a later jump can't un-confirm a locked green.
+    // still confirm. Fresh missing-green readings and agreeing abrupt geometry
+    // changes are handled above, separately from whole-meter capture dropouts.
     if ((*sMax - *sMin) < 3.0 && (*eMax - *eMin) < 3.0) {
         std::sort(recentStart.begin(), recentStart.end());
         std::sort(recentEnd.begin(), recentEnd.end());
@@ -880,12 +1039,9 @@ double GreenWindowTracker::adaptiveTargetPct(double tipMarginPct, double learnin
     if (!confirmed_) {
         return -1.0;  // no green -> caller times the meter fully to the top
     }
-    // DEAD-TOP for EVERY width: aim the window's TOP EDGE (bestEndPct_). The top is the
-    // contest-INVARIANT make-point (contest shrinks the green from BELOW, never the top), so it
-    // stays green at any contest and is the one part still detectable when the window is a sliver.
-    // Live-confirmed: fades green miniscule/contested windows by timing the tip. tipMarginPct pulls
-    // the aim a hair below the edge for late-safety (default 0 = dead top); the per-type offset loop
-    // keeps the meter actually reaching the top.
+    // Aim at the observed upper edge, less the configured margin. This is a
+    // geometric target, not a guarantee of a made shot under every contest.
+    // The autonomous live-tip path predicts the physical meter tip separately.
     const double base = bestEndPct_ - tipMarginPct;
     return clampPct(base + learningBiasPct);
 }
@@ -1241,7 +1397,8 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // its observations were normalised at the OLD base and are not commensurable with the new
     // one -- so it is cleared rather than translated (samples are raw measurements; a translated
     // sample is a guess wearing a measurement's clothes).
-    const double phaseRestoreShiftMs = settings.tipPhaseAnchorBase20 ? kAnchorBase20ShiftMs : 0.0;
+    const double phaseRestoreShiftMs = settings.tipPhaseAnchorBase20
+        ? kAnchorBase20ShiftMs * meterTimeScaleFromEnv() : 0.0;
     if (config_.anchorBase20 != settings.tipPhaseAnchorBase20) {
         phaseConstantSamplesMs_.clear();
         learnedPhasePhysicalMs_ = -1.0;
@@ -1279,7 +1436,393 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // select it in a shipped build.
     const bool effectiveNoMeterEnabled = false;
 #endif
-    const bool authorityModeChanged = config_.noMeterEnabled != effectiveNoMeterEnabled;
+    // [ORION_NO_METER_V2 2026-09-14] Normalised and carried, but no longer consumed by any hold
+    // (see RemapConfig). Kept so an existing settings.json round-trips byte-identically.
+    const double inputTimedDelay = std::isfinite(settings.inputTimedDelayMs)
+        ? std::clamp(settings.inputTimedDelayMs, 100.0, 2500.0) : 500.0;
+    const double inputTimedLead = std::isfinite(settings.inputTimedLeadMs)
+        ? std::clamp(settings.inputTimedLeadMs, 150.0, 400.0) : 272.0;
+    // [ORION_NO_METER_V2 2026-09-14] H_ref. Clamped to the slider's own band; the env override
+    // is for offline sweeps and is clamped identically, so no path — file, UI or environment —
+    // can install a reference hold the slider could not have produced.
+    double noMeterHold = std::isfinite(settings.noMeterHoldMs)
+        ? std::clamp(settings.noMeterHoldMs, AppConfigData::kNoMeterHoldMinMs,
+                     AppConfigData::kNoMeterHoldMaxMs)
+        : 650.0;
+    if (qEnvironmentVariableIsSet("ORION_NO_METER_HOLD_MS")) {
+        bool ok = false;
+        const double envHold =
+            qEnvironmentVariable("ORION_NO_METER_HOLD_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envHold)) {
+            noMeterHold = std::clamp(envHold, AppConfigData::kNoMeterHoldMinMs,
+                                     AppConfigData::kNoMeterHoldMaxMs);
+        }
+    }
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14 owner] The fade-only trim, same clamp policy as H_ref.
+    double noMeterFadeTrim = std::isfinite(settings.noMeterFadeTrimMs)
+        ? std::clamp(settings.noMeterFadeTrimMs, AppConfigData::kNoMeterFadeTrimMinMs,
+                     AppConfigData::kNoMeterFadeTrimMaxMs)
+        : 0.0;
+    if (qEnvironmentVariableIsSet("ORION_NO_METER_FADE_TRIM_MS")) {
+        bool ok = false;
+        const double envTrim =
+            qEnvironmentVariable("ORION_NO_METER_FADE_TRIM_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envTrim)) {
+            noMeterFadeTrim = std::clamp(envTrim, AppConfigData::kNoMeterFadeTrimMinMs,
+                                         AppConfigData::kNoMeterFadeTrimMaxMs);
+        }
+    }
+    // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] The console's frame grid and the switch
+    // that snaps every blind hold onto it. Same clamp-on-every-path policy as H_ref: the file,
+    // the setting and the environment all land inside the one band, so no route can install a
+    // period the blind law would have to defend itself against a second time.
+    double consoleFrameMs = clampedConsoleFrameMs(settings.consoleFrameMs);
+    if (qEnvironmentVariableIsSet("ORION_CONSOLE_FRAME_MS")) {
+        bool ok = false;
+        const double envFrame =
+            qEnvironmentVariable("ORION_CONSOLE_FRAME_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envFrame)) {
+            consoleFrameMs = clampedConsoleFrameMs(envFrame);
+        }
+    }
+    // Same ignore-don't-clamp env policy as every other boolean: only an exact "0" or "1".
+    bool noMeterFrameQuantize = settings.noMeterFrameQuantize;
+    if (qEnvironmentVariableIsSet("ORION_NO_METER_FRAME_QUANTIZE")) {
+        const QString envQuantize =
+            qEnvironmentVariable("ORION_NO_METER_FRAME_QUANTIZE").trimmed();
+        if (envQuantize == QLatin1String("0")) {
+            noMeterFrameQuantize = false;
+        } else if (envQuantize == QLatin1String("1")) {
+            noMeterFrameQuantize = true;
+        }
+    }
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14 owner] How late the vision path may still fire. Same
+    // clamp-on-every-path policy as the blind hold: file, setting and environment all land inside
+    // the one band, so no route can install a tolerance the setting could not have produced.
+    double lateFireTolerance = std::isfinite(settings.lateFireToleranceMs)
+        ? std::clamp(settings.lateFireToleranceMs, AppConfigData::kLateFireToleranceMinMs,
+                     AppConfigData::kLateFireToleranceMaxMs)
+        : 24.0;
+    if (qEnvironmentVariableIsSet("ORION_LATE_FIRE_TOLERANCE_MS")) {
+        bool ok = false;
+        const double envTolerance =
+            qEnvironmentVariable("ORION_LATE_FIRE_TOLERANCE_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envTolerance)) {
+            lateFireTolerance = std::clamp(envTolerance,
+                                           AppConfigData::kLateFireToleranceMinMs,
+                                           AppConfigData::kLateFireToleranceMaxMs);
+        }
+    }
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] The banner closed loop. The switch takes the
+    // same ignore-don't-clamp env policy as every other boolean here (only an exact "0" or "1",
+    // so a typo leaves the setting alone); the step and the clamp are clamped into their bands on
+    // every route, exactly as late_fire_tolerance_ms is, because the clamp is what keeps this a
+    // trim rather than a second lead control.
+    bool bannerLeadTrimEnabled = settings.bannerLeadTrim;
+    if (qEnvironmentVariableIsSet("ORION_BANNER_LEAD_TRIM")) {
+        const QString envTrim = qEnvironmentVariable("ORION_BANNER_LEAD_TRIM").trimmed();
+        if (envTrim == QLatin1String("0")) {
+            bannerLeadTrimEnabled = false;
+        } else if (envTrim == QLatin1String("1")) {
+            bannerLeadTrimEnabled = true;
+        }
+    }
+    // Queued observations belong to the enable interval that released them.
+    // A delayed panel/proxy must not revive disabled learning after a toggle.
+    if (config_.bannerLeadTrim != bannerLeadTrimEnabled) {
+        pendingReleaseOracles_.clear();
+        bannerTrimReleases_.clear();
+    }
+    config_.bannerLeadTrim = bannerLeadTrimEnabled;
+    config_.bannerTrimStepMs = std::isfinite(settings.bannerTrimStepMs)
+        ? std::clamp(settings.bannerTrimStepMs, AppConfigData::kBannerTrimStepMinMs,
+                     AppConfigData::kBannerTrimStepMaxMs)
+        : 3.0;
+    config_.bannerTrimMaxMs = std::isfinite(settings.bannerTrimMaxMs)
+        ? std::clamp(settings.bannerTrimMaxMs, AppConfigData::kBannerTrimMaxMinMs,
+                     AppConfigData::kBannerTrimMaxMaxMs)
+        : 15.0;
+    // [ORION_BANNER_TRIM_HOLD 2026-09-16 owner] How many consecutive EXCELLENT/GREEN verdicts
+    // hold the trim before it idles back toward the slider. Same clamp-on-every-route policy as
+    // the step and the band above -- file, setting and environment all land inside the one band,
+    // so no route can install a hold the setting could not have produced. IGNORE, don't guess: a
+    // non-numeric env value leaves the setting's own hold in force.
+    config_.bannerTrimHoldShots = std::clamp(settings.bannerTrimHoldShots,
+                                             AppConfigData::kBannerTrimHoldShotsMin,
+                                             AppConfigData::kBannerTrimHoldShotsMax);
+    if (qEnvironmentVariableIsSet("ORION_BANNER_TRIM_HOLD_SHOTS")) {
+        bool holdOk = false;
+        const int envHold =
+            qEnvironmentVariable("ORION_BANNER_TRIM_HOLD_SHOTS").trimmed().toInt(&holdOk);
+        if (holdOk) {
+            config_.bannerTrimHoldShots = std::clamp(envHold,
+                                                     AppConfigData::kBannerTrimHoldShotsMin,
+                                                     AppConfigData::kBannerTrimHoldShotsMax);
+        }
+    }
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16 owner] The tempo sub-buckets. Same ignore-don't-clamp
+    // env policy as banner_lead_trim itself (only an exact "0" or "1"), because this is a keying
+    // decision rather than a magnitude: there is nothing to clamp a typo into.
+    bool bannerTrimTempoBuckets = settings.bannerTrimTempoBuckets;
+    if (qEnvironmentVariableIsSet("ORION_BANNER_TRIM_TEMPO")) {
+        const QString envTempo = qEnvironmentVariable("ORION_BANNER_TRIM_TEMPO").trimmed();
+        if (envTempo == QLatin1String("0")) {
+            bannerTrimTempoBuckets = false;
+        } else if (envTempo == QLatin1String("1")) {
+            bannerTrimTempoBuckets = true;
+        }
+    }
+    config_.bannerTrimTempoBuckets = bannerTrimTempoBuckets;
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17 owner] The fade RANGE sub-buckets, same keying-decision
+    // policy: only an exact "0" or "1" is honoured. 0 collapses every key back to (type, tempo).
+    bool bannerTrimRangeBuckets = settings.bannerTrimRangeBuckets;
+    if (qEnvironmentVariableIsSet("ORION_BANNER_TRIM_RANGE")) {
+        const QString envRange = qEnvironmentVariable("ORION_BANNER_TRIM_RANGE").trimmed();
+        if (envRange == QLatin1String("0")) {
+            bannerTrimRangeBuckets = false;
+        } else if (envRange == QLatin1String("1")) {
+            bannerTrimRangeBuckets = true;
+        }
+    }
+    config_.bannerTrimRangeBuckets = bannerTrimRangeBuckets;
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19 owner] Whether a panel with NO coverage cell
+    // calibrates. Same ignore-don't-clamp env policy as the two keying switches above: this is a
+    // semantics decision, so there is nothing to clamp a typo into.
+    bool bannerTrimAbsentCoverageOpen = settings.bannerTrimAbsentCoverageOpen;
+    if (qEnvironmentVariableIsSet("ORION_BANNER_TRIM_ABSENT_COVERAGE_OPEN")) {
+        const QString envAbsent =
+            qEnvironmentVariable("ORION_BANNER_TRIM_ABSENT_COVERAGE_OPEN").trimmed();
+        if (envAbsent == QLatin1String("0")) {
+            bannerTrimAbsentCoverageOpen = false;
+        } else if (envAbsent == QLatin1String("1")) {
+            bannerTrimAbsentCoverageOpen = true;
+        }
+    }
+    config_.bannerTrimAbsentCoverageOpen = bannerTrimAbsentCoverageOpen;
+    // [ORION_BANNER_TRIM_BIAS 2026-09-19 owner] The integrator's window and vote margin, on the
+    // same clamp-on-every-route policy the hold uses: file, setting and environment all land
+    // inside the one band, and a non-numeric env value leaves the setting's own limit in force.
+    config_.bannerTrimBiasWindow = std::clamp(settings.bannerTrimBiasWindow,
+                                              AppConfigData::kBannerTrimBiasWindowMin,
+                                              AppConfigData::kBannerTrimBiasWindowMax);
+    if (qEnvironmentVariableIsSet("ORION_BANNER_TRIM_BIAS_WINDOW")) {
+        bool windowOk = false;
+        const int envWindow =
+            qEnvironmentVariable("ORION_BANNER_TRIM_BIAS_WINDOW").trimmed().toInt(&windowOk);
+        if (windowOk) {
+            config_.bannerTrimBiasWindow = std::clamp(envWindow,
+                                                      AppConfigData::kBannerTrimBiasWindowMin,
+                                                      AppConfigData::kBannerTrimBiasWindowMax);
+        }
+    }
+    config_.bannerTrimBiasVotes = std::clamp(settings.bannerTrimBiasVotes,
+                                             AppConfigData::kBannerTrimBiasVotesMin,
+                                             AppConfigData::kBannerTrimBiasVotesMax);
+    if (qEnvironmentVariableIsSet("ORION_BANNER_TRIM_BIAS_VOTES")) {
+        bool votesOk = false;
+        const int envVotes =
+            qEnvironmentVariable("ORION_BANNER_TRIM_BIAS_VOTES").trimmed().toInt(&votesOk);
+        if (votesOk) {
+            config_.bannerTrimBiasVotes = std::clamp(envVotes,
+                                                     AppConfigData::kBannerTrimBiasVotesMin,
+                                                     AppConfigData::kBannerTrimBiasVotesMax);
+        }
+    }
+    // === [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16 owner] ======================================
+    // The fixed per-shot-type addition to the Shot Lead, with the same clamp-on-every-route
+    // policy every neighbouring timing knob uses: file, setting and environment all land inside
+    // the one band, so no route can install an offset the setting could not have produced.
+    config_.leadOffsetLeftFadeMs = clampedLeadOffsetMs(settings.leadOffsetLeftFadeMs, 8.0);
+    config_.leadOffsetRightFadeMs = clampedLeadOffsetMs(settings.leadOffsetRightFadeMs, 8.0);
+    config_.leadOffsetStandstillMs = clampedLeadOffsetMs(settings.leadOffsetStandstillMs, 0.0);
+    config_.leadOffsetOtherMs = clampedLeadOffsetMs(settings.leadOffsetOtherMs, 0.0);
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17 owner] The mid-range fade's own offset, clamped on
+    // the same route as the other four.
+    config_.leadOffsetFadeMidMs = clampedLeadOffsetMs(settings.leadOffsetFadeMidMs, 6.0);
+    // ONE env knob for BOTH fades, because the measurement is one number: the 2026-09-16 oracle
+    // graded left and right fades together (7 gaps, 5 misses, all late) and nothing in that
+    // session separates them. Sweeping them independently would be inventing a distinction the
+    // evidence does not have. IGNORE, don't guess: a value this does not parse leaves the
+    // setting's own offsets in force rather than installing a fabricated one.
+    if (qEnvironmentVariableIsSet("ORION_LEAD_OFFSET_FADE_MS")) {
+        bool fadeOffsetOk = false;
+        const double envFadeOffset =
+            qEnvironmentVariable("ORION_LEAD_OFFSET_FADE_MS").trimmed().toDouble(&fadeOffsetOk);
+        if (fadeOffsetOk && std::isfinite(envFadeOffset)) {
+            const double clamped = std::clamp(envFadeOffset,
+                                              AppConfigData::kLeadOffsetByTypeMinMs,
+                                              AppConfigData::kLeadOffsetByTypeMaxMs);
+            config_.leadOffsetLeftFadeMs = clamped;
+            config_.leadOffsetRightFadeMs = clamped;
+        }
+    }
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17] The mid-range fade's own sweep. Deliberately its
+    // OWN variable and not folded into ORION_LEAD_OFFSET_FADE_MS: the whole point of the split is
+    // that the two ranges are different numbers, so a sweep of one must not move the other.
+    if (qEnvironmentVariableIsSet("ORION_LEAD_OFFSET_FADE_MID_MS")) {
+        bool midOffsetOk = false;
+        const double envMidOffset =
+            qEnvironmentVariable("ORION_LEAD_OFFSET_FADE_MID_MS").trimmed().toDouble(&midOffsetOk);
+        if (midOffsetOk && std::isfinite(envMidOffset)) {
+            config_.leadOffsetFadeMidMs = std::clamp(envMidOffset,
+                                                     AppConfigData::kLeadOffsetByTypeMinMs,
+                                                     AppConfigData::kLeadOffsetByTypeMaxMs);
+        }
+    }
+    // THE KILL SWITCH, and it is deliberately LAST so it outranks the fade sweep above: with
+    // ORION_LEAD_OFFSET_BY_TYPE=0 every bucket is 0 and measuredLeadForActuationMs() is
+    // byte-for-byte the 2026-09-16 baseline on every shot type. Same ignore-don't-clamp policy as
+    // every other boolean here: only an exact "0" is honoured (and "1" means "leave the settings
+    // alone", which is what they already are), so a typo cannot silently disarm the feature.
+    if (qEnvironmentVariable("ORION_LEAD_OFFSET_BY_TYPE").trimmed() == QLatin1String("0")) {
+        config_.leadOffsetLeftFadeMs = 0.0;
+        config_.leadOffsetRightFadeMs = 0.0;
+        config_.leadOffsetStandstillMs = 0.0;
+        config_.leadOffsetOtherMs = 0.0;
+        config_.leadOffsetFadeMidMs = 0.0;
+    }
+    {
+        // The restore is a ONCE-PER-PROCESS latch for the same reason the NO METER hold's is: the
+        // loop's own write-back re-enters applyConfig through the save path, and re-restoring the
+        // freshly written value would decay it another 50 % on every verdict.
+        if (!bannerLeadTrimLoaded_) {
+            bannerLeadTrimLoaded_ = true;
+            bannerLeadTrim_.restoreDecayed(learning.bannerLeadTrimByType, config_.bannerTrimMaxMs,
+                                           config_.bannerTrimTempoBuckets,
+                                           config_.bannerTrimRangeBuckets);
+            if (!bannerLeadTrim_.isZero()) {
+                emit engineDiagnostic(QStringLiteral(
+                    "BANNER TRIM: restored reason=app_start decay=0.50 %1")
+                        .arg(bannerLeadTrimSummary()));
+            }
+        }
+        // THE OWNER'S INTENT WINS. The trim was built from verdicts that graded the OLD Shot
+        // Lead; carrying any part of it onto a value the owner just chose would move their new
+        // setting before a single shot had graded it. Keyed off the same committed-lead edge the
+        // session probe uses, so the two corrections can never disagree about which value is live.
+        const bool leadChangedForTrim = std::isfinite(bannerTrimUserLeadMs_)
+            && std::abs(bannerTrimUserLeadMs_ - settings.actuationLeadMs) > 1e-9;
+        bannerTrimUserLeadMs_ = settings.actuationLeadMs;
+        if (leadChangedForTrim) {
+            // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] A parked oracle graded the OLD value too.
+            // Dropped whether or not the trim itself had anything to reset, so an in-flight
+            // measurement can never land on a number the owner just typed.
+            pendingReleaseOracles_.clear();
+            // The panel can arrive later than its proxy, or without one. Both
+            // are observations of the retired lead and lose attribution here.
+            bannerTrimReleases_.clear();
+        }
+        if (leadChangedForTrim && bannerLeadTrim_.reset()) {
+            emit engineDiagnostic(QStringLiteral(
+                "BANNER TRIM: reset reason=user_lead_change user_lead=%1")
+                    .arg(settings.actuationLeadMs, 0, 'f', 0));
+            emit bannerLeadTrimUpdated(bannerLeadTrim_.snapshot());
+        } else if (bannerLeadTrim_.clampTo(config_.bannerTrimMaxMs)) {
+            // A lowered clamp must not leave a larger trim standing.
+            emit bannerLeadTrimUpdated(bannerLeadTrim_.snapshot());
+        }
+    }
+    // [ORION_LEAD_AUTO_SEED 2026-09-15 owner] The plug-and-play Shot Lead. Same ignore-don't-clamp
+    // env policy as banner_lead_trim for the switch (only an exact "0" or "1"); the margin and
+    // the placeholder are clamped into their bands on every route, exactly as the trim's step and
+    // ceiling are, so no route can install a seed the setting could not have produced.
+    bool leadAutoSeedEnabled = settings.leadAutoSeed;
+    if (qEnvironmentVariableIsSet("ORION_LEAD_AUTO_SEED")) {
+        const QString envSeed = qEnvironmentVariable("ORION_LEAD_AUTO_SEED").trimmed();
+        if (envSeed == QLatin1String("0")) {
+            leadAutoSeedEnabled = false;
+        } else if (envSeed == QLatin1String("1")) {
+            leadAutoSeedEnabled = true;
+        }
+    }
+    config_.leadAutoSeed = leadAutoSeedEnabled;
+    config_.aimMarginMs = std::isfinite(settings.aimMarginMs)
+        ? std::clamp(settings.aimMarginMs, AppConfigData::kAimMarginMinMs,
+                     AppConfigData::kAimMarginMaxMs)
+        : 69.0;
+    if (qEnvironmentVariableIsSet("ORION_AIM_MARGIN_MS")) {
+        bool ok = false;
+        const double envMargin =
+            qEnvironmentVariable("ORION_AIM_MARGIN_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envMargin)) {
+            config_.aimMarginMs = std::clamp(envMargin, AppConfigData::kAimMarginMinMs,
+                                             AppConfigData::kAimMarginMaxMs);
+        }
+    }
+    config_.leadFactoryPlaceholderMs = std::isfinite(settings.leadFactoryPlaceholderMs)
+        ? std::clamp(settings.leadFactoryPlaceholderMs,
+                     AppConfigData::kLeadFactoryPlaceholderMinMs,
+                     AppConfigData::kLeadFactoryPlaceholderMaxMs)
+        : 269.0;
+    config_.leadSourceKey = actuationLeadSourceKey(settings.videoSource);
+    // [ORION_OWNED_METER_NEVER_ABORTS 2026-09-14 owner] and [ORION_OWNERSHIP_PROOF_LENIENCY].
+    // Same ignore-don't-clamp env policy as every other boolean: only an exact "0" or "1".
+    config_.ownedMeterNeverAborts = settings.ownedMeterNeverAborts;
+    if (qEnvironmentVariableIsSet("ORION_OWNED_METER_NEVER_ABORTS")) {
+        const QString envNeverAborts =
+            qEnvironmentVariable("ORION_OWNED_METER_NEVER_ABORTS").trimmed();
+        if (envNeverAborts == QLatin1String("0")) {
+            config_.ownedMeterNeverAborts = false;
+        } else if (envNeverAborts == QLatin1String("1")) {
+            config_.ownedMeterNeverAborts = true;
+        }
+    }
+    config_.ownershipProofLeniency = settings.ownershipProofLeniency;
+    if (qEnvironmentVariableIsSet("ORION_OWNERSHIP_PROOF_LENIENCY")) {
+        const QString envLeniency =
+            qEnvironmentVariable("ORION_OWNERSHIP_PROOF_LENIENCY").trimmed();
+        if (envLeniency == QLatin1String("0")) {
+            config_.ownershipProofLeniency = false;
+        } else if (envLeniency == QLatin1String("1")) {
+            config_.ownershipProofLeniency = true;
+        }
+    }
+    // [ORION_PROOF_DETECTOR_BOX 2026-09-19] Env-only (no settings key): the shape gate reads the
+    // DETECTOR's rectangle, not the drawn one. Same ignore-don't-clamp policy as every other
+    // boolean. See AutomationEngine::Config::ownershipProofDetectorBox.
+    config_.ownershipProofDetectorBox = true;
+    if (qEnvironmentVariableIsSet("ORION_OWNERSHIP_PROOF_DETECTOR_BOX")) {
+        const QString envProofBox =
+            qEnvironmentVariable("ORION_OWNERSHIP_PROOF_DETECTOR_BOX").trimmed();
+        if (envProofBox == QLatin1String("0")) {
+            config_.ownershipProofDetectorBox = false;
+        } else if (envProofBox == QLatin1String("1")) {
+            config_.ownershipProofDetectorBox = true;
+        }
+    }
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] The hybrid switch. Same ignore-don't-clamp
+    // env policy the other booleans use: only an exact "0" or "1" is honoured, so a live A/B
+    // (pure blind vs vision-assisted) needs no rebuild and a typo leaves the setting alone.
+    bool noMeterVisionAssist = settings.noMeterVisionAssist;
+    if (qEnvironmentVariableIsSet("ORION_NO_METER_VISION_ASSIST")) {
+        const QString envAssist =
+            qEnvironmentVariable("ORION_NO_METER_VISION_ASSIST").trimmed();
+        if (envAssist == QLatin1String("0")) {
+            noMeterVisionAssist = false;
+        } else if (envAssist == QLatin1String("1")) {
+            noMeterVisionAssist = true;
+        }
+    }
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] The MODE edge itself, kept separate from the
+    // "a NO METER knob moved" edge below: only a real METER <-> NO METER transition may clear
+    // the other path's transient release state (see clearTransientReleaseStateForModeSwitch).
+    const bool timingModeSwitched = config_.inputTimedEnabled != settings.inputTimedEnabled;
+    const bool inputTimedChanged = timingModeSwitched
+        || (settings.inputTimedEnabled
+            && (config_.noMeterHoldMs != noMeterHold
+                || config_.noMeterFadeTrimMs != noMeterFadeTrim
+                // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14] The grid IS the hold: moving either
+                // of these moves the deadline a press already in flight was armed against, so
+                // they tear a live arm down exactly as moving H_ref does.
+                || config_.consoleFrameMs != consoleFrameMs
+                || config_.noMeterFrameQuantize != noMeterFrameQuantize
+                // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The hybrid switch decides who owns a
+                // live arm's release, so flipping it mid-hold must tear that arm down exactly as
+                // moving the hold does — not leave a press flying under half of each rule.
+                || config_.noMeterVisionAssist != noMeterVisionAssist
+                || config_.inputTimedRhythmEnabled != settings.inputTimedRhythmEnabled));
+    const bool authorityModeChanged = config_.noMeterEnabled != effectiveNoMeterEnabled
+        || inputTimedChanged;
     if (authorityModeChanged) {
         // Never reinterpret an in-flight hold or copied precise-fire deadline under a
         // different authority model. Abort first (which synchronously fences the worker)
@@ -1298,10 +1841,38 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
             pose_.poseScheduled = false;
         }
     }
-    // Meter detection is the only shipped release-authority mode, so the
-    // engine arms unconditionally here. A stale settings.json meter_enabled=false must not
-    // silently disable the whole pipeline — there is no UI to flip it back. The
-    // remotePlayInputSource==off override below remains the explicit hard-disable.
+    if (authorityModeChanged) {
+        inputTimedReady_ = false;
+        inputTimedNeutralPolls_ = 0;
+        // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The deferral is deadline state: it must die
+        // with the deadline it was deferring, or the next arm inherits a cap it never opened.
+        // [ORION_METER_BLIND_BACKSTOP 2026-09-14] One clear() now covers deadline + deferral +
+        // type grace for BOTH paths, so a field added to the machine can never be forgotten here.
+        noMeterBackstop_.clear();
+        meterBackstop_.clear();
+        meterBackstopArmedEpoch_ = 0;
+        inputTimedVisionOwnedLoggedToken_ = 0;
+    }
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] "switching between the two should cut off the
+    // other and vice versa". Runs AFTER the abort above on purpose: abort()'s own
+    // preserveTempoSquareGesture branch re-latches pendingSquareTempoRemap_, so clearing before
+    // it would leave exactly the latch this is here to kill.
+    if (timingModeSwitched) {
+        clearTransientReleaseStateForModeSwitch(settings.inputTimedEnabled);
+    }
+    config_.inputTimedEnabled = settings.inputTimedEnabled;
+    config_.inputTimedDelayMs = inputTimedDelay;
+    config_.inputTimedLeadMs = inputTimedLead;
+    config_.inputTimedRhythmEnabled = settings.inputTimedRhythmEnabled;
+    config_.noMeterHoldMs = noMeterHold;
+    config_.noMeterFadeTrimMs = noMeterFadeTrim;
+    config_.consoleFrameMs = consoleFrameMs;
+    config_.noMeterFrameQuantize = noMeterFrameQuantize;
+    config_.noMeterVisionAssist = noMeterVisionAssist;
+    config_.lateFireToleranceMs = lateFireTolerance;
+    // Meter remains the default; inputTimedEnabled selects the separate timer.
+    // The legacy meter_enabled field is not a mode selector. Route input "off"
+    // remains a hard disable; runtime pause/auth/route gates still control armed().
     config_.enabled = true;
     const auto input = settings.remotePlayInputSource.toLower();
     if (input == QLatin1String("off") || input == QLatin1String("disabled")) {
@@ -1314,19 +1885,87 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     } else {
         config_.inputMode = QStringLiteral("square_only");
     }
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] THE LEAK, FIXED. This line used to read
+    //
+    //     config_.tempoRemapEnabled = settings.inputTimedEnabled
+    //         ? settings.inputTimedRhythmEnabled : settings.tempoRemapEnabled;
+    //
+    // i.e. while NO METER was selected the METER path's remap authority WAS the NO METER rhythm
+    // flag. Two failures, both of which the owner hit on 2026-09-14:
+    //
+    //   * Leak in (NO METER -> METER). `resolveTempoForType()` — the meter path's Tempo decision
+    //     at processIdle:6049 — reads exactly this flag, as do applySquarePassthrough()'s gate
+    //     and rhythmFlickReleasePending()'s pre-shot fallback. Turning Rhythm ON for the blind
+    //     path therefore turned the meter path's stick-flick remap on as well.
+    //   * Mask out (METER -> NO METER). While NO METER was on, `settings.tempoRemapEnabled` was
+    //     DISCARDED rather than merely unused. The owner's meter-path Rhythm had been ON since
+    //     21:36:48Z; it was invisibly suspended for the whole NO METER session (where the card he
+    //     could see reads `inputTimedRhythmEnabled`, which he turned OFF at 22:02:07Z), and it
+    //     came straight back at 22:11:25Z when he switched to METER. Meter shots seq=115..122
+    //     released as TempoSquare with `Input timer: rhythm=0` in the same log, and the five
+    //     22:11Z blind-release lines carried `rhythm_offset=40.0` — the blind flick he
+    //     reported as "the tempo still takes place".
+    //
+    // Each path now reads ITS OWN flag and only its own: the meter path pivots on
+    // tempoRemapEnabled / tempoEnabled, the blind path on inputTimedRhythmEnabled, and neither
+    // value is ever written from the other's setting.
     config_.tempoRemapEnabled = settings.tempoRemapEnabled;
+    // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] Carried so rhythmFlickReleasePending()'s pre-shot
+    // fallback answers "is Rhythm on?" with the SAME expression the UI shows
+    // (OrionAppController::tempoEnabled() = tempoEnabled || tempoRemapEnabled).
+    config_.tempoEnabled = settings.tempoEnabled;
     config_.tempoRemapType = settings.tempoRemapType;
     // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88
     config_.squarePassthroughEnabled = settings.squarePassthroughEnabled;
     // [ORION_SETTLE_SMOOTH_MOTION 2026-08-13] was compile-time only; see AppConfigData.
     config_.meterSettleAllowSmoothMotion = settings.meterSettleAllowSmoothMotion;
     config_.squarePassthroughButton = settings.squarePassthroughButton;
+    // === [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] =================================
+    // The kill switch, on the same ignore-don't-clamp env policy as every other boolean here:
+    // only an exact "0" or "1" is honoured, so a typo cannot silently re-arm the dead press. The
+    // threshold is clamped on every route (file, setting, and the save path in AppConfig::save)
+    // so no route can install a cut the settings schema could not have produced.
+    bool sprintReleaseOnSquare = settings.sprintReleaseOnSquare;
+    if (qEnvironmentVariableIsSet("ORION_SPRINT_RELEASE_ON_SQUARE")) {
+        const QString envSprint =
+            qEnvironmentVariable("ORION_SPRINT_RELEASE_ON_SQUARE").trimmed();
+        if (envSprint == QLatin1String("0")) {
+            sprintReleaseOnSquare = false;
+        } else if (envSprint == QLatin1String("1")) {
+            sprintReleaseOnSquare = true;
+        }
+    }
+    config_.sprintReleaseOnSquare = sprintReleaseOnSquare;
+    config_.sprintReleaseR2Threshold =
+        std::clamp(settings.sprintReleaseR2Threshold,
+                   AppConfigData::kSprintReleaseR2ThresholdMin,
+                   AppConfigData::kSprintReleaseR2ThresholdMax);
+    // === [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] =====================================
+    // The corrected fix's window, clamped on every route exactly as the file and the setting are
+    // (0 = inert = the kill switch). The env knob IGNORES anything it cannot parse -- a typo must
+    // not install a fabricated hold -- and CLAMPS anything it can, so the three routes can never
+    // disagree about what a hold of "500" means.
+    config_.squarePressR2HoldMs = std::isfinite(settings.squarePressR2HoldMs)
+        ? std::clamp(settings.squarePressR2HoldMs, AppConfigData::kSquarePressR2HoldMinMs,
+                     AppConfigData::kSquarePressR2HoldMaxMs)
+        : 50.0;
+    if (qEnvironmentVariableIsSet("ORION_SQUARE_PRESS_R2_HOLD_MS")) {
+        bool holdOk = false;
+        const double envHold =
+            qEnvironmentVariable("ORION_SQUARE_PRESS_R2_HOLD_MS").trimmed().toDouble(&holdOk);
+        if (holdOk && std::isfinite(envHold)) {
+            config_.squarePressR2HoldMs =
+                std::clamp(envHold, AppConfigData::kSquarePressR2HoldMinMs,
+                           AppConfigData::kSquarePressR2HoldMaxMs);
+        }
+    }
     // Built-in default-ON (user directive): no-dip is the default shot, so the engine forces the
     // mode on regardless of the (signed) settings value. noDipLeadMs stays live-tuned (default 0 =
     // behaviour-neutral until dialled). Was: config_.noDipEnabled = settings.noDipEnabled;
     config_.noDipEnabled = true;
     config_.noDipLeadMs = settings.noDipLeadMs;
     config_.tempoWaitMs = settings.tempoWaitMs;
+    config_.rhythmFlickDelayMs = settings.rhythmFlickDelayMs;
     config_.tempoFlickHoldMs = settings.tempoFlickHoldMs;
     config_.tempoMinStickHoldMs = settings.tempoMinStickHoldMs;
     config_.tempoFallbackTimeoutMs = settings.tempoFallbackTimeoutMs;
@@ -1469,6 +2108,15 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
         pressTipPriorSigmaMs_ = settings.pressAnchoredTipSigmaMs;
         pressTipPriorW_ = settings.pressAnchoredTipN;
     }
+    // [ORION_NO_METER_V2 2026-09-14] Same once-per-process latch, same reason: the hold
+    // learner's own write-back re-enters applyConfig through the save path, and re-snapshotting
+    // the freshly blended records while the session window still holds the same samples would
+    // count them twice.
+    if (!noMeterHoldPriorsLoaded_) {
+        noMeterHoldPriorsLoaded_ = true;
+        config_.noMeterHoldByType = learning.noMeterHoldByType;
+        noMeterHoldPrior_ = learning.noMeterHoldByType;
+    }
     // [ORION_GOTO_METER_WAIT] (fix 2b) Go-To waits for a REAL meter before timing.
     // SHIPPED DEFAULT-ON 2026-08-04. It was default-OFF in code and set only by the dev
     // launcher, so every measured Go-To result on this rig -- including the 9/9 and 10/11 phase
@@ -1537,6 +2185,9 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     config_.anchorMaxFirstFillPct = settings.anchorMaxFirstFillPct;
     config_.anchorRiseMinPct = settings.anchorRiseMinPct;
     config_.ownershipProofTwoFrame = settings.ownershipProofTwoFrame;
+    config_.tipPhaseAnchorConsensus = settings.tipPhaseAnchorConsensus;
+    // [ORION_TIP_PHASE_FIRST_SIGHT] default ON; the env override below may flip it.
+    config_.tipPhaseFirstSightAnchor = settings.tipPhaseFirstSightAnchor;
     // [ORION_TYPE_TRIM] per-shot-type tip-phase trim (default OFF; see RemapConfig).
     config_.tipPhaseTypeTrimEnabled = settings.tipPhaseTypeTrimEnabled;
     config_.tipPhaseTypeTrims = settings.tipPhaseTypeTrimMs;
@@ -1555,8 +2206,26 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // compiled out of production builds). Parsed once; malformed input leaves it disarmed.
     parseDevFireOffsetEnv();
     config_.phaseVetoDirectional = settings.phaseVetoDirectional;
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] Fire on the console's frame grid, and date the anchor
+    // crossing to the game frame it happened in. Same ignore-don't-clamp env policy as every
+    // other boolean here: only an exact "0" or "1" moves it, so a malformed value leaves the
+    // owner's setting alone rather than silently installing a state nobody chose.
+    config_.tipFrameNative = settings.tipFrameNative;
+    if (qEnvironmentVariableIsSet("ORION_TIP_FRAME_NATIVE")) {
+        const QString envFrameNative = qEnvironmentVariable("ORION_TIP_FRAME_NATIVE").trimmed();
+        if (envFrameNative == QLatin1String("0")) {
+            config_.tipFrameNative = false;
+        } else if (envFrameNative == QLatin1String("1")) {
+            config_.tipFrameNative = true;
+        }
+    }
+    // The grid's period is the console's, which the blind path already describes and clamps
+    // (console_frame_ms). One description of the console, read by both paths.
+    shot_.framePhase.configure(config_.consoleFrameMs, config_.tipFrameNativeMinEdges,
+                               config_.tipFrameNativeMaxSdMs);
     config_.tipPhaseAimFrozen = settings.tipPhaseAimFrozen;
     config_.tipTimingAutoUnlockEnabled = settings.tipTimingAutoUnlockEnabled;
+    config_.sessionLeadProbeEnabled = settings.sessionLeadProbeEnabled;
     config_.tipSourceStealGuardEnabled = settings.tipSourceStealGuardEnabled;
     // [ORION_RUNG_IMMINENT] Extend the imminent hold's target to ladder rungs (default OFF).
     config_.tipPhaseRungImminentHold = settings.tipPhaseRungImminentHold;
@@ -1582,6 +2251,149 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // [ORION_USER_LEAD_AUTHORITY] user-set lead may satisfy readiness (default OFF; see RemapConfig).
     config_.userLeadSatisfiesAuthority = settings.userLeadSatisfiesAuthority;
     config_.tempoFadeMirrorGesture = settings.tempoFadeMirrorGesture;
+    // [ORION_METER_BLIND_BACKSTOP 2026-09-14] default TRUE; the env override below may flip it.
+    config_.meterBlindBackstop = settings.meterBlindBackstop;
+    // [ORION_METER_BACKSTOP_GRACE 2026-09-15 owner] The backstop's own margin past the law. Same
+    // clamp-on-every-path policy as the blind hold and the late-fire tolerance: file, setting and
+    // environment all land inside the one band, so no route can install a grace the setting could
+    // not have produced. A non-finite value falls back to the compiled default rather than
+    // poisoning a deadline with a NaN.
+    config_.meterBackstopGraceMs = std::isfinite(settings.meterBackstopGraceMs)
+        ? std::clamp(settings.meterBackstopGraceMs, AppConfigData::kMeterBackstopGraceMinMs,
+                     AppConfigData::kMeterBackstopGraceMaxMs)
+        : 100.0;
+    if (qEnvironmentVariableIsSet("ORION_METER_BACKSTOP_GRACE_MS")) {
+        bool graceOk = false;
+        const double envGrace =
+            qEnvironmentVariable("ORION_METER_BACKSTOP_GRACE_MS").trimmed().toDouble(&graceOk);
+        if (graceOk && std::isfinite(envGrace)) {
+            config_.meterBackstopGraceMs = std::clamp(envGrace,
+                                                      AppConfigData::kMeterBackstopGraceMinMs,
+                                                      AppConfigData::kMeterBackstopGraceMaxMs);
+        }
+    }
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15 owner] The fade's own grace, same
+    // clamp-on-every-route policy as the Standstill one above: file, setting and environment all
+    // land inside the one band, so no route can install a margin that outlives the animation.
+    config_.meterBackstopGraceFadeMs = std::isfinite(settings.meterBackstopGraceFadeMs)
+        ? std::clamp(settings.meterBackstopGraceFadeMs,
+                     AppConfigData::kMeterBackstopGraceFadeMinMs,
+                     AppConfigData::kMeterBackstopGraceFadeMaxMs)
+        : 220.0;
+    if (qEnvironmentVariableIsSet("ORION_METER_BACKSTOP_GRACE_FADE_MS")) {
+        bool fadeGraceOk = false;
+        const double envFadeGrace =
+            qEnvironmentVariable("ORION_METER_BACKSTOP_GRACE_FADE_MS").trimmed()
+                .toDouble(&fadeGraceOk);
+        if (fadeGraceOk && std::isfinite(envFadeGrace)) {
+            config_.meterBackstopGraceFadeMs =
+                std::clamp(envFadeGrace, AppConfigData::kMeterBackstopGraceFadeMinMs,
+                           AppConfigData::kMeterBackstopGraceFadeMaxMs);
+        }
+    }
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16 owner] The probe that decides whether this
+    // press's deadline carries a grace at all, on the same clamp-on-every-route policy as the two
+    // graces above: file, setting and environment all land inside the one band, so no route can
+    // install a probe that asks its question before a meter could have been drawn. A non-finite
+    // value falls back to the compiled default rather than poisoning the comparison with a NaN
+    // (a NaN probe would make every comparison false and silently disable the collapse while the
+    // setting still read 100).
+    config_.meterBackstopNeverSeenProbeMs = std::isfinite(settings.meterBackstopNeverSeenProbeMs)
+        ? std::clamp(settings.meterBackstopNeverSeenProbeMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeMinMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeMaxMs)
+        : 0.0;   // [2026-09-17] the compiled default, which is now the collapse OFF
+    if (qEnvironmentVariableIsSet("ORION_METER_BACKSTOP_NEVER_SEEN_PROBE_MS")) {
+        bool probeOk = false;
+        const double envProbe =
+            qEnvironmentVariable("ORION_METER_BACKSTOP_NEVER_SEEN_PROBE_MS").trimmed()
+                .toDouble(&probeOk);
+        if (probeOk && std::isfinite(envProbe)) {
+            config_.meterBackstopNeverSeenProbeMs =
+                std::clamp(envProbe, AppConfigData::kMeterBackstopNeverSeenProbeMinMs,
+                           AppConfigData::kMeterBackstopNeverSeenProbeMaxMs);
+        }
+    }
+    // [ORION_METER_BACKSTOP_NEVER_SEEN_FADE 2026-09-16 owner] The fade's own probe, same
+    // clamp-on-every-route policy, its own band, and a default of 0 that EXCLUDES fades from the
+    // collapse: a slow fade's meter is first seen 1000-1051 ms into the press, after its own law,
+    // so collapsing one answers a shot vision was about to time correctly.
+    config_.meterBackstopNeverSeenProbeFadeMs =
+        std::isfinite(settings.meterBackstopNeverSeenProbeFadeMs)
+        ? std::clamp(settings.meterBackstopNeverSeenProbeFadeMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeFadeMinMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeFadeMaxMs)
+        : 0.0;
+    if (qEnvironmentVariableIsSet("ORION_METER_BACKSTOP_NEVER_SEEN_PROBE_FADE_MS")) {
+        bool fadeProbeOk = false;
+        const double envFadeProbe =
+            qEnvironmentVariable("ORION_METER_BACKSTOP_NEVER_SEEN_PROBE_FADE_MS").trimmed()
+                .toDouble(&fadeProbeOk);
+        if (fadeProbeOk && std::isfinite(envFadeProbe)) {
+            config_.meterBackstopNeverSeenProbeFadeMs =
+                std::clamp(envFadeProbe, AppConfigData::kMeterBackstopNeverSeenProbeFadeMinMs,
+                           AppConfigData::kMeterBackstopNeverSeenProbeFadeMaxMs);
+        }
+    }
+    // === [ORION_VISION_HOLD_BAND 2026-09-15 owner] =========================================
+    // The vision release's band around the press-anchored hold law, with the same
+    // clamp-on-every-route policy every neighbouring timing knob uses: file, setting and
+    // environment all land inside the one band, so no route can install a band the setting could
+    // not have produced. A non-finite value falls back to the compiled default rather than
+    // poisoning the clamp with a NaN (a NaN bound would make every comparison false and silently
+    // disable the band while the UI still showed it on).
+    config_.visionHoldBandMs = std::isfinite(settings.visionHoldBandMs)
+        ? std::clamp(settings.visionHoldBandMs, AppConfigData::kVisionHoldBandMinMs,
+                     AppConfigData::kVisionHoldBandMaxMs)
+        // [2026-09-17] The compiled default is the SHIPPED default, and the ship-defaults pass
+        // moved that to 0.0 (band off). A hard-coded 40.0 here re-armed the band on exactly the
+        // route that carries no opinion -- a NaN setting -- so a corrupt/absent value switched a
+        // live-timing behaviour ON while every honest route left it off.
+        : 0.0;
+    if (qEnvironmentVariableIsSet("ORION_VISION_HOLD_BAND_MS")) {
+        bool bandOk = false;
+        const double envBand =
+            qEnvironmentVariable("ORION_VISION_HOLD_BAND_MS").trimmed().toDouble(&bandOk);
+        // IGNORE, don't guess: a value this does not parse leaves the setting's band in force
+        // rather than installing a fabricated one. An in-range value is adopted; an out-of-range
+        // one is clamped into the band exactly as the file and the setting are, so the three
+        // routes can never disagree about what a band of "500" means.
+        if (bandOk && std::isfinite(envBand)) {
+            config_.visionHoldBandMs = std::clamp(envBand, AppConfigData::kVisionHoldBandMinMs,
+                                                  AppConfigData::kVisionHoldBandMaxMs);
+        }
+    }
+    config_.visionHoldBandFadeMs = std::isfinite(settings.visionHoldBandFadeMs)
+        ? std::clamp(settings.visionHoldBandFadeMs, AppConfigData::kVisionHoldBandFadeMinMs,
+                     AppConfigData::kVisionHoldBandFadeMaxMs)
+        // [2026-09-17] Same reason as visionHoldBandMs above: the non-finite route must land on
+        // the shipped default (0.0 = no fade band), never on a value the settings file could
+        // no longer produce.
+        : 0.0;
+    if (qEnvironmentVariableIsSet("ORION_VISION_HOLD_BAND_FADE_MS")) {
+        bool fadeBandOk = false;
+        const double envFadeBand =
+            qEnvironmentVariable("ORION_VISION_HOLD_BAND_FADE_MS").trimmed()
+                .toDouble(&fadeBandOk);
+        if (fadeBandOk && std::isfinite(envFadeBand)) {
+            config_.visionHoldBandFadeMs =
+                std::clamp(envFadeBand, AppConfigData::kVisionHoldBandFadeMinMs,
+                           AppConfigData::kVisionHoldBandFadeMaxMs);
+        }
+    }
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15 owner] Rhythm's release EDGE. Ignore-unknown on every
+    // route: a style the engine does not recognise leaves the shipped flick in force, because the
+    // failure mode of guessing here is a release packet the console does not read as a shot.
+    config_.tempoReleaseStyle =
+        (settings.tempoReleaseStyle == QLatin1String("letgo")) ? QStringLiteral("letgo")
+                                                               : QStringLiteral("flick");
+    if (qEnvironmentVariableIsSet("ORION_TEMPO_RELEASE_STYLE")) {
+        const QString envStyle =
+            qEnvironmentVariable("ORION_TEMPO_RELEASE_STYLE").trimmed().toLower();
+        if (envStyle == QLatin1String("flick") || envStyle == QLatin1String("letgo")) {
+            config_.tempoReleaseStyle = envStyle;
+        }
+    }
     // [ORION_PROBE_CACHE_AUTHORITY] accept the probe-cache seed source (default OFF; see RemapConfig).
     config_.probeCachePriorAuthority = settings.probeCachePriorAuthority;
     // [ORION_PROBE_COUNT] warmup probe-run length (default 16 = today's behaviour).
@@ -1598,14 +2410,19 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // sampler chain (+61-92ms) that the phase member exists to replace.
     if (settings.tipPhaseAnchorBase20 != config_.anchorBase20) {
         const RemapConfig remapDefaults;
-        const double shiftMs = settings.tipPhaseAnchorBase20 ? kAnchorBase20ShiftMs : 0.0;
+        const double meterScale = meterTimeScaleFromEnv();
+        config_.meterTimeScale = meterScale;
+        const double shiftMs = settings.tipPhaseAnchorBase20 ? kAnchorBase20ShiftMs * meterScale : 0.0;
         config_.anchorBase20 = settings.tipPhaseAnchorBase20;
         config_.tipPhaseAnchorPct = settings.tipPhaseAnchorBase20
             ? 20.0 : remapDefaults.tipPhaseAnchorPct;
-        config_.tipPhaseConstantMs = remapDefaults.tipPhaseConstantMs + shiftMs;
-        config_.tipPhaseSeedPhysicalMs = remapDefaults.tipPhaseSeedPhysicalMs + shiftMs;
-        config_.tipPhaseLearnMinMs = remapDefaults.tipPhaseLearnMinMs + shiftMs;
-        config_.tipPhaseLearnMaxMs = remapDefaults.tipPhaseLearnMaxMs + shiftMs;
+        // [ORION_METER_TIME_SCALE] the seed physical and the learner band are METER time (scale);
+        // the aim offset (constant - seed) is RIG time (never scales).
+        const double aimOffsetMs = remapDefaults.tipPhaseConstantMs - remapDefaults.tipPhaseSeedPhysicalMs;
+        config_.tipPhaseSeedPhysicalMs = remapDefaults.tipPhaseSeedPhysicalMs * meterScale + shiftMs;
+        config_.tipPhaseConstantMs = config_.tipPhaseSeedPhysicalMs + aimOffsetMs;
+        config_.tipPhaseLearnMinMs = remapDefaults.tipPhaseLearnMinMs * meterScale + shiftMs;
+        config_.tipPhaseLearnMaxMs = remapDefaults.tipPhaseLearnMaxMs * meterScale + shiftMs;
         config_.tipPhaseAnchorLadderCount = settings.tipPhaseAnchorBase20
             ? 4 : remapDefaults.tipPhaseAnchorLadderCount;
     }
@@ -1633,7 +2450,32 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // does the band validation so an out-of-range persisted value degrades to "not configured"
     // (the pre-existing authority path) rather than installing a lead no other gate would accept.
     config_.userActuationLeadMs = settings.actuationLeadMs;
+    // [ORION_SESSION_LEAD_PROBE] The reference pair belongs to ONE lead value: a changed Shot Lead
+    // drops the in-session trim and the reference, and the next probe window recaptures under the
+    // new lead. Restore from learning only when nothing was captured in this session yet, so a
+    // settings save that races the persistence of a fresh capture cannot erase it.
+    {
+        const bool leadChanged = std::isfinite(sessionProbeUserLeadMs_)
+            && std::abs(sessionProbeUserLeadMs_ - settings.actuationLeadMs) > 1e-9;
+        sessionProbeUserLeadMs_ = settings.actuationLeadMs;
+        if (leadChanged) {
+            sessionLeadTrimMs_ = 0.0;
+            sessionLeadTrimLatched_ = false;
+            leadReferencePhysicalMs_ = -1.0;
+            leadReferenceLeadMs_ = -1.0;
+        }
+        if (leadReferencePhysicalMs_ <= 0.0
+            && learning.leadReferencePhysicalMs > 0.0
+            && std::abs(learning.leadReferenceLeadMs - settings.actuationLeadMs) < 0.5) {
+            leadReferencePhysicalMs_ = learning.leadReferencePhysicalMs;
+            leadReferenceLeadMs_ = learning.leadReferenceLeadMs;
+        }
+    }
     config_.userActuationLeadSet = settings.actuationLeadUserSet;
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] Re-evaluate the seed the moment the pair above lands: a
+    // slider move must make the seed inert on the SAME apply that installs the owner's value, and
+    // a reset back to "Auto" must resume it on the same apply that clears it.
+    updateLeadAutoSeed(nowMs());
     // [ORION_METER_DELAY_LEAD_KEYING 2026-08-09] The delay-condition Shot Lead offset. Copied
     // verbatim (AppConfig has already banded it); appliedMeterDelayLeadOffsetMs() re-validates
     // and gates it on an actually-applied delay, so a persisted value can never reach a
@@ -1717,6 +2559,149 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // Its whole job is to keep a live sweep byte-identical to today, so it OUT-RANKS the user
     // setting — see measuredLeadForActuationMs.
     config_.leadOverrideFromEnv = leadOverrideFromEnv;
+    // [ORION_HORIZON_DEBIAS] No-rebuild kill-switch for the (now default-ON, 2026-08-30) horizon
+    // de-bias, so a live A/B can flip it the way ORION_LEAD_BIAS_MS sweeps the lead bias. Same
+    // ignore-don't-clamp policy: only an exact "0" or "1" is honoured, anything else keeps the
+    // compiled default rather than silently installing a state the operator did not choose.
+    // Parsed BEFORE the double-count guard below so the guard judges the EFFECTIVE flag.
+    if (qEnvironmentVariableIsSet("ORION_HORIZON_DEBIAS")) {
+        const QString envDebias = qEnvironmentVariable("ORION_HORIZON_DEBIAS").trimmed();
+        if (envDebias == QLatin1String("0")) {
+            config_.samplerHorizonDebiasEnabled = false;
+        } else if (envDebias == QLatin1String("1")) {
+            config_.samplerHorizonDebiasEnabled = true;
+        }
+    }
+    // Per-feature bench switch: never alter the user's shared lead or standstill policy.
+    config_.fadePhaseCatchup = qEnvironmentVariable("ORION_FADE_PHASE_CATCHUP").trimmed()
+        != QLatin1String("0");
+    // [ORION_TIP_PHASE_SOLO] Same ignore-don't-clamp policy: only an exact "0" or "1".
+    if (qEnvironmentVariableIsSet("ORION_TIP_PHASE_SOLO")) {
+        const QString envSolo = qEnvironmentVariable("ORION_TIP_PHASE_SOLO").trimmed();
+        if (envSolo == QLatin1String("0")) {
+            config_.tipPhaseSolo = false;
+        } else if (envSolo == QLatin1String("1")) {
+            config_.tipPhaseSolo = true;
+        }
+    }
+    // [ORION_TIP_PHASE_FIRST_SIGHT] Same ignore-don't-clamp policy: only an exact "0" or "1".
+    // A counted batch can bench the first-sight anchor without a rebuild, which matters because
+    // it is the only phase-family flag that ships ON.
+    if (qEnvironmentVariableIsSet("ORION_TIP_PHASE_FIRST_SIGHT")) {
+        const QString envFirstSight =
+            qEnvironmentVariable("ORION_TIP_PHASE_FIRST_SIGHT").trimmed();
+        if (envFirstSight == QLatin1String("0")) {
+            config_.tipPhaseFirstSightAnchor = false;
+        } else if (envFirstSight == QLatin1String("1")) {
+            config_.tipPhaseFirstSightAnchor = true;
+        }
+    }
+    // [ORION_METER_BLIND_BACKSTOP] Same ignore-don't-clamp policy: only an exact "0" or "1".
+    // A live batch can bench the backstop without a rebuild; anything else leaves the setting.
+    // (The retired ORION_PRESS_ANCHORED_FALLBACK override is deleted with its firing rule; the
+    // settings KEY is still tolerated on load so an existing file round-trips.)
+    if (qEnvironmentVariableIsSet("ORION_METER_BLIND_BACKSTOP")) {
+        const QString envBackstop =
+            qEnvironmentVariable("ORION_METER_BLIND_BACKSTOP").trimmed();
+        if (envBackstop == QLatin1String("0")) {
+            config_.meterBlindBackstop = false;
+        } else if (envBackstop == QLatin1String("1")) {
+            config_.meterBlindBackstop = true;
+        }
+    }
+    // [ORION_RAMP_SHAPE] Same ignore-don't-clamp policy: only an exact "0" or "1" is honoured.
+    if (qEnvironmentVariableIsSet("ORION_RAMP_SHAPE")) {
+        const QString envShape = qEnvironmentVariable("ORION_RAMP_SHAPE").trimmed();
+        if (envShape == QLatin1String("0")) {
+            config_.samplerRampShapeEnabled = false;
+        } else if (envShape == QLatin1String("1")) {
+            config_.samplerRampShapeEnabled = true;
+        }
+    }
+    // [ORION_RULER_TRANSITION_TOLERANCE] numeric override, 0 disables; ignore anything else.
+    if (qEnvironmentVariableIsSet("ORION_RULER_TRANSITION_TOLERANCE_PCT")) {
+        bool ok = false;
+        const double envTol =
+            qEnvironmentVariable("ORION_RULER_TRANSITION_TOLERANCE_PCT").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envTol) && envTol >= 0.0 && envTol <= 20.0) {
+            config_.rulerTransitionTolerancePct = envTol;
+        }
+    }
+    // Explicitly opt-in: reference-clock normalization changes candidate mean timing
+    // as well as acquisition-phase bias. Keep the established actuator comparator
+    // until a labelled A/B establishes the new mapping. No getenv on the hot path.
+    referenceRateClockEnabled_ =
+        qEnvironmentVariable("ORION_REFERENCE_RATE_CLOCK").trimmed() == QLatin1String("1");
+
+    // [ORION_CURVE_MODEL] kill switch + tuning; unreadable values are ignored.
+    if (qEnvironmentVariableIsSet("ORION_CURVE_MODEL")) {
+        const QString v = qEnvironmentVariable("ORION_CURVE_MODEL").trimmed();
+        config_.curveModelEnabled = !(v == QLatin1String("0")
+                                      || v.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0
+                                      || v.compare(QLatin1String("false"), Qt::CaseInsensitive) == 0);
+    }
+    if (qEnvironmentVariableIsSet("ORION_CURVE_ARM_MARGIN_MS")) {
+        bool ok = false;
+        const double v = qEnvironmentVariable("ORION_CURVE_ARM_MARGIN_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(v) && v >= 0.0 && v <= 200.0) {
+            config_.curveArmGateMarginMs = v;
+        }
+    }
+    // [ORION_PRESS_LATENCY_TRIM] kill switch + tuning; unreadable values are ignored.
+    if (qEnvironmentVariableIsSet("ORION_PRESS_LATENCY_TRIM")) {
+        const QString v = qEnvironmentVariable("ORION_PRESS_LATENCY_TRIM").trimmed();
+        config_.pressLatencyTrimEnabled = !(v == QLatin1String("0")
+                                            || v.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0
+                                            || v.compare(QLatin1String("false"), Qt::CaseInsensitive) == 0);
+    }
+    if (qEnvironmentVariableIsSet("ORION_PRESS_LATENCY_TRIM_GAIN")) {
+        bool ok = false;
+        const double v = qEnvironmentVariable("ORION_PRESS_LATENCY_TRIM_GAIN").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(v) && v >= 0.0 && v <= 1.5) {
+            config_.pressLatencyTrimGain = v;
+        }
+    }
+    if (qEnvironmentVariableIsSet("ORION_PRESS_LATENCY_TRIM_CAP_MS")) {
+        bool ok = false;
+        const double v = qEnvironmentVariable("ORION_PRESS_LATENCY_TRIM_CAP_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(v) && v >= 0.0 && v <= 80.0) {
+            config_.pressLatencyTrimCapMs = v;
+        }
+    }
+    if (qEnvironmentVariableIsSet("ORION_PRESS_LATENCY_TRIM_WINDOW_MS")) {
+        bool ok = false;
+        const double v = qEnvironmentVariable("ORION_PRESS_LATENCY_TRIM_WINDOW_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(v) && v >= 0.0 && v <= 200.0) {
+            config_.pressLatencyTrimWindowMs = v;
+        }
+    }
+    // [ORION_CAPTURE_PHASE_LOCK] opt-in + target; unreadable values are ignored.
+    if (qEnvironmentVariableIsSet("ORION_CAPTURE_PHASE_LOCK")) {
+        const QString v = qEnvironmentVariable("ORION_CAPTURE_PHASE_LOCK").trimmed();
+        config_.capturePhaseLockEnabled = (v == QLatin1String("1")
+                                           || v.compare(QLatin1String("on"), Qt::CaseInsensitive) == 0
+                                           || v.compare(QLatin1String("true"), Qt::CaseInsensitive) == 0);
+    }
+    if (qEnvironmentVariableIsSet("ORION_CAPTURE_PHASE_LOCK_TARGET_MS")) {
+        bool ok = false;
+        const double v = qEnvironmentVariable("ORION_CAPTURE_PHASE_LOCK_TARGET_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(v) && v >= 0.0 && v < 1000.0 / 60.0) {
+            config_.capturePhaseLockTargetMs = v;
+        }
+    }
+    if (qEnvironmentVariableIsSet("ORION_ANCHOR_CONSENSUS_APPLY_ON_SPREAD")) {
+        const QString v = qEnvironmentVariable("ORION_ANCHOR_CONSENSUS_APPLY_ON_SPREAD").trimmed();
+        config_.tipPhaseConsensusApplyOnSpread = !(v == QLatin1String("0")
+                                                   || v.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0
+                                                   || v.compare(QLatin1String("false"), Qt::CaseInsensitive) == 0);
+    }
+    if (qEnvironmentVariableIsSet("ORION_CURVE_STRETCH_ALPHA")) {
+        bool ok = false;
+        const double v = qEnvironmentVariable("ORION_CURVE_STRETCH_ALPHA").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(v) && v >= 0.0 && v <= 1.5) {
+            config_.curveRateStretchAlpha = v;
+        }
+    }
     // [ORION_TIP_PHASE] DOUBLE-COUNT GUARD -- name both, pick neither.
     //
     // autonomousLeadBiasMs and samplerHorizonDebiasEnabled are two corrections for ONE physical
@@ -1968,9 +2953,62 @@ void AutomationEngine::updatePoseLandmark(const QString& kind, int frameSeq, dou
     ++pose_.authorityEpoch;
 }
 
-void AutomationEngine::updateDetection(const DetectionResult& result)
+void AutomationEngine::updateDetection(const DetectionResult& incoming)
 {
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] THE MASTER ARM SITE. Until today this line
+    // was unconditional: in NO METER mode not one detector payload reached the engine, so the
+    // meter could be filling the screen and nothing downstream could see it — every fence,
+    // sampler, phase anchor and schedule below was unreachable by construction, which is why the
+    // blind hold's own spread (rMAD 21 ms Standstill, 48-50 ms fades, against a ~16 ms green
+    // window) was the entire error budget.
+    //
+    // With the hybrid on, a NO METER shot admits video exactly as a meter-mode shot does. What it
+    // does NOT admit is a second way to ARM: the Idle->ownership promotion below is fenced on
+    // !inputTimedEnabled, so a NO METER press is owned by processInputTimedIdle and by nothing
+    // else. Video here can only refine the release of a press the blind path already owns.
+    //
+    // The latch is read from the SHOT when one is live: a settings write mid-hold must not change
+    // the rules an armed press is flying under, and a shot armed before the switch flipped keeps
+    // its own answer to the end.
+    const bool visionAssistedShot = shot_.inputTimedShot
+        ? shot_.noMeterVisionAssist
+        : noMeterVisionAssistActive();
+    if ((config_.inputTimedEnabled || shot_.inputTimedShot) && !visionAssistedShot) return;
+    const bool nativeAgeStamped = incoming.nativeFrameAgeSampleSteadyNs > 0;
+    const auto steadyNowNs = []() -> qint64 {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const qint64 receiptSteadyBeforeNs = nativeAgeStamped ? steadyNowNs() : 0;
     const double sampleNow = nowMs();
+    const qint64 receiptSteadyNs = nativeAgeStamped ? steadyNowNs() : 0;
+    DetectionResult result = incoming;
+    if (nativeAgeStamped) {
+        // The sidecar->native age was already evaluated before JSON field
+        // decoding. Accrue native residence once, using its earliest stamped
+        // bound and this latest receipt bound AFTER sampleNow. Any scheduling
+        // pause between the clock reads therefore ages the sample instead of
+        // hiding half the pause in a midpoint. But a wide bracket would also
+        // bias the capture-aligned anchor early: reject it as missing timing
+        // evidence, even if total age still fits the usual freshness budget.
+        // Both accepted brackets combined bound pairing-induced conservative
+        // error to 1 ms. No latency is guessed and no deadline is tuned here.
+        const qint64 receiptBracketNs = receiptSteadyNs - receiptSteadyBeforeNs;
+        const qint64 epochBracketNs = result.nativeFrameAgeSampleBracketNs;
+        const qint64 precisionBudgetNs = DetectionResult::kNativeClockPrecisionBudgetNs;
+        const bool clockPairPrecise = epochBracketNs >= 0 && receiptBracketNs >= 0
+            && epochBracketNs <= precisionBudgetNs
+            && receiptBracketNs <= precisionBudgetNs - epochBracketNs;
+        if (!clockPairPrecise
+            || receiptSteadyNs < result.nativeFrameAgeSampleSteadyNs) {
+            result.frameAgeMs = std::numeric_limits<double>::infinity();
+        } else {
+            result.frameAgeMs += static_cast<double>(
+                receiptSteadyNs - result.nativeFrameAgeSampleSteadyNs) / 1'000'000.0;
+        }
+        // The copy leaves all other consumers and repeated deliveries' source
+        // age/stamp tuple immutable; adjustment can never accumulate twice.
+    }
     // Invalid decoder payloads are negative evidence, never proof frames. In strict
     // live-meter mode, however, one such callback must not erase the valid current-shot
     // frames immediately around it. Retain only a bounded candidate whose first frame
@@ -2051,6 +3089,9 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
     // also left the old values live indefinitely. Every authoritative source frame now
     // either replaces the whole snapshot or clears the whole authority state.
     const bool frameIdentityAuthoritative = !duplicateDetectedFrame && !outOfOrderDetectedFrame;
+    if (!frameIdentityAuthoritative || detectorSequenceRestart) {
+        shot_.fadePhaseCatchup.clearEvidence();
+    }
     if (frameIdentityAuthoritative) {
         const quint64 incomingLatencyScopeEpoch = result.measuredLatencyScopeEpoch;
         const quint64 priorLatencyScopeEpoch = measuredLatencyScopeEpoch_;
@@ -2277,11 +3318,31 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
                 // measured lead must not mutate/rebaseline those clocks or depend
                 // on the persisted compatibility latch. Legacy timing retains its
                 // one-time shift while that path remains available.
-                if (config_.measuredLeadEnabled && !autonomousLiveMeterTimingEnabled()
+                // [ORION_LEAD_REBASELINE_RATE 2026-09-15 owner] ONE expression for "these clocks
+                // need no shift", used by BOTH the attempt and the epoch latch, and identical to
+                // measuredLeadAuthoritative()'s clockCompatibilityReady.
+                //
+                // The hybrid's NO METER vision release consumes no learned clock — it IS the live
+                // meter release, so measuredLeadAuthoritative() / userLeadAuthorityActive()
+                // already accept it via noMeterVisionAssistActive() WITHOUT config_.leadRebaselined.
+                // Leaving that term out HERE, while gating the re-baseline attempt out of NO METER
+                // (which is right: the blind path has no learned lead to rebaseline against, and on
+                // 2026-09-14 the attempt refused ~50 times a second), would have made the latch
+                // permanently false in NO METER and starved the vision arm site of epoch readiness
+                // — i.e. silently switched the hybrid back off.
+                //
+                // The METER path is bit-for-bit unchanged: noMeterVisionAssistActive() requires
+                // config_.inputTimedEnabled, which is exactly when autonomousLiveMeterTimingEnabled()
+                // is false, so the added term can never be true on a meter shot.
+                const bool leadClocksCompatible = autonomousLiveMeterTimingEnabled()
+                    || noMeterVisionAssistActive();
+                if (config_.measuredLeadEnabled && !leadClocksCompatible
                     && !config_.leadRebaselined) {
-                    rebaselineLeadClocks();
+                    // Rate/mode gate ONLY — the shift itself is untouched. See
+                    // maybeRebaselineLeadClocks().
+                    maybeRebaselineLeadClocks();
                 }
-                measuredLeadEpochReady_ = autonomousLiveMeterTimingEnabled()
+                measuredLeadEpochReady_ = leadClocksCompatible
                     || config_.leadRebaselined;
                 if (measuredLeadEpochReady_) {
                     measuredLeadRequireNProgress_ = false;
@@ -2308,10 +3369,30 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
             measuredLatencyFactoryPrior_ = false;
             measuredLatencyPriorSource_.clear();
             measuredLatencyModelVersion_.clear();
-            measuredLatencyAttestationGeneration_ = 0;
-            measuredLatencyDeliveryRoute_ = LatencyControllerRoute::None;
-            measuredLeadLastUpdateMs_ = -1.0;
-            measuredLeadTelemetryPresent_ = false;
+            // [ORION_USER_LEAD_LIVENESS 2026-09-02] A payload whose VALUE snapshot is cold or
+            // torn revokes value authority (above). It is still telemetry that arrived on a
+            // route inside a live scope, which is the whole proof the USER-TYPED lead path needs
+            // (see measuredLeadAuthoritative: channel liveness, not posterior shape). Clearing
+            // telemetry-present here dropped the user lead for exactly one tick on every such
+            // payload; the dropout guard then killed the token armed a few ms earlier
+            // (session 19:57 today: 8 of 32 presses died as live_tip_deadline_missed with
+            // "measured_lead_unready" logged 3 ms after each arm while the estimator was
+            // healthy). Keep liveness and the route echo when the payload carries them; drop
+            // them, exactly as before, when the payload carries no route/scope at all.
+            const bool liveRouteCarried = currentLatencyScopeEpoch
+                && result.measuredLatencyDeliveryRoute != LatencyControllerRoute::None;
+            if (liveRouteCarried) {
+                measuredLatencyDeliveryRoute_ = result.measuredLatencyDeliveryRoute;
+                measuredLatencyAttestationGeneration_ =
+                    result.measuredLatencyAttestationGeneration;
+                measuredLeadLastUpdateMs_ = sampleNow;
+                measuredLeadTelemetryPresent_ = true;
+            } else {
+                measuredLatencyAttestationGeneration_ = 0;
+                measuredLatencyDeliveryRoute_ = LatencyControllerRoute::None;
+                measuredLeadLastUpdateMs_ = -1.0;
+                measuredLeadTelemetryPresent_ = false;
+            }
             if (measuredLeadEverValid_) {
                 measuredLeadRequireNProgress_ = true;
                 measuredLeadRestartFloorN_ = -1;
@@ -2548,6 +3629,11 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
     if (result.detected && std::isfinite(result.fillPct)
         && result.fillPct >= 0.0 && result.fillPct <= 100.0) {
         maxFillThisShot_ = std::max(maxFillThisShot_, result.fillPct);
+        // [ORION_RAW_TOP] the coarse read reaches 100.0 on a full bar; the sub-pixel one does not.
+        const double rawFill = (std::isfinite(result.coarseFillPct)
+                                && result.coarseFillPct > 0.0 && result.coarseFillPct <= 100.0)
+            ? std::max(result.fillPct, result.coarseFillPct) : result.fillPct;
+        maxRawFillThisShot_ = std::max(maxRawFillThisShot_, rawFill);
     }
 
     // [ORION_COURT_POSITION] Frame-normalize this detection's bbox center and keep it as the
@@ -2590,12 +3676,25 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
         MeterCalSample s;
         s.tMs = sampleNow;
         s.fillPct = result.fillPct;
+        s.rawFillPct = (std::isfinite(result.coarseFillPct)
+                        && result.coarseFillPct > 0.0 && result.coarseFillPct <= 100.0)
+            ? std::max(result.fillPct, result.coarseFillPct) : result.fillPct;
         s.greenStartPct = result.greenStartPct;
         s.greenEndPct = result.greenEndPct;
         s.greenCenterPct = result.greenCenterPct;
         s.greenConfidence = result.greenConfidence;   // [ORION_GREEN_TRUTH] 0.0 == scan failed
         s.confidence = result.confidence;
-        s.accepted = result.detected
+        // This is the saved PHYSICAL shot epoch, not a detector/ruler
+        // generation. A scoped landing only learns from structure-proven
+        // pixels of that release; zero is legacy/unscoped compatibility.
+        const bool captureEpochMatches = meterCapPhysicalEpoch_ == 0
+            || (result.gameplayStructureVerified
+                && result.gameplayStructureEpoch == meterCapPhysicalEpoch_);
+        const QString captureStage = result.stage.trimmed().toLower();
+        s.accepted = result.detected && captureEpochMatches
+            && captureStage != QLatin1String("coast")
+            && captureStage != QLatin1String("no_meter")
+            && captureStage != QLatin1String("stale")
             && (result.rejectionReason.isEmpty()
                 || result.rejectionReason == QStringLiteral("green_not_found"));
         s.bx = static_cast<double>(result.x) + static_cast<double>(result.width) * 0.5;
@@ -2605,6 +3704,16 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
         s.ny = meterNormY;
         if (s.accepted && std::isfinite(s.fillPct)) {
             meterCapPeakFillPct_ = std::max(meterCapPeakFillPct_, s.fillPct);
+        }
+        if (s.accepted && std::isfinite(s.rawFillPct)) {
+            // [ORION_RAW_TOP] raw top and how long the bar sat there (bounce = LATE, hold = tip).
+            meterCapRawPeakFillPct_ = std::max(meterCapRawPeakFillPct_, s.rawFillPct);
+            if (s.rawFillPct >= kRawTopPct) {
+                if (meterCapTopFirstMs_ < 0.0) {
+                    meterCapTopFirstMs_ = s.tMs;
+                }
+                meterCapTopLastMs_ = s.tMs;
+            }
         }
         // [ORION_TIP_PHASE] END-OF-RISE detector, on the CAPTURE clock (the clock the anchor is
         // on; s.tMs is engine-arrival and would fold this frame's decode/IPC age into the learned
@@ -2704,7 +3813,13 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
     // Input routing can be revoked independently of detector delivery.  A proof
     // callback that races a GUI disable or Defense-mode disarm must remain
     // overlay-only; ownership may be promoted only while both gates are live.
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] ONE arm site per mode, stated rather than
+    // emergent. NO METER arms at processInputTimedIdle and nowhere else; it never records a
+    // pending Square press, so pendingCandidate is already false for it — but this feature exists
+    // precisely to let video into a NO METER shot, and "the other arm site happens to be
+    // unreachable" is not a property worth leaving to inspection.
     if (config_.enabled && armed_.load(std::memory_order_acquire)
+        && !config_.inputTimedEnabled
         && shot_.state == HoldState::Idle && pendingCandidate && liveOwnershipAllowed
         && recordPendingMeterOwnershipSample(
             result, sampleNow, pendingMode, pendingGestureStartMs,
@@ -2713,7 +3828,7 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
             // The output representation is latched on physical DOWN. In particular, an
             // automatic cold-start begins as physical Button/Square even if its measured
             // lead becomes ready between proof frames; switching mid-hold would leak UP.
-            squareLatchedUntilRelease_ = true;
+            armSquareOverlapLatch();
         } else if (pendingMode == ShotMode::GoToStick) {
             stickUpLatchedUntilNeutral_ = true;
         } else {
@@ -2742,9 +3857,64 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
             "Evidence-backed ownership: mode=%1 press_age=%2ms first_fill=%3 current_fill=%4 epoch=%5")
                 .arg(static_cast<int>(pendingMode))
                 .arg(sampleNow - pendingGestureStartMs, 0, 'f', 1)
-                .arg(pendingMeterOwnership_.first.fillPct, 0, 'f', 1)
-                .arg(result.fillPct, 0, 'f', 1)
+                .arg(pendingMeterOwnership_.firstProofFillPct, 0, 'f', 1)
+                .arg(std::isfinite(result.coarseFillPct)
+                         ? result.coarseFillPct : result.fillPct, 0, 'f', 1)
                 .arg(pendingPhysicalEpoch));
+        // Emit the existing proof census before promotion clears it. A late first
+        // accepted frame alone cannot distinguish missing structure stamps from
+        // repeated proof restarts. This is one bounded line per promotion, not a
+        // new ownership condition or a per-frame logging path.
+        emit engineDiagnostic(QStringLiteral(
+            "Ownership proof census: physical_epoch=%1 shot_attempt=%2 proof_samples=%3"
+            " retained_samples=%4 max_proof_samples=%5 first_frame=%6 last_frame=%7"
+            " first_capture_ts_ms=%8 last_capture_ts_ms=%9 first_measurement_ts_ms=%10"
+            " first_fill=%11 last_fill=%12 unstamped_samples=%13"
+            " unstamped_first_fill=%14 unstamped_last_fill=%15 unstamped_span_ms=%16"
+            " unstamped_stamp_epoch=%17 restarts=%18 break_gap=%19 break_drop=%20"
+            " break_anchor=%21 break_geometry=%22 break_identity=%23 break_estimator_ruler=%24")
+                .arg(pendingPhysicalEpoch)
+                .arg(shot_.armToken)
+                .arg(pendingMeterOwnership_.sampleCount)
+                .arg(pendingMeterOwnership_.samples.size())
+                .arg(pendingMeterOwnershipMaxProofSamples_)
+                .arg(pendingMeterOwnership_.first.frameNumber)
+                .arg(pendingMeterOwnership_.lastFrameNumber)
+                .arg(pendingMeterOwnership_.first.captureTsMs, 0, 'f', 3)
+                .arg(pendingMeterOwnership_.lastCaptureTsMs, 0, 'f', 3)
+                .arg(pendingMeterOwnership_.first.measurementCaptureTsMs, 0, 'f', 3)
+                .arg(pendingMeterOwnership_.firstProofFillPct, 0, 'f', 3)
+                .arg(pendingMeterOwnership_.lastProofFillPct, 0, 'f', 3)
+                .arg(pendingMeterOwnershipUnstampedSamples_)
+                .arg(pendingMeterOwnershipUnstampedFirstFillPct_, 0, 'f', 3)
+                .arg(pendingMeterOwnershipUnstampedLastFillPct_, 0, 'f', 3)
+                .arg(pendingMeterOwnershipUnstampedSamples_ > 0
+                         ? pendingMeterOwnershipUnstampedLastMs_
+                             - pendingMeterOwnershipUnstampedFirstMs_ : 0.0, 0, 'f', 3)
+                .arg(pendingMeterOwnershipUnstampedStampEpoch_)
+                .arg(pendingMeterOwnershipBreaks_.restarts)
+                .arg(pendingMeterOwnershipBreaks_.gapOrCandidate)
+                .arg(pendingMeterOwnershipBreaks_.drop)
+                .arg(pendingMeterOwnershipBreaks_.anchor)
+                .arg(pendingMeterOwnershipBreaks_.geometry)
+                .arg(pendingMeterOwnershipBreaks_.identity)
+                .arg(pendingMeterOwnershipBreaks_.estimatorRuler));
+        if (pendingMeterOwnershipBreaks_.geometryResumes > 0) {
+            emit engineDiagnostic(QStringLiteral(
+                "Ownership geometry resume: physical_epoch=%1 shot_attempt=%2 "
+                "ignored_frames=%3 proof_samples=%4 first_fill=%5")
+                                      .arg(pendingPhysicalEpoch).arg(shot_.armToken)
+                                      .arg(pendingMeterOwnershipBreaks_.geometryResumes)
+                                      .arg(pendingMeterOwnership_.sampleCount)
+                                      .arg(pendingMeterOwnership_.firstProofFillPct, 0, 'f', 3));
+        }
+        // A one-line, per-promotion measurement of the first geometry break.
+        // The count alone does not tell us whether a fade moved, the contour
+        // scale jumped, or a false candidate replaced the meter.
+        emitPendingMeterOwnershipAcquisitionCensus(
+            pendingPhysicalEpoch, pendingGestureStartMs, "promoted");
+        emitPendingMeterOwnershipGeometryBreak(
+            pendingPhysicalEpoch, shot_.armToken, "promoted");
         clearPendingMeterOwnershipEpisode();
         clearPendingMeterOwnershipEvidence();
         clearPendingStickCalibration();
@@ -2855,6 +4025,14 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
         && (!strictShotStructureRequired
             || (currentGameplayStructureProof && hasCaptureTs
                 && hasMeasurementCaptureTs));
+    // Fill-ruler identity outranks the detector's generic re-lock preservation.  Run
+    // this before relockDiscontinuity can carry a phase token across an `acquire`:
+    // a phase anchor may survive a box re-seat on the SAME ruler, but it may never
+    // survive an explicit ruler generation change or an impossible same-ruler rewind.
+    const bool fillIntegrityBreak = genuineFresh
+        && fenceArmedTokenOnFillIntegrityBreak(
+            result.fillPct, result.fillEstimatorMode,
+            result.fillEstimatorGeneration, sampleNow);
     if (genuineFresh && currentGameplayStructureProof) {
         shot_.gameplayStructureVerified = true;
         shot_.gameplayStructureEpoch = result.gameplayStructureEpoch;
@@ -2874,8 +4052,16 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
             // clear priorSampleGenuine. The elapsed gap itself must therefore be
             // sufficient to start a new trajectory episode.
             || genuineGapMs > 50.0);
-    if (relockDiscontinuity) {
-        invalidateUnconfirmedVisionSchedule("detect_stale_or_ghost");
+    if (relockDiscontinuity && !fillIntegrityBreak) {
+        // A phase token is dated from a witnessed anchor in this same physical shot. Re-seating
+        // the detector starts a new trajectory episode for all FUTURE estimates, but it cannot
+        // erase that past crossing. Sampler/registration tokens still depend on the old fit and
+        // are synchronously fenced as before.
+        if (armedPhaseTokenCarriesAnchorAuthority(sampleNow)) {
+            notePhaseAnchorCommitRide("detect_relock_phase_anchor_commit", sampleNow);
+        } else {
+            invalidateUnconfirmedVisionSchedule("detect_stale_or_ghost");
+        }
         sampler_.reset();
         greenTracker_.reset();
         fused_.reset();
@@ -2908,8 +4094,41 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
         // with the last pre-relock one to synthesise a crossing across the discontinuity.
         shot_.fillPhaseAnchorMs = -1.0;
         shot_.fillPhaseAnchorLevelPct = -1.0;
+        // [ORION_TIP_PHASE_FIRST_SIGHT] A re-lock is a new episode for the first-sight candidate
+        // for exactly the reason above: the post-relock stream's first sample is a NEW first
+        // sight, and the pre-relock candidate would otherwise date it across the discontinuity.
+        shot_.phaseFirstSightFillPct = -1.0;
+        shot_.phaseFirstSightCaptureMs = -1.0;
+        shot_.phaseFirstSightEstimatorMode.clear();
+        shot_.phaseFirstSightEstimatorGeneration = 0;
+        shot_.phaseFirstSightMissedRungs = 0;
+        shot_.phaseAnchorFromFirstSight = false;
+        shot_.phaseAnchorBase20WitnessMs.fill(-1.0);
+        shot_.phaseAnchorBase20WitnessMask = 0;
+        shot_.phaseRateStretch = 1.0;
+        shot_.phaseRateStretchLatched = false;
+        shot_.phaseRateReferenceDiagnosticLogged = false;
+        shot_.phaseRateStretchSlopePctPerMs = 0.0;
+        shot_.phaseRateRecoveryLastSampleMs = -1.0;
+        shot_.phaseAnchorConsensusApplied = false;
+        shot_.phaseAnchorConsensusStagePct = 0;
+        shot_.phaseAnchorConsensusC30Ms = -1.0;
+        shot_.phaseAnchorRefinement = {};
+        shot_.phaseAnchorConsensusEstimatorMode.clear();
+        shot_.phaseAnchorConsensusEstimatorGeneration = 0;
+        shot_.fadePhaseCatchup.clearEvidence();
         shot_.phasePrevFillPct = -1.0;
         shot_.phasePrevCaptureMs = -1.0;
+        shot_.phasePrevFillEstimatorMode.clear();
+        shot_.phasePrevFillEstimatorGeneration = 0;
+        // [ORION_TIP_FRAME_NATIVE 2026-09-15] A re-lock is a new capture episode, so it is a new
+        // grid: the step edges either side of the discontinuity do not belong to one continuous
+        // 60 Hz fit, and carrying them across would hand the new animation the old episode's
+        // phase. Reset here for exactly the reason phasePrevFillPct is reset here.
+        shot_.framePhase.reset();
+        shot_.framePhaseLogged = false;
+        shot_.phaseAnchorFrameDated = false;
+        shot_.phaseAnchorFrameCorrectionMs = 0.0;
         ++shot_.visionEpoch;
         ++shot_.detRelockResets;
     }
@@ -2942,7 +4161,18 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
     const bool freshAccept = genuineFresh || memoryTrusted;
     shot_.lastSampleFreshAccept = freshAccept;
     shot_.lastSampleGenuineAccept = genuineFresh;
+    if (genuineFresh) {
+        const QString estimatorMode = result.fillEstimatorMode.trimmed().toLower();
+        const bool estimatorValid = result.fillEstimatorGeneration != 0
+            && (estimatorMode == QLatin1String("coarse")
+                || estimatorMode == QLatin1String("subpixel"));
+        shot_.lastGenuineFillEstimatorMode = estimatorValid
+            ? estimatorMode : QString{};
+        shot_.lastGenuineFillEstimatorGeneration = estimatorValid
+            ? result.fillEstimatorGeneration : 0;
+    }
     if (!genuineFresh) {
+        shot_.fadePhaseCatchup.clearEvidence();
         invalidateVisionScheduleForDropout(sampleNow);
     }
 
@@ -2983,16 +4213,22 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
         // Autonomous timing operates on the source/capture clock. Timestamping samples at callback
         // arrival made a 5-20 ms processing variation look like real meter acceleration and was a
         // direct source of inconsistent tip extrapolation.
-        sampler_.addSample(result.fillPct, captureAlignedSampleMs);
+        addMeterTimingSample(result.fillPct, captureAlignedSampleMs,
+                             result.fillEstimatorMode, result.fillEstimatorGeneration);
+        latchPhaseRateStretch(result.fillPct, captureAlignedSampleMs);
         // [ORION_TIP_PHASE] Same sample, same capture clock: date the anchor crossing. Placed on
         // the sampler feed deliberately -- these are the samples the engine already trusts to
         // build a trajectory, so the phase anchor inherits every genuineFresh gate above rather
         // than inventing its own weaker one.
-        notePhaseAnchorSample(result.fillPct, captureAlignedSampleMs);
+        notePhaseAnchorSample(result.fillPct, captureAlignedSampleMs,
+                              result.fillEstimatorMode,
+                              result.fillEstimatorGeneration);
+        noteFadePhaseCatchup(result, captureAlignedSampleMs);
         // [ORION_TEMPLATE_ARRIVAL] H4: feed the crossing-vector on the CAPTURE timeline
         // (sampleNow - frameAgeMs) so the template's time-at-fill crossings are anchored to
         // when the meter actually showed that fill, not when the sample arrived.
-        if (config_.templateArrivalEnabled && !autonomousLiveMeterTimingEnabled()) {
+        if (config_.templateArrivalEnabled && !autonomousLiveMeterTimingEnabled()
+        && !config_.inputTimedEnabled) {
             const double captureMs = sampleNow
                 - std::clamp(result.frameAgeMs, 0.0, config_.captureAgeLeadCapMs);
             templateArrival_.addSample(result.fillPct, captureMs);
@@ -3059,9 +4295,47 @@ void AutomationEngine::updateDetection(const DetectionResult& result)
             shot_.anchorCandLastMs = sampleNow;
             shot_.anchorCandLastFill = result.fillPct;
         }
+        if (shot_.fillRollbackRecoveryActive) {
+            ++shot_.fillRollbackRecoveryFreshFrames;
+            if (shot_.fillRollbackRecoveryFreshFrames >= 2
+                && shot_.anchorValidMs >= 0.0) {
+                shot_.fillRollbackRecoveryActive = false;
+                emit engineDiagnostic(QStringLiteral(
+                    "TIP FILL ROLLBACK RECOVERED: fresh_frames=%1 fill_pct=%2 "
+                    "estimator_mode=%3 estimator_generation=%4 physical_epoch=%5 "
+                    "shot_attempt=%6 vision_epoch=%7")
+                                          .arg(shot_.fillRollbackRecoveryFreshFrames)
+                                          .arg(result.fillPct, 0, 'f', 2)
+                                          .arg(shot_.lastGenuineFillEstimatorMode)
+                                          .arg(shot_.lastGenuineFillEstimatorGeneration)
+                                          .arg(shot_.physicalShotEpoch)
+                                          .arg(shot_.armToken)
+                                          .arg(shot_.visionEpoch));
+            }
+        }
     }
-    if (genuineFresh && result.greenStartPct >= 0.0 && result.greenEndPct >= 0.0) {
-        greenTracker_.update(result.greenStartPct, result.greenEndPct, result.confidence);
+    if (genuineFresh) {
+        // Pass fresh missing-green observations too: skipping negative bounds
+        // kept a vanished band confirmed indefinitely. This updates evidence
+        // only; live-tip timing and already-issued release tokens stay separate.
+        greenTracker_.update(result.greenStartPct, result.greenEndPct, result.greenConfidence);
+        // Snapshot at evidence ingestion, including the autonomous path which
+        // returns before the legacy release-attribution block. These fields
+        // describe observed green, never grant a release or move a copied token.
+        shot_.greenConfirmedAtRelease = greenTracker_.confirmed();
+        shot_.greenWidthAtReleasePct = greenTracker_.confirmed() ? greenTracker_.widthPct() : 0.0;
+        if (greenTracker_.confirmed() && shot_.greenConfirmFillPct < 0.0) {
+            shot_.greenConfirmFillPct = result.fillPct;
+            shot_.greenConfirmMs = shot_.firstMeterSeenMs >= 0.0
+                ? std::max(0.0, sampleNow - shot_.firstMeterSeenMs) : -1.0;
+        }
+        // A missing/invalid current green scan must not spend older pair evidence.
+        if (std::isfinite(result.greenConfidence) && result.greenConfidence > 0.0
+            && std::isfinite(result.greenStartPct) && std::isfinite(result.greenEndPct)
+            && result.greenStartPct >= 0.0 && result.greenEndPct <= 100.0
+            && result.greenEndPct > result.greenStartPct) {
+            maybeLatchFadeWindowLeadPolicy();
+        }
     }
 }
 
@@ -3110,10 +4384,19 @@ void AutomationEngine::applySquarePassthrough(ControllerState& output,
     squarePassthroughInjected_ = false;
     // [ORION_SQUARE_PASSTHROUGH 2026-08-12] #88 -- see RemapConfig::squarePassthroughEnabled.
     //
-    // Gated on tempoRemapEnabled because that is the ONLY condition under which Square is
-    // unreachable. With Tempo off the physical button already passes through, and a second
+    // Gated on the flick being on because that is the ONLY condition under which Square is
+    // unreachable. With the flick off the physical button already passes through, and a second
     // binding would be a surprise (a stick click silently shooting) rather than a fix.
-    if (!config_.squarePassthroughEnabled || !config_.tempoRemapEnabled) {
+    //
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] Read the ACTIVE path's own flick switch. This
+    // used to read config_.tempoRemapEnabled alone, which worked only because applyConfig
+    // overwrote that field with inputTimedRhythmEnabled while NO METER was selected — the same
+    // aliasing that leaked the meter path's stick flick across a mode switch. With the two flags
+    // separated, the condition this gate is actually about ("something is consuming Square right
+    // now") has to name the path that is running.
+    const bool flickConsumesSquare = config_.inputTimedEnabled
+        ? config_.inputTimedRhythmEnabled : config_.tempoRemapEnabled;
+    if (!config_.squarePassthroughEnabled || !flickConsumesSquare) {
         return;
     }
     // [ORION_SQUARE_PASSTHROUGH fix-2 2026-08-13] Suppress across the RELEASE EDGE only.
@@ -3151,9 +4434,359 @@ void AutomationEngine::applySquarePassthrough(ControllerState& output,
 
 ControllerState AutomationEngine::process(const ControllerState& physical)
 {
+    // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] THE GRACE PUMP. The controller tick is the only
+    // thing this engine is guaranteed to receive while the owner is playing, so it is what
+    // retires a parked oracle 2.6 s after its release. Placed here rather than inside
+    // processInternal so a disarmed / disabled tick still retires it: the trim is bookkeeping
+    // about a shot that has already happened, not an actuation. Returns immediately when nothing
+    // is parked, which is every tick outside the 2.6 s after a release.
+    flushExpiredReleaseOracles(nowMs());
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] DECIDED BEFORE THE STATE MACHINE RUNS,
+    // because the controller's "Physical shot epoch" line asks the same predicate on the same
+    // physical sample earlier in this same tick. processInternal can arm, abort or retire a shot,
+    // so evaluating the gate afterwards would let the forensic line and the shaping disagree
+    // about a press exactly when a stick shot ends on the Square edge. The APPLICATION of the
+    // latch stays last (below) so it shapes the final packet.
+    const bool sprintReleaseEngagesAtEdge = sprintReleaseWouldEngage(physical);
+    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] Asked here for the same reason, and on the
+    // same sample: the two latches share one writer of output.r2 below.
+    const bool r2HoldEngagesAtEdge = squarePressR2HoldWouldEngage(physical);
+    // [ORION_PRESS_ANALOG_TRACE 2026-09-16 owner] BEFORE the state machine, because the ring is a
+    // record of the PAD, not of the engine: a press the state machine gates out is exactly the
+    // press this instrument exists to describe. Shapes nothing, gated on nothing.
+    updatePressAnalogTrace(physical);
     ControllerState output = processInternal(physical);
     applySquarePassthrough(output, physical);
+    // LAST, and after the passthrough: this is the only writer of output.r2 in the whole engine,
+    // and it must shape the packet every route actually sends (see applySprintReleaseOnSquare).
+    applySprintReleaseOnSquare(output, physical, sprintReleaseEngagesAtEdge, r2HoldEngagesAtEdge);
     return output;
+}
+
+bool AutomationEngine::sprintReleaseWouldEngage(const ControllerState& physical) const noexcept
+{
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] See AppConfigData::sprintReleaseOnSquare.
+    if (!config_.sprintReleaseOnSquare) {
+        return false;
+    }
+    // A disarmed / disabled route is passing the pad through verbatim. Taking sprint away there
+    // would cost the player a real input for a shot Venice is not going to take.
+    if (!config_.enabled || !armed_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // NO METER runs its own blind press law and is shelved; it never asked for this and must stay
+    // byte-identical.
+    if (config_.inputTimedEnabled) {
+        return false;
+    }
+    // THE PHYSICAL SQUARE-DOWN EDGE, read from the pad alone. Keyed off the previous tick's
+    // physical sample rather than any shot state so a press the state machine gates out (stale
+    // epoch, waiting for a meter, latched) is still shaped -- a dead press is exactly the press
+    // that never reaches those paths.
+    if (!physical.square() || sprintReleaseSquareDownPrev_) {
+        return false;
+    }
+    // Deliberately NOT gated on stick magnitude: a full-speed press IS the failing case.
+    if (static_cast<int>(physical.r2) < config_.sprintReleaseR2Threshold) {
+        return false;
+    }
+    // A stick-armed press (Go-To / raw TempoStick) is not ours to reshape: the Pro Stick starts
+    // those shots at sprint perfectly well, which is precisely why the owner's manual stick tempo
+    // works when the button appears stuck. Only an overlap press -- Square pushed while a stick
+    // shot already owns the output -- can reach this line.
+    if (shot_.state != HoldState::Idle
+        && (shot_.mode == ShotMode::GoToStick || shot_.mode == ShotMode::TempoStick)) {
+        return false;
+    }
+    return true;
+}
+
+bool AutomationEngine::squarePressR2HoldWouldEngage(const ControllerState& physical) const noexcept
+{
+    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] See AppConfigData::squarePressR2HoldMs.
+    // 0 is the kill switch: no latch, no line, output byte-identical to the 2026-09-16 build.
+    if (!(config_.squarePressR2HoldMs > 0.0)) {
+        return false;
+    }
+    // MUTUALLY EXCLUSIVE with the refuted sprint release. One drops the trigger on the edge, the
+    // other pins it there; if both were ever armed at once the packet would depend on which latch
+    // the writer happened to test first. Asked here, in the predicate, so the exclusion holds on
+    // every route rather than only where the two happen to be applied.
+    if (sprintReleaseWouldEngage(physical)) {
+        return false;
+    }
+    // A disarmed / disabled route is passing the pad through verbatim. Shaping it would be Venice
+    // writing a byte on a shot it is not taking.
+    if (!config_.enabled || !armed_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // NO METER runs its own blind press law and is shelved; it never asked for this and must stay
+    // byte-identical.
+    if (config_.inputTimedEnabled) {
+        return false;
+    }
+    // THE PHYSICAL SQUARE-DOWN EDGE, read from the pad alone -- a press the state machine gates
+    // out (stale epoch, waiting for a meter, latched) is exactly the dead press this protects.
+    if (!physical.square() || sprintReleaseSquareDownPrev_) {
+        return false;
+    }
+    // The trigger must have been DEEP-HELD at the edge. Below the cut there is no sprint to let go
+    // of in the button's frame, so there is nothing to mask and the pad passes through untouched.
+    if (static_cast<int>(physical.r2) < config_.sprintReleaseR2Threshold) {
+        return false;
+    }
+    // A stick-armed press (Go-To / raw TempoStick) is not ours to reshape: the Pro Stick starts
+    // those shots at sprint perfectly well. Only an overlap press -- Square pushed while a stick
+    // shot already owns the output -- can reach this line.
+    if (shot_.state != HoldState::Idle
+        && (shot_.mode == ShotMode::GoToStick || shot_.mode == ShotMode::TempoStick)) {
+        return false;
+    }
+    return true;
+}
+
+void AutomationEngine::finishSquarePressR2Hold(double heldMs)
+{
+    // ONE line per affected press, and ONLY when the latch actually did something: a press whose
+    // trigger stayed deep-held for the whole window was shaped by zero bytes, and logging it would
+    // bury the presses that matter under one line per sprint shot.
+    const bool maskedARelease = squarePressR2HoldMinPhysR2_ < config_.sprintReleaseR2Threshold;
+    if (maskedARelease) {
+        emit engineDiagnostic(QStringLiteral(
+            "R2 HELD THROUGH PRESS: epoch=%1 held_ms=%2 phys_r2_min=%3")
+                                  .arg(squarePressR2HoldEpoch_)
+                                  .arg(heldMs, 0, 'f', 1)
+                                  .arg(squarePressR2HoldMinPhysR2_));
+    }
+    squarePressR2HoldActive_ = false;
+    squarePressR2HoldValue_ = 0;
+    squarePressR2HoldEdgeMs_ = -1.0;
+    squarePressR2HoldEpoch_ = 0;
+    squarePressR2HoldMinPhysR2_ = 255;
+}
+
+void AutomationEngine::applySprintReleaseOnSquare(ControllerState& output,
+                                                  const ControllerState& physical,
+                                                  bool engagesAtEdge,
+                                                  bool r2HoldEngagesAtEdge)
+{
+    const bool squareDownNow = physical.square();
+    // THE END OF THE PRESS owns the latch. The physical button going up is the press's physical
+    // end; losing the route (disarm / disable) or the switch being turned off mid-press hands the
+    // trigger straight back. Everything else about the press -- the release edge, the cooldown,
+    // the owned-output drain -- stays inside the window on purpose: restoring sprint at the
+    // release instant would re-engage the sprint the console just saw let go, mid-shot-start.
+    if (sprintReleaseActive_
+        && (!squareDownNow || !config_.sprintReleaseOnSquare || !config_.enabled
+            || !armed_.load(std::memory_order_acquire))) {
+        sprintReleaseActive_ = false;
+        sprintReleaseEpoch_ = 0;
+        sprintReleaseR2AtEdge_ = 0;
+    }
+    if (engagesAtEdge) {
+        sprintReleaseActive_ = true;
+        sprintReleaseEpoch_ = physicalShotEpoch_;
+        sprintReleaseR2AtEdge_ = static_cast<int>(physical.r2);
+        // ONE line per affected press (this branch is an edge, so it cannot repeat inside a
+        // press). classifyShotType is the same call the Square branch of processIdle makes for
+        // its provisional type, so the line names the shot the engine is about to time.
+        emit engineDiagnostic(QStringLiteral(
+            "SPRINT RELEASED FOR SHOT: epoch=%1 r2_phys=%2 ls=(%3,%4) type=%5")
+                                  .arg(sprintReleaseEpoch_)
+                                  .arg(sprintReleaseR2AtEdge_)
+                                  .arg(physical.leftStickX)
+                                  .arg(physical.leftStickY)
+                                  .arg(classifyShotType(physical, ShotMode::ButtonShot)));
+    }
+    // === [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] =====================================
+    // THE END OF THE WINDOW owns this latch, and it is a SHORT window rather than the whole press
+    // on purpose: the mechanism is a trigger release landing in the button's own game frame, so
+    // three frames of cover is the entire fix. After that the player's trigger is their own again.
+    // The press physically ending, and losing the route / the switch mid-press, also hand it back.
+    if (squarePressR2HoldActive_) {
+        const double heldMs = nowMs() - squarePressR2HoldEdgeMs_;
+        const bool featureLive = config_.squarePressR2HoldMs > 0.0 && config_.enabled
+            && armed_.load(std::memory_order_acquire);
+        if (!squareDownNow || !featureLive || !(heldMs < config_.squarePressR2HoldMs)) {
+            finishSquarePressR2Hold(heldMs);
+        } else {
+            // Inside the window: remember how far the trigger actually fell, because that number
+            // IS the evidence for or against the mechanism on the next dead press.
+            squarePressR2HoldMinPhysR2_ =
+                std::min(squarePressR2HoldMinPhysR2_, static_cast<int>(physical.r2));
+        }
+    }
+    if (r2HoldEngagesAtEdge) {
+        squarePressR2HoldActive_ = true;
+        squarePressR2HoldValue_ = static_cast<int>(physical.r2);
+        squarePressR2HoldEdgeMs_ = nowMs();
+        squarePressR2HoldEpoch_ = physicalShotEpoch_;
+        squarePressR2HoldMinPhysR2_ = static_cast<int>(physical.r2);
+    }
+    sprintReleaseSquareDownPrev_ = squareDownNow;
+    // The sprint release wins the packet if it is somehow live: the two are mutually exclusive by
+    // construction (squarePressR2HoldWouldEngage refuses whenever the sprint release would
+    // engage), and an explicit precedence here means a future third writer cannot make the output
+    // depend on statement order.
+    if (sprintReleaseActive_) {
+        output.r2 = 0;
+    } else if (squarePressR2HoldActive_) {
+        output.r2 = static_cast<uint8_t>(squarePressR2HoldValue_);
+    }
+}
+
+// === [ORION_PRESS_ANALOG_TRACE 2026-09-16 owner] ==========================================
+// The sprint theory survived a whole build cycle because nothing in the log said what the ANALOG
+// channels were doing either side of a Square edge: the epoch line carries one sample, AT the
+// press, and every dead press therefore looked identical to every answered one. This is the
+// instrument that settles it. One line per physical Square-down edge, always on, shaping nothing:
+// the physical R2 and both stick magnitudes on a fixed ladder around the press, plus the offset of
+// the first trigger release inside the window -- which is the accused mechanism itself, timed.
+bool AutomationEngine::padTraceNearest(double targetMs, int& r2, int& lsMag, int& rsMag) const
+{
+    r2 = -1;
+    lsMag = -1;
+    rsMag = -1;
+    const PadTraceSample* best = nullptr;
+    double bestGap = kPadTraceNearestToleranceMs;
+    for (int i = 0; i < padTraceRingCount_; ++i) {
+        const int idx = (padTraceRingHead_ - padTraceRingCount_ + i + 2 * kPadTraceRingSize)
+            % kPadTraceRingSize;
+        const PadTraceSample& sample = padTraceRing_[idx];
+        const double gap = std::abs(sample.tMs - targetMs);
+        if (gap <= bestGap) {
+            bestGap = gap;
+            best = &sample;
+        }
+    }
+    if (best == nullptr) {
+        return false;
+    }
+    r2 = best->r2;
+    lsMag = best->lsMag;
+    rsMag = best->rsMag;
+    return true;
+}
+
+void AutomationEngine::emitPressAnalogTrace()
+{
+    const auto join = [](const std::array<int, kPadTraceOffsetCount>& values) {
+        QString out;
+        for (int i = 0; i < kPadTraceOffsetCount; ++i) {
+            if (i > 0) {
+                out += QLatin1Char(',');
+            }
+            // "-" = the ring had no sample within half a game frame of that offset (a press near
+            // session start, or a window the press ended before reaching). Never a borrowed one.
+            out += values[i] < 0 ? QStringLiteral("-") : QString::number(values[i]);
+        }
+        return out;
+    };
+    // The ladder is FIXED (-32,-16,0,+16,+33,+50,+100,+200 ms relative to the press), so the line
+    // carries values only and offline tooling can join on position alone.
+    emit engineDiagnostic(QStringLiteral(
+        "PRESS ANALOG TRACE: epoch=%1 r2=[%2] ls=[%3] rs=[%4] r2_release_edge_ms=%5")
+                              .arg(padTracePressEpoch_)
+                              .arg(join(padTraceR2_), join(padTraceLs_), join(padTraceRs_),
+                                   padTraceReleaseEdgeFound_
+                                       ? QString::number(padTraceReleaseEdgeMs_, 'f', 1)
+                                       : QStringLiteral("none")));
+    padTracePending_ = false;
+    padTracePressMs_ = -1.0;
+    padTracePressEpoch_ = 0;
+    padTraceNextOffset_ = 0;
+    padTraceReleaseEdgeFound_ = false;
+    padTraceReleaseEdgeMs_ = 0.0;
+}
+
+void AutomationEngine::updatePressAnalogTrace(const ControllerState& physical)
+{
+    // THE LADDER, in ms relative to the physical Square-down edge. -32/-16 are the two game frames
+    // BEFORE the button (where a trigger release that kills the press has to live); 0 is the press
+    // itself; +16/+33/+50 are the three frames after it; +100/+200 say whether the trigger came
+    // back and whether the player was still moving.
+    static constexpr double kOffsetsMs[kPadTraceOffsetCount] =
+        {-32.0, -16.0, 0.0, 16.0, 33.0, 50.0, 100.0, 200.0};
+
+    const double now = nowMs();
+    const int r2 = static_cast<int>(physical.r2);
+    const int lsMag = static_cast<int>(std::lround(
+        std::hypot(static_cast<double>(physical.leftStickX),
+                   static_cast<double>(physical.leftStickY))));
+    const int rsMag = static_cast<int>(std::lround(
+        std::hypot(static_cast<double>(physical.rightStickX),
+                   static_cast<double>(physical.rightStickY))));
+
+    // 1) THE RING, every tick and unconditionally: it is a record of the PAD, and the presses
+    //    worth explaining are exactly the ones the engine refused to act on.
+    padTraceRing_[padTraceRingHead_] = PadTraceSample{now, r2, lsMag, rsMag};
+    padTraceRingHead_ = (padTraceRingHead_ + 1) % kPadTraceRingSize;
+    padTraceRingCount_ = std::min(padTraceRingCount_ + 1, kPadTraceRingSize);
+
+    const bool squareDownNow = physical.square();
+    const bool squareDownEdge = squareDownNow && !padTraceSquareDownPrev_;
+
+    // 2) An OPEN trace: watch the trigger, fill every slot this sample has reached, and close at
+    //    +200 ms or at the physical end of the press, whichever comes first.
+    if (padTracePending_) {
+        if (!padTraceReleaseEdgeFound_ && padTraceLastR2_ >= kPadTraceReleaseR2
+            && r2 < kPadTraceReleaseR2) {
+            padTraceReleaseEdgeFound_ = true;
+            padTraceReleaseEdgeMs_ = now - padTracePressMs_;
+        }
+        while (padTraceNextOffset_ < kPadTraceOffsetCount
+               && now >= padTracePressMs_ + kOffsetsMs[padTraceNextOffset_]) {
+            const int slot = padTraceNextOffset_;
+            padTraceNearest(padTracePressMs_ + kOffsetsMs[slot], padTraceR2_[slot],
+                            padTraceLs_[slot], padTraceRs_[slot]);
+            ++padTraceNextOffset_;
+        }
+        if (padTraceNextOffset_ >= kPadTraceOffsetCount || !squareDownNow || squareDownEdge) {
+            emitPressAnalogTrace();
+        }
+    }
+    padTraceLastR2_ = r2;
+
+    // 3) A NEW EDGE opens the next trace. The negative slots are resolved HERE rather than at emit
+    //    time so a 64-sample ring can never lose them, and the pre-press half of the release scan
+    //    runs here for the same reason: a trigger that came up one or two frames BEFORE the button
+    //    is precisely what the mechanism accuses, and it must be reported as a negative offset
+    //    rather than missed.
+    if (squareDownEdge) {
+        padTracePending_ = true;
+        padTracePressMs_ = now;
+        padTracePressEpoch_ = physicalShotEpoch_;
+        padTraceNextOffset_ = 0;
+        padTraceR2_.fill(-1);
+        padTraceLs_.fill(-1);
+        padTraceRs_.fill(-1);
+        padTraceReleaseEdgeFound_ = false;
+        padTraceReleaseEdgeMs_ = 0.0;
+        while (padTraceNextOffset_ < kPadTraceOffsetCount
+               && now >= padTracePressMs_ + kOffsetsMs[padTraceNextOffset_]) {
+            const int slot = padTraceNextOffset_;
+            padTraceNearest(padTracePressMs_ + kOffsetsMs[slot], padTraceR2_[slot],
+                            padTraceLs_[slot], padTraceRs_[slot]);
+            ++padTraceNextOffset_;
+        }
+        const double windowStartMs = now + kOffsetsMs[0];
+        int scanPrevR2 = -1;
+        for (int i = 0; i < padTraceRingCount_ && !padTraceReleaseEdgeFound_; ++i) {
+            const int idx = (padTraceRingHead_ - padTraceRingCount_ + i + 2 * kPadTraceRingSize)
+                % kPadTraceRingSize;
+            const PadTraceSample& sample = padTraceRing_[idx];
+            if (sample.tMs < windowStartMs) {
+                scanPrevR2 = sample.r2;
+                continue;
+            }
+            if (scanPrevR2 >= kPadTraceReleaseR2 && sample.r2 < kPadTraceReleaseR2) {
+                padTraceReleaseEdgeFound_ = true;
+                padTraceReleaseEdgeMs_ = sample.tMs - now;
+            }
+            scanPrevR2 = sample.r2;
+        }
+    }
+    padTraceSquareDownPrev_ = squareDownNow;
 }
 
 ControllerState AutomationEngine::processInternal(const ControllerState& physical)
@@ -3185,10 +4818,27 @@ ControllerState AutomationEngine::processInternal(const ControllerState& physica
         physicalSquareReleaseSeenSinceArm_ = true;
     }
     auto output = physical.clone();
+    auto observeDrainWhileReleaseStateAdvances = [this, &physical, now]() {
+        if (ownedOutputDrain_ == OwnedOutputDrain::None) {
+            return;
+        }
+        // Releasing/Cooldown owns the actual packet shape, but the
+        // independent drain must still consume physical UP/neutral polls in
+        // parallel. Otherwise three recovery-neutral polls are discarded and
+        // the first post-reconnect gesture is suppressed by a stale drain.
+        const QString plan = shot_.releasePlan;
+        const QString reason = shot_.releaseReason;
+        ControllerState ignored = physical.clone();
+        (void)applyOwnedOutputDrain(ignored, physical, now);
+        shot_.releasePlan = plan;
+        shot_.releaseReason = reason;
+    };
 
     const quint64 armGeneration = armRevocationGeneration_.load(
         std::memory_order_acquire);
     if (armGeneration != handledArmRevocationGeneration_) {
+        inputTimedReady_ = false;
+        inputTimedNeutralPolls_ = 0;
         // Consume every cross-thread disarm on the engine thread, even when the
         // watchdog re-armed before this controller tick.  A pre-proof gesture is
         // fenced; an owned shot can never resume from stale state. A release that
@@ -3207,6 +4857,8 @@ ControllerState AutomationEngine::processInternal(const ControllerState& physica
         handledArmRevocationGeneration_ = armGeneration;
     }
     if (!config_.enabled || !armed_.load(std::memory_order_acquire)) {
+        inputTimedReady_ = false;
+        inputTimedNeutralPolls_ = 0;
         // Disabling the route while a physical edge is awaiting meter proof is
         // terminal for that edge. Pre-release ownership is aborted into a
         // mode-aware drain; a submitted release keeps its exact pulse/cooldown.
@@ -3231,21 +4883,6 @@ ControllerState AutomationEngine::processInternal(const ControllerState& physica
                                       shot_.mode, shot_.shotType);
             }
         }
-        auto observeDrainWhileReleaseStateAdvances = [this, &physical, now]() {
-            if (ownedOutputDrain_ == OwnedOutputDrain::None) {
-                return;
-            }
-            // Releasing/Cooldown owns the actual packet shape, but the
-            // independent drain must still consume physical UP/neutral polls in
-            // parallel. Otherwise three recovery-neutral polls are discarded and
-            // the first post-reconnect gesture is suppressed by a stale drain.
-            const QString plan = shot_.releasePlan;
-            const QString reason = shot_.releaseReason;
-            ControllerState ignored = physical.clone();
-            (void)applyOwnedOutputDrain(ignored, physical, now);
-            shot_.releasePlan = plan;
-            shot_.releaseReason = reason;
-        };
         if (shot_.state == HoldState::Releasing) {
             observeDrainWhileReleaseStateAdvances();
             processReleasing(output, now);
@@ -3285,6 +4922,21 @@ ControllerState AutomationEngine::processInternal(const ControllerState& physica
     // mode-specific output shaping erases the physical evidence.
     latchSuppressedShotControlOverlap(physical);
 
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] The first tick after a METER <-> NO METER switch
+    // hands the console the player's own packet, so a virtual Square or a half-held tempo gather
+    // that belonged to the old mode cannot survive the switch. An owned-output drain keeps
+    // priority (it is the fail-closed finish of a gesture the console already saw the front half
+    // of, and it ends at the physical end regardless).
+    if (modeSwitchPassThroughPending_) {
+        modeSwitchPassThroughPending_ = false;
+        if (ownedOutputDrain_ == OwnedOutputDrain::None) {
+            output = physical;
+            prevSquare_ = physical.square();
+            prevStickActive_ = stickShotActive(physical);
+            return output;
+        }
+    }
+
     if (shot_.state == HoldState::Idle
         && applyOwnedOutputDrain(output, physical, now)) {
         prevSquare_ = physical.square();
@@ -3294,22 +4946,26 @@ ControllerState AutomationEngine::processInternal(const ControllerState& physica
 
     switch (shot_.state) {
     case HoldState::Idle:
-        processIdle(output, physical, now);
+        if (config_.inputTimedEnabled) processInputTimedIdle(output, physical, now);
+        else processIdle(output, physical, now);
         break;
     case HoldState::Armed:
         processArmed(output, now);
         break;
     case HoldState::Holding:
     case HoldState::GreenWindow:
-        processHolding(output, now);
+        if (shot_.inputTimedShot) processInputTimedHolding(output, now);
+        else processHolding(output, now);
         break;
     case HoldState::Releasing:
+        observeDrainWhileReleaseStateAdvances();
         processReleasing(output, now);
         break;
     case HoldState::PumpFake:
         processPumpFake(output, now);
         break;
     case HoldState::Cooldown:
+        observeDrainWhileReleaseStateAdvances();
         processCooldown(output, now);
         break;
     }
@@ -3346,6 +5002,10 @@ ControllerState AutomationEngine::processInternal(const ControllerState& physica
 
 void AutomationEngine::reset()
 {
+    inputTimedReady_ = false;
+    inputTimedNeutralPolls_ = 0;
+    noMeterBackstop_.clear();
+    inputTimedVisionOwnedLoggedToken_ = 0;
     tipReservation_ = AutonomousTipReservation{};
     latencyCalibrationMode_ = false;
     latencyCalibrationAutomatic_ = false;
@@ -3360,6 +5020,8 @@ void AutomationEngine::reset()
     prevStickActive_ = false;
     squareHoldStartMs_ = -1.0;
     physicalShotEpoch_ = 0;
+    lastSquarePressEpoch_ = 0;
+    squareLatchArmSquareEpoch_ = 0;
     clearPendingMeterOwnershipEpisode();
     clearPendingMeterOwnershipEvidence();
     clearPendingStickCalibration();
@@ -3371,6 +5033,44 @@ void AutomationEngine::reset()
     resetTempoMovementTransaction();
     tempoPassThroughPulseActive_ = false;
     tempoPassThroughPulseEndMs_ = -1.0;
+    tempoPassThroughPulseHeldPress_ = false;
+    // [ORION_METER_BLIND_BACKSTOP 2026-09-14] The meter path's half of the blind machine.
+    meterBackstop_.clear();
+    meterBackstopArmedEpoch_ = 0;
+    meterBackstopFiredEpoch_ = 0;
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16] Hygiene: the latch is epoch-keyed, so a stale
+    // one can never be mistaken for a new press's evidence, but a full reset owns every field.
+    pendingMeterFirstSeenEpoch_ = 0;
+    pendingMeterFirstSeenMs_ = -1.0;
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16] A reset hands the pad back whole: the latch is
+    // dropped and the edge detector forgets the previous physical sample, so the first press after
+    // a reset is judged on its own edge rather than inheriting a half-seen one.
+    sprintReleaseActive_ = false;
+    sprintReleaseSquareDownPrev_ = false;
+    sprintReleaseEpoch_ = 0;
+    sprintReleaseR2AtEdge_ = 0;
+    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16] Same hygiene, and the latch is dropped SILENTLY: a
+    // reset is not a press ending, so it owes no "R2 HELD THROUGH PRESS" line.
+    squarePressR2HoldActive_ = false;
+    squarePressR2HoldValue_ = 0;
+    squarePressR2HoldEdgeMs_ = -1.0;
+    squarePressR2HoldEpoch_ = 0;
+    squarePressR2HoldMinPhysR2_ = 255;
+    // [ORION_PRESS_ANALOG_TRACE 2026-09-16] The instrument forgets the pad it was watching: a
+    // pending trace is dropped rather than emitted (its window never completed), and the edge
+    // memory is cleared so the first press after a reset is judged on its own edge.
+    padTraceRing_.fill(PadTraceSample{});
+    padTraceRingHead_ = 0;
+    padTraceRingCount_ = 0;
+    padTraceSquareDownPrev_ = false;
+    padTracePending_ = false;
+    padTracePressMs_ = -1.0;
+    padTracePressEpoch_ = 0;
+    padTraceNextOffset_ = 0;
+    padTraceReleaseEdgeFound_ = false;
+    padTraceReleaseEdgeMs_ = 0.0;
+    padTraceLastR2_ = -1;
+    modeSwitchPassThroughPending_ = false;
     stickDownHoldStartMs_ = -1.0;
     stickUpHoldStartMs_ = -1.0;
     squareLatchedUntilRelease_ = false;
@@ -3427,6 +5127,19 @@ void AutomationEngine::beginSidecarProcessGeneration()
     // Fence any copied precise-fire token before erasing its timing authority.
     // `clearScheduledFire()` alone cannot revoke a worker that already copied it.
     invalidateUnconfirmedSchedule(false, "sidecar_generation");
+
+    // A restart ends the old capture/label namespace. Neither a late landing
+    // nor a restarted post-hoc counter can teach the prior process's shot.
+    cancelPostReleaseGrade(meterCapSeq_);
+    endedShotAppearMs_ = -1.0;
+    endedShotBucketKey_.clear();
+    lastPosthocNConsumed_ = 0;
+    epochBridgeN_ = 0;
+    epochBridgeInit_.fill(0.0);
+    epochToEngineOffsetMs_ = 0.0;
+    lastGenuineCaptureSampleMs_ = -1.0;
+    genuineFrameGapEmaMs_ = 1000.0 / 60.0;
+    genuineFrameGapHighWaterMs_ = 1000.0 / 60.0;
 
     // Frame ids and latency scope epochs are both process-local. Reset them on
     // the confirmed QProcess::started boundary so a valid fresh process may
@@ -3536,7 +5249,36 @@ bool AutomationEngine::stickTempoArmAllowed() const
 {
     // Raw RS-DOWN is its own physical shot source. The Square Tempo remap cannot
     // silently opt a square-only user into bot ownership of stick/dribble input.
-    return stickInputAllowed();
+    if (stickInputAllowed()) {
+        return true;
+    }
+    // [ORION_RHYTHM_STICK_PULL 2026-09-15 owner] "we already have rhythm working fully but the
+    // stick pull-down function isn't there yet, it's already pre-built."
+    //
+    // IT WAS. The whole TempoStick transaction -- the gather, the ownership proof, the hold
+    // timer, beginShot(ShotMode::TempoStick), the flick release -- has been built and tested
+    // since the Tempo work; the ONE thing missing was its door. `stickInputAllowed()` is keyed
+    // on remote_play_input_source, which ships as "square", so on every shipped install the
+    // gesture was computed, logged as a physical shot epoch, armed at the reader... and then
+    // silently declined by this predicate. That is the "isn't there yet".
+    //
+    // WHAT OPENS IT, AND WHY THIS EXACT FLAG. Rhythm's release IS a right-stick flick
+    // (rhythmFlickReleasePending / rhythm_flick_delay_ms). A player who has turned Rhythm on has
+    // already told the app the right stick is a shooting control on this rig, so honouring the
+    // pull-down is the same statement the switch made, not a new one. The gate is
+    // `config_.tempoEnabled` -- the value the Rhythm switch itself writes
+    // (OrionAppController::setTempoEnabled sets tempoEnabled/tempoRemapEnabled/tempoFlickEnabled
+    // together) -- and deliberately NOT `tempoRemapEnabled` alone: the per-type Square remap can
+    // be on without the switch, and the invariant above ("the Square Tempo remap cannot silently
+    // opt a square-only user into bot ownership of stick/dribble input") still holds.
+    if (!config_.tempoEnabled) {
+        return false;
+    }
+    // GUARD: a pull-down while a Square press is pending is IGNORED. In 2K a right stick pushed
+    // during a held Square is an aim/lean on a shot that already exists, never a second shot, and
+    // taking it would mint a competing TempoStick transaction against a press the Square path
+    // already owns -- two gathers, two holds, one console.
+    return !pendingSquarePressActive() && squareHoldStartMs_ < 0.0;
 }
 
 QString AutomationEngine::classifyShotType(const ControllerState& physical, ShotMode mode) const
@@ -3611,7 +5353,18 @@ double AutomationEngine::tipPhaseTypeTrimMs(const QString& shotType) const noexc
     if (it == config_.tipPhaseTypeTrims.constEnd() || !std::isfinite(it.value())) {
         return 0.0;
     }
-    return std::clamp(it.value(), -kTipPhaseTypeTrimCapMs, kTipPhaseTypeTrimCapMs);
+    const double configured = std::clamp(it.value(), -kTipPhaseTypeTrimCapMs, kTipPhaseTypeTrimCapMs);
+    const QString liveType = shotTypeWithBackstopFadeRetype();
+    if (shot_.fadeWindowLeadPolicyLatched && config_.greenWindowPriority
+        && autonomousLiveMeterTimingEnabled() && !shot_.inputTimedShot
+        && !shot_.latencyCalibrationProbe
+        && liveShotRange() != orion::BannerLeadTrim::Range::Mid
+        && shotType.trimmed() == liveType
+        && orion::BannerLeadTrim::isFadeBucket(orion::BannerLeadTrim::bucketFor(liveType))) {
+        return configured + std::min(std::max(0.0, -configured),
+                                     shot_.fadeWindowPhaseAdvanceRemovedMs);
+    }
+    return configured;
 }
 
 QString AutomationEngine::timingKey(const QString& shotType, ShotMode mode)
@@ -3690,11 +5443,21 @@ bool AutomationEngine::tempoRemapBridgeLive(double now) const noexcept
         && (now - tempoBridgeHealthBeatMs_) <= kTempoRemapBridgeHealthFreshMs;
 }
 
-void AutomationEngine::setPhysicalShotEpoch(quint64 epoch) noexcept
+void AutomationEngine::setPhysicalShotEpoch(quint64 epoch, bool squarePressEdge) noexcept
 {
     // The source is a local synchronous monotonic counter. Ignore zero and regressions so
     // no delayed/replayed caller can move the expected identity back to a prior shot.
     if (epoch > physicalShotEpoch_) {
+        // The prior release's landing window can outlive cooldown. A new
+        // certified gesture retires that unfinished measurement BEFORE its
+        // first meter frame arrives; otherwise the old anchor can be paired
+        // with this shot's rise/stop and move the learned timing after a few
+        // rapid shots. This discards only an ambiguous automatic measurement,
+        // never a release marker or the player's independently recorded tally.
+        if (meterCapActive_ && meterCapPhysicalEpoch_ != 0
+            && epoch > meterCapPhysicalEpoch_) {
+            cancelPostReleaseGrade(meterCapSeq_);
+        }
         physicalShotEpoch_ = epoch;
         // [ORION_PRESS_ANCHOR] Date the press at WALL time. This call happens on the same
         // synchronous GUI tick that polled the raw input edge (OrionAppController assigns the
@@ -3703,7 +5466,60 @@ void AutomationEngine::setPhysicalShotEpoch(quint64 epoch) noexcept
         // delay. Keyed by epoch: a consumer must match its own shot epoch to use it.
         pressWallEpoch_ = epoch;
         pressWallMsForEpoch_ = nowMs();
+        // [ORION_LATCH_CANARY] A certified Square DOWN edge. The tracker requires
+        // debounced release evidence (including its delivered-release rapid path), so any squareLatchedUntilRelease_ armed
+        // for an OLDER press is now provably stale — its release physically happened.
+        // Recording the epoch here (and comparing in processIdle, where the strip lives)
+        // is what encodes the owner invariant "no latch may ever swallow a fresh press".
+        if (squarePressEdge) {
+            const bool followsEarlierSquare = lastSquarePressEpoch_ != 0;
+            lastSquarePressEpoch_ = epoch;
+            // A certified new Square epoch proves the earlier physical press ended.
+            // The rapid delivered-release route needs two UP reports; Idle's
+            // independent three-report rearm fence must not consume that new press.
+            // An unresolved HOLD drain still owns its output until physical end.
+            if (followsEarlierSquare && shot_.state == HoldState::Idle
+                && ownedOutputDrain_ != OwnedOutputDrain::HoldUntilPhysicalEnd
+                && (squareRearmBlockedUntilRelease_
+                    || (pendingSquarePhysicalEpoch_ != 0
+                        && pendingSquarePhysicalEpoch_ < epoch))) {
+                squareRearmBlockedUntilRelease_ = false;
+                squareHoldStartMs_ = -1.0;
+                pendingSquarePhysicalEpoch_ = 0;
+                pendingSquareArmGeneration_ = 0;
+                pendingSquareTempoRemap_ = false;
+                clearPendingSquareMovementContext();
+                clearPendingMeterOwnershipEpisode();
+                clearPendingMeterOwnershipEvidence();
+                if (tempoMovement_.mode == ShotMode::TempoSquare) {
+                    resetTempoMovementTransaction();
+                }
+            }
+            // A certified fresh Square epoch already proves that the old press
+            // ended. In particular, the delivered-release path accepts two real
+            // UP reports; the independent released-output drain still counting
+            // three must not hide this new press before processIdle can see it.
+            // Only finish an existing Square RELEASE drain. Raw DOWN, reused or
+            // stick epochs, HOLD drains and another control's drain stay fenced.
+            if (followsEarlierSquare
+                && ownedOutputDrain_ == OwnedOutputDrain::ReleasedUntilPhysicalEnd
+                && (ownedOutputDrainMode_ == ShotMode::ButtonShot
+                    || ownedOutputDrainMode_ == ShotMode::TempoSquare)) {
+                ownedOutputDrainEndObserved_ = true;
+            }
+        }
     }
+}
+
+void AutomationEngine::armSquareOverlapLatch() noexcept
+{
+    squareLatchedUntilRelease_ = true;
+    // The press being suppressed is by definition the most recent physical Square DOWN
+    // edge (the button is held right now, or the arm site guards on physical.square()).
+    // A caller path where no certified square epoch exists leaves this at 0, and the
+    // canary then treats ANY later certified press as newer — still the safe direction,
+    // because a certified press proves an intervening release regardless.
+    squareLatchArmSquareEpoch_ = lastSquarePressEpoch_;
 }
 
 bool AutomationEngine::automaticCalibrationEpochCurrent() const noexcept
@@ -3714,14 +5530,76 @@ bool AutomationEngine::automaticCalibrationEpochCurrent() const noexcept
         && shot_.gameplayStructureEpoch == shot_.physicalShotEpoch;
 }
 
+void AutomationEngine::emitPendingMeterOwnershipAcquisitionCensus(
+    quint64 physicalEpoch, double gestureStartMs, const char* disposition)
+{
+    if (physicalEpoch == 0) return;
+    // Arrival-clock evidence only: a reader proposal, current stamped evidence,
+    // initial admission and native ownership are distinct stages. The historical
+    // StaleSamples counter counts high first-fill samples, not stale video.
+    const auto afterPressMs = [gestureStartMs](double sampleMs) {
+        return std::isfinite(gestureStartMs) && gestureStartMs >= 0.0
+                && std::isfinite(sampleMs) && sampleMs >= gestureStartMs
+            ? sampleMs - gestureStartMs : -1.0;
+    };
+    const bool proposalSeen = pendingMeterFirstSeenEpoch_ == physicalEpoch
+        && pendingMeterFirstSeenMs_ >= 0.0;
+    const bool highSeen = pendingMeterOwnershipStaleSamples_ > 0;
+    emit engineDiagnostic(QStringLiteral(
+        "Ownership acquisition census: physical_epoch=%1 disposition=%2"
+        " proposal_seen=%3 proposal_arrival_after_press_ms=%4 evidence_seen=%5"
+        " sub_anchor_seen=%6 initial_high_samples=%7 initial_high_first_after_press_ms=%8"
+        " initial_high_min_pct=%9 initial_high_max_pct=%10 first_fill_limit_pct=%11"
+        " unstamped_samples=%12 stamp_epoch_seen=%13")
+            .arg(physicalEpoch).arg(QString::fromLatin1(disposition))
+            .arg(proposalSeen ? 1 : 0)
+            .arg(proposalSeen ? afterPressMs(pendingMeterFirstSeenMs_) : -1.0, 0, 'f', 1)
+            .arg(pendingMeterOwnershipCurrentEvidenceSeen_ ? 1 : 0)
+            .arg(pendingMeterOwnershipSubAnchorSeen_ ? 1 : 0)
+            .arg(pendingMeterOwnershipStaleSamples_)
+            .arg(highSeen ? afterPressMs(pendingMeterOwnershipStaleFirstMs_) : -1.0, 0, 'f', 1)
+            .arg(highSeen ? pendingMeterOwnershipStaleMinPct_ : -1.0, 0, 'f', 1)
+            .arg(highSeen ? pendingMeterOwnershipStaleMaxPct_ : -1.0, 0, 'f', 1)
+            .arg(config_.anchorMaxFirstFillPct, 0, 'f', 1)
+            .arg(pendingMeterOwnershipUnstampedSamples_)
+            .arg(pendingMeterOwnershipUnstampedStampEpoch_));
+}
+
+void AutomationEngine::emitPendingMeterOwnershipGeometryBreak(
+    quint64 physicalEpoch, qint64 shotAttempt, const char* disposition)
+{
+    if (pendingMeterOwnershipBreaks_.firstGeometryCaptured) {
+        const auto& g = pendingMeterOwnershipBreaks_;
+        emit engineDiagnostic(QStringLiteral(
+            "Ownership geometry break: physical_epoch=%1 shot_attempt=%2 "
+            "old_box=%3,%4,%5,%6 new_box=%7,%8,%9,%10 "
+            "iou=%11 width_scale=%12 height_scale=%13 aspect_scale=%14 "
+            "old_frame=%15 new_frame=%16 geometry_breaks=%17 disposition=%18")
+                                  .arg(physicalEpoch).arg(shotAttempt)
+                                  .arg(g.firstOldX).arg(g.firstOldY)
+                                  .arg(g.firstOldW).arg(g.firstOldH)
+                                  .arg(g.firstNewX).arg(g.firstNewY)
+                                  .arg(g.firstNewW).arg(g.firstNewH)
+                                  .arg(g.firstIou, 0, 'f', 3)
+                                  .arg(g.firstWidthScale, 0, 'f', 3)
+                                  .arg(g.firstHeightScale, 0, 'f', 3)
+                                  .arg(g.firstAspectScale, 0, 'f', 3)
+                                  .arg(g.firstOldFrame).arg(g.firstNewFrame)
+                                  .arg(g.geometry).arg(QString::fromLatin1(disposition)));
+    }
+}
+
 void AutomationEngine::clearPendingMeterOwnershipEpisode() noexcept
 {
     pendingMeterOwnership_ = PendingMeterOwnershipEpisode{};
+    pendingMeterOwnershipBeforeGeometry_ = PendingMeterOwnershipEpisode{};
 }
 
 void AutomationEngine::clearPendingMeterOwnershipEvidence() noexcept
 {
     pendingMeterOwnershipBreaks_ = PendingMeterOwnershipBreakCensus{};
+    pendingMeterOwnershipGeometryRestart_ = false;   // [ORION_OWNERSHIP_PROOF_LENIENCY]
+    pendingMeterOwnershipLenientSigmaMs_ = 0.0;
     pendingMeterOwnershipCurrentEvidenceSeen_ = false;
     pendingMeterOwnershipMaxProofSamples_ = 0;
     pendingMeterOwnershipFirstEvidenceFillPct_ = 0.0;
@@ -3731,6 +5609,12 @@ void AutomationEngine::clearPendingMeterOwnershipEvidence() noexcept
     pendingMeterOwnershipStaleFirstMs_ = -1.0;
     pendingMeterOwnershipStaleMinPct_ = 0.0;
     pendingMeterOwnershipStaleMaxPct_ = 0.0;
+    pendingMeterOwnershipUnstampedSamples_ = 0;
+    pendingMeterOwnershipUnstampedFirstMs_ = -1.0;
+    pendingMeterOwnershipUnstampedLastMs_ = -1.0;
+    pendingMeterOwnershipUnstampedFirstFillPct_ = 0.0;
+    pendingMeterOwnershipUnstampedLastFillPct_ = 0.0;
+    pendingMeterOwnershipUnstampedStampEpoch_ = 0;
 }
 
 bool AutomationEngine::pendingMeterOwnershipStaleMeterBlocked(
@@ -3960,6 +5844,96 @@ void AutomationEngine::failTempoMovementTransaction(ShotMode mode,
         clearPendingMeterOwnershipEvidence();
         clearPendingTempoStickMovementContext();
     }
+}
+
+// [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] ---------------------------------------------------
+//
+// THE OWNER'S RULE: "switching between the two should cut off the other and vice versa."
+//
+// Everything cleared here is PRE-OWNERSHIP, in-flight-gesture state: a Square press that has not
+// yet become a shot, the Tempo movement transaction and pass-through pulse that shape its output,
+// the meter-ownership evidence gathered for it, the NO METER arm/timer, and the press-anchored
+// fallback's single-fire epoch. Under the old code every one of these could be latched under one
+// timing mode and then consumed under the other — which is precisely the shape of the 22:11Z
+// report ("the tempo still takes place and is glitchy"): a remap decided while one path was
+// selected still driving the stick after the switch.
+//
+// WHAT IS DELIBERATELY NOT CLEARED. An OWNED shot (Releasing / Cooldown) and the owned-output
+// drain it may have latched are left alone. applyConfig has already aborted or drain-latched
+// that shot a few lines above, and the drain is the engine's fail-closed way of finishing a
+// gesture the console has already seen the front half of; tearing it up mid-flight is how you
+// leave a stuck stick, not how you avoid one. The drain always ends at the physical end of the
+// gesture, so nothing here can outlive the button the player is holding.
+void AutomationEngine::clearTransientReleaseStateForModeSwitch(bool nowInputTimed)
+{
+    // Was anything actually in flight? Only then does the console have something to be handed
+    // back. A switch made between gestures must cost the new mode NOTHING — not even one tick of
+    // its neutral-poll accounting, which is what gates the next arm.
+    const bool gestureInFlight = squareHoldStartMs_ >= 0.0
+        || pendingSquareTempoRemap_
+        || tempoPassThroughPulseActive_
+        || tempoMovement_.phase != TempoMovementPhase::None
+        || noMeterBackstop_.deadlineMs >= 0.0;
+
+    // The pending physical press, its epoch and its classification. Retire the epoch so a late
+    // meter frame from the OLD mode can never promote it after the switch.
+    if (pendingSquarePhysicalEpoch_ != 0) {
+        retiredPhysicalShotEpoch_ = std::max(retiredPhysicalShotEpoch_,
+                                             pendingSquarePhysicalEpoch_);
+    }
+    squareHoldStartMs_ = -1.0;
+    pendingSquarePhysicalEpoch_ = 0;
+    pendingSquareArmGeneration_ = 0;
+    pendingSquareShotType_.clear();
+    pendingSquareTempoRemap_ = false;
+    clearPendingSquareMovementContext();
+    clearPendingTempoStickMovementContext();
+    clearPendingStickCalibration();
+    clearPendingMeterOwnershipEpisode();
+    clearPendingMeterOwnershipEvidence();
+
+    // Both halves of the Tempo output machinery: the ordered movement transaction and the
+    // pass-through flick pulse. Either one alive across the switch is a stick the new mode never
+    // asked for.
+    resetTempoMovementTransaction();
+    tempoPassThroughPulseActive_ = false;
+    tempoPassThroughPulseEndMs_ = -1.0;
+    tempoPassThroughPulseHeldPress_ = false;
+    tempoPassThroughPulseFadeGesture_ = false;
+
+    // [ORION_METER_BLIND_BACKSTOP 2026-09-14] BOTH halves of the blind machine — the meter path's
+    // backstop and the blind path's timer — including each one's deadline, open deferral and type
+    // grace. An open deferral is a licence to hold the button up to 400 ms past the law's
+    // deadline; it belongs to the mode that opened it and may not survive the switch. The
+    // single-fire fences go with them: the press they fenced is being retired on this same line.
+    meterBackstop_.clear();
+    meterBackstopArmedEpoch_ = 0;
+    meterBackstopFiredEpoch_ = 0;
+    inputTimedReady_ = false;
+    inputTimedNeutralPolls_ = 0;
+    noMeterBackstop_.clear();
+    inputTimedVisionOwnedLoggedToken_ = 0;
+
+    // A button that is down RIGHT NOW must not be re-read as a fresh press by the mode that just
+    // took over: squareHoldStartMs_ was just cleared, which is exactly what processIdle calls a
+    // new press. Require a real physical UP first — the same gate every pre-ownership refusal in
+    // this engine uses, and it clears itself on the debounced release.
+    if (lastPhysical_.square()) {
+        squareRearmBlockedUntilRelease_ = true;
+        armSquareOverlapLatch();
+    }
+    stickRearmBlockedUntilNeutral_ = stickRearmBlockedUntilNeutral_ || stickShotActive(lastPhysical_);
+
+    // One neutral tick, so whatever virtual Square or stick deflection the old mode was driving
+    // is handed straight back to the player's own packet instead of hanging until the next
+    // gesture. Honoured in process() only while no owned-output drain is running (see above),
+    // and owed only when something was actually in flight.
+    modeSwitchPassThroughPending_ = gestureInFlight;
+
+    emit engineDiagnostic(QStringLiteral(
+        "Timing mode switched: %1 (transient release state cleared)")
+                              .arg(nowInputTimed ? QStringLiteral("no_meter")
+                                                 : QStringLiteral("meter")));
 }
 
 void AutomationEngine::resetTempoMovementTransaction() noexcept
@@ -4263,7 +6237,12 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
     const bool coasted = stage == QLatin1String("coast")
         || stage == QLatin1String("no_meter")
         || stage == QLatin1String("stale");
+    const bool canonicalCoarseValid = std::isfinite(result.coarseFillPct)
+        && result.coarseFillPct > 0.0 && result.coarseFillPct <= 100.0;
+    const double proofFillPct = strictOwnershipProof
+        ? result.coarseFillPct : result.fillPct;
     const bool finite = std::isfinite(result.fillPct)
+        && std::isfinite(proofFillPct)
         && std::isfinite(result.confidence)
         && std::isfinite(result.frameAgeMs);
     const bool strictAge = finite && result.frameAgeMs >= 0.0
@@ -4280,15 +6259,62 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
     const bool genuineCurrent = pendingGesture && result.detected && acceptedReason
         && !result.staleFrame && !result.ghostFrame && !coasted && strictAge
         && capturedAfterPress && result.confidence >= config_.confidenceGate
-        && result.fillPct > 0.0 && result.fillPct <= 100.0
+        && proofFillPct > 0.0 && proofFillPct <= 100.0
         && result.width > 0 && result.height > 0
         && (!strictOwnershipProof
-            || (usableIdentity && canonicalTimingIdentity));
+            || (canonicalCoarseValid && usableIdentity && canonicalTimingIdentity));
     const bool currentGameplayEpochProof = result.gameplayStructureVerified
         && physicalEpoch != 0
         && result.gameplayStructureEpoch == physicalEpoch;
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16 owner] "HAS ANYTHING BEEN SEEN FOR THIS PRESS?"
+    // — recorded HERE, above the accept/reject fork, because the question the meter backstop's
+    // collapse asks is not "did the reader produce an OWNABLE meter" but "did the reader propose
+    // ANYTHING at all". The owner's 7 stuck holds produced `PICKUP first_sight_fill=-1`: not a
+    // rejected candidate, not an unstamped one, NOTHING. So every sample that carries a real box
+    // on a frame DATED AFTER THIS PRESS counts, accepted or not — an unstamped frame (the
+    // structure-stamp starvation census below), a low-confidence one, a non-rising one, a frame
+    // slightly older than the strict release bound. Deliberately generous: this latch only ever
+    // KEEPS the grace, so the collapse fires on a press with no evidence whatsoever and on no
+    // other kind.
+    //
+    // WHAT IS NOT "SEEN": a ghost or stale frame (the previous shot's feedback meter bridging the
+    // press — see the ghost-meter note; it belongs to the shot before this one), a coasted/
+    // no_meter row (the reader saying it has nothing), and any frame captured BEFORE the press
+    // edge. Each of those would let a press that truly never got a meter keep the grace, which is
+    // the whole failure being fixed.
+    const bool frameDatedAfterPress = std::isfinite(result.frameAgeMs)
+        && result.frameAgeMs >= 0.0
+        && sampleNow - result.frameAgeMs >= gestureStartMs;
+    const bool presenceForThisPress = pendingGesture && result.detected
+        && !result.staleFrame && !result.ghostFrame && !coasted
+        && frameDatedAfterPress && result.width > 0 && result.height > 0;
+    if (presenceForThisPress && physicalEpoch != 0
+        && pendingMeterFirstSeenEpoch_ != physicalEpoch) {
+        pendingMeterFirstSeenEpoch_ = physicalEpoch;
+        pendingMeterFirstSeenMs_ = sampleNow;
+    }
     if (!genuineCurrent
         || (strictOwnershipProof && !currentGameplayEpochProof)) {
+        // STRUCTURE-STAMP STARVATION CENSUS (2026-08-29). A frame that is genuine by every
+        // clause of this engine's own test and fails ONLY the sidecar's gameplay-structure
+        // stamp is the signature of an upstream stamping failure (the reader never latched
+        // structure proof under this press's epoch), not of a menu press or décor. Live
+        // session_20260829_123758: 11 of 19 square presses lost EVERY rise frame here and
+        // produced no decision of any kind. Recording only — this branch still contributes
+        // no evidence and no episode, so nothing here can own, arm or release a shot.
+        if (genuineCurrent && strictOwnershipProof && !currentGameplayEpochProof) {
+            if (pendingMeterOwnershipUnstampedSamples_ == 0) {
+                pendingMeterOwnershipUnstampedFirstMs_ = sampleNow;
+                pendingMeterOwnershipUnstampedFirstFillPct_ = proofFillPct;
+            }
+            ++pendingMeterOwnershipUnstampedSamples_;
+            pendingMeterOwnershipUnstampedLastMs_ = sampleNow;
+            pendingMeterOwnershipUnstampedLastFillPct_ = proofFillPct;
+            if (result.gameplayStructureVerified
+                && result.gameplayStructureEpoch != 0) {
+                pendingMeterOwnershipUnstampedStampEpoch_ = result.gameplayStructureEpoch;
+            }
+        }
         // A rejected/coasted frame contributes no ownership evidence, but one
         // decoder blink must not erase the unique, structure-proven frames that
         // surround it. Preserve the candidate only inside the same bounded
@@ -4314,10 +6340,114 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
     }
 
     if (!pendingMeterOwnershipCurrentEvidenceSeen_) {
-        pendingMeterOwnershipFirstEvidenceFillPct_ = result.fillPct;
+        pendingMeterOwnershipFirstEvidenceFillPct_ = proofFillPct;
     }
     pendingMeterOwnershipCurrentEvidenceSeen_ = true;
-    pendingMeterOwnershipLastEvidenceFillPct_ = result.fillPct;
+    pendingMeterOwnershipLastEvidenceFillPct_ = proofFillPct;
+
+    // [ORION_PROOF_DETECTOR_BOX 2026-09-19] WHICH rectangle the shape gate judges. The reader
+    // publishes two for the same frame: the DRAWN one (x/y/width/height — the overlay hug, which
+    // may reach 0..18 px past each edge of the meter's housing and is re-derived from this
+    // frame's colour pixels) and the DETECTOR's own (detX..detHeight). Detection geometry is the
+    // question the gate asks, so it reads the detector's. A frame without one — older sidecar,
+    // or a build with the presentation transform off, where the two are identical — falls back
+    // to the drawn rectangle, which is byte-identical to the shipped behaviour.
+    //
+    // This is a CHANGE OF RULER, not of the bounds: the same IoU >= 0.10 / 1.5x dimension /
+    // 1.25x aspect limits below are unchanged and still run on every frame.
+    const auto proofBox = [this](const DetectionResult& r) {
+        struct Box { int x, y, w, h; };
+        if (config_.ownershipProofDetectorBox && r.detWidth > 0 && r.detHeight > 0) {
+            return Box{r.detX, r.detY, r.detWidth, r.detHeight};
+        }
+        return Box{r.x, r.y, r.width, r.height};
+    };
+    const auto geometryMatches = [&proofBox](const DetectionResult& result,
+                                             const PendingMeterOwnershipEpisode& episode) {
+        const auto now = proofBox(result);
+        const int left = std::max(now.x, episode.lastX);
+        const int top = std::max(now.y, episode.lastY);
+        const int right = std::min(now.x + now.w,
+                                   episode.lastX + episode.lastWidth);
+        const int bottom = std::min(now.y + now.h,
+                                    episode.lastY + episode.lastHeight);
+        const double intersection = static_cast<double>(std::max(0, right - left))
+            * static_cast<double>(std::max(0, bottom - top));
+        const double areaNow = static_cast<double>(now.w) * now.h;
+        const double areaLast = static_cast<double>(episode.lastWidth)
+            * episode.lastHeight;
+        const double unionArea = areaNow + areaLast - intersection;
+        const double widthScale = static_cast<double>(now.w)
+            / episode.lastWidth;
+        const double heightScale = static_cast<double>(now.h)
+            / episode.lastHeight;
+        const double aspectNow = static_cast<double>(now.w) / now.h;
+        const double aspectLast = static_cast<double>(episode.lastWidth)
+            / episode.lastHeight;
+        const double aspectScale = aspectNow / aspectLast;
+        // A false lock can share a center with the meter yet stretch one dimension by 10x,
+        // which still passes an IoU>=0.10 check. Strict live ownership proof therefore requires
+        // both spatial overlap and bounded per-frame shape drift.  These are detector-integrity
+        // limits, not release timing constants.
+        constexpr double kMaxDimensionScale = 1.50;
+        constexpr double kMaxAspectScale = 1.25;
+        return unionArea > 0.0 && intersection / unionArea >= 0.10
+            && widthScale >= 1.0 / kMaxDimensionScale
+            && widthScale <= kMaxDimensionScale
+            && heightScale >= 1.0 / kMaxDimensionScale
+            && heightScale <= kMaxDimensionScale
+            && aspectScale >= 1.0 / kMaxAspectScale
+            && aspectScale <= kMaxAspectScale;
+    };
+    const auto sameRuler = [](const DetectionResult& a, const DetectionResult& b) {
+        return a.fillEstimatorGeneration != 0
+            && a.fillEstimatorGeneration == b.fillEstimatorGeneration
+            && (a.fillEstimatorMode == QLatin1String("coarse")
+                || a.fillEstimatorMode == QLatin1String("subpixel"))
+            && a.fillEstimatorMode == b.fillEstimatorMode
+            && a.detectorSource == b.detectorSource && a.style == b.style
+            && a.colorName == b.colorName
+            && a.bboxFrameWidth == b.bboxFrameWidth
+            && a.bboxFrameHeight == b.bboxFrameHeight;
+    };
+    // A width-flapping contour used to erase good onset samples on each frame.
+    // Keep ONE previous episode through ONE geometry-only break. Restore only
+    // on a new, same-ruler frame matching its original (unchanged) strict box
+    // limits. The outlier is NOT seeded into phase timing or counted as proof.
+    // A sustained replacement keeps the original restart behavior and latency.
+    auto& previous = pendingMeterOwnershipBeforeGeometry_;
+    if (strictOwnershipProof && previous.active && pendingMeterOwnership_.active
+        && result.captureTsMs > pendingMeterOwnership_.lastCaptureTsMs + 1e-6
+        && (result.frameNumber < 0 || pendingMeterOwnership_.lastFrameNumber < 0
+            || result.frameNumber > pendingMeterOwnership_.lastFrameNumber)) {
+        const bool sameEpisode = previous.mode == mode
+            && pendingMeterOwnership_.mode == mode
+            && pendingMeterOwnership_.physicalEpoch == physicalEpoch
+            && std::abs(pendingMeterOwnership_.gestureStartMs - gestureStartMs) <= 1e-6
+            && previous.physicalEpoch == physicalEpoch
+            && std::abs(previous.gestureStartMs - gestureStartMs) <= 1e-6;
+        const bool timely = sampleNow >= previous.lastMs
+            && sampleNow - previous.lastMs <= kPendingMeterOwnershipMaxGapMs
+            && result.captureTsMs > previous.lastCaptureTsMs
+            && result.captureTsMs - previous.lastCaptureTsMs <= kPendingMeterOwnershipMaxGapMs;
+        const bool resume = sameEpisode && timely
+            && pendingMeterOwnership_.sampleCount == 1
+            && !previous.samples.isEmpty() && !pendingMeterOwnership_.samples.isEmpty()
+            && sameRuler(result, previous.samples.constLast().result)
+            && sameRuler(result, pendingMeterOwnership_.samples.constLast().result)
+            && !geometryMatches(result, pendingMeterOwnership_)
+            && geometryMatches(result, previous)
+            && proofFillPct >= previous.lastProofFillPct - kStaleMeterMaxSpreadPct
+            && proofFillPct >= previous.firstProofFillPct - kStaleMeterMaxSpreadPct;
+        if (resume) {
+            pendingMeterOwnership_ = previous;
+            // Never grant the separate post-break two-frame leniency to a
+            // resumed episode: the ordinary unique-frame/rise proof must pass.
+            pendingMeterOwnershipGeometryRestart_ = false;
+            ++pendingMeterOwnershipBreaks_.geometryResumes;
+        }
+        previous = PendingMeterOwnershipEpisode{};
+    }
 
     bool identityAdvanced = true;
     bool geometryContinuous = true;
@@ -4334,39 +6464,7 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
             && result.captureTsMs > pendingMeterOwnership_.lastCaptureTsMs + 1e-6;
         identityAdvanced = frameAdvanced || captureAdvanced;
 
-        const int left = std::max(result.x, pendingMeterOwnership_.lastX);
-        const int top = std::max(result.y, pendingMeterOwnership_.lastY);
-        const int right = std::min(result.x + result.width,
-                                   pendingMeterOwnership_.lastX + pendingMeterOwnership_.lastWidth);
-        const int bottom = std::min(result.y + result.height,
-                                    pendingMeterOwnership_.lastY + pendingMeterOwnership_.lastHeight);
-        const double intersection = static_cast<double>(std::max(0, right - left))
-            * static_cast<double>(std::max(0, bottom - top));
-        const double areaNow = static_cast<double>(result.width) * result.height;
-        const double areaLast = static_cast<double>(pendingMeterOwnership_.lastWidth)
-            * pendingMeterOwnership_.lastHeight;
-        const double unionArea = areaNow + areaLast - intersection;
-        const double widthScale = static_cast<double>(result.width)
-            / pendingMeterOwnership_.lastWidth;
-        const double heightScale = static_cast<double>(result.height)
-            / pendingMeterOwnership_.lastHeight;
-        const double aspectNow = static_cast<double>(result.width) / result.height;
-        const double aspectLast = static_cast<double>(pendingMeterOwnership_.lastWidth)
-            / pendingMeterOwnership_.lastHeight;
-        const double aspectScale = aspectNow / aspectLast;
-        // A false lock can share a center with the meter yet stretch one dimension by 10x,
-        // which still passes an IoU>=0.10 check. Strict live ownership proof therefore requires
-        // both spatial overlap and bounded per-frame shape drift.  These are detector-integrity
-        // limits, not release timing constants.
-        constexpr double kMaxDimensionScale = 1.50;
-        constexpr double kMaxAspectScale = 1.25;
-        geometryContinuous = unionArea > 0.0 && intersection / unionArea >= 0.10
-            && widthScale >= 1.0 / kMaxDimensionScale
-            && widthScale <= kMaxDimensionScale
-            && heightScale >= 1.0 / kMaxDimensionScale
-            && heightScale <= kMaxDimensionScale
-            && aspectScale >= 1.0 / kMaxAspectScale
-            && aspectScale <= kMaxAspectScale;
+        geometryContinuous = geometryMatches(result, pendingMeterOwnership_);
         // A repeated payload is not a new proof frame. Ignore it without
         // destroying the genuine episode around it; if it persists beyond the
         // bounded gap, the normal broken-episode path below starts over.
@@ -4405,28 +6503,84 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
     // ownershipProofTwoFrame), which stays strictly outside the 2.5 pp static band a frozen or
     // decaying HUD occupies.
     const bool descendedBelowAnchor = pendingMeterOwnership_.active
-        && result.fillPct
-            < pendingMeterOwnership_.first.fillPct - kStaleMeterMaxSpreadPct;
+        && proofFillPct
+            < pendingMeterOwnership_.firstProofFillPct - kStaleMeterMaxSpreadPct;
     const bool broken = pendingMeterOwnership_.active
         && (!sameCandidate
             || (sampleNow - pendingMeterOwnership_.lastMs) > kPendingMeterOwnershipMaxGapMs
-            || result.fillPct < pendingMeterOwnership_.lastFillPct - 8.0
+            || proofFillPct < pendingMeterOwnership_.lastProofFillPct - 8.0
             || descendedBelowAnchor
             || !identityAdvanced || !geometryContinuous);
     if (broken) {
+        // A different input epoch, stale gap, drop, rewind, or ruler is not a
+        // transient contour wobble. It must rebuild proof from scratch.
+        const bool geometryOnly = strictOwnershipProof && sameCandidate
+            && sampleNow - pendingMeterOwnership_.lastMs <= kPendingMeterOwnershipMaxGapMs
+            && proofFillPct >= pendingMeterOwnership_.lastProofFillPct - 8.0
+            && !descendedBelowAnchor && identityAdvanced && !geometryContinuous
+            && proofFillPct <= config_.anchorMaxFirstFillPct + 1e-6
+            && !pendingMeterOwnership_.samples.isEmpty()
+            && sameRuler(result, pendingMeterOwnership_.samples.constLast().result);
+        pendingMeterOwnershipBeforeGeometry_ = geometryOnly
+            ? pendingMeterOwnership_ : PendingMeterOwnershipEpisode{};
         // Recording only: attribute the teardown so a press that never accumulates three proof
         // samples names its own cause instead of leaving samples=1 to be guessed at.
         if (!sameCandidate
             || (sampleNow - pendingMeterOwnership_.lastMs) > kPendingMeterOwnershipMaxGapMs) {
             ++pendingMeterOwnershipBreaks_.gapOrCandidate;
-        } else if (result.fillPct < pendingMeterOwnership_.lastFillPct - 8.0) {
+            pendingMeterOwnershipGeometryRestart_ = false;
+        } else if (proofFillPct < pendingMeterOwnership_.lastProofFillPct - 8.0) {
             ++pendingMeterOwnershipBreaks_.drop;
+            pendingMeterOwnershipGeometryRestart_ = false;
         } else if (descendedBelowAnchor) {
             ++pendingMeterOwnershipBreaks_.anchor;
+            pendingMeterOwnershipGeometryRestart_ = false;
         } else if (!identityAdvanced) {
             ++pendingMeterOwnershipBreaks_.identity;
+            pendingMeterOwnershipGeometryRestart_ = false;
         } else {
             ++pendingMeterOwnershipBreaks_.geometry;
+            if (!pendingMeterOwnershipBreaks_.firstGeometryCaptured) {
+                auto& g = pendingMeterOwnershipBreaks_;
+                g.firstGeometryCaptured = true;
+                g.firstOldX = pendingMeterOwnership_.lastX;
+                g.firstOldY = pendingMeterOwnership_.lastY;
+                g.firstOldW = pendingMeterOwnership_.lastWidth;
+                g.firstOldH = pendingMeterOwnership_.lastHeight;
+                // [ORION_PROOF_DETECTOR_BOX] Census the rectangles that were actually COMPARED,
+                // so `Ownership geometry break:` never reports a drawn box for a detector-box
+                // judgement (the 2026-09-18 lines reported the overlay hug and read as a 44->26
+                // detector collapse that never happened).
+                const auto newBox = proofBox(result);
+                g.firstNewX = newBox.x;
+                g.firstNewY = newBox.y;
+                g.firstNewW = newBox.w;
+                g.firstNewH = newBox.h;
+                g.firstOldFrame = pendingMeterOwnership_.lastFrameNumber;
+                g.firstNewFrame = result.frameNumber;
+                const int overlapLeft = std::max(g.firstOldX, g.firstNewX);
+                const int overlapTop = std::max(g.firstOldY, g.firstNewY);
+                const int overlapRight = std::min(g.firstOldX + g.firstOldW,
+                                                  g.firstNewX + g.firstNewW);
+                const int overlapBottom = std::min(g.firstOldY + g.firstOldH,
+                                                   g.firstNewY + g.firstNewH);
+                const double overlap = static_cast<double>(std::max(0, overlapRight - overlapLeft))
+                    * static_cast<double>(std::max(0, overlapBottom - overlapTop));
+                const double unionArea = static_cast<double>(g.firstOldW) * g.firstOldH
+                    + static_cast<double>(g.firstNewW) * g.firstNewH - overlap;
+                g.firstIou = unionArea > 0.0 ? overlap / unionArea : -1.0;
+                g.firstWidthScale = static_cast<double>(g.firstNewW) / g.firstOldW;
+                g.firstHeightScale = static_cast<double>(g.firstNewH) / g.firstOldH;
+                g.firstAspectScale = g.firstWidthScale / g.firstHeightScale;
+            }
+            // [ORION_OWNERSHIP_PROOF_LENIENCY] THE ONLY FORGIVABLE BREAK, and the branch it is
+            // read off is the same one the census already calls "geometry": same candidate (mode,
+            // gesture, physical epoch), inside the gap bound, no >8 pp cliff, no descent below the
+            // anchor, and the frame identity DID advance. That is a meter still on screen and
+            // still climbing whose detector box changed shape. Every other branch above clears
+            // the flag, so a candidate change or a gap can never be laundered into leniency by a
+            // later geometry break -- the flag records the break that opened THIS episode.
+            pendingMeterOwnershipGeometryRestart_ = true;
         }
     }
     if (!pendingMeterOwnership_.active || broken) {
@@ -4435,7 +6589,7 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
         // A late court-wide acquire remains presentation-only until the detector
         // sees a fresh low-fill episode for the current physical input token.
         if (strictOwnershipProof
-            && result.fillPct > config_.anchorMaxFirstFillPct + 1e-6) {
+            && proofFillPct > config_.anchorMaxFirstFillPct + 1e-6) {
             // Census the rejected high-fill run so a STATIC one (the previous shot's meter
             // still rendered, or frozen, over this press's epoch) can be reported early
             // instead of costing the player the whole buttonNoMeterAbortMs wait holding the
@@ -4443,13 +6597,13 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
             // before, so nothing here can own, arm or release a shot.
             if (pendingMeterOwnershipStaleSamples_ == 0) {
                 pendingMeterOwnershipStaleFirstMs_ = sampleNow;
-                pendingMeterOwnershipStaleMinPct_ = result.fillPct;
-                pendingMeterOwnershipStaleMaxPct_ = result.fillPct;
+                pendingMeterOwnershipStaleMinPct_ = proofFillPct;
+                pendingMeterOwnershipStaleMaxPct_ = proofFillPct;
             } else {
                 pendingMeterOwnershipStaleMinPct_ = std::min(
-                    pendingMeterOwnershipStaleMinPct_, result.fillPct);
+                    pendingMeterOwnershipStaleMinPct_, proofFillPct);
                 pendingMeterOwnershipStaleMaxPct_ = std::max(
-                    pendingMeterOwnershipStaleMaxPct_, result.fillPct);
+                    pendingMeterOwnershipStaleMaxPct_, proofFillPct);
             }
             ++pendingMeterOwnershipStaleSamples_;
             clearPendingMeterOwnershipEpisode();
@@ -4460,6 +6614,11 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
         // rise/geometry proof decides, and a genuine meter can never be censused.
         pendingMeterOwnershipSubAnchorSeen_ = true;
         ++pendingMeterOwnershipBreaks_.restarts;
+        if (!broken) {
+            // [ORION_OWNERSHIP_PROOF_LENIENCY] A FIRST episode for this press, not a forgiven
+            // restart of one. Nothing to be lenient about.
+            pendingMeterOwnershipGeometryRestart_ = false;
+        }
         pendingMeterOwnership_ = PendingMeterOwnershipEpisode{};
         pendingMeterOwnership_.active = true;
         pendingMeterOwnership_.mode = mode;
@@ -4468,14 +6627,20 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
         pendingMeterOwnership_.first = result;
         pendingMeterOwnership_.firstMs = sampleNow;
         pendingMeterOwnership_.lastMs = sampleNow;
-        pendingMeterOwnership_.lastFillPct = result.fillPct;
+        pendingMeterOwnership_.firstProofFillPct = proofFillPct;
+        pendingMeterOwnership_.lastProofFillPct = proofFillPct;
         pendingMeterOwnership_.sampleCount = 1;
         pendingMeterOwnership_.lastFrameNumber = result.frameNumber;
         pendingMeterOwnership_.lastCaptureTsMs = result.captureTsMs;
-        pendingMeterOwnership_.lastX = result.x;
-        pendingMeterOwnership_.lastY = result.y;
-        pendingMeterOwnership_.lastWidth = result.width;
-        pendingMeterOwnership_.lastHeight = result.height;
+        // [ORION_PROOF_DETECTOR_BOX] The episode's geometry reference is the rectangle the gate
+        // judges, so both sides of every comparison come from the same ruler.
+        {
+            const auto box = proofBox(result);
+            pendingMeterOwnership_.lastX = box.x;
+            pendingMeterOwnership_.lastY = box.y;
+            pendingMeterOwnership_.lastWidth = box.w;
+            pendingMeterOwnership_.lastHeight = box.h;
+        }
         pendingMeterOwnership_.samples.append(PendingMeterOwnershipSample{result, sampleNow});
         pendingMeterOwnershipMaxProofSamples_ = std::max(
             pendingMeterOwnershipMaxProofSamples_, pendingMeterOwnership_.sampleCount);
@@ -4485,17 +6650,21 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
     // Early ownership is intentionally stricter than the normal post-debounce
     // anchor: it requires material forward motion. A static two-frame menu HUD
     // lookalike may remain visible in the overlay but cannot seize Square.
-    const bool roseEnough = result.fillPct - pendingMeterOwnership_.first.fillPct
+    const bool roseEnough = proofFillPct - pendingMeterOwnership_.firstProofFillPct
         >= config_.anchorRiseMinPct;
     pendingMeterOwnership_.lastMs = sampleNow;
-    pendingMeterOwnership_.lastFillPct = result.fillPct;
+    pendingMeterOwnership_.lastProofFillPct = proofFillPct;
     pendingMeterOwnership_.sampleCount += 1;
     pendingMeterOwnership_.lastFrameNumber = result.frameNumber;
     pendingMeterOwnership_.lastCaptureTsMs = result.captureTsMs;
-    pendingMeterOwnership_.lastX = result.x;
-    pendingMeterOwnership_.lastY = result.y;
-    pendingMeterOwnership_.lastWidth = result.width;
-    pendingMeterOwnership_.lastHeight = result.height;
+    // [ORION_PROOF_DETECTOR_BOX] Same ruler as the restart path above.
+    {
+        const auto box = proofBox(result);
+        pendingMeterOwnership_.lastX = box.x;
+        pendingMeterOwnership_.lastY = box.y;
+        pendingMeterOwnership_.lastWidth = box.w;
+        pendingMeterOwnership_.lastHeight = box.h;
+    }
     // Match TemporalSampler's bounded evidence window. Preserve the episode's first
     // frame for the rise proof and the newest frames for the crossing fit.
     if (pendingMeterOwnership_.samples.size() >= 16) {
@@ -4510,9 +6679,120 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
     // rise proof above stays the discriminator; a static/decaying lookalike is
     // bounded by kStaleMeterMaxSpreadPct (2.5pp) and cannot make anchorRiseMinPct.
     const int strictRequiredSamples = config_.ownershipProofTwoFrame ? 2 : 3;
-    const int requiredSamples = strictOwnershipProof ? strictRequiredSamples : 2;
-    return inputQualified && roseEnough
-        && pendingMeterOwnership_.sampleCount >= requiredSamples;
+    int requiredSamples = strictOwnershipProof ? strictRequiredSamples : 2;
+    // [ORION_RUNWAY_AWARE_OWNERSHIP] Scale the proof frame count to the runway that actually
+    // remains. On a LATE first lock the 3rd proof frame is the whole miss: the reservation is
+    // born one cadence overdue and dies live_tip_deadline_missed. When waiting for that frame
+    // would carry the arm past its own command deadline, grant on the 2nd unique rising frame.
+    // FLOOR 2: this only ever lowers 3 -> 2, never below. Every false-lock discriminator above
+    // (material rise >= anchorRiseMinPct, geometry continuity, identity advance, structure
+    // verification, current epoch) is unchanged, and the 2-frame proof is offline-validated
+    // equivalent for false-lock rejection. It cannot fire blind or on decor: the relaxation is
+    // gated on a POSITIVE remaining runway measured from this episode's own climb, so a shot
+    // already past its deadline at frame 2 is left to require 3 (owning it early would only swap
+    // one abort reason for another, never make a shot).
+    if (config_.ownershipProofRunwayAware && strictOwnershipProof
+        && requiredSamples > 2 && roseEnough
+        && pendingMeterOwnership_.sampleCount == 2) {
+        const double leadMs = measuredLeadForActuationMs();
+        const double spanMs = sampleNow - pendingMeterOwnership_.firstMs;
+        const double risePp = proofFillPct - pendingMeterOwnership_.firstProofFillPct;
+        if (std::isfinite(leadMs) && leadMs > 0.0 && spanMs > 1.0 && risePp > 0.0
+            && std::isfinite(proofFillPct) && proofFillPct < 100.0) {
+            const double ratePpMs = risePp / spanMs;               // this episode's own climb
+            const double tipEtaMs = (100.0 - proofFillPct) / std::max(1e-6, ratePpMs);
+            const double fireEtaMs = tipEtaMs - leadMs;            // runway to the command deadline
+            const double oneGapMs =
+                std::isfinite(genuineFrameGapEmaMs_) && genuineFrameGapEmaMs_ >= 1.0
+                    ? std::clamp(genuineFrameGapEmaMs_, 8.0, 29.0)
+                    : 1000.0 / 60.0;
+            // Positive runway (the shot is still recoverable) but too short to spend another
+            // cadence on a 3rd proof frame without stepping over the deadline.
+            if (fireEtaMs > 0.0 && fireEtaMs <= 2.0 * oneGapMs) {
+                requiredSamples = 2;
+            }
+        }
+    }
+    if (inputQualified && roseEnough
+        && pendingMeterOwnership_.sampleCount >= requiredSamples) {
+        pendingMeterOwnershipLenientSigmaMs_ = 0.0;   // a complete proof pays no sigma
+        return true;
+    }
+
+    // === [ORION_OWNERSHIP_PROOF_LENIENCY 2026-09-14 owner] ==================================
+    //
+    // "When there's a genuine meter on the screen it always picks it up." The strict proof above
+    // is a FALSE-LOCK gate, and the 2026-09-12 work proved it earns its keep -- jerseys, the
+    // scoreboard and the shot chart are all taken as meters without it. But one of its break
+    // kinds is not a false-lock signal at all: a GEOMETRY break says this detector box changed
+    // shape more than the continuity bound allows, on a candidate whose identity advanced, whose
+    // fill did not cliff and did not descend below its own anchor. That is the same meter with a
+    // wobbling box, and the cost of restarting its sample count is the whole shot when the
+    // restart lands inside one arming horizon of the deadline.
+    //
+    // SO: forgive ONLY that break, ONLY near the deadline, ONLY on >= 2 consecutive post-break
+    // frames, and CHARGE for it in sigma. Everything the shape gate exists for is untouched --
+    // a different candidate, a sample gap, an >8 pp cliff and a descent below the anchor all
+    // cleared pendingMeterOwnershipGeometryRestart_ at the break site, so they can never reach
+    // this branch; structure verification, current-epoch identity, confidence, freshness and
+    // frame-identity advance are all upstream of here and equally untouched.
+    //
+    // WHAT IS RELAXED, exactly: the anchorRiseMinPct (3.0 pp) rise across the POST-BREAK episode,
+    // and only down to "the meter is still going up". The pre-break episode already demonstrated
+    // this candidate rising -- that is why it was an episode -- and that evidence is what the
+    // restart threw away. A frozen or decaying HUD still cannot reach this branch: it produces no
+    // net rise at all, and it would have tripped the descent/drop breaks first.
+    const bool lenientEligible = config_.ownershipProofLeniency
+        && strictOwnershipProof
+        && inputQualified
+        && pendingMeterOwnershipGeometryRestart_
+        && sameCandidate
+        && identityAdvanced
+        && geometryContinuous
+        && pendingMeterOwnership_.sampleCount >= kProofLeniencyMinSamples
+        && proofFillPct > pendingMeterOwnership_.firstProofFillPct
+        && std::isfinite(proofFillPct) && proofFillPct < 100.0;
+    if (!lenientEligible) {
+        return false;
+    }
+    // The arming horizon, from THIS episode's own climb -- the same construction the
+    // runway-aware relaxation above uses, so the two cannot disagree about how much runway a
+    // proof frame costs. A horizon that is already past (<= 0) qualifies too: under
+    // [ORION_OWNED_METER_NEVER_ABORTS] that shot is still firable, and refusing ownership for it
+    // only swaps one abort reason for another.
+    const double leadMs = measuredLeadForActuationMs();
+    const double spanMs = sampleNow - pendingMeterOwnership_.firstMs;
+    const double risePp = proofFillPct - pendingMeterOwnership_.firstProofFillPct;
+    if (!std::isfinite(leadMs) || leadMs <= 0.0 || !(spanMs > 1.0) || !(risePp > 0.0)) {
+        return false;
+    }
+    const double ratePpMs = risePp / spanMs;
+    const double tipEtaMs = (100.0 - proofFillPct) / std::max(1e-6, ratePpMs);
+    const double fireEtaMs = tipEtaMs - leadMs;
+    if (!std::isfinite(fireEtaMs) || fireEtaMs > kProofLeniencyHorizonMs) {
+        return false;   // there is still time to prove this episode properly; do that instead
+    }
+    const int geometryBreaks = std::max(1, pendingMeterOwnershipBreaks_.geometry);
+    pendingMeterOwnershipLenientSigmaMs_ =
+        static_cast<double>(geometryBreaks) * kProofLeniencySigmaPerBreakMs;
+    emit engineDiagnostic(QStringLiteral(
+        "OWNERSHIP ACCEPTED LENIENT: samples=%1 breaks=%2 sigma=%3 required_samples=%4 "
+        "rise_pp=%5 first_fill=%6 fill_pct=%7 rate_pp_ms=%8 tip_eta_ms=%9 fire_eta_ms=%10 "
+        "lead_ms=%11 horizon_ms=%12 physical_epoch=%13")
+                              .arg(pendingMeterOwnership_.sampleCount)
+                              .arg(geometryBreaks)
+                              .arg(pendingMeterOwnershipLenientSigmaMs_, 0, 'f', 1)
+                              .arg(requiredSamples)
+                              .arg(risePp, 0, 'f', 2)
+                              .arg(pendingMeterOwnership_.firstProofFillPct, 0, 'f', 2)
+                              .arg(proofFillPct, 0, 'f', 2)
+                              .arg(ratePpMs, 0, 'f', 4)
+                              .arg(tipEtaMs, 0, 'f', 1)
+                              .arg(fireEtaMs, 0, 'f', 1)
+                              .arg(leadMs, 0, 'f', 1)
+                              .arg(kProofLeniencyHorizonMs, 0, 'f', 1)
+                              .arg(physicalEpoch));
+    return true;
 }
 
 void AutomationEngine::seedPromotedMeterOwnershipEpisode()
@@ -4522,6 +6802,10 @@ void AutomationEngine::seedPromotedMeterOwnershipEpisode()
     }
     const DetectionResult& first = pendingMeterOwnership_.first;
     const double firstMs = pendingMeterOwnership_.firstMs;
+    // [ORION_OWNERSHIP_PROOF_LENIENCY] Carry the sigma this ownership was bought at into the shot.
+    // beginShot() ran between the acceptance and here and reset shot_, which is exactly why the
+    // value was staged on the engine. 0 for every normally-proved shot.
+    shot_.ownershipLenientSigmaPaddingMs = pendingMeterOwnershipLenientSigmaMs_;
     shot_.detectionPresence = QStringLiteral("accepted");
     shot_.detectorSource = first.detectorSource;
     shot_.fillPct = first.fillPct;
@@ -4557,15 +6841,20 @@ void AutomationEngine::seedPromotedMeterOwnershipEpisode()
     const double firstCaptureMs = std::isfinite(first.frameAgeMs)
         && first.frameAgeMs >= 0.0 && first.frameAgeMs <= 250.0
         ? firstMs - first.frameAgeMs : firstMs;
-    sampler_.addSample(first.fillPct, firstCaptureMs);
-    notePhaseAnchorSample(first.fillPct, firstCaptureMs);
+    addMeterTimingSample(first.fillPct, firstCaptureMs,
+                         first.fillEstimatorMode, first.fillEstimatorGeneration);
+    notePhaseAnchorSample(first.fillPct, firstCaptureMs,
+                          first.fillEstimatorMode,
+                          first.fillEstimatorGeneration);
     if (first.greenStartPct >= 0.0 && first.greenEndPct >= 0.0) {
-        greenTracker_.update(first.greenStartPct, first.greenEndPct, first.confidence);
+        greenTracker_.update(first.greenStartPct, first.greenEndPct, first.greenConfidence);
     }
-    if (config_.templateArrivalEnabled && !autonomousLiveMeterTimingEnabled()) {
+    if (config_.templateArrivalEnabled && !autonomousLiveMeterTimingEnabled()
+        && !config_.inputTimedEnabled) {
         templateArrival_.addSample(first.fillPct, firstMs - first.frameAgeMs);
     }
     maxFillThisShot_ = first.fillPct;
+    maxRawFillThisShot_ = first.fillPct;
 
     // updateDetection() continues with the promoting (last) payload after this
     // handoff. Seed every validated historical proof frame before it, so the live
@@ -4582,11 +6871,14 @@ void AutomationEngine::seedPromotedMeterOwnershipEpisode()
         const double captureMs = std::isfinite(sample.frameAgeMs)
             && sample.frameAgeMs >= 0.0 && sample.frameAgeMs <= 250.0
             ? sampleMs - sample.frameAgeMs : sampleMs;
-        sampler_.addSample(sample.fillPct, captureMs);
-        notePhaseAnchorSample(sample.fillPct, captureMs);
+        addMeterTimingSample(sample.fillPct, captureMs,
+                             sample.fillEstimatorMode, sample.fillEstimatorGeneration);
+        notePhaseAnchorSample(sample.fillPct, captureMs,
+                              sample.fillEstimatorMode,
+                              sample.fillEstimatorGeneration);
         if (sample.greenStartPct >= 0.0 && sample.greenEndPct >= 0.0) {
             greenTracker_.update(sample.greenStartPct, sample.greenEndPct,
-                                 sample.confidence);
+                                 sample.greenConfidence);
         }
         shot_.lastFreshAcceptMs = sampleMs;
         shot_.pushFreshAccept(sampleMs);
@@ -4596,6 +6888,7 @@ void AutomationEngine::seedPromotedMeterOwnershipEpisode()
             shot_.peakFillMs = sampleMs;
         }
         maxFillThisShot_ = std::max(maxFillThisShot_, sample.fillPct);
+        maxRawFillThisShot_ = std::max(maxRawFillThisShot_, sample.fillPct);
     }
     // The promoting payload is processed normally below, outside the pre-promotion
     // census branch. Account for the whole validated episode once so diagnostics
@@ -4631,10 +6924,19 @@ void AutomationEngine::beginShot(ShotMode mode, double now, const QString& shotT
                                  double physicalPressMs)
 {
     clearScheduledFire();
+    // Legacy callers may not provide physical epochs. Starting another owned
+    // shot still ends any unfinished prior landing observation; its pixels
+    // cannot share the old release's learning window.
+    cancelPostReleaseGrade(meterCapSeq_);
     // A new shot starts with no plan. Silent (not cancelAutonomousTipReservation) because a
     // fulfilled reservation from the previous shot is not an anomaly worth a log line; genuine
     // cancellations are already logged at their own abort sites.
     tipReservation_ = AutonomousTipReservation{};
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] THE rate-limit unit. Stepping the seed here -- before any
+    // of this shot's scheduling reads the lead -- is what makes "<= 2 ms per shot" a property of
+    // the shot rather than of how many times a tick happened to ask for the lead, and it fixes
+    // the seed for the whole life of this shot exactly as the arm-time lease fixes the authority.
+    updateLeadAutoSeed(now);
     // [ORION_GREEN_CENTER] the centring offset is per-shot telemetry; re-arm the once-per-shot
     // log so every shot reports the offset it actually flew with.
     greenCenterLoggedOffsetMs_ = -1.0;
@@ -4667,6 +6969,8 @@ void AutomationEngine::beginShot(ShotMode mode, double now, const QString& shotT
     // Preserve the actual Square edge for mode-neutral telemetry. Timing clocks
     // remain ownership-anchored below so existing Button calibration is not shifted.
     shot_.armTimestampMs = physicalPressMs >= 0.0 ? physicalPressMs : now;
+    // [ORION_PRESS_LATENCY_TRIM] only a press-dated shot can measure its press->anchor delay.
+    shot_.physicalPressMs = physicalPressMs >= 0.0 ? physicalPressMs : -1.0;
     shot_.shotType = shotType.isEmpty() ? QStringLiteral("Standstill") : shotType;
     // [ORION_TEMPO_FADE_MIRROR] Decide the gesture ONCE, here, from the arm-time
     // classification. Later reclassification must not reverse a held stick.
@@ -4677,6 +6981,13 @@ void AutomationEngine::beginShot(ShotMode mode, double now, const QString& shotT
     shot_.latencyCalibrationAutomaticProbe = shot_.latencyCalibrationProbe
         && latencyCalibrationAutomatic_;
     shot_.physicalShotEpoch = physicalShotEpoch_;
+    // Commit the same-epoch late fade classification before creating timing and
+    // feedback buckets. Otherwise the lead/band use a fade while phase prediction
+    // and banner learning use Standstill. Keep tempoFadeGesture latched above:
+    // correcting timing metadata must not reverse a gather already on the wire.
+    if (mode == ShotMode::ButtonShot || mode == ShotMode::TempoSquare) {
+        shot_.shotType = shotTypeWithBackstopFadeRetype();
+    }
     if (autonomousLiveMeterTimingEnabled() && physicalShotEpoch_ != 0) {
         // Ownership consumes the controller's global shot identity across every
         // input family.  A later delayed proof for this epoch can never migrate
@@ -4740,12 +7051,14 @@ void AutomationEngine::beginShot(ShotMode mode, double now, const QString& shotT
     fusedPeakLatched_ = false;
     fusedFrameAgeEmaMs_ = -1.0;
     maxFillThisShot_ = 0.0;
+    maxRawFillThisShot_ = 0.0;
     // [ORION_TEMPLATE_ARRIVAL] H4: fold the PREVIOUS shot's completed crossing-vector into the
     // per-bucket templates (online cluster learning), then open this shot's vector. Press-t0
     // (H5): the user's shoot-press timestamp is already native — squareHoldStartMs_ was stamped
     // on the rising physical hold, ~100-300ms before the meter appears — so the template SELECT
     // gains the press->first-crossing feature when [ORION_PRESS_T0] is on.
-    if (config_.templateArrivalEnabled && !autonomousLiveMeterTimingEnabled()) {
+    if (config_.templateArrivalEnabled && !autonomousLiveMeterTimingEnabled()
+        && !config_.inputTimedEnabled) {
         templateArrival_.endShot();
         const double pressT0 = (config_.pressT0Enabled && physicalPressMs > 0.0)
             ? physicalPressMs : -1.0;
@@ -4827,7 +7140,7 @@ void AutomationEngine::latchSuppressedShotControlOverlap(const ControllerState& 
         // RS-up is this shot's own gesture. Square and a new RS-down gesture
         // are both hidden by Go-To's owned output.
         if (physical.square()) {
-            squareLatchedUntilRelease_ = true;
+            armSquareOverlapLatch();
         }
         suppressedStickOverlap = physicalDown;
         break;
@@ -4835,7 +7148,7 @@ void AutomationEngine::latchSuppressedShotControlOverlap(const ControllerState& 
         // RS-down is this shot's own gesture. Square and a new RS-up gesture
         // are hidden by the tempo gather/flick output.
         if (physical.square()) {
-            squareLatchedUntilRelease_ = true;
+            armSquareOverlapLatch();
         }
         suppressedStickOverlap = physicalUp;
         break;
@@ -4863,6 +7176,575 @@ void AutomationEngine::startPumpFake(ShotMode mode, double now)
     shot_.networkOffsetMs = offset;
     sampler_.reset();
     greenTracker_.reset();
+    emit shotStateChanged(shot_);
+}
+
+// Input-timed Square mode. No detector, audio, RTT, learned offset, or phase snap
+// participates in the deadline. The same controller worker owns the release edge.
+void AutomationEngine::processInputTimedIdle(ControllerState& output,
+                                           const ControllerState& physical, double now)
+{
+    const bool neutral = shotInputControlsNeutral(physical,
+        config_.stickUpThreshold, config_.stickDownThreshold);
+    if (neutral) {
+        inputTimedNeutralPolls_ = std::min(inputTimedNeutralPolls_ + 1, 3);
+        if (inputTimedNeutralPolls_ >= 3) {
+            inputTimedReady_ = true;
+            squareLatchedUntilRelease_ = false;
+            squareRearmBlockedUntilRelease_ = false;
+        }
+        return;
+    }
+    inputTimedNeutralPolls_ = 0;
+    if (!inputTimedReady_ || !physical.square() || physical.cross()
+        || physical.options()
+        || std::hypot(static_cast<double>(physical.rightStickX), static_cast<double>(physical.rightStickY))
+            >= std::min(rawStickThreshold(config_.stickUpThreshold), rawStickThreshold(config_.stickDownThreshold))) {
+        inputTimedReady_ = false;
+        return;
+    }
+    inputTimedReady_ = false;
+    if (controllerRouteBindingRequired_
+        && !controllerDeliveryRouteAttestationSnapshot().valid()) return;
+    const ShotMode mode = config_.inputTimedRhythmEnabled
+        ? ShotMode::TempoSquare : ShotMode::ButtonShot;
+    // [ORION_NO_METER_V2 2026-09-14 owner] HOLD THE BUTTON FOR THE HOLD, nothing else. The
+    // console sees exactly release - press, so the hold IS the control quantity: no lead is
+    // subtracted (v1 subtracted a vision-path lead on a path with no vision and fired ~256 ms
+    // early on every Standstill) and there is no flat-delay fallback (H_ref + Δ already covers
+    // an unlearned type with a number of the right order). See blindReleaseHold().
+    //
+    // Go-To cannot arise here: this site classifies with ShotMode::ButtonShot, which never
+    // returns "Go-To", and the gate above already refuses any right-stick deflection — so the
+    // one excluded type is excluded structurally, not by a comparison that could rot.
+    const QString shotType = classifyShotType(physical, ShotMode::ButtonShot);
+    const BlindReleaseHold hold = blindReleaseHold(shotType, config_.inputTimedRhythmEnabled);
+    const double holdMs = hold.holdMs;
+    beginShot(mode, now, shotType, now);
+    shot_.inputTimedShot = true;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] Latch the hybrid decision ONTO THE SHOT,
+    // once, here. Every consumer (updateDetection's gate, the subtick arm site, the deferral,
+    // the learner fence) reads the latch rather than config_, so a settings write mid-hold cannot
+    // change the rules a press already in flight is being judged by — the same sample-and-hold
+    // discipline the network offset, the tempo gesture and the phase anchor already use.
+    shot_.noMeterVisionAssist = noMeterVisionAssistActive();
+    const auto routeBinding = controllerDeliveryRouteAttestationSnapshot();
+    shot_.releaseScheduleRouteGeneration = routeBinding.generation;
+    shot_.releaseScheduleRoute = routeBinding.route;
+    shot_.holdStartMs = now;
+    shot_.holdStartFrameAgeMs = 0.0;
+    shot_.frameAgeMs = 0.0;
+    noMeterBackstop_.deadlineMs = now + holdMs;
+    // A fresh arm opens no deferral and owes no handover line.
+    noMeterBackstop_.deferFromMs = -1.0;
+    noMeterBackstop_.deferCapMs = -1.0;
+    inputTimedVisionOwnedLoggedToken_ = 0;
+    // [ORION_NO_METER_TYPE_GRACE 2026-09-14 owner] "a few jumpshots not timed all the way". The
+    // classification above is taken from the ONE poll that carried the Square edge, and every arm
+    // in the 2026-09-14 log shows `ls=(0,0)`: a fade whose stick push lands a few frames after the
+    // button is typed Standstill and released ~280 ms short of its animation. processInputTimedHolding
+    // re-reads the stick for this long and may UPGRADE the type (see the window's argument there).
+    noMeterBackstop_.typeGraceEndMs = now + kNoMeterTypeGraceMs;
+    shot_.releasePlan = QStringLiteral("NO METER / input timer");
+    shot_.releaseReason = QStringLiteral("input_timed_release");
+    shot_.releaseReasonCode = QStringLiteral("input_timed_release");
+    armSquareOverlapLatch();
+    forceHeldOutput(output);
+    // [ORION_NO_METER_V2 2026-09-14] Every TERM of the sum plus its provenance, so a future
+    // "it fires early" report is answered from one grep and nometer_prior_audit.py can grade a
+    // NO METER session the same way it grades the meter path.
+    // [ORION_NO_METER_TYPE_GRACE 2026-09-14] ls= is the LEFT STICK at the press — the single
+    // input classifyShotType read to pick the type. Tonight's "not timed all the way" report was
+    // only diagnosable because the unrelated `Physical shot epoch:` line happened to carry it;
+    // the arm line now says it itself.
+    emit engineDiagnostic(QStringLiteral(
+        // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14] raw_ms is the law's number BEFORE the grid,
+        // frames/frame_ms the grid it was snapped onto (quantize=0 => hold_ms == raw_ms). One
+        // grep now answers "was this hold a whole number of frames" — the question behind
+        // "641 felt inconsistent, 650 is basically perfect".
+        "NO METER: hold_ms=%1 type=%2 h_ref=%3 delta=%4 delta_src=%5 n=%6 table=%7 learned=%8 "
+        "fade_trim=%9 rhythm=%10 floor=%11 ls=(%12,%13) vision_assist=%14 source=v2 arm=%15 "
+        "raw_ms=%16 frames=%17 frame_ms=%18 quantize=%19 rhythm_frames=%20")
+        .arg(holdMs, 0, 'f', 1)
+        .arg(shotType)
+        .arg(hold.hRefMs, 0, 'f', 1)
+        .arg(hold.deltaMs, 0, 'f', 1)
+        .arg(hold.deltaLearned ? QStringLiteral("blend") : QStringLiteral("table"))
+        .arg(hold.deltaLearnedN)
+        .arg(hold.deltaTableMs, 0, 'f', 1)
+        .arg(std::isfinite(hold.deltaLearnedMs) ? QString::number(hold.deltaLearnedMs, 'f', 1)
+                                                : QStringLiteral("none"))
+        .arg(hold.fadeTrimMs, 0, 'f', 1)
+        .arg(hold.rhythmMs, 0, 'f', 1)
+        .arg(hold.floored ? 1 : 0)
+        .arg(static_cast<int>(physical.leftStickX))
+        .arg(static_cast<int>(physical.leftStickY))
+        .arg(shot_.noMeterVisionAssist ? 1 : 0)
+        .arg(shot_.armToken)
+        .arg(hold.rawHoldMs, 0, 'f', 1)
+        .arg(hold.frames)
+        .arg(hold.frameMs, 0, 'f', 4)
+        .arg(hold.quantized ? 1 : 0)
+        .arg(hold.rhythmMs > 0.0 && hold.quantized ? kBlindReleaseRhythmFrames : 0));
+    // [ORION_BLIND_WAITER 2026-09-15 owner] ARM THE WAITER NOW, WITH THE WHOLE HOLD.
+    //
+    // The deadline is fully known at this instant — it is press + hold, and nothing downstream
+    // can make it EARLIER (the type grace only ever upgrades Standstill -> fade, i.e. later; the
+    // vision deferral only ever waits longer). Handing it to the precise-fire worker here is what
+    // makes the release independent of the 4 ms GUI tick: every later tick only supervises.
+    //
+    // Deliberately AFTER the arm line, so a press that produced `NO METER: hold_ms=` is exactly
+    // the population the `scheduler=1` release lines must account for, and so the arm line is
+    // emitted even on the (config-disabled) path where no token can be created.
+    //
+    // The old comment here — "don't copy the whole controller packet into the worker hundreds of
+    // milliseconds early" — described a real hazard, and it is answered rather than ignored:
+    // OrionAppController refreshes the armed release packet from the live poll on every tick a
+    // blind token stays armed (scheduledFireIsBlindInputTimed), so the packet is now at most one
+    // tick old instead of the 24 ms the pre-arm horizon used to allow.
+    armBlindPreciseFire(noMeterBackstop_.deadlineMs, now);
+}
+
+// [ORION_BLIND_WAITER 2026-09-15 owner] The single place a blind NO METER deadline becomes a
+// precise-fire token. It is the SAME scheduleFire()/ScheduledFireAuthority::InputTimed arm the
+// 24 ms pre-arm site used; only the horizon (and therefore the moment) is different, and the
+// horizon is derived from the deadline itself rather than tuned.
+bool AutomationEngine::armBlindPreciseFire(double deadlineMs, double now)
+{
+    if (!config_.subTickScheduler || schedFireDeadlineMs_ >= 0.0) {
+        return false;
+    }
+    if (!std::isfinite(deadlineMs) || deadlineMs <= now) {
+        return false;
+    }
+    // Never SHRINK the horizon below the legacy pre-arm value: a deadline already inside 24 ms
+    // must still arm exactly as it did before this change.
+    const double horizonMs = std::max(kBlindPreArmHorizonMs, (deadlineMs - now) + 1.0);
+    if (!scheduleFire(deadlineMs, now, horizonMs, ScheduledFireAuthority::InputTimed)) {
+        return false;
+    }
+    schedFirePlan_ = QStringLiteral("NO METER / input timer");
+    schedFireReason_ = QStringLiteral("input_timed_release");
+    schedFireCode_ = schedFireReason_;
+    schedFireArmedSource_ = QStringLiteral("input_timer");
+    return true;
+}
+
+bool AutomationEngine::blindWaiterStealableByVision(double now) const noexcept
+{
+    // The blind token exists from the press now, so "is there a token" is no longer the question
+    // it used to be. The question that PRESERVES the old behaviour exactly is "would the old code
+    // have had one yet": it armed at kBlindPreArmHorizonMs, and from that instant the blind
+    // release was committed and outranked vision. Same boundary, same answer.
+    return blindWaiterArmed()
+        && (schedFireDeadlineMs_ - now) > kBlindPreArmHorizonMs;
+}
+
+void AutomationEngine::noteBlindDeadlineMissed(double now, BlindBackstop& state, bool waiterArmed,
+                                               const BlindBackstopLogContext& ctx)
+{
+    if (waiterArmed || !state.armed()) {
+        state.missLoggedDeadlineMs = -1.0;
+        return;
+    }
+    const double overdueMs = now - state.deadlineMs;
+    // A tick lands a few ms past every ordinary blind deadline — that is the 4 ms cadence, not a
+    // stall. Only report a miss wide enough that the waiter should have owned the release.
+    if (!std::isfinite(overdueMs) || overdueMs <= kBlindDeadlineMissLoudMs) {
+        return;
+    }
+    if (std::abs(state.missLoggedDeadlineMs - state.deadlineMs) <= 1e-6) {
+        return;   // already reported this exact deadline
+    }
+    state.missLoggedDeadlineMs = state.deadlineMs;
+    emit engineDiagnostic(QStringLiteral(
+        "%1: DEADLINE MISSED unarmed by=%2 ms hold_ms=%3 scheduler=%4 %5")
+                              .arg(ctx.label)
+                              .arg(overdueMs, 0, 'f', 1)
+                              .arg(ctx.pressMs >= 0.0 ? now - ctx.pressMs : -1.0, 0, 'f', 1)
+                              .arg(config_.subTickScheduler ? 1 : 0)
+                              .arg(ctx.identity));
+}
+
+bool AutomationEngine::inputTimedAuthorityCurrentCore(double now,
+                                                      bool enforceLateLimit) const noexcept
+{
+    return config_.inputTimedEnabled && shot_.inputTimedShot && armed()
+        && lastPhysical_.square() && !lastPhysical_.cross() && !lastPhysical_.options()
+        && std::hypot(static_cast<double>(lastPhysical_.rightStickX), static_cast<double>(lastPhysical_.rightStickY))
+            < std::min(rawStickThreshold(config_.stickUpThreshold), rawStickThreshold(config_.stickDownThreshold))
+        && (!controllerRouteBindingRequired_
+            || controllerDeliveryRouteAttestationExpected(shot_.releaseScheduleRouteGeneration,
+                                                         shot_.releaseScheduleRoute))
+        && std::isfinite(noMeterBackstop_.deadlineMs) && noMeterBackstop_.deadlineMs >= 0.0
+        && (!enforceLateLimit || now <= inputTimedAuthorityLimitMs());
+}
+
+bool AutomationEngine::inputTimedAuthorityCurrent(double now) const noexcept
+{
+    return inputTimedAuthorityCurrentCore(now, /*enforceLateLimit=*/true);
+}
+
+double AutomationEngine::inputTimedAuthorityLimitMs() const noexcept
+{
+    // The blind deadline plus the late limit is the ordinary answer, and it is unchanged.
+    //
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] One exception: while a VISION token is armed for
+    // this NO METER shot, the shot's authority must reach that token's own deadline. Vision times
+    // the tip, which on a fade sits ~300 ms past a Standstill-typed blind deadline, so measuring
+    // the shot's life against the blind number would revoke authority underneath a token
+    // scheduleFire() has already proven future and leased — i.e. it would abort exactly the
+    // shots this feature exists to save. The token carries its own rolling frame+lead lease and
+    // is fenced below on every tick, so this widens no other guarantee; schedulerGraceMs is added
+    // for the same reason consumeDueScheduledFire waits that long for a confirm.
+    double limitMs = noMeterBackstop_.deadlineMs + kInputTimedLateLimitMs;
+    if (shot_.noMeterVisionAssist && schedFireDeadlineMs_ >= 0.0
+        && schedFireRequiresGenuineFrame_) {
+        limitMs = std::max(limitMs,
+                           schedFireDeadlineMs_
+                               + std::max(kInputTimedLateLimitMs, config_.schedulerGraceMs));
+    }
+    return limitMs;
+}
+
+void AutomationEngine::processInputTimedHolding(ControllerState& output, double now)
+{
+    // A confirmed physical edge wins cancellation exactly once; otherwise fence
+    // the copied worker token BEFORE returning the player's early release.
+    const bool confirmed = schedFireDeadlineMs_ >= 0.0
+        && schedFireConfirmedToken_ == schedFireToken_ && schedFireActualMs_ >= 0.0;
+    if (confirmed && consumeDueScheduledFire(output, now)) return;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] A VISION token armed for this NO METER shot
+    // carries the meter path's rolling frame+lead lease, not the blind timer's. Refresh it and
+    // fence it here — the same two operations processAutonomousLiveMeterHolding does at its own
+    // top — so a token whose evidence has gone stale is RETURNED to the blind path (which still
+    // owns a real deadline for this press) instead of sitting armed until the shot dies. Extend
+    // first, fence second, so the fence sees an honest answer.
+    if (shot_.noMeterVisionAssist && schedFireDeadlineMs_ >= 0.0
+        && schedFireRequiresGenuineFrame_) {
+        refreshScheduledFireAuthorityLease();
+        const bool tokenConfirmed = schedFireConfirmedToken_ == schedFireToken_
+            && schedFireActualMs_ >= 0.0;
+        const bool wrongEpoch = schedFireVisionEpoch_ != shot_.visionEpoch;
+        const bool authorityExpired = schedFireAuthorityExpiryMs_ < 0.0
+            || now > schedFireAuthorityExpiryMs_ + 1e-6;
+        const double untilArmedMs = schedFireDeadlineMs_ - now;
+        const bool uncoveredAtCommit = !scheduledFireAuthorityCoversDeadline()
+            && untilArmedMs > 0.0 && untilArmedMs <= cleanSourceGapMs();
+        if (!tokenConfirmed && (wrongEpoch || authorityExpired || uncoveredAtCommit)
+            && !armedTokenSubmitInFlight(now)
+            && !armedPhaseTokenCarriesAnchorAuthority(now)) {
+            invalidateUnconfirmedVisionSchedule("no_meter_vision_authority");
+        }
+    }
+    if (!inputTimedAuthorityCurrent(now)) {
+        // [ORION_BLIND_WAITER 2026-09-15 owner] THE RESCUE, and it runs BEFORE the abort for the
+        // one reason that matters: a press that produced a `NO METER: hold_ms=` arm line and is
+        // still being held by the player must never die as `input_timer_late_abort`. Everything
+        // the authority asks EXCEPT "still in time" is re-checked inside, so a player who let go,
+        // a route that changed and a disarm all still abort exactly as before.
+        if (maybeRescueOverdueBlindRelease(output, now)) {
+            return;
+        }
+        relinquishAutonomousLiveMeterShot(output,
+            now > inputTimedAuthorityLimitMs()
+                ? QStringLiteral("input_timer_late_abort")
+                : QStringLiteral("input_timer_manual_cancel"));
+        if (!lastPhysical_.square() && shot_.state != HoldState::Releasing) {
+            // Unlike a detector dropout, a manual timer cancellation must not
+            // reassert a button/gather while waiting for release debounce.
+            ownedOutputDrain_ = OwnedOutputDrain::None;
+            pendingSquareTempoRemap_ = false;
+            output = lastPhysical_;
+        }
+        return;
+    }
+    forceHeldOutput(output);
+    maybeUpgradeInputTimedShotType(now);
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The meter-appear ANCHOR, latched exactly as
+    // processHolding latches it and gated on the same GENUINE accept (never on a memory echo,
+    // whose held fill is a stale copy of a previous shot's meter). It is not cosmetic: it is the
+    // precondition reevaluateScheduleOnFreshSample checks before it will consider a crossing at
+    // all, so without this line the vision arm site is unreachable in NO METER no matter how
+    // clearly the meter is visible.
+    if (shot_.noMeterVisionAssist && shot_.sawFreshMeterThisShot
+        && shot_.firstFreshAcceptMs >= 0.0 && !shot_.meterSeenThisShot) {
+        shot_.meterSeenThisShot = true;
+        shot_.firstMeterSeenMs = shot_.firstFreshAcceptMs;
+        shot_.firstMeterFrameAgeMs = shot_.frameAgeMs;
+    }
+    if (consumeDueScheduledFire(output, now)) return;
+    // PRECEDENCE IS STRUCTURAL, NOT NEGOTIATED. A VISION token ends the decision for this tick,
+    // so a vision token that arms before the blind deadline cancels the blind release by making
+    // everything below unreachable, exactly the way a promoted meter makes the blind backstop
+    // site unreachable on the meter path. There is no flag comparison to get wrong and there can
+    // be no second release.
+    //
+    // [ORION_BLIND_WAITER 2026-09-15] The BLIND token no longer short-circuits here. It is armed
+    // from the press now, so returning on it would have frozen the deferral and the type-grace
+    // upgrade out of existence — the two things that legitimately MOVE a blind deadline. The
+    // blind token is instead kept in sync with the blind deadline below, which is the same
+    // "one deadline, one description of it" discipline resolveBlindDeadline already enforces.
+    if (schedFireDeadlineMs_ >= 0.0 && !schedFireBlindInputTimed_) return;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] ...and if the deadline has arrived while a meter
+    // is on screen and still climbing, WAIT for it, bounded. Releasing blind mid-fill is a
+    // guaranteed miss; the rising meter in front of us is the shot.
+    const double blindDeadlineMs = resolveBlindDeadlineWithVisionDeferral(now);
+    if (schedFireDeadlineMs_ >= 0.0) {
+        // A blind waiter is holding this release. It is authoritative unless the deadline it was
+        // armed against has MOVED (type-grace upgrade, deferral opened, deferral ended) — in
+        // which case tear it down here and let the normal arm/fire decision below re-take it on
+        // the new instant. The teardown is the ordinary synchronous worker fence, so a token the
+        // worker already submitted is confirmed rather than lost.
+        if (std::abs(schedFireDeadlineMs_ - blindDeadlineMs) <= 1e-6) {
+            return;
+        }
+        invalidateUnconfirmedSchedule(true, "blind_deadline_moved");
+        if (schedFireDeadlineMs_ >= 0.0) {
+            return;   // the fence raced a confirmed physical submit; the next tick consumes it
+        }
+    }
+    if (now >= blindDeadlineMs) {
+        // [ORION_BLIND_WAITER 2026-09-15] Reaching here past the deadline WITH the scheduler
+        // enabled means no waiter was holding it — a GUI-thread stall, or an arm the gates
+        // refused. Say so, once, with the exact lateness, then fire: an owed blind release is
+        // worth more late than not at all, and this is the branch that must never become an
+        // abort.
+        BlindBackstopLogContext missCtx;
+        missCtx.label = QStringLiteral("NO METER");
+        missCtx.identity = QStringLiteral("arm=%1").arg(shot_.armToken);
+        missCtx.pressMs = shot_.holdStartMs;
+        noteBlindDeadlineMissed(now, noMeterBackstop_, /*waiterArmed=*/false, missCtx);
+        shot_.releaseReason = QStringLiteral("input_timed_release");
+        shot_.releaseReasonCode = QStringLiteral("input_timed_release");
+        if (triggerRelease(now)) clearReleaseOutput(output);
+        else restoreAbortOutput(output);
+    } else {
+        // Supervision: the press-time arm is the normal path, so this only ever catches a shot
+        // whose arm was refused at the press (route not yet attested, scheduler toggled on
+        // mid-hold) or whose deadline just moved. Same token, same authority, same identity
+        // check — only the horizon is the full runway instead of 24 ms.
+        armBlindPreciseFire(blindDeadlineMs, now);
+    }
+}
+
+// [ORION_BLIND_WAITER 2026-09-15 owner] THE OVERDUE RESCUE -----------------------------------
+//
+// 2026-09-14 00:24:56.466: physical epoch 3 armed a 633.3 ms hold and the next thing in the log
+// for it is `reason=input_timer_late_abort` at 00:24:58.218 — 1.75 s later, because
+// inputTimedAuthorityCurrent() had stopped being true 12 ms past the deadline while the GUI
+// thread was elsewhere. The press was correct, the hold was correct, and the shot was thrown
+// away for the sole reason that nobody was there to take it.
+//
+// An owed blind release is worth more LATE than never: the console sees the button held either
+// way (the engine owns the output), so "abort" here does not undo anything — it just converts a
+// timed release into an untimed one at an arbitrary instant. Fire it, loudly.
+//
+// EVERY authority term except the late limit is re-checked, so this forgives exactly one thing.
+// A player who let go of Square, a route that re-attested, a disarm, a mode switch: all still
+// abort on the line below this call, unchanged.
+bool AutomationEngine::maybeRescueOverdueBlindRelease(ControllerState& output, double now)
+{
+    if (!inputTimedAuthorityCurrentCore(now, /*enforceLateLimit=*/false)) {
+        return false;
+    }
+    if (now <= noMeterBackstop_.deadlineMs) {
+        return false;   // not overdue at all: whatever failed, it was not the clock
+    }
+    forceHeldOutput(output);
+    // The late limit — and ONLY the late limit — is forgiven for the release calls below.
+    blindOverdueRescueActive_ = true;
+    // An armed-but-unconfirmed token past its own deadline + grace is consumed by the ordinary
+    // takeover path (which synchronously fences the worker first, so a submit that already
+    // happened is confirmed rather than double-pressed). Inside the grace it is still the
+    // worker's shot and this tick simply waits.
+    if (schedFireDeadlineMs_ >= 0.0) {
+        if (consumeDueScheduledFire(output, now)) {
+            blindOverdueRescueActive_ = false;
+            return true;
+        }
+        blindOverdueRescueActive_ = false;
+        return schedFireDeadlineMs_ >= 0.0;   // still the worker's; hold the press one more tick
+    }
+    BlindBackstopLogContext missCtx;
+    missCtx.label = QStringLiteral("NO METER");
+    missCtx.identity = QStringLiteral("arm=%1").arg(shot_.armToken);
+    missCtx.pressMs = shot_.holdStartMs;
+    noteBlindDeadlineMissed(now, noMeterBackstop_, /*waiterArmed=*/false, missCtx);
+    shot_.releaseReason = QStringLiteral("input_timed_release");
+    shot_.releaseReasonCode = QStringLiteral("input_timed_release");
+    const bool fired = triggerRelease(now);
+    blindOverdueRescueActive_ = false;
+    if (fired) {
+        clearReleaseOutput(output);
+    } else {
+        restoreAbortOutput(output);
+    }
+    return true;
+}
+
+// [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] THE DEFERRAL ------------------------------
+//
+// Three outcomes, one bounded wait, and every one of them logged:
+//
+//   (b) NO candidate at the blind deadline -> the deadline stands and the blind release fires,
+//       byte-identical to pure NO METER. This is also the whole behaviour when the in-game meter
+//       is off, because then no candidate can ever exist.
+//   (c) A candidate is visible and still RISING at the deadline -> hold, up to
+//       kNoMeterVisionDeferMaxMs, and never past the fill at which there is no tip left to wait
+//       for. If vision arms inside that window it takes the shot (the caller returns on the armed
+//       token); if the candidate stops rising or the cap expires, the blind release fires then.
+//
+// The deferral MOVES noMeterBackstop_.deadlineMs rather than carrying a parallel deadline, so the
+// authority window, the InputTimed scheduleFire identity check and the NO METER RELEASE lateness
+// line all keep describing the one instant the shot is actually aimed at.
+// [ORION_METER_BLIND_BACKSTOP 2026-09-14 owner] ONE IMPLEMENTATION, BOTH PATHS. The NO METER
+// hold and the meter path's backstop differ ONLY in (a) which BlindBackstop instance they own,
+// (b) how they answer "is a meter candidate rising right now" — the shot's own accepted sample on
+// one path, the pending ownership episode on the other, because before ownership no ShotContext
+// exists — and (c) the label/identity they log under. Everything else, including the
+// pre-arm-horizon timing of the decision and all three outcomes, is this function.
+double AutomationEngine::resolveBlindDeadline(double now, BlindBackstop& state,
+                                              bool deferralAllowed, bool rising,
+                                              const BlindBackstopLogContext& ctx)
+{
+    if (!deferralAllowed) {
+        return state.deadlineMs;   // pure blind: nothing to defer for
+    }
+    if (!state.deferring()) {
+        // Not deferring yet. Open one only for a rising candidate, and only once the deadline is
+        // close enough that this is the LAST moment the decision can still be taken:
+        // kBlindPreArmHorizonMs out is where the blind release stops being a decision and becomes
+        // a copied precise-fire token, and a token already handed to the worker cannot be
+        // deferred. Checking at the deadline itself would therefore have made a meter that
+        // surfaced in the final 24 ms unreachable — which is precisely the fade case (the meter
+        // appears ~650-700 ms into a press whose Standstill-typed deadline is 650).
+        if (now < state.deadlineMs - kBlindPreArmHorizonMs || !rising) {
+            return state.deadlineMs;
+        }
+        state.deferFromMs = state.deadlineMs;
+        state.deferCapMs = state.deadlineMs + kNoMeterVisionDeferMaxMs;
+        state.deadlineMs = state.deferCapMs;
+        emit engineDiagnostic(QStringLiteral(
+            "%1: blind deadline deferred (rising meter fill=%2 peak=%3) hold_ms=%4 "
+            "cap_ms=%5 max_defer_ms=%6 %7")
+                                  .arg(ctx.label)
+                                  .arg(ctx.fillPct, 0, 'f', 1)
+                                  .arg(ctx.peakFillPct, 0, 'f', 1)
+                                  .arg(state.deferFromMs - ctx.pressMs, 0, 'f', 1)
+                                  .arg(state.deferCapMs - ctx.pressMs, 0, 'f', 1)
+                                  .arg(kNoMeterVisionDeferMaxMs, 0, 'f', 1)
+                                  .arg(ctx.identity));
+        return state.deadlineMs;
+    }
+    // Already deferring. It ends the moment the candidate stops being one, and at the cap.
+    const bool capExpired = now >= state.deferCapMs;
+    if (!rising || capExpired) {
+        emit engineDiagnostic(QStringLiteral(
+            "%1: deferral ended outcome=%2 waited_ms=%3 fill=%4 peak=%5 hold_ms=%6 %7")
+                                  .arg(ctx.label)
+                                  .arg(rising ? QStringLiteral("cap_expired")
+                                              : QStringLiteral("candidate_lost"))
+                                  .arg(now - state.deferFromMs, 0, 'f', 1)
+                                  .arg(ctx.fillPct, 0, 'f', 1)
+                                  .arg(ctx.peakFillPct, 0, 'f', 1)
+                                  .arg(now - ctx.pressMs, 0, 'f', 1)
+                                  .arg(ctx.identity));
+        state.deferCapMs = -1.0;
+        state.deferFromMs = -1.0;
+        if (!rising) {
+            state.deadlineMs = now;   // fire blind on this tick
+        }
+        // On cap expiry state.deadlineMs is already the cap: fire blind on this tick too.
+    }
+    return state.deadlineMs;
+}
+
+double AutomationEngine::resolveBlindDeadlineWithVisionDeferral(double now)
+{
+    BlindBackstopLogContext ctx;
+    ctx.label = QStringLiteral("NO METER");
+    ctx.identity = QStringLiteral("arm=%1").arg(shot_.armToken);
+    ctx.pressMs = shot_.holdStartMs;
+    ctx.fillPct = shot_.fillPct;
+    ctx.peakFillPct = shot_.peakFillPct;
+    return resolveBlindDeadline(now, noMeterBackstop_, shot_.noMeterVisionAssist,
+                                noMeterVisionCandidateRising(now), ctx);
+}
+
+// [ORION_NO_METER_TYPE_GRACE 2026-09-14 owner] ------------------------------------------------
+//
+// THE LOSS: "a few jumpshots not timed all the way". NO METER types the shot from the SINGLE
+// controller poll that carried the Square edge. A player who starts the fade lean a few frames
+// after the button — which is how the stick actually moves, and why every arm in the 2026-09-14
+// log reads `ls=(0,0)` — gets Δ = 0 and a ~641 ms hold where the fade animation wants ~945 ms.
+// ~300 ms early is not a mistimed shot, it is a different shot.
+//
+// THE WINDOW IS SAFE BY ARITHMETIC, not by tuning. The shortest hold this law can produce is
+// 500 ms (kNoMeterHoldMinMs), so when the 200 ms window closes the release is still >= 300 ms
+// away and the deadline has never been armed with the precise-fire scheduler (that happens
+// inside 24 ms of the deadline). An upgrade only ever moves the deadline LATER, by a positive Δ.
+//
+// UPGRADE ONLY, NEVER DOWNGRADE. A fade typed at the press is the player's committed gesture and
+// stands even if the stick returns to centre mid-hold (the lean is already in the animation).
+// Only Standstill — the "I saw nothing" answer — is revisited, and only into a fade. No Dip and
+// Post Fade are L2 shots whose signature is present at the press by construction; they are not
+// re-typed, so an L2 released mid-hold cannot silently re-time the shot.
+//
+// The gather output is NOT touched: forceHeldOutput reads shot_.tempoFadeGesture, which is
+// latched at arm, so this cannot manufacture a stick direction change mid-press.
+// [ORION_METER_BLIND_BACKSTOP 2026-09-14] The LAW, shared by both blind paths. The caller owns
+// the press state it applies to (a ShotContext in NO METER, the pending Square press on the meter
+// path) and recomputes its own deadline; the rules about WHEN and WHAT MAY CHANGE live here once.
+// An empty return means "leave the type alone"; `graceEndMs < 0` means the window is closed.
+QString AutomationEngine::blindShotTypeUpgrade(double now, const QString& currentType,
+                                               double graceEndMs) const
+{
+    if (graceEndMs < 0.0 || now > graceEndMs) {
+        return QString();
+    }
+    if (currentType != QLatin1String("Standstill")) {
+        return QString();   // only the "I saw nothing" answer is ever revisited
+    }
+    const QString upgraded = classifyShotType(lastPhysical_, ShotMode::ButtonShot);
+    if (upgraded != QLatin1String("Left Fade") && upgraded != QLatin1String("Right Fade")) {
+        return QString();
+    }
+    return upgraded;
+}
+
+void AutomationEngine::maybeUpgradeInputTimedShotType(double now)
+{
+    if (noMeterBackstop_.typeGraceEndMs < 0.0 || now > noMeterBackstop_.typeGraceEndMs) {
+        return;
+    }
+    if (shot_.shotType != QLatin1String("Standstill")) {
+        noMeterBackstop_.typeGraceEndMs = -1.0;   // nothing left to upgrade
+        return;
+    }
+    const QString upgraded = blindShotTypeUpgrade(now, shot_.shotType,
+                                                  noMeterBackstop_.typeGraceEndMs);
+    if (upgraded.isEmpty()) {
+        return;
+    }
+    const BlindReleaseHold before = blindReleaseHold(shot_.shotType,
+                                                     config_.inputTimedRhythmEnabled);
+    const BlindReleaseHold after = blindReleaseHold(upgraded, config_.inputTimedRhythmEnabled);
+    const double elapsedMs = now - shot_.holdStartMs;
+    shot_.shotType = upgraded;
+    noMeterBackstop_.deadlineMs = shot_.holdStartMs + after.holdMs;
+    noMeterBackstop_.typeGraceEndMs = -1.0;
+    // [ORION_SHOT_GATE_TYPE 2026-09-15] The sidecar was armed with the type this press's edge
+    // carried (Standstill). Re-type it there too, on the same epoch, so its meter-onset window
+    // follows the fade the engine just committed to instead of expecting a standing shot's
+    // ~150 ms onset for an animation that will not show a meter for ~675 ms.
+    emit shotGateShotType(shot_.physicalShotEpoch, upgraded, config_.inputTimedRhythmEnabled);
+    emit engineDiagnostic(QStringLiteral(
+        "NO METER: reclassified Standstill -> %1 at +%2 ms, hold %3 -> %4")
+        .arg(upgraded)
+        .arg(elapsedMs, 0, 'f', 1)
+        .arg(before.holdMs, 0, 'f', 1)
+        .arg(after.holdMs, 0, 'f', 1));
     emit shotStateChanged(shot_);
 }
 
@@ -4919,23 +7801,34 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
     const bool squareTrulyReleased = !physical.square() && allFalse(shot_.xButtonHistory);
 
     if (tempoPassThroughPulseActive_) {
-        if (squareHeld) {
+        // [ORION_METER_BLIND_BACKSTOP 2026-09-14] Every OTHER pulse starts after the physical
+        // press ended, so a held Square is genuinely a new edge and supersedes it. The blind
+        // backstop's flick starts while the same press is still down — cancelling it there would
+        // swallow the very release it just committed — so that one pulse is excluded from this
+        // rule and runs out its bounded window instead.
+        if (squareHeld && !tempoPassThroughPulseHeldPress_) {
             // A new physical edge supersedes the previous pass-through pulse.
             tempoPassThroughPulseActive_ = false;
             tempoPassThroughPulseEndMs_ = -1.0;
             resetTempoMovementTransaction();
         } else if (now < tempoPassThroughPulseEndMs_) {
             applyShotReleaseEdge(output, ShotMode::TempoSquare, pendingSquareShotType_,
-                         tempoGestureIsFade(pendingSquareShotType_, config_.tempoFadeMirrorGesture));
+                         tempoPassThroughPulseFadeGesture_,
+                         tempoReleaseStyleFromString(config_.tempoReleaseStyle));
             preserveFadeMovementVector(
                 output, pendingSquareShotType_, pendingSquareLsArmX_,
                 pendingSquareLsArmY_, pendingSquareMovementValid_);
-            shot_.releasePlan = QStringLiteral("Idle / tempo pass-through flick");
-            shot_.releaseReason = QStringLiteral("tempo_remap_passthrough");
+            shot_.releasePlan = tempoPassThroughPulseHeldPress_
+                ? QStringLiteral("Idle / meter backstop tempo flick")
+                : QStringLiteral("Idle / tempo pass-through flick");
+            shot_.releaseReason = tempoPassThroughPulseHeldPress_
+                ? QStringLiteral("press_answered_by_backstop")
+                : QStringLiteral("tempo_remap_passthrough");
             return;
         } else {
             tempoPassThroughPulseActive_ = false;
             tempoPassThroughPulseEndMs_ = -1.0;
+            tempoPassThroughPulseHeldPress_ = false;
             pendingSquareTempoRemap_ = false;
             clearPendingSquareMovementContext();
             resetTempoMovementTransaction();
@@ -4978,10 +7871,30 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
         return;
     }
     if (squareLatchedUntilRelease_ && physical.square()) {
-        output.buttons &= ~XINPUT_GAMEPAD_X;
-        shot_.releasePlan = QStringLiteral("Idle / pass-through");
-        shot_.releaseReason = QStringLiteral("waiting_for_button_release");
-        return;
+        // [ORION_LATCH_CANARY 2026-08-30] Owner fail-safe invariant, encoded: a physical
+        // press must ALWAYS be able to produce a shot. This strip exists only to keep the
+        // press that armed the latch from re-triggering after the bot's own release. A
+        // certified square epoch STRICTLY NEWER than the arm proves the pad went through
+        // three clean UP polls and a fresh DOWN since then — the suppressed press is over,
+        // the latch is a leak (the twice-fixed B2c/C5 / A1 class), and stripping now would
+        // swallow a brand-new press indefinitely. Break the latch loudly and fall through
+        // so this tick already handles the press as the new gesture it is. A continuously
+        // held Square can never mint a new certified epoch, so anti-auto-repeat holds.
+        if (lastSquarePressEpoch_ != 0
+            && lastSquarePressEpoch_ > squareLatchArmSquareEpoch_) {
+            emit engineDiagnostic(QStringLiteral(
+                "LATCH LEAK BROKEN AT FRESH PRESS: press_epoch=%1 latch_arm_epoch=%2 "
+                "(stale waiting_for_button_release cleared; the new physical press "
+                "proceeds — it is never stripped)")
+                                      .arg(lastSquarePressEpoch_)
+                                      .arg(squareLatchArmSquareEpoch_));
+            squareLatchedUntilRelease_ = false;
+        } else {
+            output.buttons &= ~XINPUT_GAMEPAD_X;
+            shot_.releasePlan = QStringLiteral("Idle / pass-through");
+            shot_.releaseReason = QStringLiteral("waiting_for_button_release");
+            return;
+        }
     }
     // Arming counter resets the instant strict RS-up is no longer present (unchanged).
     if (!stickUp) {
@@ -5039,6 +7952,10 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
                                   .arg(pendingMeterOwnershipLastEvidenceFillPct_, 0, 'f', 1)
                                   .arg(pendingStickCalibrationPhysicalEpoch_)
                                   .arg(waitMs, 0, 'f', 1));
+        emitPendingMeterOwnershipAcquisitionCensus(
+            pendingStickCalibrationPhysicalEpoch_, pendingStickCalibrationStartMs_, "not_owned");
+        emitPendingMeterOwnershipGeometryBreak(
+            pendingStickCalibrationPhysicalEpoch_, -1, "not_owned");
         // [ORION_ABORT_IDENTITY] Pre-ownership stick fault (ownership_epoch_superseded /
         // ownership_proof_incomplete). The pending epoch is still live here — clearPendingStick-
         // Candidate() runs only after this lambda returns — so the abort is genuinely joinable.
@@ -5329,7 +8246,7 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
                 emit engineDiagnostic(QStringLiteral(
                     "SHOT NOT OWNED: reason=%1 samples=%2 "
                     "first_fill=%3 last_fill=%4 physical_epoch=%5 wait_ms=%6 "
-                    "stale_samples=%7 stale_span_pct=%8")
+                    "stale_samples=%7 stale_span_pct=%8 unstamped=%9 stamp_epoch_seen=%10")
                                           .arg(notOwnedReason)
                                           .arg(pendingMeterOwnershipMaxProofSamples_)
                                           .arg(pendingMeterOwnershipFirstEvidenceFillPct_, 0, 'f', 1)
@@ -5339,7 +8256,13 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
                                           .arg(pendingMeterOwnershipStaleSamples_)
                                           .arg(pendingMeterOwnershipStaleMaxPct_
                                                    - pendingMeterOwnershipStaleMinPct_,
-                                               0, 'f', 1));
+                                               0, 'f', 1)
+                                          .arg(pendingMeterOwnershipUnstampedSamples_)
+                                          .arg(pendingMeterOwnershipUnstampedStampEpoch_));
+                emitPendingMeterOwnershipAcquisitionCensus(
+                    pendingSquarePhysicalEpoch_, squareHoldStartMs_, "timeout");
+                emitPendingMeterOwnershipGeometryBreak(
+                    pendingSquarePhysicalEpoch_, -1, "timeout");
                 // [ORION_ABORT_IDENTITY] Square ownership-proof timeout /
                 // ownership_blocked_stale_meter. pendingSquarePhysicalEpoch_ is retired and
                 // zeroed a few lines below, so it must be read here while still valid.
@@ -5395,6 +8318,21 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
         shot_.releasePlan = QStringLiteral("Idle / pass-through");
         shot_.releaseReason = QStringLiteral("waiting_for_strict_hold");
         if (liveMeterOnly) {
+            // [ORION_METER_BLIND_BACKSTOP 2026-09-14 owner] THE ONLY BACKSTOP SITE, and the ONE
+            // fact that makes vision's precedence structural: this is the pre-ownership wait. The
+            // moment the strict proof promotes the press, the engine leaves HoldState::Idle,
+            // processIdle stops being dispatched for it and this line is unreachable — so an
+            // OWNED shot can never fall to the backstop and every never-aborts / late-fire /
+            // ownership-leniency rule keeps precedence over it without a single comparison.
+            //
+            // It also runs AFTER every ownership/lead gate above, so a press vision can still
+            // claim is untouched. What changes is the press vision could NEVER claim: instead of
+            // dying at the player's release as `press_unanswered_no_meter` it gets the blind
+            // deadline — deferred, bounded, while a candidate is still climbing. See
+            // maybeFireMeterBlindBackstop() for the precedence, single-fire and learner argument.
+            if (maybeFireMeterBlindBackstop(output, now, useTempo)) {
+                return;
+            }
             // Strict production ownership is evidence-driven, never elapsed-hold-
             // driven. Button mode stays physical and Tempo stays in its existing
             // remap representation until three unique, geometry-continuous rising
@@ -5413,7 +8351,7 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
         const double armMs = config_.squareHoldArmMs;
         if ((now - squareHoldStartMs_) >= armMs) {
             const double physicalPressMs = squareHoldStartMs_;
-            squareLatchedUntilRelease_ = true;
+            armSquareOverlapLatch();
             // Tempo converts the Square hold into the right-stick tempo motion (TempoSquare). The
             // arm gate + meter-timed release are identical; only forceHeldOutput / processReleasing
             // differ (RS down-load then up-flick).
@@ -5438,18 +8376,31 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
     if (squareTrulyReleased && squareHoldStartMs_ >= 0.0 && !squareLatchedUntilRelease_) {
         const bool incompleteStrictProof = liveMeterOnly
             && pendingMeterOwnershipCurrentEvidenceSeen_;
+        // A press with NO evidence but a full proof-complement of genuine frames that
+        // failed ONLY the structure stamp is a real shot the sidecar failed to stamp,
+        // not a menu press. Report it; only a press with neither evidence nor a
+        // censused genuine run stays deliberately quiet (that one really may be a
+        // menu press). Threshold = 3, the same complement the ownership proof itself
+        // requires, so a single stray frame can never manufacture an abort report.
+        const bool structureStampStarved = liveMeterOnly
+            && !pendingMeterOwnershipCurrentEvidenceSeen_
+            && pendingMeterOwnershipUnstampedSamples_ >= 3;
+        if (incompleteStrictProof || structureStampStarved) {
+            emitPendingMeterOwnershipAcquisitionCensus(
+                pendingSquarePhysicalEpoch_, squareHoldStartMs_, "not_owned");
+        }
         if (incompleteStrictProof) {
             // We saw current-epoch gameplay meter structure, but never obtained
             // enough unique rising frames to take ownership safely. The physical
             // release still passes through untouched; surface the fail-closed
             // non-intervention so it cannot look like the bot silently ignored a
-            // genuine shot. No structure evidence means this may be a menu press
-            // and remains deliberately quiet.
+            // genuine shot. No structure evidence AND no censused genuine run means
+            // this may be a menu press and remains deliberately quiet.
             emit engineDiagnostic(QStringLiteral(
                 "SHOT NOT OWNED: reason=ownership_proof_incomplete samples=%1 "
                 "first_fill=%2 last_fill=%3 physical_epoch=%4 restarts=%5 "
                 "break_drop=%6 break_anchor=%7 break_geometry=%8 break_identity=%9 "
-                "break_gap=%10")
+                "break_gap=%10 break_ruler=%11 unstamped=%12 stamp_epoch_seen=%13")
                                       .arg(pendingMeterOwnershipMaxProofSamples_)
                                       .arg(pendingMeterOwnershipFirstEvidenceFillPct_, 0, 'f', 1)
                                       .arg(pendingMeterOwnershipLastEvidenceFillPct_, 0, 'f', 1)
@@ -5459,7 +8410,12 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
                                       .arg(pendingMeterOwnershipBreaks_.anchor)
                                       .arg(pendingMeterOwnershipBreaks_.geometry)
                                       .arg(pendingMeterOwnershipBreaks_.identity)
-                                      .arg(pendingMeterOwnershipBreaks_.gapOrCandidate));
+                                      .arg(pendingMeterOwnershipBreaks_.gapOrCandidate)
+                                      .arg(pendingMeterOwnershipBreaks_.estimatorRuler)
+                                      .arg(pendingMeterOwnershipUnstampedSamples_)
+                                      .arg(pendingMeterOwnershipUnstampedStampEpoch_));
+            emitPendingMeterOwnershipGeometryBreak(
+                pendingSquarePhysicalEpoch_, -1, "not_owned");
             // [ORION_ABORT_IDENTITY] Square early release with incomplete strict proof. This is
             // the single highest-volume unattributed abort in logs/orion_native.log.1 (all 23
             // `ownership_proof_incomplete` aborts in that log's post-identity era had no stamp).
@@ -5469,7 +8425,89 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
                                   QStringLiteral("ownership_proof_incomplete"),
                                   pendingSquareShotType_);
             emit shotAborted(QStringLiteral("ownership_proof_incomplete"));
+        } else if (structureStampStarved) {
+            // [ORION_STRUCTURE_STAMP_MISSING 2026-08-29] The silent-drop path from
+            // session_20260829_123758: a full genuine rise arrived during the press and every
+            // frame of it was discarded for lacking gameplayStructureVerified under this
+            // exact press epoch, so the press previously ended with no decision of any kind.
+            // Same fail-closed action as ownership_proof_incomplete — the physical release
+            // has already passed through untouched, nothing is fabricated — but a DISTINCT
+            // reason so live batches can separate "sidecar never stamped this press" from
+            // "stamped frames never completed the rise proof". stamp_epoch_seen names the
+            // upstream failure mode: 0 = the sidecar never claimed structure during this
+            // press; a nonzero older epoch = the stamp was stuck on a previous shot.
+            emit engineDiagnostic(QStringLiteral(
+                "SHOT NOT OWNED: reason=ownership_structure_stamp_missing unstamped=%1 "
+                "first_fill=%2 last_fill=%3 span_ms=%4 stamp_epoch_seen=%5 "
+                "physical_epoch=%6")
+                                      .arg(pendingMeterOwnershipUnstampedSamples_)
+                                      .arg(pendingMeterOwnershipUnstampedFirstFillPct_, 0, 'f', 1)
+                                      .arg(pendingMeterOwnershipUnstampedLastFillPct_, 0, 'f', 1)
+                                      .arg(pendingMeterOwnershipUnstampedLastMs_
+                                               - pendingMeterOwnershipUnstampedFirstMs_,
+                                           0, 'f', 1)
+                                      .arg(pendingMeterOwnershipUnstampedStampEpoch_)
+                                      .arg(pendingSquarePhysicalEpoch_));
+            emitShotAbortIdentity("square_early_release",
+                                  static_cast<qint64>(pendingSquarePhysicalEpoch_),
+                                  -1, -1, -1,
+                                  QStringLiteral("ownership_structure_stamp_missing"),
+                                  pendingSquareShotType_);
+            emit shotAborted(QStringLiteral("ownership_structure_stamp_missing"));
+        } else if (liveMeterOnly && pendingSquarePhysicalEpoch_ != 0) {
+            // (epoch 0 = a synthetic edge with no physical shot identity: live 10:05 e32 emitted
+            // this line twice for one Settings button-up.)
+            // [ORION_UNANSWERED_PRESS 2026-08-30] The formerly-quiet terminal: a live-mode
+            // Square press ended with NO meter evidence of any kind — not one genuine frame,
+            // not even an unstamped one. Session 20260830_191051 had 8 in-play presses land
+            // here; reconstructing them took the framedump + a per-tick delivery audit, and
+            // the ground truth was "press and release were delivered, the GAME never started
+            // a shot" (pickup/recovery windows). One bounded line per press epoch makes that
+            // conclusion a single grep next time: sq_latch is the engine's own possible
+            // swallow site (always 0 here — a latched press can't reach this branch), the
+            // controller-side SQUARE SUPPRESSED audit covers every other strip, so this line
+            // plus a silent audit equals proof the console saw the press. Diagnostic only:
+            // no abort is raised, no state or output changes, menu presses simply log short
+            // hold_ms values.
+            // [ORION_METER_BLIND_BACKSTOP 2026-09-14] This press reached the player's release
+            // with no meter AND was not answered by the blind backstop. Name WHY in one token so
+            // the next diagnosis is read, not inferred: off / not_live_meter / unclassified /
+            // excluded_type / no_lead come from the gate itself, and an empty (i.e. eligible)
+            // reason means the player simply let go before the blind deadline — user_released.
+            // Diagnostic-only precedence. The shared block predicate also gates
+            // type-grace updates and METER VISION WAIT; changing it would alter
+            // behavior, not merely fix this terminal label.
+            const QString backstopBlock = config_.meterBlindBackstop && config_.greenWindowPriority
+                ? QStringLiteral("green_window_priority")
+                : meterBlindBackstopBlockReason(now);
+            emit engineDiagnostic(QStringLiteral(
+                "SHOT NOT OWNED: reason=press_unanswered_no_meter physical_epoch=%1 "
+                "hold_ms=%2 shot_type=%3 unstamped=%4 stale_samples=%5 stamp_epoch_seen=%6 "
+                "lead_ready=%7 sq_latch=0 output=pass_through backstop=%8")
+                                      .arg(pendingSquarePhysicalEpoch_)
+                                      .arg(squareHoldStartMs_ >= 0.0
+                                               ? now - squareHoldStartMs_ : -1.0,
+                                           0, 'f', 1)
+                                      .arg(pendingSquareShotType_.isEmpty()
+                                               ? QStringLiteral("unclassified")
+                                               : pendingSquareShotType_)
+                                      .arg(pendingMeterOwnershipUnstampedSamples_)
+                                      .arg(pendingMeterOwnershipStaleSamples_)
+                                      .arg(pendingMeterOwnershipUnstampedStampEpoch_)
+                                      .arg(liveLeadReady ? 1 : 0)
+                                      .arg(backstopBlock.isEmpty()
+                                               ? QStringLiteral("user_released")
+                                               : backstopBlock));
         }
+        // [ORION_SHOT_GATE_RELEASE 2026-09-15] MANUAL CANCEL. The player let go before the bot
+        // ever owned the press: a tap, a pump fake, or a shot the detector never saw. No release
+        // edge exists, so nothing else would ever tell the sidecar this press is over and its
+        // anchor would keep running until ORION_ANCHOR_ARM_S. Emitted AFTER the census branches
+        // above so an abort that already named a specific reason (ownership_proof_incomplete,
+        // ownership_structure_stamp_missing) wins the per-epoch fence, and BEFORE the pending
+        // state below is torn down, while the epoch still exists.
+        emitShotGateDisarm(pendingSquarePhysicalEpoch_,
+                           QStringLiteral("square_early_release"));
         if (pendingSquareTempoRemap_) {
             squareHoldStartMs_ = -1.0;
             retiredPhysicalShotEpoch_ = std::max(
@@ -5479,10 +8517,14 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
             clearPendingMeterOwnershipEpisode();
             clearPendingMeterOwnershipEvidence();
             tempoPassThroughPulseActive_ = true;
+            tempoPassThroughPulseHeldPress_ = false;   // this one follows the PHYSICAL release
+            tempoPassThroughPulseFadeGesture_ = tempoGestureIsFade(
+                pendingSquareShotType_, config_.tempoFadeMirrorGesture);
             tempoPassThroughPulseEndMs_ = now
                 + std::max(config_.tempoFlickHoldMs, config_.releasePulseMs);
             applyShotReleaseEdge(output, ShotMode::TempoSquare, pendingSquareShotType_,
-                         tempoGestureIsFade(pendingSquareShotType_, config_.tempoFadeMirrorGesture));
+                         tempoGestureIsFade(pendingSquareShotType_, config_.tempoFadeMirrorGesture),
+                         tempoReleaseStyleFromString(config_.tempoReleaseStyle));
             preserveFadeMovementVector(
                 output, pendingSquareShotType_, pendingSquareLsArmX_,
                 pendingSquareLsArmY_, pendingSquareMovementValid_);
@@ -5735,7 +8777,8 @@ void AutomationEngine::processArmed(ControllerState& output, double now)
 void AutomationEngine::latchOwnedOutputDrain(OwnedOutputDrain state, ShotMode mode,
                                               const QString& shotType,
                                               double lsArmX, double lsArmY,
-                                              bool movementValid)
+                                              bool movementValid,
+                                              quint64 sourcePhysicalEpoch)
 {
     if (state == OwnedOutputDrain::None) {
         clearOwnedOutputDrain();
@@ -5755,6 +8798,9 @@ void AutomationEngine::latchOwnedOutputDrain(OwnedOutputDrain state, ShotMode mo
     ownedOutputDrain_ = state;
     ownedOutputDrainMode_ = mode;
     ownedOutputDrainShotType_ = shotType;
+    ownedOutputDrainTempoFadeGesture_ = shot_.armToken != 0 && shot_.mode == mode
+        ? shot_.tempoFadeGesture
+        : tempoGestureIsFade(shotType, config_.tempoFadeMirrorGesture);
     if (!movementValid && (mode == ShotMode::TempoSquare
                            || mode == ShotMode::TempoStick)
         && shot_.mode == mode && shot_.state != HoldState::Idle) {
@@ -5775,9 +8821,19 @@ void AutomationEngine::latchOwnedOutputDrain(OwnedOutputDrain state, ShotMode mo
     // born complete. This is the same three-sample contract, not a weaker one.
     // Stick modes deliberately restart their neutral census here, so they keep the existing
     // three-fresh-sample behaviour untouched; only Square carries proven prior evidence.
+    const quint64 drainEpoch = sourcePhysicalEpoch != 0
+        ? sourcePhysicalEpoch : shot_.physicalShotEpoch;
+    // A revocation/abort can be handled AFTER the next certified physical DOWN.
+    // The old ShotContext may already be reset by abort(), and its current UP
+    // count is then zero again. Preserve that old gesture's completed end rather
+    // than binding a new release fence to the player's newer press. HOLD drains
+    // are deliberately excluded: an undelivered hold still needs its real end.
+    const bool previouslyEndedRelease = state == OwnedOutputDrain::ReleasedUntilPhysicalEnd
+        && (physicalSquareReleaseSeenSinceArm_
+            || (drainEpoch != 0 && lastSquarePressEpoch_ > drainEpoch));
     ownedOutputDrainEndObserved_ = (mode == ShotMode::ButtonShot
                                     || mode == ShotMode::TempoSquare)
-        && physicalSquareUpPolls_ >= kPhysicalReleaseSamples;
+        && (physicalSquareUpPolls_ >= kPhysicalReleaseSamples || previouslyEndedRelease);
     if (mode == ShotMode::GoToStick || mode == ShotMode::TempoStick) {
         rightStickNeutralFrames_ = 0;
     }
@@ -5788,6 +8844,7 @@ void AutomationEngine::clearOwnedOutputDrain() noexcept
     ownedOutputDrain_ = OwnedOutputDrain::None;
     ownedOutputDrainMode_ = ShotMode::ButtonShot;
     ownedOutputDrainShotType_.clear();
+    ownedOutputDrainTempoFadeGesture_ = false;
     ownedOutputDrainLsArmX_ = 0.0;
     ownedOutputDrainLsArmY_ = 0.0;
     ownedOutputDrainMovementValid_ = false;
@@ -5805,6 +8862,7 @@ bool AutomationEngine::applyOwnedOutputDrain(ControllerState& output,
 
     const ShotMode mode = ownedOutputDrainMode_;
     const QString shotType = ownedOutputDrainShotType_;
+    const bool drainTempoFadeGesture = ownedOutputDrainTempoFadeGesture_;
     const double drainLsArmX = ownedOutputDrainLsArmX_;
     const double drainLsArmY = ownedOutputDrainLsArmY_;
     const bool drainMovementValid = ownedOutputDrainMovementValid_;
@@ -5828,10 +8886,14 @@ bool AutomationEngine::applyOwnedOutputDrain(ControllerState& output,
     // ShotContext is already Idle: hidden input cannot surface as a synthetic
     // DOWN edge on the exact primary-end tick.
     if (mode == ShotMode::GoToStick) {
-        squareLatchedUntilRelease_ = squareLatchedUntilRelease_ || physical.square();
+        if (physical.square()) {
+            armSquareOverlapLatch();
+        }
         stickOverlapLatchedUntilNeutral_ = stickOverlapLatchedUntilNeutral_ || physicalDown;
     } else if (mode == ShotMode::TempoStick) {
-        squareLatchedUntilRelease_ = squareLatchedUntilRelease_ || physical.square();
+        if (physical.square()) {
+            armSquareOverlapLatch();
+        }
         // During an unresolved/ambiguous RELEASE drain, RS-up could duplicate a
         // transaction that already reached the route and remains suppressed. In
         // a pre-release HOLD abort, however, RS-up is the player's physical
@@ -5907,12 +8969,12 @@ bool AutomationEngine::applyOwnedOutputDrain(ControllerState& output,
             // [ORION_TEMPO_FADE_MIRROR] fade gathers UP; see ShotReleasePolicy.h.
             output.buttons &= ~XINPUT_GAMEPAD_X;
             output.rightStickX = 0;
-            output.rightStickY = shot_.tempoFadeGesture ? -127 : 127;
+            output.rightStickY = drainTempoFadeGesture ? -127 : 127;
             break;
         case ShotMode::TempoStick:
             output.buttons &= ~XINPUT_GAMEPAD_X;
             output.rightStickX = 0;
-            output.rightStickY = shot_.tempoFadeGesture ? -127 : 127;
+            output.rightStickY = drainTempoFadeGesture ? -127 : 127;
             break;
         }
         if (mode == ShotMode::TempoSquare || mode == ShotMode::TempoStick) {
@@ -5998,10 +9060,13 @@ bool AutomationEngine::applyOwnedOutputDrain(ControllerState& output,
         pendingSquareLsArmY_ = drainLsArmY;
         pendingSquareMovementValid_ = drainMovementValid;
         tempoPassThroughPulseActive_ = true;
+        tempoPassThroughPulseHeldPress_ = false;   // this one follows the PHYSICAL release
+        tempoPassThroughPulseFadeGesture_ = drainTempoFadeGesture;
         tempoPassThroughPulseEndMs_ = now
             + std::max(config_.tempoFlickHoldMs, config_.releasePulseMs);
         applyShotReleaseEdge(output, ShotMode::TempoSquare, shotType,
-                         tempoGestureIsFade(shotType, config_.tempoFadeMirrorGesture));
+                         drainTempoFadeGesture,
+                         tempoReleaseStyleFromString(config_.tempoReleaseStyle));
         preserveFadeMovementVector(
             output, shotType, drainLsArmX, drainLsArmY, drainMovementValid);
         shot_.releasePlan = QStringLiteral("Idle / tempo pass-through flick");
@@ -6014,8 +9079,17 @@ bool AutomationEngine::applyOwnedOutputDrain(ControllerState& output,
     // opposite shot gesture hidden under the old ownership stays neutral until
     // its own physical neutral fence. Successful Tempo releases already emitted
     // their up-flick before entering ReleasedUntilPhysicalEnd.
+    // If this drain was already released and its genuine physical end is
+    // proven, a current DOWN belongs to the next press. Do not strip that first
+    // packet or make processIdle wait another controller tick to see it. The
+    // ordinary ownership/meter-proof gates still decide what that new press may
+    // do; HOLD drains and unresolved/same-gesture releases never use this path.
+    const bool freshSquarePress = squareMode && primaryActive
+        && completedDrain == OwnedOutputDrain::ReleasedUntilPhysicalEnd;
     if (squareMode) {
-        applyReleased();
+        if (!freshSquarePress) {
+            applyReleased();
+        }
     } else {
         if (stickOverlapLatchedUntilNeutral_) {
             output.rightStickX = 0;
@@ -6030,7 +9104,7 @@ bool AutomationEngine::applyOwnedOutputDrain(ControllerState& output,
     resetTempoMovementTransaction();
     shot_.releasePlan = QStringLiteral("Idle / physical end accepted");
     shot_.releaseReason = QStringLiteral("physical_end_debounced");
-    return true;
+    return !freshSquarePress;
 }
 
 void AutomationEngine::observePhysicalEndWhileDisarmed(
@@ -6052,6 +9126,7 @@ void AutomationEngine::observePhysicalEndWhileDisarmed(
         resetTempoMovementTransaction();
         tempoPassThroughPulseActive_ = false;
         tempoPassThroughPulseEndMs_ = -1.0;
+        tempoPassThroughPulseHeldPress_ = false;
     }
 
     const bool rsNeutral = std::hypot(
@@ -6097,6 +9172,11 @@ bool AutomationEngine::consumeDueScheduledFire(ControllerState& output, double n
 
     const quint64 token = schedFireToken_;
     const double deadlineMs = schedFireDeadlineMs_;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] Snapshot WHO armed this token before
+    // clearScheduledFire() wipes it. For a NO METER shot this is the whole difference between a
+    // shot vision timed (an ordinary vision landing, which teaches) and one the blind timer
+    // answered (which must teach nothing — see meterCapBlindRelease_).
+    const bool visionToken = schedFireRequiresGenuineFrame_;
     const QString plan = schedFirePlan_;
     const QString reason = schedFireReason_;
     const QString code = schedFireCode_;
@@ -6128,6 +9208,13 @@ bool AutomationEngine::consumeDueScheduledFire(ControllerState& output, double n
     }
 
     shot_.firedByScheduler = confirmed;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The single moment a vision token actually fires,
+    // and therefore the single place this is written. An in-tick blind release never reaches
+    // here, so a NO METER shot that ends on its own timer leaves this false — which is exactly
+    // the discriminator the learner fence needs.
+    if (visionToken) {
+        shot_.noMeterVisionRelease = true;
+    }
     shot_.scheduledFireDeltaMs = confirmed
         ? schedFireActualMs_ - deadlineMs : 0.0;
     shot_.releasePlan = plan;
@@ -6239,6 +9326,19 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
     // FORWARD and only from a genuine frame in this token's own vision epoch, so the fence below
     // still sees an honest "is this token's evidence current" answer.
     refreshScheduledFireAuthorityLease();
+    // [ORION_INFLIGHT_AUTHORITY_ORDER] The authority/epoch fence below runs before the due-fire
+    // consumer. Once this exact token's deadline has arrived, the precise worker may already be
+    // spinning/submitting inside schedulerGraceMs; disarming it here cancels the edge the consumer
+    // is explicitly waiting to confirm. Keep only an identity- and route-bound token in that
+    // existing grace. No deadline is created or moved, and an unconfirmed token is still fenced
+    // when the grace expires.
+    const bool submitInFlight = armedTokenSubmitInFlight(now)
+        && schedFireRequiresGenuineFrame_
+        && schedFirePhysicalShotEpoch_ == shot_.physicalShotEpoch
+        && schedFireShotAttempt_ == shot_.armToken
+        && (schedFireRouteGeneration_ == 0
+            || controllerDeliveryRouteAttestationExpected(
+                schedFireRouteGeneration_, schedFireRoute_));
     if (schedFireDeadlineMs_ >= 0.0) {
         const bool confirmed = schedFireConfirmedToken_ == schedFireToken_
             && schedFireActualMs_ >= 0.0;
@@ -6252,12 +9352,36 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         const bool uncoveredAtCommit = !scheduledFireAuthorityCoversDeadline()
             && untilArmedMs > 0.0 && untilArmedMs <= cleanSourceGapMs();
         if (!confirmed && (wrongEpoch || authorityExpired || uncoveredAtCommit)) {
-            invalidateUnconfirmedVisionSchedule(
-                uncoveredAtCommit && !wrongEpoch && !authorityExpired
-                    ? "tick_authority_uncovered" : "tick_epoch_or_authority");
+            // [ORION_PHASE_ANCHOR_COMMIT 2026-08-31] A phase-attributed token carries the
+            // authority of its already-witnessed anchor crossing to its committed deadline.
+            // Later negative video state cannot revoke history. Every non-phase token retains
+            // the rolling lease because its deadline depends on the newest fit.
+            if (submitInFlight) {
+                // The live failure signature was a phase token logged HELD before its deadline,
+                // then killed here 0.376-4.654 ms after it while the worker was still completing
+                // the submit. Preserve that exact-token race and keep it countable.
+                if (schedFireArmedSource_ == QLatin1String("phase")) {
+                    notePhaseAnchorCommitRide("tick_phase_submit_in_flight", now);
+                }
+            } else if (armedPhaseTokenCarriesAnchorAuthority(now)) {
+                notePhaseAnchorCommitRide("tick_phase_anchor_commit", now);
+            } else {
+                invalidateUnconfirmedVisionSchedule(
+                    uncoveredAtCommit && !wrongEpoch && !authorityExpired
+                        ? "tick_authority_uncovered" : "tick_epoch_or_authority");
+            }
         }
     }
     if (consumeDueScheduledFire(output, now)) {
+        return;
+    }
+    if (submitInFlight && schedFireDeadlineMs_ >= 0.0) {
+        // Do not fall into a later dropout/prediction fence during the same grace interval. The
+        // next tick either consumes one confirmed edge or, after grace, retires the token through
+        // the pre-existing missed-deadline path.
+        shot_.releasePlan = QStringLiteral("Live meter tip scheduled");
+        shot_.releaseReason = QStringLiteral("release_scheduled");
+        shot_.releaseReasonCode = QStringLiteral("release_scheduled");
         return;
     }
 
@@ -6337,6 +9461,52 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
     }
 
     if (!calibrationProbe && !measuredLeadAuthoritative(now)) {
+        // [ORION_USER_LEAD_LIVENESS] Name the clause once per armed attempt. Every kill at this
+        // site used to read only "measured_lead_unready", which cost a session to attribute.
+        if (schedFireDeadlineMs_ >= 0.0
+            && (leadAuthorityLostDiagEpoch_ != shot_.physicalShotEpoch
+                || leadAuthorityLostDiagAttempt_ != shot_.armToken)) {
+            leadAuthorityLostDiagEpoch_ = shot_.physicalShotEpoch;
+            leadAuthorityLostDiagAttempt_ = shot_.armToken;
+            const auto expected = controllerDeliveryRouteAttestationSnapshot();
+            emit engineDiagnostic(QStringLiteral(
+                "LEAD AUTHORITY LOST: telemetry_present=%1 age_ms=%2 freshness_ms=%3 "
+                "scope_epoch=%4 expected_route=%5 expected_gen=%6 measured_route=%7 "
+                "measured_gen=%8 authority_kind=%9 n=%10 sd_ms=%11 epoch_ready=%12 "
+                "user_lead_set=%13 armed_source=%14 until_armed_ms=%15 armed_eta_ms=%16 "
+                "authority_expiry_ok=%17 physical_epoch=%18 shot_attempt=%19")
+                                      .arg(measuredLeadTelemetryPresent_ ? 1 : 0)
+                                      .arg(measuredLeadLastUpdateMs_ >= 0.0
+                                               ? now - measuredLeadLastUpdateMs_ : -1.0, 0, 'f', 1)
+                                      .arg(config_.measuredLeadFreshnessMs, 0, 'f', 0)
+                                      .arg(measuredLatencyScopeEpoch_)
+                                      .arg(static_cast<int>(expected.route))
+                                      .arg(expected.generation)
+                                      .arg(static_cast<int>(measuredLatencyDeliveryRoute_))
+                                      .arg(measuredLatencyAttestationGeneration_)
+                                      .arg(measuredLatencyAuthorityKind_)
+                                      .arg(measuredLatencyN_)
+                                      .arg(measuredLatencySdMs_, 0, 'f', 1)
+                                      .arg(measuredLeadEpochReady_ ? 1 : 0)
+                                      .arg(config_.userActuationLeadSet ? 1 : 0)
+                                      .arg(schedFireArmedSource_)
+                                      .arg(schedFireDeadlineMs_ - now, 0, 'f', 1)
+                                      .arg(schedFireArmedCommandEtaMs_, 0, 'f', 1)
+                                      .arg(schedFireAuthorityExpiryMs_ >= 0.0 ? 1 : 0)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(shot_.armToken));
+        }
+        // The lead value was authoritative when scheduleFire froze this phase deadline. A later
+        // telemetry absence cannot retroactively change the already-computed command instant;
+        // preserve this token only under the same provenance/identity/runway bounds used for a
+        // video dropout. No token can be created while lead authority is absent.
+        if (armedPhaseTokenCarriesAnchorAuthority(now)) {
+            notePhaseAnchorCommitRide("lead_phase_anchor_commit", now);
+            shot_.releasePlan = QStringLiteral("Live meter tip scheduled");
+            shot_.releaseReason = QStringLiteral("release_scheduled_phase_commit");
+            shot_.releaseReasonCode = shot_.releaseReason;
+            return;
+        }
         invalidateUnconfirmedVisionSchedule("tick_dropout_guard");
         if (consumeDueScheduledFire(output, now)) {
             return;
@@ -6399,11 +9569,23 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
             return;
         }
         if (ownedHold) {
-            if (autonomousVisionScheduleLeaseCurrent(now)) {
-                shot_.releasePlan = QStringLiteral(
-                    "Live meter / committed crossing inside authority lease");
-                shot_.releaseReason = QStringLiteral(
-                    "release_scheduled_lease_continuation");
+            // The rolling lease is required for estimators whose timestamp comes from their
+            // newest frame. A phase token instead carries the authority of its already-witnessed
+            // anchor, so the generic relock timeout must not abort it after the first fence just
+            // preserved it. The precise worker remains armed and the due-token path above owns
+            // the release at the immutable deadline.
+            const bool phaseAnchorCommitted =
+                armedPhaseTokenCarriesAnchorAuthority(now);
+            if (autonomousVisionScheduleLeaseCurrent(now) || phaseAnchorCommitted) {
+                if (phaseAnchorCommitted) {
+                    notePhaseAnchorCommitRide("hold_phase_anchor_commit", now);
+                }
+                shot_.releasePlan = phaseAnchorCommitted
+                    ? QStringLiteral("Live meter / committed phase-anchor crossing")
+                    : QStringLiteral("Live meter / committed crossing inside authority lease");
+                shot_.releaseReason = phaseAnchorCommitted
+                    ? QStringLiteral("release_scheduled_phase_commit")
+                    : QStringLiteral("release_scheduled_lease_continuation");
                 shot_.releaseReasonCode = shot_.releaseReason;
             } else {
                 const double relockGraceMs = config_.meterFreshWindowMs
@@ -6462,6 +9644,26 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         shot_.firstMeterFrameAgeMs = shot_.frameAgeMs;
     }
 
+    // A same-ruler rollback has already synchronously destroyed the contradictory
+    // deadline and reset every trajectory estimator.  Do not let a registration value
+    // carried by sample 1 immediately recreate a token; require the ordinary two-frame
+    // current-shot anchor proof to rebuild first.  The gesture stays owned only inside
+    // the existing absolute hold ceiling, so recovery cannot create a stuck button.
+    if (shot_.fillRollbackRecoveryActive) {
+        if (ownedHold && heldMs < std::max(1.0, config_.maxHoldMs)) {
+            holdOwnedSquareUnresolved(
+                QStringLiteral("owned_fill_rollback_reacquire"),
+                QStringLiteral("Live meter / holding output; rebuilding trajectory after "
+                               "same-ruler fill rollback"));
+        } else {
+            relinquishAutonomousLiveMeterShot(
+                output, QStringLiteral("fill_rollback_reacquire_abort"));
+        }
+        return;
+    }
+
+    // Freeze both fade adjustments before computing either the tip or its command deadline.
+    maybeLatchFadeWindowLeadPolicy(true);
     const AutonomousTipDecision tipDecision = canonicalAutonomousTipDecision(now);
     const TemporalSampler::CrossingFit& fit = tipDecision.samplerFit;
     const double velocity = tipDecision.velocityPctPerMs;
@@ -6473,6 +9675,27 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
     const bool tipEstimatePresent = std::isfinite(predictedTipMs)
         && predictedTipMs > now && !predictedTipSource.isEmpty();
 
+    // [ORION_SAMPLER_REACH] The sole-sampler branch withheld an authoritative fit whose slope was
+    // physically impossible for its fill (see samplerSoleAuthoritySlopePlausible). Without this
+    // line the refusal is invisible -- the decision just carries no sampler source. One line per
+    // physical shot epoch. `slope_ceil` is the fill-dependent ceiling the slope exceeded.
+    if (tipDecision.samplerSoleSlopeRefused
+        && samplerSlopeRefusedLoggedEpoch_ != physicalShotEpoch_) {
+        samplerSlopeRefusedLoggedEpoch_ = physicalShotEpoch_;
+        const double slopeCeil = kSamplerImpliedSlopeCeilBasePctPerMs
+            + kSamplerImpliedSlopeCeilPerFillPct * std::clamp(shot_.fillPct, 0.0, 100.0);
+        emit engineDiagnostic(QStringLiteral(
+            "SOLE-SAMPLER SLOPE REFUSED: fill_pct=%1 slope_pct_ms=%2 slope_ceil_pct_ms=%3 "
+            "span_ms=%4 fit_n=%5 crossing_eta_ms=%6 physical_epoch=%7")
+                                  .arg(shot_.fillPct, 0, 'f', 2)
+                                  .arg(fit.slopePctPerMs, 0, 'f', 4)
+                                  .arg(slopeCeil, 0, 'f', 4)
+                                  .arg(fit.spanMs, 0, 'f', 1)
+                                  .arg(fit.n)
+                                  .arg(fit.crossingMs - now, 0, 'f', 1)
+                                  .arg(physicalShotEpoch_));
+    }
+
     shot_.targetPct = kTipTargetPct;
     // Keep a finite estimate visible for diagnostics even when its uncertainty
     // is too large to authorize actuation.  `tipPredictionValid` remains the
@@ -6482,6 +9705,30 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         : QStringLiteral("meter_tip_live");
     shot_.releaseVelocityPctMs = velocity;
     shot_.releaseCrossingEtaMs = tipEstimatePresent ? predictedTipMs - now : -1.0;
+    // [ORION_ATTRIBUTION_RISE] 2026-08-31: `Release attribution:` reported expectedRise=0.0 and
+    // withinReach=0 on 100% of live fires, and a whole investigation was spent asking why the
+    // "rate-compensated aim" was dormant. It is not dormant and it is not gated off -- those two
+    // fields were only ever written by processHolding's LEGACY vision-crossing block, and
+    // processHolding hands every autonomous-vision shot to THIS function and returns
+    // (see processHolding: `if (autonomousLiveMeterTimingEnabled()) { ...; return; }`), so the
+    // legacy stamp is unreachable in the shipped configuration and the fields kept their reset
+    // defaults. Write the same physical quantity here so the line stops reading as a dead lever.
+    //
+    // expectedRise = velocity x lead = how much fill the meter covers while the command is in
+    // flight, so 100 - expectedRise is the fill the command must be issued at to land on the tip.
+    // withinReachAtRelease is RECORDING ONLY on this path -- it gates nothing here (this path's
+    // authority gate is decision.valid + the schedulability of tipAbs - lead). It is kept to the
+    // same arithmetic as the legacy gate purely so one field means one thing in both logs.
+    // measuredLeadForActuationMs() and not shot_.tipPredictionLeadMs: the latter is assigned a
+    // few lines BELOW this point, so reading it here would carry the PREVIOUS shot's lead.
+    const double attributionLeadMs = measuredLeadForActuationMs();
+    shot_.expectedRiseAtReleasePct =
+        (velocity > 0.0 && std::isfinite(attributionLeadMs) && attributionLeadMs > 0.0)
+            ? velocity * attributionLeadMs : 0.0;
+    shot_.withinReachAtRelease = shot_.expectedRiseAtReleasePct > 0.0
+        && std::isfinite(shot_.fillPct)
+        && (kTipTargetPct - shot_.fillPct)
+               <= shot_.expectedRiseAtReleasePct + config_.reachabilitySlackPct;
     shot_.tipPredictionSource = predictedTipSource;
     shot_.tipPredictionSigmaMs = predictedTipSigmaMs;
     shot_.tipPredictionAuthorityKind = measuredLatencyAuthorityKind_;
@@ -6946,7 +10193,53 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
     // that edge and into the window. 0.0 unless explicitly enabled, so the default build schedules
     // exactly as before.
     const double greenCenterOffsetMs = autonomousGreenCenterOffsetMs(fit.slopePctPerMs);
-    const double fireAtMs = predictedTipMs - effectiveLeadMs - greenCenterOffsetMs;
+    // [ORION_TIP_FRAME_NATIVE 2026-09-17] THE 4 ms TICK AIMS AT THE SAME INSTANT THE SUB-TICK
+    // DOES, and until today it did not.
+    //
+    // MEASURED (docs/POLL_PHASE_TRACKER.md §10, 284 banner-graded shots over 12 sessions): the
+    // SCHEDULE carried the frame-centre offset -- command_eta - (tip_eta - lead) == frame_offset
+    // on 99 % of frame-centre reservations -- but the FIRE did not: command_issued_ms reproduced
+    // anchor + phase_const - lead to MAD 0.030 ms with no offset term at all, and the realised
+    // release phase sat a mean 3.83 ms from the frame centre against 4.17 for a uniform target
+    // (true centring is ~1). The mechanism was here. The sub-tick mirror
+    // (reevaluateScheduleOnFreshSample) armed the frame-centred target; this tick then recomputed
+    // a candidate from the RAW tip, compared it against that aligned armed deadline, found them
+    // apart by the frame offset -- which is uniform on +-8.3 ms and therefore exceeds the 1 ms
+    // tokenDeadlineDriftToleranceMs on ~88 % of shots -- tore the aligned token down
+    // (TIP TOKEN KILL site=tick_reschedule) and re-armed UNALIGNED, 4 ms later. The tick runs at
+    // 250 Hz against the mirror's ~60 Hz, so the tick was almost always the last writer and the
+    // console saw the un-offset instant. fire_target=frame_centre was still stamped by the
+    // mirror, which is why the logs claimed centring on 89 % of shots that were not centred.
+    //
+    // The lead is untouched, decision.tipAbsMs is untouched, and every learner input is what it
+    // was: only the instant we AIM the release at moves, exactly as at the mirror. Inert with the
+    // flag off or the grid unlocked -- phaseAlignedFireTargetMs then returns the same double it
+    // was handed, so the expression below is bit-for-bit today's on a benched build.
+    //
+    // [ORION_GREEN_CENTER] The green-centre displacement is subtracted BEFORE the snap so the
+    // final target is a real frame centre rather than a centre pushed off it. That knob ships at
+    // 0.0 (autonomousGreenCenterFrac = 0.0), and x - 0.0 == x exactly, so this reorder changes no
+    // bit of any shipped configuration; when the experiment is armed the composition is now the
+    // one it always meant.
+    const double greenCentredTipMs = predictedTipMs - greenCenterOffsetMs;
+    QString fireTargetMode;
+    double fireFrameOffsetMs = 0.0;
+    const double fireTargetMs =
+        phaseAlignedFireTargetMs(greenCentredTipMs, &fireTargetMode, &fireFrameOffsetMs);
+    // [ORION_VISION_HOLD_BAND 2026-09-15] THE 4 ms TICK'S FIRE INSTANT. Clamped into
+    // [press + law - band, press + law + band] before anything reads it, which is what makes the
+    // late-fire path, the never-aborts path, the arm and the miss accounting below all agree
+    // about where this release is due: they all read this one local. Inert (returns the same
+    // double, writes no state, logs nothing) whenever the band is off, the shot is not
+    // press-dated, or the instant is already inside the band. The band's own re-snap
+    // ([ORION_TIP_FRAME_NATIVE] inside clampVisionFireToHoldBand) re-centres a clamped target, so
+    // a bound band and a frame-centred target still agree about the grid.
+    const double fireAtMs = clampVisionFireToHoldBand(
+        fireTargetMs - effectiveLeadMs, effectiveLeadMs);
+    // The UNALIGNED instant -- the bare tip less the lead, the thing §10 measured the console
+    // actually receiving -- kept only so the `Scheduled fire:` line can carry both and a graded
+    // batch can price the offset directly without re-deriving the tip.
+    const double unalignedFireAtMs = predictedTipMs - effectiveLeadMs;
     shot_.effectiveLatencyMs = effectiveLeadMs;
     shot_.releaseEtaMs = fireAtMs - now;
     shot_.tipPredictionDeadlineMs = fireAtMs;
@@ -7032,6 +10325,45 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         // Restricted to owned Square exactly as every other holdOwnedSquareUnresolved() site is;
         // stick modes keep their existing abort. This is the mode the ship blocker and live
         // epoch 5 are in, and narrowing it keeps the revert surface a single predicate.
+        // [ORION_CURVE_MODEL 2026-09-03] A registration-family deadline that the meter's own
+        // geometry contradicts is HELD, never aborted. The registration template was trained on
+        // the 2K26 meter and predicts the 2K27 tip 100-180 ms early at low fill: live e69/e111
+        // died "unschedulable_lead" on their FIRST sample (fill 13.75/11.10, tip_eta 208/285)
+        // while the pixels show the tip 420-440 ms away; e138/e142/e143 held on
+        // registration_far_disagreement until the runway really was gone. Bounded by the same
+        // hold ceiling; creates no token and no command.
+        const double curveTipEtaAtMissMs =
+            curveModelApplicable() && curvePreAnchorRegime(shot_.fillPct)
+            ? curveTipEtaMs(shot_.fillPct, shot_.frameAgeMs)
+            : std::numeric_limits<double>::quiet_NaN();
+        const double curveCommandEtaAtMissMs = curveTipEtaAtMissMs - effectiveLeadMs;
+        if (ownedHold
+            && heldMs < std::max(1.0, config_.maxHoldMs)
+            && predictedTipSource.startsWith(QStringLiteral("registration"))
+            && std::isfinite(curveCommandEtaAtMissMs)
+            && curveCommandEtaAtMissMs > config_.schedulerGraceMs) {
+            emit engineDiagnostic(QStringLiteral(
+                "TIP DEADLINE DECISION: disposition=curve_runway_remains source=%1 "
+                "tip_eta_ms=%2 command_eta_ms=%3 curve_tip_eta_ms=%4 curve_command_eta_ms=%5 "
+                "lead_ms=%6 fill_pct=%7 frame_age_ms=%8 held_ms=%9 physical_epoch=%10 "
+                "shot_attempt=%11")
+                                      .arg(predictedTipSource.left(64))
+                                      .arg(predictedTipMs - now, 0, 'f', 3)
+                                      .arg(fireAtMs - now, 0, 'f', 3)
+                                      .arg(curveTipEtaAtMissMs, 0, 'f', 3)
+                                      .arg(curveCommandEtaAtMissMs, 0, 'f', 3)
+                                      .arg(effectiveLeadMs, 0, 'f', 3)
+                                      .arg(shot_.fillPct, 0, 'f', 2)
+                                      .arg(shot_.frameAgeMs, 0, 'f', 2)
+                                      .arg(heldMs, 0, 'f', 1)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(shot_.armToken));
+            holdOwnedSquareUnresolved(
+                QStringLiteral("owned_square_curve_runway"),
+                QStringLiteral("Live meter / holding output; registration deadline "
+                               "contradicted by the fill curve"));
+            return;
+        }
         if (ownedHold
             && heldMs < std::max(1.0, config_.maxHoldMs)
             && contestedTipDeadlineOutrunByMeasuredRunway(
@@ -7063,6 +10395,102 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         // now would make the visible release late by exactly now-fireAtMs. Never
         // disguise that guaranteed overtime packet as a successful live-tip edge.
         const double latenessMs = std::max(0.0, now - fireAtMs);
+        // === [ORION_LATE_FIRE_TOLERANCE 2026-09-14 owner] FIRE A FEW MS LATE, DO NOT ABORT ====
+        //
+        // THE LOSS, measured 2026-09-14: six owned, wide-open shots in one session died here as
+        //   disposition=rejected_missed source=phase tip_eta_ms=257..282 command_eta_ms=-4..-20
+        //   lateness_ms=4.4 / 16.3 / 16.4 / 18.4 / 20.2 / 22.5 lead_kind=validated lead_ms=274..286
+        // i.e. the reservation arrived 4-22 ms too late FOR THE LEAD, on a shot the engine owned
+        // and had a validated lead for. Aborting does not make any of them on time — it hands the
+        // button back, and the owner then releases manually hundreds of ms later. A release 16 ms
+        // late is a worse shot; an abort is no shot at all.
+        //
+        // WHAT IS NOT RELAXED. The comment above ("never disguise that guaranteed overtime packet
+        // as a successful live-tip edge") states an HONESTY rule, and it is kept in full: the
+        // packet is emitted, named fired_late, carries its exact lateness, is counted for the
+        // session, and is excluded from every learner that would otherwise read it as an on-time
+        // landing (see meterCapLateFireMs_). Every fence stays exactly where it was — this branch
+        // sits AFTER the in-flight-token consume, the stale-token invalidation and both
+        // runway-remains holds, it requires an owned hold and a still-current lead authority, and
+        // it releases through the ordinary triggerRelease boundary, which re-proves genuine
+        // vision authority at the instant of the edge. All it replaces is the terminal ABORT, and
+        // only inside a bounded window the owner can set to 0 to get the old behaviour back.
+        // === [ORION_OWNED_METER_NEVER_ABORTS 2026-09-14 owner] ================================
+        //
+        // "Remove aborts as a whole so that when there's a genuine meter on the screen it always
+        // picks it up." The tolerance above already proved the principle on a 24 ms window; the
+        // window itself was never the argument. The argument is the comparison: a release N ms
+        // late is a worse shot, an abort is NO shot, and the abort does not recover the N ms --
+        // it hands the button back and the owner releases manually hundreds of ms later. That
+        // comparison does not change at N = 25, or at N = 60.
+        //
+        // WHAT IS STILL REFUSED, unchanged and deliberately: everything above this line. A wrong
+        // vision epoch or an expired authority still fences the token; a confirmed or in-flight
+        // submit is still consumed rather than duplicated (schedFireDeadlineMs_ < 0.0 here means
+        // no token is standing); a calibration probe still owns its own release policy; a shot
+        // this engine does not OWN is still none of its business; and a shot without a current
+        // lead authority still has no deadline worth being late for. This flag widens exactly one
+        // bound -- how far past the command deadline a release may still be issued -- and nothing
+        // else. Set it false (or ORION_OWNED_METER_NEVER_ABORTS=0) for today's bounded tolerance.
+        //
+        // HONESTY IS NOT RELAXED EITHER: the packet is still named fired_late, still carries its
+        // exact lateness, now also carries beyond_tolerance=1 when it is past the configured
+        // window, is counted separately for the session, and is still excluded from every learner
+        // (meterCapLateFireMs_) -- a release the engine KNOWS it displaced can never teach the aim.
+        const bool beyondTolerance = !(std::isfinite(config_.lateFireToleranceMs)
+                                       && config_.lateFireToleranceMs > 0.0
+                                       && latenessMs <= config_.lateFireToleranceMs);
+        const bool lateFireAllowed = config_.ownedMeterNeverAborts || !beyondTolerance;
+        if (latenessMs > 0.0
+            && lateFireAllowed
+            && ownedHold
+            && !calibrationProbe
+            && measuredLeadAuthoritative(now)
+            && schedFireDeadlineMs_ < 0.0) {
+            ++lateFireTolerated_;
+            if (beyondTolerance) {
+                ++lateFireBeyondTolerance_;
+            }
+            shot_.lateFireLatenessMs = latenessMs;
+            emit engineDiagnostic(QStringLiteral(
+                "TIP DEADLINE DECISION: disposition=fired_late source=%1 tip_eta_ms=%2 "
+                "command_eta_ms=%3 lateness_ms=%4 tolerance_ms=%5 lead_kind=%6 lead_ms=%7 "
+                "predictor_sigma_ms=%8 fill_pct=%9 frame_age_ms=%10 held_ms=%11 "
+                "physical_epoch=%12 shot_attempt=%13 session_count=%14 "
+                // [ORION_OWNED_METER_NEVER_ABORTS] APPEND-ONLY (key=value parsers keep every
+                // position). beyond_tolerance=1 marks a release that the pre-flag build would
+                // have ABORTED, and session_beyond_tolerance is this session's running tally of
+                // them -- the number that answers "how many shots did never-aborts actually
+                // save, and how late were they" from a returned log alone.
+                "beyond_tolerance=%15 session_beyond_tolerance=%16 never_aborts=%17")
+                                      .arg(predictedTipSource.left(64))
+                                      .arg(predictedTipMs - now, 0, 'f', 3)
+                                      .arg(fireAtMs - now, 0, 'f', 3)
+                                      .arg(latenessMs, 0, 'f', 3)
+                                      .arg(config_.lateFireToleranceMs, 0, 'f', 1)
+                                      .arg(measuredLatencyAuthorityKind_.left(16))
+                                      .arg(effectiveLeadMs, 0, 'f', 3)
+                                      .arg(predictedTipSigmaMs, 0, 'f', 3)
+                                      .arg(shot_.fillPct, 0, 'f', 2)
+                                      .arg(shot_.frameAgeMs, 0, 'f', 2)
+                                      .arg(heldMs, 0, 'f', 1)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(shot_.armToken)
+                                      .arg(lateFireTolerated_)
+                                      .arg(beyondTolerance ? 1 : 0)
+                                      .arg(lateFireBeyondTolerance_)
+                                      .arg(config_.ownedMeterNeverAborts ? 1 : 0));
+            shot_.targetPct = kTipTargetPct;
+            shot_.releasePlan = QStringLiteral("Live meter tip (fired late)");
+            shot_.releaseReason = QStringLiteral("live_tip_fired_late");
+            shot_.releaseReasonCode = QStringLiteral("live_tip_fired_late");
+            if (triggerRelease(now)) {
+                clearReleaseOutput(output);
+            } else {
+                restoreAbortOutput(output);
+            }
+            return;
+        }
         // Attribute the miss to the subsystem that actually caused it. The ordering matters:
         // classify on whether a genuine OPPORTUNITY ever existed (valid decision AND deadline
         // still ahead), not on whether the decision was ever valid at all.
@@ -7117,7 +10545,21 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
             // lead_kind above names only the AUTHORITY, which the in-band Shot Lead replaces.
             // The 2026-08-08 production log was misread precisely because
             // lead_kind=factory/validated dressed a user-set 320 ms as an estimator product.
-            "armed_token_eta_ms=%20 grace_ms=%21 lead_source=%22")
+            // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] APPEND-ONLY. rhythm_delay = the flick trim
+            // ACTUALLY charged to lead_ms on this shot (0 when the release is a Square tap, or
+            // when the setting is 0), so a customer's EARLY/LATE report can be read against the
+            // trim that was really applied rather than the one that was configured.
+            // [ORION_TIP_FRAME_NATIVE 2026-09-15] APPEND-ONLY. fire_target names the rule the
+            // LAST vision arm of this shot aimed with ("frame_centre" when its game-frame grid
+            // was locked, "instant" otherwise) and frame_offset_ms the signed ms that rule moved
+            // the target by -- bounded by half a console frame by construction. Empty
+            // fire_target means this shot never reached the vision arm site at all, which is
+            // itself the answer to "was the frame target involved in this miss".
+            // [ORION_LEAD_AUTO_SEED 2026-09-15] APPEND-ONLY. Same pair as the reservation line:
+            // the user-equivalent lead the untuned-install seed contributed to lead_ms (field 6)
+            // and where it came from. A miss on a seeded install is only readable against them.
+            "armed_token_eta_ms=%20 grace_ms=%21 lead_source=%22 rhythm_delay=%23 "
+            "fire_target=%24 frame_offset_ms=%25 auto_seed_ms=%26 auto_seed_kind=%27")
                                   .arg(predictedTipSource.left(64))
                                   .arg(predictedTipMs - now, 0, 'f', 3)
                                   .arg(fireAtMs - now, 0, 'f', 3)
@@ -7151,7 +10593,13 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                                   // magnitude than grace_ms.
                                   .arg(armedTokenEtaAtMissMs, 0, 'f', 3)
                                   .arg(config_.schedulerGraceMs, 0, 'f', 3)
-                                  .arg(actuationLeadSourceLabel(effectiveLeadMs)));
+                                  .arg(actuationLeadSourceLabel(effectiveLeadMs))
+                                  .arg(appliedRhythmFlickDelayMs(), 0, 'f', 1)
+                                  .arg(shot_.fireTargetMode)
+                                  .arg(shot_.fireTargetFrameOffsetMs, 0, 'f', 2)
+                                  .arg(appliedLeadAutoSeedMs(), 0, 'f', 1)
+                                  .arg(leadAutoSeedActive_ && !leadAutoSeedKind_.isEmpty()
+                                           ? leadAutoSeedKind_ : QStringLiteral("none")));
         // [ORION_LEAD_CONFLICT] When the miss is the structural lead-vs-tip-timing impossibility
         // rather than a transient, say WHY in one short line that leads with the two numbers the
         // user can act on -- the full decision line above carries every term but is routinely
@@ -7294,6 +10742,8 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                                       .arg(schedFireToken_));
         }
         if (std::abs(fireAtMs - armedBaseMs) <= tokenDeadlineDriftToleranceMs()
+            || frameBoundaryNoiseKeepsToken(tipDecision, fireAtMs, fireTargetMode,
+                                            fireFrameOffsetMs, "tick")
             || irreplaceable || deferEarlierCandidate || qualityStealRefused) {
             shot_.releasePlan = QStringLiteral("Live meter tip scheduled");
             shot_.releaseReason = QStringLiteral("release_scheduled");
@@ -7345,6 +10795,13 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                            "the phase schedule"));
         return;
     }
+    if (curvePrematureArm(predictedTipSource, fireAtMs, now,
+                          adaptiveAutonomousSchedulerHorizonMs())) {
+        shot_.releasePlan = QStringLiteral("Live meter / waiting for a plausible estimate");
+        shot_.releaseReason = QStringLiteral("waiting_for_live_tip_deadline");
+        shot_.releaseReasonCode = QStringLiteral("curve_premature");
+        return;
+    }
     if (scheduleFire(fireAtMs, now, -1.0,
                      ScheduledFireAuthority::AutonomousMeterVision)) {
         schedFirePlan_ = QStringLiteral("Live meter tip");
@@ -7357,6 +10814,25 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         schedFireArmedSigmaMs_ = predictedTipSigmaMs;
         schedFireArmedFillPct_ = shot_.fillPct;
         schedFireArmedCommandEtaMs_ = fireAtMs - now;
+        // [ORION_TIP_FRAME_NATIVE 2026-09-17] Stamped with the rest of the attribution, on a
+        // SUCCESSFUL arm only, so the fields describe the token that will actually fire. The tick
+        // never stamped these before, which is the second half of the §10 defect: with the tick
+        // as the last writer on ~88 % of shots, fire_target= reported the MIRROR's evaluation
+        // while the console got the tick's token.
+        shot_.fireTargetMode = fireTargetMode;
+        shot_.fireTargetFrameOffsetMs = fireFrameOffsetMs;
+        shot_.fireAlignedFireAtMs = fireAtMs;
+        shot_.fireUnalignedFireAtMs = unalignedFireAtMs;
+        // The TOTAL displacement this token carries away from the bare model (frame snap, plus
+        // any hold-band clamp and its re-snap). The rate-recovery reproduction adds it back.
+        schedFireArmedFrameOffsetMs_ = fireAtMs - unalignedFireAtMs;
+        schedFireArmedFillEstimatorMode_ = shot_.lastGenuineFillEstimatorMode;
+        schedFireArmedFillEstimatorGeneration_ =
+            shot_.lastGenuineFillEstimatorGeneration;
+        // scheduleFire had to prove current frame + lead authority before this exact phase
+        // attribution existed. Complete the phase-anchor contract now, before the controller
+        // copies the lease into the precise-fire worker on this same tick.
+        commitArmedPhaseTokenAuthority(now);
         shot_.releasePlan = QStringLiteral("Live meter tip scheduled");
         shot_.releaseReason = QStringLiteral("release_scheduled");
         shot_.releaseReasonCode = QStringLiteral("release_scheduled");
@@ -7368,7 +10844,8 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                 "TIP RESERVATION: disposition=reservation_promoted source=%1 "
                 "command_eta_ms=%2 lead_kind=%3 lead_ms=%4 predictor_sigma_ms=%5 "
                 "fill_pct=%6 physical_epoch=%7 shot_attempt=%8 schedule_token=%9 "
-                "reservation_age_ms=%10 reservation_updates=%11 first_fill=%12")
+                "reservation_age_ms=%10 reservation_updates=%11 first_fill=%12 "
+                "rate_stretch=%13")
                                       .arg(predictedTipSource.left(64))
                                       .arg(fireAtMs - now, 0, 'f', 3)
                                       .arg(measuredLatencyAuthorityKind_.left(16))
@@ -7382,7 +10859,8 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                                                ? now - tipReservation_.createdMs : -1.0,
                                            0, 'f', 3)
                                       .arg(tipReservation_.updates)
-                                      .arg(tipReservation_.firstFillPct, 0, 'f', 2));
+                                      .arg(tipReservation_.firstFillPct, 0, 'f', 2)
+                                      .arg(shot_.phaseRateStretch, 0, 'f', 3));
         }
     } else {
         shot_.releasePlan = QStringLiteral("Live meter / tracking tip");
@@ -8572,7 +12050,15 @@ void AutomationEngine::processHolding(ControllerState& output, double now)
     shot_.greenWidthAtReleasePct = greenTracker_.confirmed() ? greenTracker_.widthPct() : 0.0;
     shot_.releaseVelocityPctMs = velocityPctPerMs;
     shot_.releaseCrossingEtaMs = crossing > 0.0 ? crossing - now : -1.0;
-    shot_.expectedRiseAtReleasePct = expectedRisePct;
+    // [ORION_ATTRIBUTION_RISE] Report the UNCLAMPED physical rise (velocity x lead), not the
+    // gate's clamped copy. `expectedRisePct` above is clamped to nonGotoMaxPredictiveRisePct
+    // (39) because it is a REACHABILITY BOUND; live velocity ~0.18 %/ms against a 300 ms lead
+    // gives 54 pp, so the clamped value saturates at 39 on essentially every shot and the log
+    // field became a constant. The unclamped number is the one an aim investigation needs:
+    // 100 - expectedRise is the fill at which the command must be issued to land on the tip,
+    // and comparing it against fill_at_rel on the same line is the whole rate-compensation
+    // question. The GATE below is unchanged and still uses the clamped value.
+    shot_.expectedRiseAtReleasePct = velocityPctPerMs * effectiveLatency;
     shot_.withinReachAtRelease = withinReach;
     // Clock-vs-vision divergence (telemetry only): when the meter-anchor clock AND a vision
     // crossing both have a deadline this frame, log how far apart they'd fire. A persistent
@@ -8890,7 +12376,8 @@ void AutomationEngine::processReleasing(ControllerState& output, double now)
 {
     const double elapsed = now - shot_.releaseTriggerMs;
 
-    applyShotReleaseEdge(output, shot_.mode, shot_.shotType, shot_.tempoFadeGesture);
+    applyShotReleaseEdge(output, shot_.mode, shot_.shotType, shot_.tempoFadeGesture,
+                         tempoReleaseStyleFromString(config_.tempoReleaseStyle));
     preserveTempoFadeMovementContext(output);
     // Stick-mode Square overlap is intentionally suppressed throughout the
     // active shot, then held until the physical button is genuinely released.
@@ -9166,13 +12653,47 @@ void AutomationEngine::pulsePumpFakeOutput(ControllerState& output) const
 
 void AutomationEngine::cancelPostReleaseGrade(int releaseSeq)
 {
-    // Close the open post-release meter capture WITHOUT grading it: the release for this seq never
-    // reached the console, so the meter that follows is not this bot's shot. Matches the seq so a
-    // stale cancel can't drop a newer shot's capture.
+    // Close WITHOUT grading: a failed delivery, new physical shot, or source
+    // boundary invalidates the attribution of any later meter pixels. Match
+    // the sequence so a delayed cancel cannot drop a newer release's capture.
     if (meterCapActive_ && meterCapSeq_ == releaseSeq) {
         meterCapActive_ = false;
         meterCapSamples_.clear();
+        meterCapPhaseCapSamples_.clear();
+        meterCapPhaseAnchorMs_ = -1.0;
+        meterCapFadePhaseCatchup_ = false;
+        meterCapPhaseAnchorFirstSight_ = false;   // [ORION_TIP_PHASE_FIRST_SIGHT]
+        meterCapPhaseStopMs_ = -1.0;
+        meterCapPhaseStopConfirmed_ = false;
+        meterCapPhaseReopenPendingMs_ = -1.0;
     }
+}
+
+// === [ORION_LEAD_REBASELINE_RATE 2026-09-15 owner] the gate in front of the re-baseline ======
+//
+// See the declaration for the measurement (28,514 refusal lines in 9 minutes). Two gates, and
+// neither of them can change WHAT the re-baseline does when it does run.
+void AutomationEngine::maybeRebaselineLeadClocks()
+{
+    // GATE 1 — never in NO METER mode, and never underneath a blind press still in flight.
+    // The blind hold contains no lead term, so there is no learned lead to rebaseline against;
+    // measuredLeadAuthoritative()/userLeadAuthorityActive() already accept the hybrid's
+    // vision release through noMeterVisionAssistActive() WITHOUT config_.leadRebaselined, so the
+    // latch this call exists to set is not on any NO METER release path. Every attempt here can
+    // therefore only refuse, and a refusal changes nothing but the log.
+    if (config_.inputTimedEnabled || shot_.inputTimedShot) {
+        return;
+    }
+    // GATE 2 — at most one attempt per shot attempt, in every mode. updateDetection runs per
+    // detector payload (~50/s); the re-baseline is a one-shot clock shift whose inputs
+    // (measuredLatencyMs_, config_.learnedLatencyMs) do not change between two payloads in any
+    // way that could turn a refusal into an acceptance. The next shot retries it on its own
+    // first payload, well before that shot can release.
+    if (leadRebaselineAttemptArmToken_ == shot_.armToken) {
+        return;
+    }
+    leadRebaselineAttemptArmToken_ = shot_.armToken;
+    rebaselineLeadClocks();
 }
 
 // === [ORION_MEASURED_LEAD] one-shot clock re-baseline ==================================
@@ -9189,11 +12710,30 @@ void AutomationEngine::rebaselineLeadClocks()
         // or stay off pending investigation (absurd one logs loudly).
         config_.leadRebaselined = std::abs(delta) < 5.0;
         if (!config_.leadRebaselined) {
-            emit fusedDiagnostic(QStringLiteral(
-                "LeadRebaseline: REFUSED — implausible delta %1ms (measured %2, learned %3)")
-                    .arg(delta, 0, 'f', 1)
-                    .arg(measuredLatencyMs_, 0, 'f', 1)
-                    .arg(config_.learnedLatencyMs, 0, 'f', 1));
+            // [ORION_LEAD_REBASELINE_RATE 2026-09-15] One line per DISTINCT (measured, learned)
+            // pair per session, quantized to 0.1 ms. A broken oracle produces the same pair
+            // every time, and the second identical line carries no information the first did
+            // not; a pair that actually MOVES is new evidence and still says so. The caller's
+            // once-per-shot-attempt gate bounds this to <= 1 line per shot regardless.
+            const auto tenths = [](double v) -> quint32 {
+                if (!std::isfinite(v)) return 0xFFFFFFFFu;
+                const double clamped = std::clamp(v, -200000.0, 200000.0);
+                return static_cast<quint32>(
+                    static_cast<qint32>(std::llround(clamped * 10.0)));
+            };
+            const quint64 memoKey = (static_cast<quint64>(tenths(measuredLatencyMs_)) << 32)
+                | static_cast<quint64>(tenths(config_.learnedLatencyMs));
+            if (!leadRebaselineRefusalLogged_.contains(memoKey)) {
+                if (leadRebaselineRefusalLogged_.size() >= kLeadRebaselineRefusalMemoMax) {
+                    leadRebaselineRefusalLogged_.clear();   // bounded; costs at most a repeat
+                }
+                leadRebaselineRefusalLogged_.append(memoKey);
+                emit fusedDiagnostic(QStringLiteral(
+                    "LeadRebaseline: REFUSED — implausible delta %1ms (measured %2, learned %3)")
+                        .arg(delta, 0, 'f', 1)
+                        .arg(measuredLatencyMs_, 0, 'f', 1)
+                        .arg(config_.learnedLatencyMs, 0, 'f', 1));
+            }
             return;
         }
         emit fusedLearningUpdated(config_.shotTypeAppearToTipMs, config_.leadRebaselined);
@@ -9340,7 +12880,8 @@ void AutomationEngine::clearReleaseOutput(ControllerState& output) const
     // Every immediate and scheduled release uses the exact same first packet as
     // the controller's precise-fire worker. Tempo modes reverse the held gather
     // on this tick; they may not wait for a later GUI processReleasing tick.
-    applyShotReleaseEdge(output, shot_.mode, shot_.shotType, shot_.tempoFadeGesture);
+    applyShotReleaseEdge(output, shot_.mode, shot_.shotType, shot_.tempoFadeGesture,
+                         tempoReleaseStyleFromString(config_.tempoReleaseStyle));
     preserveTempoFadeMovementContext(output);
     if (squareLatchedUntilRelease_) {
         output.buttons &= ~XINPUT_GAMEPAD_X;
@@ -9359,11 +12900,20 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
         return false;
     }
     if (!alreadySubmitted) {
-        if (!config_.noMeterEnabled && !meterReleaseAuthorityCurrent(now)) {
+        // [ORION_BLIND_WAITER 2026-09-15] `enforceLateLimit` is false ONLY inside
+        // maybeRescueOverdueBlindRelease(), which has already re-proved every other term of this
+        // authority. Without the exception the rescue would abort here instead — the same lost
+        // shot the rescue exists to prevent, reported as input_timer_authority_lost_abort.
+        if (shot_.inputTimedShot
+            && !inputTimedAuthorityCurrentCore(now, !blindOverdueRescueActive_)) {
+            abort(QStringLiteral("input_timer_authority_lost_abort"));
+            return false;
+        }
+        if (!shot_.inputTimedShot && !config_.noMeterEnabled && !meterReleaseAuthorityCurrent(now)) {
             abort(QStringLiteral("detector_authority_lost_abort"));
             return false;
         }
-        if (config_.noMeterEnabled && !poseReleaseAuthorityCurrent(now)) {
+        if (!shot_.inputTimedShot && config_.noMeterEnabled && !poseReleaseAuthorityCurrent(now)) {
             abort(QStringLiteral("pose_authority_lost_abort"));
             return false;
         }
@@ -9395,7 +12945,7 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
         }
         const bool routeSensitive = controllerRouteBindingRequired_
             && (autonomousLiveMeterTimingEnabled()
-                || shot_.latencyCalibrationProbe);
+                || shot_.inputTimedShot || shot_.latencyCalibrationProbe);
         if (routeSensitive
             && (shot_.releaseScheduleRouteGeneration == 0
                 || shot_.releaseScheduleRoute == LatencyControllerRoute::None)) {
@@ -9427,9 +12977,13 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     // instant? Same wifi-scaled window processHolding's meterFresh uses, but keyed on the
     // GENUINE-accept anchor so a stale_or_memory echo can't count as fresh here.
     {
-        shot_.visionFreshAtRelease = alreadySubmitted
+        // [ORION_NO_METER_VISION_ASSIST 2026-09-14] A NO METER shot released by a VISION token is
+        // a vision-timed release and reports as one; the blind timer's own releases still report
+        // false, which is what the flag has always meant (it is a diagnostic, not an authority).
+        shot_.visionFreshAtRelease = (!shot_.inputTimedShot || shot_.noMeterVisionRelease)
+            && (alreadySubmitted
             || (config_.noMeterEnabled ? poseReleaseAuthorityCurrent(now)
-                                       : meterReleaseAuthorityCurrent(now));
+                                       : meterReleaseAuthorityCurrent(now)));
     }
     shot_.releasePlan = QStringLiteral("Release scheduled");
     shot_.releaseReason = shot_.mode == ShotMode::GoToStick
@@ -9457,7 +13011,7 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     lastReleaseMarkerShotAttempt_ = shot_.armToken;
     // Calibration releases are oracle probes, not gameplay attempts. Do not
     // open a native outcome/learning association for intentionally early probes.
-    if (!latencyCalibrationRelease) {
+    if (!latencyCalibrationRelease && !shot_.inputTimedShot) {
         lastReleaseWallMs_ = now;
         lastReleaseShotType_ = shot_.shotType;
         lastReleaseBucketKey_ = shot_.bucketKey;
@@ -9528,11 +13082,44 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     // never looser — while keeping the observation alive on an extreme-slope rise.
     const double validationToleranceMarkerPct = validationTargetMarker
         ? std::min(shot_.latencyValidationTolerancePct, 50.0) : -1.0;
-    emit releaseMarker(
-        shot_.releaseSeq, releaseWallEpochMs, latencyCalibrationRelease,
-        validationTargetMarker ? shot_.latencyValidationTargetPct : -1.0,
-        validationToleranceMarkerPct,
-        shot_.physicalShotEpoch, shot_.armToken);
+    // [ORION_VISION_HOLD_BAND 2026-09-15] A BAND-CLAMPED RELEASE TEACHES THE LATENCY ESTIMATOR
+    // NOTHING. The marker is the estimator's ONLY input: it closes (t* - release) against the
+    // sidecar's frozen-meter oracle, so the observation is only a measurement of the transport if
+    // the release went where the prediction said. On a clamped shot it did not -- it went where
+    // the band said -- and the residual the estimator would accept is the clamp, not the route's
+    // latency. Left in, the estimator would learn a lead that cancels the band and the band would
+    // then clamp the new lead: the same self-chasing loop the learner fences above exist to
+    // prevent, one level further out. Dropping the marker is the whole mechanism available here
+    // (the estimator lives sidecar-side and accepts exactly what this signal stages), and it
+    // fails in the safe direction: fewer accepted observations, never a corrupted one.
+    //
+    // A calibration release can never reach this branch -- visionHoldBandForShot() refuses to arm
+    // on a latencyCalibrationProbe -- so the L1/L2 protocol is untouched by construction, and the
+    // suppression is logged rather than silent so a returned log can account for every missing
+    // marker.
+    if (shot_.holdBandKind.isEmpty()) {
+        emit releaseMarker(
+            shot_.releaseSeq, releaseWallEpochMs, latencyCalibrationRelease,
+            validationTargetMarker ? shot_.latencyValidationTargetPct : -1.0,
+            validationToleranceMarkerPct,
+            shot_.physicalShotEpoch, shot_.armToken);
+    } else {
+        emit engineDiagnostic(QStringLiteral(
+            "HOLD BAND: marker_suppressed seq=%1 hold_band=%2 epoch=%3 shot_attempt=%4")
+                                  .arg(shot_.releaseSeq)
+                                  .arg(shot_.holdBandKind)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(shot_.armToken));
+    }
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] Close the sidecar's press window on the SAME
+    // timestamp. Deliberately NOT routed through releaseMarker: that marker is staged behind the
+    // controller's delivery gate (an undelivered release must never teach the latency oracle) and
+    // is suppressed outright for input-timed shots, whereas this one is about where the ANCHOR
+    // may look -- a release edge that the pipe then dropped still ends the press window, and a NO
+    // METER release ends it exactly like a vision release does. This is the only site the vision
+    // and blind NO METER paths share; the METER BACKSTOP emits its own (it owns no ShotContext
+    // and never calls triggerRelease).
+    emitShotGateRelease(shot_.physicalShotEpoch, releaseWallEpochMs, shot_.shotType);
     // [ORION_DEV_FIRE_OFFSET] One seq-paired line per release while the sweep hook is armed, so
     // the offline sweep can join (applied offset -> banner verdict) on the release seq exactly
     // like every other per-release analysis. applied_ms=0 covers both an undisplaced token and
@@ -9574,13 +13161,13 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     //   shotTypeMeterToReleaseMs = firstMeterSeen->release (meter_appear anchor)
     // Each is seeded only while its own clock is still UNARMED (<= its floor); once armed the
     // outcome relay (learnFromOutcome) calibrates it and seeding stops for that clock.
-    const bool visionTimed = shot_.releaseReasonCode == QStringLiteral("green_confirmed")
+    const bool visionTimed = !shot_.inputTimedShot && (shot_.releaseReasonCode == QStringLiteral("green_confirmed")
         || shot_.releaseReasonCode == QStringLiteral("predictive_target")
         // (B) The no-meter zero-cross crossing is a vision-timed release too -> seed THIS type's
         // hold-start clock from holdStart->crossing so the NEXT shot fires feedforward (greens).
         // The feedforward release itself (pose_feedforward_target) is NOT vision-timed, so it never
         // re-seeds -- only a fresh crossing measurement does. Matches the meter green/predictive rule.
-        || shot_.releaseReasonCode == QStringLiteral("pose_release_reactive");
+        || shot_.releaseReasonCode == QStringLiteral("pose_release_reactive"));
     // [ORION_LEAD_VISION_GATE] Fire-time vision confidence for the autonomous lead learner: the release
     // was vision-timed (NOT a blind feedforward/timeout/abort clock), vision was genuinely fresh at the
     // trigger instant, and the lock quality (detector confidence) clears the gate. Stamped now and paired
@@ -9701,7 +13288,30 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
             }
         }
     }
-    learnFromRelease(shot_);
+    if (shot_.inputTimedShot && shot_.noMeterVisionRelease) {
+        // [ORION_NO_METER_VISION_ASSIST 2026-09-14] A NO METER shot the METER actually timed. It
+        // is deliberately NOT reported as a NO METER RELEASE: that line's whole content is the
+        // blind timer's lateness against a deadline this release never used, and reporting it
+        // would put vision-timed shots into the blind path's own audit. The hold it did fly is
+        // still stated, so the two populations can be compared directly.
+        emit engineDiagnostic(QStringLiteral(
+            "NO METER VISION RELEASE: hold_ms=%1 blind_hold_ms=%2 fill_pct=%3 source=%4 "
+            "scheduler=%5 arm=%6")
+            .arg(now - shot_.holdStartMs, 0, 'f', 3)
+            .arg(noMeterBackstop_.deadlineMs - shot_.holdStartMs, 0, 'f', 3)
+            .arg(shot_.fillPct, 0, 'f', 2)
+            .arg(shot_.armedPredictorSource.isEmpty() ? QStringLiteral("none")
+                                                      : shot_.armedPredictorSource.left(64))
+            .arg(shot_.firedByScheduler ? 1 : 0)
+            .arg(shot_.armToken));
+    } else if (shot_.inputTimedShot) {
+        shot_.scheduledFireDeltaMs = now - noMeterBackstop_.deadlineMs;
+        emit engineDiagnostic(QStringLiteral("NO METER RELEASE: requested_ms=%1 actual_ms=%2 lateness_ms=%3 scheduler=%4")
+            .arg(noMeterBackstop_.deadlineMs - shot_.holdStartMs, 0, 'f', 3)
+            .arg(now - shot_.holdStartMs, 0, 'f', 3)
+            .arg(shot_.scheduledFireDeltaMs, 0, 'f', 3)
+            .arg(shot_.firedByScheduler ? 1 : 0));
+    } else learnFromRelease(shot_);
     emit releaseIssued(shot_);
     emit shotStateChanged(shot_);
     return true;
@@ -9916,6 +13526,7 @@ const char* AutomationEngine::armGateName(ArmGate gate) noexcept
     case ArmGate::AuthorityLease:     return "authority_lease";
     case ArmGate::AuthorityStaleNow:  return "authority_stale_now";
     case ArmGate::PoseAuthority:      return "pose_authority";
+    case ArmGate::CurvePremature:     return "curve_premature";
     }
     return "unknown";
 }
@@ -9996,6 +13607,310 @@ bool AutomationEngine::armedTokenIrreplaceable(double now) const noexcept
     }
     const double untilArmedMs = schedFireDeadlineMs_ - now;
     return untilArmedMs > 0.0 && untilArmedMs <= imminentTokenWindowMs();
+}
+
+bool AutomationEngine::fenceArmedTokenOnFillIntegrityBreak(
+    double freshFillPct, const QString& fillEstimatorMode,
+    quint64 fillEstimatorGeneration, double atMs)
+{
+    const QString currentMode = fillEstimatorMode.trimmed().toLower();
+    const bool currentRulerValid = fillEstimatorGeneration != 0
+        && (currentMode == QLatin1String("coarse")
+            || currentMode == QLatin1String("subpixel"));
+    const bool armedRulerValid = schedFireArmedFillEstimatorGeneration_ != 0
+        && (schedFireArmedFillEstimatorMode_ == QLatin1String("coarse")
+            || schedFireArmedFillEstimatorMode_ == QLatin1String("subpixel"));
+    if (!autonomousLiveMeterTimingEnabled()
+        || schedFireDeadlineMs_ < 0.0 || !schedFireRequiresGenuineFrame_
+        || schedFireConfirmedToken_ == schedFireToken_
+        || !std::isfinite(freshFillPct) || freshFillPct < 0.0 || freshFillPct > 100.0
+        || !std::isfinite(schedFireArmedFillPct_) || schedFireArmedFillPct_ < 0.0
+        || !currentRulerValid || !armedRulerValid
+        // Likewise, never let a delayed callback from another physical/vision identity
+        // tear down the current token through this narrowly scoped integrity fence.
+        || schedFirePhysicalShotEpoch_ != shot_.physicalShotEpoch
+        || schedFireShotAttempt_ != shot_.armToken
+        || schedFireVisionEpoch_ != shot_.visionEpoch) {
+        return false;
+    }
+
+    // Values from different rulers are never numerically compared.  The transition is
+    // nevertheless an explicit identity break: a token dated on the old ruler cannot
+    // remain armed merely because the rollback comparator correctly stood down.
+    const bool rulerTransition =
+        currentMode != schedFireArmedFillEstimatorMode_
+        || fillEstimatorGeneration != schedFireArmedFillEstimatorGeneration_;
+    const double rollbackPct = schedFireArmedFillPct_ - freshFillPct;
+    if (!rulerTransition
+        && !(rollbackPct > armedSameRulerRollbackLimitPct() + 1e-6)) {
+        return false;
+    }
+
+    const quint64 staleToken = schedFireToken_;
+    const double staleDeadlineMs = schedFireDeadlineMs_;
+    const double armedFillPct = schedFireArmedFillPct_;
+    if (rulerTransition) {
+        // [ORION_RULER_TRANSITION_TOLERANCE] (header note at RemapConfig). The rulers are
+        // never compared to each other; the fresh value is compared with what the PREVIOUS
+        // genuine sample on the armed ruler predicts for this instant (one source cadence of
+        // nominal mid-rise travel, so the extrapolation error is bounded by ~1 pp). Agreement
+        // means the new ruler is the same meter a hair re-based -- keep the proven token and
+        // move the rollback comparator onto the new ruler. No previous sample on the armed
+        // ruler, or a disagreement, falls through to the unconditional fence exactly as before.
+        double expectedPct = std::numeric_limits<double>::quiet_NaN();
+        double tolerancePct = config_.rulerTransitionTolerancePct;
+        constexpr double kNominalMidRiseRatePctPerMs = 0.20;    // 2K27 measured 0.16-0.27
+        constexpr double kRateUncertaintyPctPerMs = 0.05;       // widens the band with horizon
+        constexpr double kMaxHorizonMs = 120.0;                 // beyond this: fence as before
+        if (tolerancePct > 0.0) {
+            // Two candidate references on the ARMED ruler, the nearer one in time wins (the
+            // nominal-rate extrapolation error grows with horizon): the previous genuine sample,
+            // and the arm-time fill itself. A real reset is tens of pp away from either.
+            double horizonMs = std::numeric_limits<double>::infinity();
+            double basePct = std::numeric_limits<double>::quiet_NaN();
+            if (std::isfinite(shot_.phasePrevFillPct) && shot_.phasePrevFillPct >= 0.0
+                && std::isfinite(shot_.phasePrevCaptureMs) && shot_.phasePrevCaptureMs >= 0.0
+                && shot_.phasePrevFillEstimatorGeneration == schedFireArmedFillEstimatorGeneration_
+                && shot_.phasePrevFillEstimatorMode.trimmed().toLower()
+                       == schedFireArmedFillEstimatorMode_
+                && atMs >= shot_.phasePrevCaptureMs) {
+                horizonMs = atMs - shot_.phasePrevCaptureMs;
+                basePct = shot_.phasePrevFillPct;
+            }
+            if (std::isfinite(schedFireArmedCommandEtaMs_) && std::isfinite(armedFillPct)
+                && armedFillPct >= 0.0) {
+                const double armedAtMs = staleDeadlineMs - schedFireArmedCommandEtaMs_;
+                const double sinceArmMs = atMs - armedAtMs;
+                if (std::isfinite(sinceArmMs) && sinceArmMs >= 0.0 && sinceArmMs < horizonMs) {
+                    horizonMs = sinceArmMs;
+                    basePct = armedFillPct;
+                }
+            }
+            if (std::isfinite(basePct) && horizonMs <= kMaxHorizonMs) {
+                expectedPct = basePct + kNominalMidRiseRatePctPerMs * horizonMs;
+                tolerancePct += kRateUncertaintyPctPerMs * horizonMs;
+            }
+            // Never as loose as the same-ruler rollback limit: a rewind that size is a reset.
+            tolerancePct = std::min(tolerancePct, armedSameRulerRollbackLimitPct() - 0.5);
+        }
+        const double discrepancyPct = freshFillPct - expectedPct;
+        // An IMMINENT token (inside one source cadence of its own fire) whose fresh fill reads
+        // AHEAD of the armed ruler's prediction is not a reset and cannot be re-armed in time:
+        // live 2026-09-02 12:47, token 43 was fenced 1.8 ms before its fire on a +5.6 pp forward
+        // step and the shot was lost outright. A forward step within the imminent window is
+        // therefore kept up to the same-ruler rollback limit; a rewind still fences.
+        // Two frame gaps, not one (live e71: a +7.3 pp forward step 19.4 ms before the fire,
+        // just past the 16.7 ms window, killed a promoted token; the shot then died
+        // live_tip_deadline_missed). No better estimate can replace a token that close either.
+        constexpr double kImminentForwardKeepFrameGaps = 2.0;
+        const bool imminentForward = std::isfinite(discrepancyPct) && discrepancyPct > 0.0
+            && config_.rulerTransitionTolerancePct > 0.0
+            && discrepancyPct <= armedSameRulerRollbackLimitPct()
+            && (staleDeadlineMs - atMs) > 0.0
+            && (staleDeadlineMs - atMs) <= kImminentForwardKeepFrameGaps * imminentTokenWindowMs();
+        if ((std::isfinite(discrepancyPct) && std::abs(discrepancyPct) <= tolerancePct)
+            || imminentForward) {
+            emit engineDiagnostic(QStringLiteral(
+                "TIP FILL RULER TRANSITION TOLERATED: armed_mode=%1 armed_generation=%2 "
+                "fresh_mode=%3 fresh_generation=%4 expected_pct=%5 fresh_pct=%6 "
+                "discrepancy_pct=%7 tolerance_pct=%8 token=%9 until_armed_ms=%10 "
+                "physical_epoch=%11 shot_attempt=%12 basis=%13")
+                                      .arg(schedFireArmedFillEstimatorMode_)
+                                      .arg(schedFireArmedFillEstimatorGeneration_)
+                                      .arg(currentMode)
+                                      .arg(fillEstimatorGeneration)
+                                      .arg(expectedPct, 0, 'f', 2)
+                                      .arg(freshFillPct, 0, 'f', 2)
+                                      .arg(discrepancyPct, 0, 'f', 2)
+                                      .arg(tolerancePct, 0, 'f', 2)
+                                      .arg(staleToken)
+                                      .arg(staleDeadlineMs - atMs, 0, 'f', 3)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(shot_.armToken)
+                                      .arg(imminentForward && std::abs(discrepancyPct) > tolerancePct
+                                               ? QStringLiteral("imminent_forward")
+                                               : QStringLiteral("band")));
+            schedFireArmedFillEstimatorMode_ = currentMode;
+            schedFireArmedFillEstimatorGeneration_ = fillEstimatorGeneration;
+            schedFireArmedFillPct_ = freshFillPct;
+            schedFireArmedCommandEtaMs_ = staleDeadlineMs - atMs;
+            return false;
+        }
+        emit engineDiagnostic(QStringLiteral(
+            "TIP FILL RULER TRANSITION FENCE: armed_mode=%1 armed_generation=%2 "
+            "fresh_mode=%3 fresh_generation=%4 token=%5 until_armed_ms=%6 "
+            "physical_epoch=%7 shot_attempt=%8 expected_pct=%9 fresh_pct=%10 "
+            "tolerance_pct=%11")
+                                  .arg(schedFireArmedFillEstimatorMode_)
+                                  .arg(schedFireArmedFillEstimatorGeneration_)
+                                  .arg(currentMode)
+                                  .arg(fillEstimatorGeneration)
+                                  .arg(staleToken)
+                                  .arg(staleDeadlineMs - atMs, 0, 'f', 3)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(shot_.armToken)
+                                  .arg(std::isfinite(expectedPct) ? expectedPct : -1.0, 0, 'f', 2)
+                                  .arg(freshFillPct, 0, 'f', 2)
+                                  .arg(tolerancePct, 0, 'f', 2));
+        cancelAutonomousTipReservation(QStringLiteral("fill_ruler_transition"));
+        invalidateUnconfirmedVisionSchedule("fill_ruler_transition");
+    } else {
+        emit engineDiagnostic(QStringLiteral(
+            "TIP FILL ROLLBACK FENCE: armed_fill_pct=%1 fresh_fill_pct=%2 rollback_pct=%3 "
+            "limit_pct=%4 estimator_mode=%5 estimator_generation=%6 token=%7 "
+            "until_armed_ms=%8 physical_epoch=%9 shot_attempt=%10")
+                                  .arg(armedFillPct, 0, 'f', 2)
+                                  .arg(freshFillPct, 0, 'f', 2)
+                                  .arg(rollbackPct, 0, 'f', 2)
+                                  .arg(armedSameRulerRollbackLimitPct(), 0, 'f', 2)
+                                  .arg(currentMode)
+                                  .arg(fillEstimatorGeneration)
+                                  .arg(staleToken)
+                                  .arg(staleDeadlineMs - atMs, 0, 'f', 3)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(shot_.armToken));
+        cancelAutonomousTipReservation(QStringLiteral("same_ruler_fill_rollback"));
+        invalidateUnconfirmedVisionSchedule("same_ruler_fill_rollback");
+    }
+    // The precise worker may have crossed its submit boundary while the synchronous
+    // fence was entering.  That physical edge wins and the normal consume path owns it;
+    // do not reset the shot underneath a release that already happened.
+    if (schedFireDeadlineMs_ >= 0.0
+        && schedFireToken_ == staleToken
+        && schedFireConfirmedToken_ == staleToken
+        && schedFireActualMs_ >= 0.0) {
+        return false;
+    }
+
+    // The stale deadline is gone.  Re-open only the VISION trajectory, not the physical
+    // gesture: the bot keeps the same held Square/stick output while ordinary current-shot
+    // proof rebuilds.  This avoids trading one bad deadline for an unnecessary non-intervention.
+    sampler_.reset();
+    greenTracker_.reset();
+    fused_.reset();
+    lastFusedSampleMs_ = -1.0;
+    lastFusedFillPct_ = -1.0;
+    fusedFireAtMs_ = -1.0;
+    fusedPeakLatched_ = false;
+    fusedFrameAgeEmaMs_ = -1.0;
+    shot_.anchorCandFirstMs = -1.0;
+    shot_.anchorCandFirstFill = 0.0;
+    shot_.anchorCandFirstFrameAgeMs = 0.0;
+    shot_.anchorCandLastMs = -1.0;
+    shot_.anchorCandLastFill = 0.0;
+    shot_.anchorValidMs = -1.0;
+    shot_.greenConfirmFillPct = -1.0;
+    shot_.greenConfirmMs = -1.0;
+    shot_.freshAcceptRingMs.fill(-1.0);
+    shot_.freshAcceptRingPos = 0;
+    shot_.lastFreshAcceptMs = -1.0;
+    shot_.minFreshFillPct = 1000.0;
+    shot_.peakFillPct = 0.0;
+    shot_.peakFillMs = atMs;
+    shot_.fillPhaseAnchorMs = -1.0;
+    shot_.fillPhaseAnchorLevelPct = -1.0;
+    // [ORION_TIP_PHASE_FIRST_SIGHT] same episode reset as the detector-relock site above.
+    shot_.phaseFirstSightFillPct = -1.0;
+    shot_.phaseFirstSightCaptureMs = -1.0;
+    shot_.phaseFirstSightEstimatorMode.clear();
+    shot_.phaseFirstSightEstimatorGeneration = 0;
+    shot_.phaseFirstSightMissedRungs = 0;
+    shot_.phaseAnchorFromFirstSight = false;
+    shot_.phaseAnchorBase20WitnessMs.fill(-1.0);
+    shot_.phaseAnchorBase20WitnessMask = 0;
+        shot_.phaseRateStretch = 1.0;
+        shot_.phaseRateStretchLatched = false;
+        shot_.phaseRateReferenceDiagnosticLogged = false;
+        shot_.phaseRateStretchSlopePctPerMs = 0.0;
+        shot_.phaseRateRecoveryLastSampleMs = -1.0;
+    shot_.phaseAnchorConsensusApplied = false;
+    shot_.phaseAnchorConsensusStagePct = 0;
+    shot_.phaseAnchorConsensusC30Ms = -1.0;
+    shot_.phaseAnchorRefinement = {};
+    shot_.phaseAnchorConsensusEstimatorMode.clear();
+    shot_.phaseAnchorConsensusEstimatorGeneration = 0;
+    shot_.fadePhaseCatchup.clearEvidence();
+    shot_.phasePrevFillPct = -1.0;
+    shot_.phasePrevCaptureMs = -1.0;
+    shot_.phasePrevFillEstimatorMode.clear();
+    shot_.phasePrevFillEstimatorGeneration = 0;
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] A re-lock is a new capture episode, so it is a new
+    // grid: the step edges either side of the discontinuity do not belong to one continuous
+    // 60 Hz fit, and carrying them across would hand the new animation the old episode's
+    // phase. Reset here for exactly the reason phasePrevFillPct is reset here.
+    shot_.framePhase.reset();
+    shot_.framePhaseLogged = false;
+    shot_.phaseAnchorFrameDated = false;
+    shot_.phaseAnchorFrameCorrectionMs = 0.0;
+    shot_.fillRollbackRecoveryActive = true;
+    shot_.fillRollbackRecoveryFreshFrames = 0;
+    shot_.detectionPresence = QStringLiteral("fill_rollback_reacquire");
+    ++shot_.visionEpoch;
+    ++shot_.detRelockResets;
+    return true;
+}
+
+bool AutomationEngine::frameBoundaryNoiseKeepsToken(
+    const AutonomousTipDecision& decision, double candidateMs,
+    const QString& targetMode, double frameOffsetMs, const char* site)
+{
+    // Sept 19 epoch 25: -8.08 -> +8.27 ms quantization cancelled a token
+    // 29.9 ms before release and moved it a full frame later. The underlying
+    // phase deadline barely changed. Apply the existing 1 ms noise band BEFORE
+    // quantization as well, but only for an adjacent-frame boundary flip.
+    // All ownership, freshness, identity and candidate-validity gates remain
+    // ahead of this helper at BOTH call sites. It cannot arm or move a token.
+    if (!config_.tipFrameNative || !decision.valid || !schedFireRequiresGenuineFrame_
+        || schedFireDeadlineMs_ <= nowMs()
+        || decision.source != schedFireArmedSource_
+        || targetMode != QLatin1String("frame_centre")
+        || shot_.fireTargetMode != QLatin1String("frame_centre")
+        || !shot_.holdBandKind.isEmpty()
+        || shot_.lastGenuineFillEstimatorMode != schedFireArmedFillEstimatorMode_
+        || shot_.lastGenuineFillEstimatorGeneration != schedFireArmedFillEstimatorGeneration_) {
+        return false;
+    }
+    const auto grid = shot_.framePhase.estimate();
+    const double armedMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
+    const double armedOffsetMs = shot_.fireTargetFrameOffsetMs;
+    if (!grid.locked || !grid.valid() || !std::isfinite(candidateMs)
+        || !std::isfinite(armedMs) || !std::isfinite(frameOffsetMs)
+        || !std::isfinite(armedOffsetMs) || !std::isfinite(shot_.fireAlignedFireAtMs)
+        || std::abs(shot_.fireAlignedFireAtMs - armedMs) > 1e-6) {
+        return false;
+    }
+    const double toleranceMs = tokenDeadlineDriftToleranceMs();
+    const double halfFrameMs = 0.5 * grid.periodMs;
+    // Both estimates must actually straddle a nearby boundary, not describe a
+    // changed frame period, hold-band clamp, or material grid correction.
+    if (frameOffsetMs * armedOffsetMs >= 0.0
+        || std::abs(frameOffsetMs) < halfFrameMs - toleranceMs
+        || std::abs(armedOffsetMs) < halfFrameMs - toleranceMs
+        || std::abs(frameOffsetMs) > halfFrameMs + 1e-6
+        || std::abs(armedOffsetMs) > halfFrameMs + 1e-6
+        || std::abs(std::abs(candidateMs - armedMs) - grid.periodMs) > 2.0 * toleranceMs) {
+        return false;
+    }
+    // The arm's metadata is immutable until a SUCCESSFUL replacement. Comparing
+    // against it (not the last considered candidate) prevents cumulative drift.
+    // Subtract only the frame offset, retaining lead/green-centre changes in the
+    // comparison so a real timing-policy change is not mistaken for grid noise.
+    const double rawDriftMs = (candidateMs - frameOffsetMs) - (armedMs - armedOffsetMs);
+    if (!std::isfinite(rawDriftMs) || std::abs(rawDriftMs) > toleranceMs) {
+        return false;
+    }
+    if (frameBoundaryHoldLoggedToken_ != schedFireToken_) {
+        frameBoundaryHoldLoggedToken_ = schedFireToken_;
+        emit engineDiagnostic(QStringLiteral(
+            "TIP FRAME BOUNDARY HOLD: site=%1 token=%2 raw_drift_ms=%3 "
+            "candidate_shift_ms=%4 armed_offset_ms=%5 candidate_offset_ms=%6")
+                                  .arg(QLatin1String(site)).arg(schedFireToken_)
+                                  .arg(rawDriftMs, 0, 'f', 3)
+                                  .arg(candidateMs - armedMs, 0, 'f', 3)
+                                  .arg(armedOffsetMs, 0, 'f', 3)
+                                  .arg(frameOffsetMs, 0, 'f', 3));
+    }
+    return true;
 }
 
 bool AutomationEngine::candidateStealBlocked(const AutonomousTipDecision& decision) const noexcept
@@ -10091,6 +14006,107 @@ bool AutomationEngine::armedTokenSubmitInFlight(double now) const noexcept
     return sinceDeadlineMs >= 0.0 && sinceDeadlineMs < graceMs;
 }
 
+bool AutomationEngine::armedPhaseTokenCarriesAnchorAuthority(double now) const noexcept
+{
+    // [ORION_PHASE_ANCHOR_COMMIT] Contract and bounds are on the declaration.
+    if (schedFireDeadlineMs_ < 0.0 || !schedFireRequiresGenuineFrame_
+        || !std::isfinite(now)) {
+        return false;
+    }
+    if (schedFireConfirmedToken_ == schedFireToken_ && schedFireActualMs_ >= 0.0) {
+        return false;   // confirmed: the consume path owns it, nothing to ride
+    }
+    // Only while the shot is still an owned live hold. The intake-side dropout fences run on
+    // detection arrival at arbitrary shot states; outside a hold there is no committed press
+    // for this predicate to keep.
+    if (shot_.state != HoldState::Holding && shot_.state != HoldState::GreenWindow) {
+        return false;
+    }
+    // PHASE only, by exact label: the deadline is dated from a witnessed past anchor, so the
+    // newest frame is not its evidence. Fused/extrapolator labels (registration+sampler_far,
+    // sampler, registration, ...) keep every existing fence -- their deadline IS the newest fit.
+    if (schedFireArmedSource_ != QLatin1String("phase")) {
+        return false;
+    }
+    // Physical identity and delivery route must hold exactly; only vision-side identity or
+    // staleness may differ. A new physical press, a new attempt, or a route flip stays fatal.
+    if (schedFirePhysicalShotEpoch_ != shot_.physicalShotEpoch
+        || schedFireShotAttempt_ != shot_.armToken) {
+        return false;
+    }
+    if (schedFireRouteGeneration_ != 0
+        && !controllerDeliveryRouteAttestationExpected(
+            schedFireRouteGeneration_, schedFireRoute_)) {
+        return false;
+    }
+    // scheduleFire() proved a genuine same-shot frame before this token existed. The stored
+    // command ETA is the immutable maximum remaining runway from that arm; checking it here
+    // prevents a corrupted/reused token from acquiring an unbounded lifetime. A positive dev
+    // displacement is included because scheduleFire applies it after the live-tip arm site
+    // computes command ETA. Tick snapping only shortens this bound.
+    const double untilArmedMs = schedFireDeadlineMs_ - now;
+    if (!std::isfinite(schedFireArmedCommandEtaMs_)
+        || schedFireArmedCommandEtaMs_ <= 0.0
+        || !(untilArmedMs > 0.0)
+        || untilArmedMs > schedFireArmedCommandEtaMs_
+            + std::max(0.0, schedFireAppliedDevOffsetMs_) + 1e-6) {
+        return false;
+    }
+    // A non-negative expiry proves the token went through the genuine-frame authority gate at
+    // arm time. It need not still cover the deadline: phase timing comes from the past anchor,
+    // not from any later box. Physical and delivery-route identity remain mandatory above.
+    return std::isfinite(schedFireAuthorityExpiryMs_) && schedFireAuthorityExpiryMs_ >= 0.0;
+}
+
+void AutomationEngine::commitArmedPhaseTokenAuthority(double now) noexcept
+{
+    // [ORION_PHASE_SUBMIT_LEASE 2026-08-31] scheduleFire() deliberately arms autonomous tokens
+    // before a future frame can roll the generic evidence lease to their deadline. That is right
+    // for sampler/registration deadlines, whose estimate depends on the newest fit. A phase
+    // deadline is different: its timestamp was fixed by a genuine PAST anchor crossing, and
+    // armedPhaseTokenCarriesAnchorAuthority() proves the exact source, owned physical identity,
+    // route identity, finite arm-time authority and bounded immutable runway.
+    //
+    // The phase-anchor commitment previously protected only the engine-side token. The precise
+    // worker still received the old shorter expiry and independently refused its UP edge at the
+    // deadline (live epochs 40/52/63: TIP TOKEN HELD -> PRECISE FIRE AUTHORITY DECLINE -> no
+    // release). Carry the SAME finite token through the submit interval the scheduler already
+    // grants. Adding schedulerGraceMs does not move the fire time: it only permits the worker's
+    // existing deadline-targeted edge to finish during its documented post-spin grace.
+    if (!armedPhaseTokenCarriesAnchorAuthority(now)) {
+        return;
+    }
+    const double graceMs = std::isfinite(config_.schedulerGraceMs)
+        ? std::max(0.0, config_.schedulerGraceMs) : 0.0;
+    const double committedExpiryMs = schedFireDeadlineMs_ + graceMs;
+    if (std::isfinite(committedExpiryMs)
+        && committedExpiryMs > schedFireAuthorityExpiryMs_) {
+        schedFireAuthorityExpiryMs_ = committedExpiryMs;
+    }
+}
+
+void AutomationEngine::notePhaseAnchorCommitRide(const char* site, double now)
+{
+    // One countable "TIP TOKEN HELD" line per committed token (census mirror of TIP TOKEN KILL).
+    if (phaseCommitHeldLoggedToken_ == schedFireToken_) {
+        return;
+    }
+    phaseCommitHeldLoggedToken_ = schedFireToken_;
+    emit engineDiagnostic(QStringLiteral(
+        "TIP TOKEN HELD: site=%1 until_armed_ms=%2 lease_short_ms=%3 token=%4 "
+        "physical_epoch=%5 shot_attempt=%6 vision_epoch_armed=%7 vision_epoch_now=%8")
+                              .arg(QLatin1String(site))
+                              .arg(schedFireDeadlineMs_ - now, 0, 'f', 3)
+                              .arg(std::max(0.0, schedFireDeadlineMs_
+                                                     - schedFireAuthorityExpiryMs_),
+                                   0, 'f', 3)
+                              .arg(schedFireToken_)
+                              .arg(shot_.physicalShotEpoch)
+                              .arg(shot_.armToken)
+                              .arg(schedFireVisionEpoch_)
+                              .arg(shot_.visionEpoch));
+}
+
 bool AutomationEngine::noteTipPredictionInvalid(double now) noexcept
 {
     if (schedFireDeadlineMs_ < 0.0) {
@@ -10101,6 +14117,13 @@ bool AutomationEngine::noteTipPredictionInvalid(double now) noexcept
     if (tipPredictionInvalidSinceMs_ < 0.0 || !std::isfinite(tipPredictionInvalidSinceMs_)
         || tipPredictionInvalidSinceMs_ > now) {
         tipPredictionInvalidSinceMs_ = now;
+    }
+    // A missing/invalid NEW fit is negative evidence, not a contradiction of the past anchor
+    // that dated an already-armed phase token. Preserve that commitment for its original bounded
+    // runway; a later valid fit can still reach the normal positive reschedule path.
+    if (armedPhaseTokenCarriesAnchorAuthority(now)) {
+        notePhaseAnchorCommitRide("prediction_phase_anchor_commit", now);
+        return true;
     }
     // (a) Pre-existing guard, unchanged: a token already inside one cadence of its own deadline
     //     cannot be replaced by anything, so a blink may not revoke it.
@@ -10188,14 +14211,72 @@ bool AutomationEngine::poseReleaseAuthorityCurrent(double atMs) const noexcept
 
 bool AutomationEngine::autonomousLiveMeterTimingEnabled() const noexcept
 {
-    return config_.autonomousVision && !config_.noMeterEnabled;
+    return config_.autonomousVision && !config_.noMeterEnabled && !config_.inputTimedEnabled;
+}
+
+// === [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] ========================================
+//
+// "the no meter part is amazing but inconsistent; standstill shots are great but inconsistent,
+// fades are janky."
+//
+// The blind hold cannot be made consistent on a fade. Its own shot-to-shot spread, measured on
+// the vision path, is rMAD 21 ms on Standstill and 48-50 ms on the fades, while the green window
+// is worth about 16 ms of hold. Half the fades miss by construction, at any slider setting. The
+// meter, on the same rig and the same corpus, graded 38 EXCELLENT of 41 banner-joined shots.
+//
+// So the fix is not a better constant, it is to stop being blind whenever we do not have to be:
+// the blind hold becomes the DEADLINE, and the ordinary vision path — same fences, same ownership
+// proof, same measuredLeadForActuationMs() — owns any release it can actually see. If the in-game
+// meter is genuinely off, no candidate ever appears and every shot is the blind hold, unchanged.
+bool AutomationEngine::noMeterVisionAssistActive() const noexcept
+{
+    // The whole vision stack must be the one the meter path uses. noMeterEnabled is the retired
+    // pose-only lab authority and owns its own release clock; it may never be layered with this.
+    return config_.inputTimedEnabled && config_.noMeterVisionAssist
+        && config_.autonomousVision && !config_.noMeterEnabled;
+}
+
+bool AutomationEngine::noMeterVisionAssistShotActive() const noexcept
+{
+    return shot_.inputTimedShot && shot_.noMeterVisionAssist;
+}
+
+bool AutomationEngine::noMeterVisionCandidateRising(double now) const noexcept
+{
+    if (!shot_.meterSeenThisShot || !shot_.meterDetected) {
+        return false;
+    }
+    // A memory echo is not a candidate: its held fill neither rises nor authorizes anything.
+    // meterReleaseAuthorityCurrent is the SAME strict source-age lease the vision release path
+    // requires, so "rising candidate" can never be a weaker claim than "could be owned".
+    if (!shot_.lastSampleGenuineAccept || !meterReleaseAuthorityCurrent(now)) {
+        return false;
+    }
+    if (!std::isfinite(shot_.fillPct) || shot_.fillPct <= 0.0
+        || shot_.fillPct >= kNoMeterVisionDeferMaxFillPct) {
+        return false;   // nothing left to climb -> no vision release is still coming
+    }
+    // Still at (or within noise of) its own peak. A meter that has fallen away from its peak has
+    // stopped — it is a spent or released meter, not this press's rising one.
+    if (std::isfinite(shot_.peakFillPct)
+        && shot_.fillPct < shot_.peakFillPct - kNoMeterVisionDeferPeakDropPct) {
+        return false;
+    }
+    return true;
 }
 
 bool AutomationEngine::measuredLeadAuthoritative(double atMs) const noexcept
 {
     constexpr double kConvergedPosteriorSdMs = 3.3;
     constexpr double kProvisionalPosteriorSdMs = 6.0;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The hybrid's vision release IS the live-meter
+    // release — same tip decision, same token authority, same lead — so it satisfies this clock
+    // gate for exactly the reason the meter path does. The extra term can only be true while
+    // inputTimedEnabled, which is precisely when autonomousLiveMeterTimingEnabled() is false, so
+    // the METER path's answer here is bit-for-bit unchanged. Kept identical at both sites (see
+    // the userLeadRouteEcho note below: the VALUE may never outrun the GATE).
     const bool clockCompatibilityReady = autonomousLiveMeterTimingEnabled()
+        || noMeterVisionAssistActive()
         || config_.leadRebaselined;
     const bool converged = measuredLatencyN_ >= 6
         && measuredLatencySdMs_ <= kConvergedPosteriorSdMs;
@@ -10336,7 +14417,14 @@ bool AutomationEngine::userLeadAuthorityActive(double atMs) const noexcept
         || config_.measuredLeadFreshnessMs <= 0.0) {
         return false;
     }
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The hybrid's vision release IS the live-meter
+    // release — same tip decision, same token authority, same lead — so it satisfies this clock
+    // gate for exactly the reason the meter path does. The extra term can only be true while
+    // inputTimedEnabled, which is precisely when autonomousLiveMeterTimingEnabled() is false, so
+    // the METER path's answer here is bit-for-bit unchanged. Kept identical at both sites (see
+    // the userLeadRouteEcho note below: the VALUE may never outrun the GATE).
     const bool clockCompatibilityReady = autonomousLiveMeterTimingEnabled()
+        || noMeterVisionAssistActive()
         || config_.leadRebaselined;
     if (!clockCompatibilityReady) {
         return false;
@@ -10455,6 +14543,19 @@ double AutomationEngine::appliedMeterDelayLeadOffsetMs() const noexcept
         || offset > AppConfigData::kMeterDelayLeadOffsetMaxMs) {
         return 0.0;
     }
+    if (std::abs(offset) <= 1e-9) {
+        // [ORION_METER_DELAY_LEAD_AUTO 2026-09-10] 0 = AUTO. The delay holds the visible meter
+        // back by D while the game grades on its own clock, so the release must come D earlier
+        // relative to what we see: the Shot Lead the user tuned with the delay OFF is kept and
+        // the applied delay is added to it. Clamped to the schedulable headroom (visible-evidence
+        // ceiling minus that lead) so a large delay degrades to "as early as the runway allows"
+        // instead of aborting every shot; the UI shows the usable maximum next to the slider.
+        const double lead = (std::isfinite(config_.userActuationLeadMs) && config_.userActuationLeadMs > 0.0)
+            ? config_.userActuationLeadMs : std::max(0.0, measuredLatencyAuthorityMs_);
+        constexpr double kAutoMarginMs = 1000.0 / 60.0;   // one capture frame under the ceiling
+        const double headroom = std::max(0.0, maxSchedulableTipLeadMs() - lead - kAutoMarginMs);
+        return std::min({meterDelayAppliedMs_, headroom, AppConfigData::kMeterDelayLeadOffsetMaxMs});
+    }
     return offset;
 }
 
@@ -10472,6 +14573,185 @@ double AutomationEngine::maxMeterDelayLeadOffsetMs() const noexcept
     return maxSchedulableTipLeadMs() - baseLeadMs;
 }
 
+bool AutomationEngine::rhythmFlickReleasePending() const noexcept
+{
+    // See the header note for the ordering. Each branch answers with the value the OUTPUT path
+    // itself would use at that moment, so the trim is charged to exactly the shots that fire as
+    // a right-stick flick and to no others.
+    if (shot_.state != HoldState::Idle) {
+        // A shot is live: beginShot already chose ShotMode::TempoSquare or ButtonShot from
+        // pendingSquareTempoRemap_ and latched it. Nothing may change it mid-shot, so the mode
+        // IS the answer -- including for a TempoStick shot (not a Square remap; not a flick
+        // trim's business either, and it compares unequal here).
+        return shot_.mode == ShotMode::TempoSquare;
+    }
+    if (squareHoldStartMs_ >= 0.0) {
+        // A physical Square is held but not yet promoted. processSquare() decides Tempo-vs-Button
+        // ONCE per physical edge (a mid-hold flip would manufacture a second input edge, which is
+        // forbidden) and stores it here, so this is already this shot's committed answer -- it
+        // includes the per-type resolution and the bridge-not-live demotion to a plain Button
+        // pass-through, which is precisely the case where the flick trim must NOT apply.
+        return pendingSquareTempoRemap_;
+    }
+    // Nothing pending. Callers in this state are sizing a reservation or reporting a ceiling
+    // before any press exists, so the honest answer is the global Rhythm switch -- the same
+    // expression the UI's orion.tempoEnabled shows, so the number the user sees and the number
+    // the engine schedules with agree.
+    return config_.tempoEnabled || config_.tempoRemapEnabled;
+}
+
+double AutomationEngine::appliedRhythmFlickDelayMs() const noexcept
+{
+    // The retired Rhythm slider must not silently retime Stick output. Keep its
+    // stored field readable for backward compatibility, but use the same lead
+    // for Button, remapped Square, and physical-stick releases, including pending
+    // and already-owned shots. No change to release-edge shape or ownership gates.
+    return 0.0;
+}
+
+// == [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16 owner] =======================================
+// The fixed per-shot-type addition to the Shot Lead. See AppConfigData::leadOffsetLeftFadeMs for
+// the measurement ("standstills basically perfect, all the fades I got were late"; the retraction
+// oracle's 8 standstill gaps 0-2 px vs 7 fade gaps 1-9 px, ~0.9 px/ms). This is the engine's
+// half: which bucket a shot spends, and what it is worth.
+// =======================================================================================
+QString AutomationEngine::shotTypeWithBackstopFadeRetype() const
+{
+    // THE TYPE, with the one correction the engine already trusts. The METER BACKSTOP may have
+    // committed an upgrade-only re-type for this exact physical epoch inside its 200 ms type-grace
+    // window (a fade lean that lands a few frames after the button is typed Standstill at the
+    // edge). Upgrade-only, exactly as the backstop's own rule is: it never downgrades a fade back
+    // to a Standstill. Shared with visionHoldBandForShot so the band's law and this offset can
+    // never disagree about what animation is in flight.
+    QString type = shot_.shotType;
+    if (meterBackstopArmedEpoch_ != 0 && meterBackstopArmedEpoch_ == shot_.physicalShotEpoch
+        && !meterBackstop_.shotType.isEmpty()
+        && type == QLatin1String("Standstill")
+        && meterBackstopTypeIsFade(meterBackstop_.shotType)) {
+        type = meterBackstop_.shotType;
+    }
+    return type;
+}
+
+double AutomationEngine::leadOffsetMsForType(
+    const QString& shotType, orion::BannerLeadTrim::Range range) const noexcept
+{
+    // THE SAME BUCKETS THE BANNER TRIM USES, on purpose: the constant offset and the closed loop
+    // both move the same lead, and two features disagreeing about what counts as a fade would be
+    // the bug. "Other" catches every type this build does not name (Go-To, Post Fade, No Dip, the
+    // Tempo words) rather than fragmenting them into settings nobody tuned.
+    const QString bucket = orion::BannerLeadTrim::bucketFor(shotType);
+    double offsetMs = 0.0;
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17 owner] A MID-RANGE fade takes its own offset
+    // INSTEAD of the +-8 the two fade buckets carry -- "middy fades should perform just as
+    // standstill shots (slightly bigger window)". A three-point fade and an UNKNOWN range both
+    // keep the 8, so an install where the sidecar never reads a range is byte-identical to the
+    // 2026-09-16 build. It is one number for both fades for the same reason the 8 is: the
+    // measurement that produced it did not separate left from right.
+    const bool midFade =
+        config_.bannerTrimRangeBuckets
+        && range == orion::BannerLeadTrim::Range::Mid
+        && orion::BannerLeadTrim::isFadeBucket(bucket);
+    if (midFade) {
+        offsetMs = config_.leadOffsetFadeMidMs;
+    } else if (bucket == QLatin1String("Left Fade")) {
+        offsetMs = config_.leadOffsetLeftFadeMs;
+    } else if (bucket == QLatin1String("Right Fade")) {
+        offsetMs = config_.leadOffsetRightFadeMs;
+    } else if (bucket == QLatin1String("Standstill")) {
+        offsetMs = config_.leadOffsetStandstillMs;
+    } else {
+        offsetMs = config_.leadOffsetOtherMs;
+    }
+    // Belt and braces against a hand-edited file reaching the engine out of band, exactly as the
+    // banner trim re-clamps to the live ceiling: this accessor can only ever hand out a value the
+    // CURRENT settings could have produced.
+    if (!std::isfinite(offsetMs)) {
+        return 0.0;
+    }
+    return std::clamp(offsetMs, AppConfigData::kLeadOffsetByTypeMinMs,
+                      AppConfigData::kLeadOffsetByTypeMaxMs);
+}
+
+double AutomationEngine::appliedLeadOffsetByTypeMs() const noexcept
+{
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17] The LIVE press's own range, exactly as the trim
+    // reads it, so the fixed offset and the closed loop can never disagree about what this shot
+    // is. Unknown before the sidecar's message lands, which is the pre-2026-09-17 answer.
+    const QString type = shotTypeWithBackstopFadeRetype();
+    double offset = leadOffsetMsForType(type, liveShotRange());
+    if (config_.greenWindowPriority && autonomousLiveMeterTimingEnabled()
+        && !shot_.inputTimedShot && !shot_.latencyCalibrationProbe
+        && liveShotRange() != orion::BannerLeadTrim::Range::Mid
+        && orion::BannerLeadTrim::isFadeBucket(orion::BannerLeadTrim::bucketFor(type))) {
+        offset -= std::min(std::max(0.0, offset), shot_.fadeWindowLeadAdvanceRemovedMs);
+    }
+    return offset;
+}
+
+void AutomationEngine::maybeLatchFadeWindowLeadPolicy(bool finalizeUnobserved)
+{
+    // The 09-19 batch exposed failures in the wide-window exemption: three of four fades
+    // with a 3.67pp initial window were EARLY. That exemption re-enabled both
+    // +8ms lead and a -4/-6ms phase trim, advancing these shots by 12/14ms solely
+    // because the initial segmentation was wider. Window size is not evidence
+    // for an earlier physical tip. Apply the existing bounded suppression to
+    // every non-mid fade; do not create another width-dependent deadline step.
+    // Keep the owner's base lead, standstills, known mids, negative offsets,
+    // NO METER and already-armed tokens intact. This is not a new tip estimate.
+    if (shot_.fadeWindowLeadPolicyLatched || !config_.greenWindowPriority
+        || !autonomousLiveMeterTimingEnabled() || shot_.inputTimedShot
+        || shot_.latencyCalibrationProbe || shot_.physicalShotEpoch == 0
+        || (shot_.state != HoldState::Holding && shot_.state != HoldState::GreenWindow)
+        || shot_.anchorValidMs < 0.0 || !shot_.lastSampleGenuineAccept
+        || !shot_.meterDetected || !meterReleaseAuthorityCurrent(nowMs())) {
+        return;
+    }
+    const QString type = shotTypeWithBackstopFadeRetype();
+    if (!orion::BannerLeadTrim::isFadeBucket(orion::BannerLeadTrim::bucketFor(type))) {
+        return;
+    }
+    // Do not alter a copied worker deadline after it has been armed/promoted.
+    if (schedFireDeadlineMs_ >= 0.0 || tipReservation_.promoted) {
+        return;
+    }
+    // Live ownership is often earned at frame2. Waiting for the tracker's
+    // third green reading made this guard unreachable once that first deadline
+    // had armed. Two agreeing observed widths can choose the bounded advance
+    // BEFORE arming; they grant neither ownership nor green release authority.
+    const double width = greenTracker_.timingEvidenceWidthPct();
+    const bool observed = std::isfinite(width) && width > 0.0;
+    if (!observed && !finalizeUnobserved) {
+        return;
+    }
+    // Unmeasured is not wide. Only finalize that fallback at the prediction entry
+    // points; earlier detection updates can still collect a genuine width pair.
+    constexpr double kMaxRemovedAdvanceMs = 8.0;
+    const double offset = leadOffsetMsForType(type, liveShotRange());
+    const double phaseTrim = tipPhaseTypeTrimMs(type);
+    shot_.fadeWindowLeadPolicyLatched = true;
+    if (liveShotRange() != orion::BannerLeadTrim::Range::Mid) {
+        shot_.fadeWindowLeadAdvanceRemovedMs =
+            std::min(kMaxRemovedAdvanceMs, std::max(0.0, offset));
+        // A negative phase trim advances the physical prediction independently of
+        // the positive release lead. Removing only the lead leaves an early bias.
+        shot_.fadeWindowPhaseAdvanceRemovedMs = std::max(0.0, -phaseTrim);
+    }
+    emit engineDiagnostic(QStringLiteral(
+        "FADE WINDOW LEAD: epoch=%1 type=%2 window_pct=%3 removed_advance_ms=%4 "
+        "offset_ms=%5 range=%6 latched=1 evidence=%7 removed_phase_advance_ms=%8 phase_trim_ms=%9 "
+        "policy=uniform_non_mid")
+        .arg(shot_.physicalShotEpoch).arg(type).arg(width, 0, 'f', 2)
+        .arg(shot_.fadeWindowLeadAdvanceRemovedMs, 0, 'f', 2)
+        .arg(offset - shot_.fadeWindowLeadAdvanceRemovedMs, 0, 'f', 2)
+        .arg(orion::BannerLeadTrim::rangeName(liveShotRange()))
+        .arg(!observed ? QStringLiteral("unobserved")
+             : greenTracker_.confirmed() ? QStringLiteral("confirmed")
+                                        : QStringLiteral("observed_pair"))
+        .arg(shot_.fadeWindowPhaseAdvanceRemovedMs, 0, 'f', 2)
+        .arg(tipPhaseTypeTrimMs(type), 0, 'f', 2));
+}
+
 double AutomationEngine::measuredLeadForActuationMs() const noexcept
 {
     // This is deliberately NOT measuredLatencyMs_: ordinary observations may
@@ -10486,7 +14766,11 @@ double AutomationEngine::measuredLeadForActuationMs() const noexcept
     // the pre-existing fail-closed path instead of quietly mistiming. The zero-authority return
     // is deliberately NOT offset: an offset must re-scale an existing lead, never manufacture
     // one (the same fence the user lead itself sits behind).
+    //
+    // The retired per-Rhythm trim accessor now returns zero for every output path.
+    // Keep all existing lead-authority and ownership fences unchanged.
     const double delayOffsetMs = appliedMeterDelayLeadOffsetMs();
+    const double rhythmDelayMs = appliedRhythmFlickDelayMs();
     double lead = std::max(0.0, measuredLatencyAuthorityMs_);
     if (lead <= 0.0) {
         // [ORION_USER_LEAD_AUTHORITY] (default OFF) With no posterior authority, the owner's
@@ -10497,7 +14781,20 @@ double AutomationEngine::measuredLeadForActuationMs() const noexcept
         // driven shot whenever any authority exists, re-checked against the same channel
         // proofs the gate demands, so an unguarded caller gets the gate's guarantees anyway.
         if (userLeadAuthorityActive(nowMs())) {
-            return std::max(0.0, config_.userActuationLeadMs + delayOffsetMs);
+            // [ORION_SESSION_LEAD_PROBE] the session trim rides the user lead only.
+            // [ORION_BANNER_LEAD_TRIM 2026-09-15] ...and so does the banner trim, for the same
+            // reason: the game's TIMING banner grades the TOTAL end-to-end result, which is the
+            // quantity the user's own Shot Lead already expresses. Adding it to an authority that
+            // drifts across a session would make the correction mean something different every
+            // hour. Effective lead = user lead + session trim + banner trim.
+            // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] ...and so does the fixed per-type offset,
+            // for a third version of the same reason: the slider is ONE number for every shot
+            // type, and the 2026-09-16 oracle measured the owner's fades landing ~7-10 ms late on
+            // exactly the value his standstills landed perfectly on. Same buckets as the trim.
+            return std::max(0.0, config_.userActuationLeadMs + delayOffsetMs
+                                     + sessionLeadTrimMs_ + appliedBannerLeadTrimMs()
+                                     + appliedLeadOffsetByTypeMs()
+                                     - rhythmDelayMs);
         }
         return lead;   // no authority -> unschedulable; never invent a lead from a correction
     }
@@ -10518,7 +14815,40 @@ double AutomationEngine::measuredLeadForActuationMs() const noexcept
         && std::isfinite(config_.userActuationLeadMs)
         && config_.userActuationLeadMs >= config_.actuationLeadMinMs
         && config_.userActuationLeadMs <= config_.actuationLeadMaxMs) {
-        return std::max(0.0, config_.userActuationLeadMs + delayOffsetMs);
+        // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] THE SHIPPED PATH'S per-type term. The owner's
+        // slider is one number for every animation; this is the fixed, clamped, per-bucket
+        // difference the 2026-09-16 retraction oracle measured between them (fades ~7-10 ms late
+        // on the same value the standstills landed on). 0 on every bucket restores the 2026-09-16
+        // lead byte-for-byte, which is what ORION_LEAD_OFFSET_BY_TYPE=0 installs.
+        return std::max(0.0, config_.userActuationLeadMs + delayOffsetMs
+                                 + sessionLeadTrimMs_ + appliedBannerLeadTrimMs()
+                                 + appliedLeadOffsetByTypeMs()
+                                 - rhythmDelayMs);
+    }
+    // [ORION_LEAD_AUTO_SEED 2026-09-15 owner] The install that has never been tuned. STRICTLY
+    // BELOW the user branch: the owner's own value is checked first and wins outright, so this
+    // can only be reached while the Shot Lead is still "never configured".
+    //
+    // WHY IT REPLACES THE AUTHORITY, not offsets it. The authority is TRANSPORT alone. The lead
+    // that actually lands is transport + the game-side aim margin (269 - ~200 on the owner's
+    // rig), and the margin is a property of 2K27's shot window rather than of this rig, so a
+    // fresh install that fires on transport alone is ~69 ms late on every shot. The seed is that
+    // same sum, and it is spent through THE SAME expression the user's value is spent through --
+    // identical delay offset, session trim, banner trim and Rhythm delay -- so an auto-seeded
+    // install is a tuned install minus the tuning session, including its closed loop.
+    //
+    // Still strictly INSIDE the "authority exists" branch: with no posterior this function has
+    // already returned 0 above. A seed re-scales an existing lead; it never manufactures one.
+    const double autoSeedMs = appliedLeadAutoSeedMs();
+    if (autoSeedMs > 0.0) {
+        // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] The per-type offset rides the seed for the same
+        // reason the banner trim does: an auto-seeded install is a tuned install minus the tuning
+        // session, and the fade difference is a property of the GAME's animations, not of the
+        // owner's slider -- so it is exactly as true on an install that has never been tuned.
+        return std::max(0.0, autoSeedMs + delayOffsetMs
+                                 + sessionLeadTrimMs_ + appliedBannerLeadTrimMs()
+                                 + appliedLeadOffsetByTypeMs()
+                                 - rhythmDelayMs);
     }
     // Correct the label pipeline's structural short bias (see RemapConfig::autonomousLeadBiasMs).
     // Applied to factory AND learned/validated authority alike: the factory prior is built by
@@ -10538,7 +14868,731 @@ double AutomationEngine::measuredLeadForActuationMs() const noexcept
     // posterior and the factory prior are both transport measurements taken in ONE delay
     // condition, so applying either blind in the other is the exact hazard MeterDelayController.h
     // names. 0 offset (the default, and always at delay 0) leaves this line inert.
-    return std::max(0.0, lead + delayOffsetMs);
+    return std::max(0.0, lead + delayOffsetMs - rhythmDelayMs);
+}
+
+// == [ORION_LEAD_AUTO_SEED 2026-09-15 owner] ============================================
+// The plug-and-play Shot Lead. See AppConfigData::leadAutoSeed for the measurement; this is the
+// engine's half: when the seed stands in for the owner's slider, what it is worth right now, how
+// fast it is allowed to move, and what one change logs.
+// =======================================================================================
+bool AutomationEngine::leadAutoSeedArmed() const noexcept
+{
+    if (!config_.leadAutoSeed) {
+        return false;
+    }
+    // An env lead sweep out-ranks the seed for the identical reason it out-ranks the user's own
+    // Shot Lead: ORION_LEAD_FLOOR_MS / BIAS_MS exist to sweep a lead live, and a value that
+    // REPLACES the lead would silently out-rank the one being swept.
+    if (config_.leadOverrideFromEnv) {
+        return false;
+    }
+    // THE PROMISE. "Configured" is exactly AppConfig's own predicate: the owner moved the control
+    // at some point, OR a value is already installed (which includes the one-time measured seed
+    // written into actuation_lead_ms). Either way the existing in-band replacement path owns the
+    // lead and this one is inert.
+    return !config_.userActuationLeadSet && !(config_.userActuationLeadMs > 0.0);
+}
+
+double AutomationEngine::leadAutoSeedTargetMs(double atMs, QString* kind) const noexcept
+{
+    const double placeholder = std::isfinite(config_.leadFactoryPlaceholderMs)
+        ? config_.leadFactoryPlaceholderMs
+        : 269.0;
+    const double margin = std::isfinite(config_.aimMarginMs) ? config_.aimMarginMs : 69.0;
+    // The POSTERIOR MEAN, not a single observation: measuredLatencyMs_ is the estimator's own
+    // running answer (the same quantity measuredLeadAuthoritative's convergence fence is stated
+    // against), so a single wild label cannot move the lead even before the rate limit sees it.
+    const bool measuredUsable = measuredLeadAuthoritative(atMs)
+        && std::isfinite(measuredLatencyMs_) && measuredLatencyMs_ > 0.0
+        && measuredLatencyMs_ <= 500.0;
+    double target = measuredUsable ? measuredLatencyMs_ + margin : placeholder;
+    if (kind) {
+        *kind = measuredUsable ? QStringLiteral("measured") : QStringLiteral("placeholder");
+    }
+    // Banded against the user control's own sanity envelope. A seed the slider could not have
+    // produced is not a lead, and the unschedulable-lead abort is a far worse answer than the
+    // honest edge of the band.
+    const double lo = std::isfinite(config_.actuationLeadMinMs) ? config_.actuationLeadMinMs : 150.0;
+    const double hi = std::isfinite(config_.actuationLeadMaxMs) ? config_.actuationLeadMaxMs : 800.0;
+    if (!std::isfinite(target)) {
+        target = placeholder;
+    }
+    return std::clamp(target, lo, hi);
+}
+
+double AutomationEngine::appliedLeadAutoSeedMs() const noexcept
+{
+    if (!leadAutoSeedActive_ || !std::isfinite(leadAutoSeedMs_) || leadAutoSeedMs_ <= 0.0) {
+        return 0.0;
+    }
+    // Belt and braces against a band narrowed underneath a standing seed, exactly as the banner
+    // trim re-clamps to the live ceiling: this accessor can only ever hand out a value the
+    // CURRENT settings could have produced.
+    const double lo = std::isfinite(config_.actuationLeadMinMs) ? config_.actuationLeadMinMs : 150.0;
+    const double hi = std::isfinite(config_.actuationLeadMaxMs) ? config_.actuationLeadMaxMs : 800.0;
+    return std::clamp(leadAutoSeedMs_, lo, hi);
+}
+
+void AutomationEngine::updateLeadAutoSeed(double atMs)
+{
+    const bool armed = leadAutoSeedArmed();
+    const double previousMs = leadAutoSeedMs_;
+    const QString previousKind = leadAutoSeedKind_;
+    const bool wasActive = leadAutoSeedActive_;
+    if (!armed) {
+        // The owner's value wins. Drop the whole seed state rather than freezing it: if they
+        // later reset the slider to Auto, the seed must restart from the CURRENT evidence, not
+        // from a value that belonged to a session before their setting existed.
+        leadAutoSeedActive_ = false;
+        leadAutoSeedInitialized_ = false;
+        leadAutoSeedMs_ = 0.0;
+        leadAutoSeedMeasuredMs_ = 0.0;
+        leadAutoSeedKind_.clear();
+        if (wasActive && !previousKind.isEmpty()) {
+            leadAutoSeedLoggedKind_.clear();
+            emit engineDiagnostic(QStringLiteral(
+                "LEAD AUTO SEED: kind=none reason=user_lead_set user_lead_ms=%1")
+                    .arg(config_.userActuationLeadMs, 0, 'f', 0));
+            emit leadAutoSeedUpdated(0.0, 0.0, QString());
+        }
+        return;
+    }
+
+    QString kind;
+    const double targetMs = leadAutoSeedTargetMs(atMs, &kind);
+    leadAutoSeedActive_ = true;
+    leadAutoSeedMeasuredMs_ = (kind == QLatin1String("measured")) ? measuredLatencyMs_ : 0.0;
+
+    bool rateLimited = false;
+    // THE RATE LIMIT AND ITS ONE EXEMPTION. The limit exists so a CONVERGING ESTIMATOR cannot
+    // walk the lead across the green window mid-session: every refinement of an existing seed is
+    // capped at 2 ms per shot. It deliberately does NOT apply to the first value of a session,
+    // nor to the one-time placeholder -> measured adoption, because neither is a refinement:
+    //   * the first value has spent no shot yet, so there is nothing to protect;
+    //   * the placeholder is the absence of a measurement (another rig's converged number).
+    //     Making this install crawl 2 ms at a time toward its OWN first authoritative latency
+    //     would fly eight or more shots on a value already known to be wrong -- the exact
+    //     failure the seed exists to remove.
+    // The transition is announced by the kind line below, so the one step that can be larger
+    // than 2 ms is also the one step that always prints.
+    if (!leadAutoSeedInitialized_ || kind != previousKind) {
+        leadAutoSeedInitialized_ = true;
+        leadAutoSeedMs_ = targetMs;
+    } else {
+        const double delta = targetMs - leadAutoSeedMs_;
+        if (std::abs(delta) > kLeadAutoSeedMaxStepMsPerShot) {
+            leadAutoSeedMs_ += (delta > 0.0 ? 1.0 : -1.0) * kLeadAutoSeedMaxStepMsPerShot;
+            rateLimited = true;
+        } else {
+            leadAutoSeedMs_ = targetMs;
+        }
+    }
+    leadAutoSeedKind_ = kind;
+
+    // ONE line per change of KIND -- placeholder -> measured is the only transition that changes
+    // what the number means, and a line per converging millisecond would bury it.
+    if (leadAutoSeedLoggedKind_ != kind) {
+        leadAutoSeedLoggedKind_ = kind;
+        if (kind == QLatin1String("measured")) {
+            emit engineDiagnostic(QStringLiteral(
+                "LEAD AUTO SEED: kind=measured measured_ms=%1 margin_ms=%2 lead_ms=%3 source=%4")
+                    .arg(measuredLatencyMs_, 0, 'f', 1)
+                    .arg(config_.aimMarginMs, 0, 'f', 1)
+                    .arg(targetMs, 0, 'f', 1)
+                    .arg(config_.leadSourceKey));
+        } else {
+            emit engineDiagnostic(QStringLiteral(
+                "LEAD AUTO SEED: kind=placeholder lead_ms=%1").arg(targetMs, 0, 'f', 1));
+        }
+    }
+    if (rateLimited) {
+        // Said out loud, because a lead that is not yet the value the line above published is
+        // exactly the kind of silent difference a graded batch cannot otherwise account for.
+        emit engineDiagnostic(QStringLiteral(
+            "LEAD AUTO SEED: rate_limited kind=%1 step_ms=%2 lead_ms=%3 target_ms=%4")
+                .arg(kind)
+                .arg(kLeadAutoSeedMaxStepMsPerShot, 0, 'f', 1)
+                .arg(leadAutoSeedMs_, 0, 'f', 1)
+                .arg(targetMs, 0, 'f', 1));
+    }
+    if (!wasActive || previousKind != leadAutoSeedKind_
+        || std::abs(previousMs - leadAutoSeedMs_) > 1e-9) {
+        emit leadAutoSeedUpdated(leadAutoSeedMs_, leadAutoSeedMeasuredMs_, leadAutoSeedKind_);
+    }
+}
+
+// == [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] ==========================================
+// The bounded closed loop from the game's own TIMING banner back onto the Shot Lead. See
+// BannerLeadTrim.h for the measurement and the rules; this is the engine's half: which trim a
+// shot spends, which releases a verdict may be attributed to, and what one application logs.
+// =======================================================================================
+// [ORION_BANNER_TRIM_TEMPO 2026-09-16] The live shot's meter onset. firstMeterSeenMs is the
+// first GENUINE fresh accept for THIS shot -- the same instant `Release timing: appearToRelMs` is
+// measured back from -- so this is the engine's own view of when the meter arrived, on the engine
+// clock, with no new sample and no new instrument. -1 (no tempo) whenever either end is missing:
+// before the meter has appeared, on a blind NO METER release, and on a backstop, all of which
+// file in the reference class exactly as a caller with no onset does.
+double AutomationEngine::liveShotOnsetMs() const noexcept
+{
+    if (!shot_.meterSeenThisShot || shot_.firstMeterSeenMs < 0.0 || shot_.physicalPressMs < 0.0) {
+        return -1.0;
+    }
+    const double onsetMs = shot_.firstMeterSeenMs - shot_.physicalPressMs;
+    return (std::isfinite(onsetMs) && onsetMs >= 0.0) ? onsetMs : -1.0;
+}
+
+// [ORION_BANNER_TRIM_RANGE 2026-09-17] The live press's range, gated on the kill switch in ONE
+// place so nothing downstream has to remember to check it.
+orion::BannerLeadTrim::Range AutomationEngine::liveShotRange() const noexcept
+{
+    return config_.bannerTrimRangeBuckets ? shot_.shotRange
+                                          : orion::BannerLeadTrim::Range::Unknown;
+}
+
+// [ORION_SHOT_RANGE 2026-09-17] The sidecar read the nameplate "3" cell for one press and says
+// whether it was a three or a mid-range shot. THE EPOCH FENCE IS THE WHOLE GUARANTEE: the message
+// lands ~120 ms after the Square edge, but a stalled sidecar could deliver it after the next
+// press has already armed, and a range from a retired shot re-aiming the live one is precisely
+// the class of bug the shot-gate epoch exists to prevent.
+bool AutomationEngine::noteShotRange(quint64 physicalShotEpoch, const QString& range, double conf)
+{
+    if (physicalShotEpoch == 0 || shot_.physicalShotEpoch == 0
+        || physicalShotEpoch != shot_.physicalShotEpoch) {
+        return false;
+    }
+    const orion::BannerLeadTrim::Range parsed = orion::BannerLeadTrim::rangeFromName(range);
+    if (parsed == orion::BannerLeadTrim::Range::Unknown) {
+        return false;   // `unknown` is the sidecar declining to answer; it never CLEARS a reading
+    }
+    shot_.shotRange = parsed;
+    shot_.shotRangeConf = std::isfinite(conf) ? std::clamp(conf, 0.0, 1.0) : 0.0;
+    return true;
+}
+
+double AutomationEngine::appliedBannerLeadTrimMs() const noexcept
+{
+    if (!config_.bannerLeadTrim) {
+        return 0.0;
+    }
+    // The LIVE shot's own bucket. ShotContext::shotType defaults to "Standstill" and is never
+    // empty, and the type is upgraded (Standstill -> fade) before any release, so a shot spends
+    // the trim its own animation earned rather than the reference bucket's.
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] ...and its own TEMPO sub-bucket, for the same reason
+    // one step further in: the 2026-09-16 21:00 evidence is that a quick press and a normal one
+    // are different animations with windows ~40 ms apart, so one trim across both is the bug.
+    // The onset is known from the moment the meter is accepted, which is strictly before the
+    // reservation this value is spent on; before that there is no tempo and this reads the
+    // reference sub-bucket, which is the honest answer rather than a guessed one.
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17] ...and, on a FADE, its own RANGE sub-bucket one step
+    // further in again. A range that never arrives reads the (type, tempo) bucket exactly as it
+    // did before, which is what makes the feature invisible on an install that cannot measure it.
+    const double trimMs = bannerLeadTrim_.trimMsForType(
+        shot_.shotType,
+        config_.bannerTrimTempoBuckets
+            ? orion::BannerLeadTrim::tempoFor(shot_.shotType, liveShotOnsetMs())
+            : orion::BannerLeadTrim::Tempo::Normal,
+        liveShotRange());
+    if (!std::isfinite(trimMs)) {
+        return 0.0;
+    }
+    // Belt and braces against a clamp lowered underneath a standing trim: this accessor can only
+    // ever hand out a value the CURRENT setting could have produced.
+    const double bound = std::max(0.0, config_.bannerTrimMaxMs);
+    return std::clamp(trimMs, -bound, bound);
+}
+
+QString AutomationEngine::bannerLeadTrimSummary() const
+{
+    const QMap<QString, double> all = bannerLeadTrim_.snapshot();
+    QStringList parts;
+    for (auto it = all.constBegin(); it != all.constEnd(); ++it) {
+        QString type = it.key();
+        type.replace(QLatin1Char(' '), QLatin1Char('_'));
+        parts << QStringLiteral("%1=%2%3")
+                     .arg(type,
+                          it.value() >= 0.0 ? QStringLiteral("+") : QStringLiteral("-"),
+                          QString::number(std::abs(it.value()), 'f', 1));
+    }
+    return parts.isEmpty() ? QStringLiteral("trims=none")
+                           : QStringLiteral("trims=%1").arg(parts.join(QLatin1Char(',')));
+}
+
+void AutomationEngine::noteBannerTrimRelease(quint64 physicalShotEpoch, const QString& shotType,
+                                            double onsetMs,
+                                            orion::BannerLeadTrim::Range range)
+{
+    if (!config_.bannerLeadTrim || physicalShotEpoch == 0) {
+        return;
+    }
+    for (const BannerTrimRelease& entry : bannerTrimReleases_) {
+        if (entry.physicalShotEpoch == physicalShotEpoch) {
+            return;   // one release per epoch, exactly as the shot-gate fence guarantees
+        }
+    }
+    BannerTrimRelease entry;
+    entry.physicalShotEpoch = physicalShotEpoch;
+    entry.shotType = shotType.trimmed().isEmpty() ? QStringLiteral("Standstill")
+                                                  : shotType.trimmed();
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] Stamped at the release, while the shot that produced
+    // it still exists. Anything else would read the onset of whatever is on screen when the
+    // banner lands 2.5-3 s later -- the same failure the shot TYPE on this ring already avoids.
+    entry.onsetMs = (std::isfinite(onsetMs) && onsetMs >= 0.0) ? onsetMs : -1.0;
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17] Stamped here for the same reason the onset is.
+    entry.range = range;
+    bannerTrimReleases_.append(entry);
+    while (bannerTrimReleases_.size() > kBannerTrimReleaseRing) {
+        bannerTrimReleases_.removeFirst();
+    }
+}
+
+bool AutomationEngine::peekBannerTrimRelease(quint64 physicalShotEpoch, QString& shotType,
+                                            double& onsetMs,
+                                            orion::BannerLeadTrim::Range* range) const
+{
+    for (int i = bannerTrimReleases_.size() - 1; i >= 0; --i) {
+        if (bannerTrimReleases_.at(i).physicalShotEpoch == physicalShotEpoch) {
+            shotType = bannerTrimReleases_.at(i).shotType;
+            onsetMs = bannerTrimReleases_.at(i).onsetMs;
+            if (range != nullptr) {
+                *range = bannerTrimReleases_.at(i).range;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AutomationEngine::consumeBannerTrimRelease(quint64 physicalShotEpoch, QString& shotType,
+                                                double& onsetMs,
+                                                orion::BannerLeadTrim::Range* range)
+{
+    for (int i = bannerTrimReleases_.size() - 1; i >= 0; --i) {
+        if (bannerTrimReleases_.at(i).physicalShotEpoch == physicalShotEpoch) {
+            shotType = bannerTrimReleases_.at(i).shotType;
+            onsetMs = bannerTrimReleases_.at(i).onsetMs;
+            if (range != nullptr) {
+                *range = bannerTrimReleases_.at(i).range;
+            }
+            // One move per release: a re-read panel, or a banner arriving behind an oracle that
+            // already spent the epoch, must never move the trim twice.
+            bannerTrimReleases_.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+void AutomationEngine::observeBannerVerdict(quint64 releaseSeq, const QString& timing)
+{
+    observeBannerVerdict(releaseSeq, timing, QString());
+}
+
+void AutomationEngine::observeBannerVerdict(quint64 releaseSeq, const QString& timing,
+                                            const QString& coverage, bool hasCoverage)
+{
+    if (!config_.bannerLeadTrim || timing.trimmed().isEmpty()) {
+        return;
+    }
+    // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] BANNER PRECEDENCE, and it is enforced HERE rather
+    // than in the sweep: a parked oracle for this epoch is dropped the moment a verdict for it
+    // arrives, so the two can never both move the trim for one shot. The banner wins because it
+    // is the only instrument that knows which SIDE of the window the release landed on -- the
+    // oracle's descent has to discover that over three shots.
+    for (int i = pendingReleaseOracles_.size() - 1; i >= 0; --i) {
+        if (pendingReleaseOracles_.at(i).physicalShotEpoch == releaseSeq) {
+            emit engineDiagnostic(QStringLiteral(
+                "ORACLE: epoch=%1 gap_px=%2 proxy=%3 bucket=%4 used=0 reason=banner_precedence"
+                " tempo=%5 onset_ms=%6")
+                    .arg(releaseSeq)
+                    .arg(QString::number(pendingReleaseOracles_.at(i).gapPx, 'f', 1),
+                         pendingReleaseOracles_.at(i).green ? QStringLiteral("green")
+                                                            : QStringLiteral("miss"),
+                         orion::BannerLeadTrim::bucketFor(
+                             pendingReleaseOracles_.at(i).shotType),
+                         orion::BannerLeadTrim::tempoName(
+                             config_.bannerTrimTempoBuckets
+                                 ? orion::BannerLeadTrim::tempoFor(
+                                       pendingReleaseOracles_.at(i).shotType,
+                                       pendingReleaseOracles_.at(i).onsetMs)
+                                 : orion::BannerLeadTrim::Tempo::Normal),
+                         QString::number(pendingReleaseOracles_.at(i).onsetMs, 'f', 0)));
+            pendingReleaseOracles_.removeAt(i);
+        }
+    }
+    // ATTRIBUTION IS THE WHOLE GUARANTEE. The caller has already dropped `attributed=0`; this is
+    // the engine's own half of it -- the panel must belong to a release THIS engine made, or the
+    // loop would be tuned by replay screens and by shots the owner took by hand. Matching on the
+    // shot-gate epoch also carries the shot TYPE, which is what makes the per-type buckets real.
+    QString shotType;
+    double onsetMs = -1.0;
+    orion::BannerLeadTrim::Range shotRange = orion::BannerLeadTrim::Range::Unknown;
+    const bool matched = consumeBannerTrimRelease(releaseSeq, shotType, onsetMs, &shotRange);
+    if (!matched) {
+        emit engineDiagnostic(QStringLiteral(
+            "BANNER TRIM: ignored reason=no_matching_release release_seq=%1 verdict=%2")
+                .arg(releaseSeq)
+                .arg(timing.trimmed().toUpper().left(32)));
+        return;
+    }
+
+    orion::BannerLeadTrimLimits limits;
+    limits.stepMs = config_.bannerTrimStepMs;
+    limits.maxMs = config_.bannerTrimMaxMs;
+    limits.holdShots = config_.bannerTrimHoldShots;
+    limits.tempoBuckets = config_.bannerTrimTempoBuckets;
+    limits.rangeBuckets = config_.bannerTrimRangeBuckets;
+    // [ORION_BANNER_TRIM_BIAS 2026-09-19] The net-vote integrator's two limits, handed in
+    // per call like every other limit here so a settings change takes effect on the next
+    // verdict without the policy holding a copy of the config.
+    limits.biasWindow = config_.bannerTrimBiasWindow;
+    limits.biasVotes = config_.bannerTrimBiasVotes;
+    const QString coverageWord = coverage.simplified().toUpper();
+    const bool coverageOpen = (coverageWord == QLatin1String("OPEN")
+                               || coverageWord == QLatin1String("WIDE OPEN"));
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19 owner] The panel had no coverage CELL, which is a
+    // statement about its LAYOUT and not about a word that failed to resolve: the game's 2-cell
+    // TIMING | DISTANCE panel has none and never will, and it was 98 of the 281 graded releases
+    // across the 2026-09-18 sessions. No coverage cell means no defender context, i.e. nothing
+    // shrinking the window -- which is exactly what the OPEN gate is testing for -- so it
+    // calibrates. The sidecar reports the layout separately from the content
+    // (banner_verdict_live.py `has_coverage`), so an UNREADABLE cell on a 3-cell panel arrives
+    // here as hasCoverage=true with an empty word and is excluded exactly as it was.
+    const bool coverageAbsentOpen = !hasCoverage && config_.bannerTrimAbsentCoverageOpen;
+    if (!coverageOpen && !coverageAbsentOpen) {
+        // A contest changes the window; its timing error is not evidence that the
+        // open-shot lead moved. Unknown is not open. Consume the joined epoch AND
+        // its parked oracle above before refusing it, so neither a duplicate panel
+        // nor the weaker visual proxy can later train on the excluded shot.
+        // An unclassified observation also breaks directional hysteresis without
+        // stepping or decaying the correction that open shots already earned.
+        bannerLeadTrim_.observe(shotType, QStringLiteral("COVERAGE_EXCLUDED"),
+                                limits, onsetMs, shotRange);
+        emit engineDiagnostic(QStringLiteral(
+            "BANNER TRIM: ignored reason=coverage_not_open release_seq=%1 "
+            "verdict=%2 coverage=%3")
+                .arg(releaseSeq)
+                .arg(timing.trimmed().toUpper().left(32))
+                .arg(coverageWord.isEmpty() ? QStringLiteral("unknown")
+                                           : coverageWord.left(32)));
+        return;
+    }
+    if (coverageAbsentOpen) {
+        // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19] The counterpart of `reason=coverage_not_open`
+        // above, and the reason it gets a line of its own: this is the ONE case where the gate
+        // admits a panel that carries no coverage word, so a session has to be greppable for
+        // "how much of this trim came from panels with no coverage cell". `coverage=-` because
+        // there is no cell to name.
+        emit engineDiagnostic(QStringLiteral(
+            "BANNER TRIM: calibrating reason=coverage_absent release_seq=%1 verdict=%2 "
+            "coverage=-")
+                .arg(releaseSeq)
+                .arg(timing.trimmed().toUpper().left(32)));
+    }
+    const orion::BannerLeadTrim::Application applied =
+        bannerLeadTrim_.observe(shotType, timing, limits, onsetMs, shotRange);
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] Appended to BOTH exits below, so the two fields mean
+    // the same thing on a line that moved the trim and on one that refused to.
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17] ` range=` is APPENDED after them, last and on both
+    // exits, so every existing key=value reader is unaffected and `type/tempo/range` -- the map
+    // key this verdict actually moved -- is readable off the line. It prints `unknown` on every
+    // non-fade and on a fade the sidecar could not read, which is the same word the message
+    // carries, so a session can be grepped for "how often did the range arrive at all".
+    const QString tempoSuffix =
+        QStringLiteral(" tempo=%1 onset_ms=%2 range=%3")
+            .arg(orion::BannerLeadTrim::tempoName(applied.tempo),
+                 QString::number(applied.onsetMs, 'f', 0),
+                 orion::BannerLeadTrim::rangeName(applied.range));
+    if (!applied.applied) {
+        // [ORION_BANNER_TRIM_ALTERNATION 2026-09-16] ONE exception to "a refusal gets no line":
+        // an alternation is the thing this guard exists to catch, and a session that alternated
+        // for ten shots must not read identically to one that graded nothing. Every other refusal
+        // (`evidence`, `hold`, `clamped`) is still silent -- a line per good shot would bury the
+        // ones that moved. The line SHAPE is the one below, field for field.
+        if (applied.reason == QLatin1String("alternating")) {
+            const bool alternatingUserLead = config_.userActuationLeadMs > 0.0;
+            const double alternatingBaseMs = alternatingUserLead ? config_.userActuationLeadMs
+                                                                 : appliedLeadAutoSeedMs();
+            emit engineDiagnostic(QStringLiteral(
+                "BANNER TRIM: verdict=%1 type=%2 trim_ms=+0.0 -> %3%4 recent=%5 user_lead=%6 "
+                "effective=%7 lead_base=%8 source=banner lead_offset_ms=%9 reason=alternating")
+                    .arg(timing.trimmed().toUpper().left(32),
+                         applied.type,
+                         applied.afterMs >= 0.0 ? QStringLiteral("+") : QStringLiteral("-"),
+                         QString::number(std::abs(applied.afterMs), 'f', 1),
+                         applied.recent,
+                         QString::number(alternatingBaseMs, 'f', 0),
+                         QString::number(alternatingBaseMs + applied.afterMs, 'f', 0),
+                         alternatingUserLead ? QStringLiteral("user") : QStringLiteral("auto"),
+                         QString::number(leadOffsetMsForType(applied.type, applied.range),
+                                         'f', 1))
+                + tempoSuffix);
+        }
+        return;   // recorded as evidence; hysteresis (or the clamp) refused the move
+    }
+    const double deltaMs = applied.afterMs - applied.beforeMs;
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] The BASE the trim actually rides. On a tuned install this
+    // is the owner's own value and the line is byte-identical to before; on an untuned one the
+    // trim rides the auto seed, and printing 0 there would make `effective` read "3" for a shot
+    // that flew at 273. lead_base names which it was, append-only.
+    const bool userConfigured = config_.userActuationLeadMs > 0.0;
+    const double baseLeadMs = userConfigured ? config_.userActuationLeadMs
+                                             : appliedLeadAutoSeedMs();
+    // [ORION_BANNER_TRIM_BIAS 2026-09-19] The integrator's own three fields, and ONLY on a line
+    // it produced: every other BANNER TRIM line is byte-identical to the 2026-09-17 build. They
+    // sit straight after `reason=bias_votes` because they are that reason's evidence -- what the
+    // window held when the vote fired -- and every field on this line is key=value, so the
+    // tools/timing readers are unaffected by where they land.
+    const QString biasSuffix = (applied.reason == QLatin1String("bias_votes"))
+        ? QStringLiteral(" late=%1 early=%2 window=%3")
+              .arg(applied.biasLate).arg(applied.biasEarly).arg(applied.biasDepth)
+        : QString();
+    emit engineDiagnostic(QStringLiteral(
+        // APPEND-ONLY field order, like every other structured line here, and `verdict` first so
+        // `grep "BANNER TRIM: verdict=LATE"` is a census of one direction.
+        // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] `source=` is APPENDED, so every existing reader
+        // of this line is unaffected and `grep "BANNER TRIM: .* source=oracle"` is a census of
+        // the banner-free half.
+        // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] `lead_offset_ms` is APPENDED: the fixed per-type
+        // term THIS bucket also carries, so `effective` (base + trim) and the lead the bucket
+        // actually flies (base + trim + offset) are both readable off one line. It is deliberately
+        // NOT folded into `effective`: the two corrections have different owners -- the offset is
+        // a setting, the trim is evidence -- and a single merged number would hide which moved.
+        // [ORION_BANNER_TRIM_HOLD 2026-09-16] `reason` is APPENDED, last, for the same reason
+        // every field before it was: `step` on a LATE/EARLY and `idle_decay` on the slow bleed
+        // that starts only after banner_trim_hold_shots consecutive EXCELLENTs. A HELD EXCELLENT
+        // never reaches this line at all -- it moved nothing, and a log line for "nothing
+        // happened" on every good shot would bury the ones that did.
+        // [ORION_BANNER_TRIM_TEMPO 2026-09-16] `tempo` and `onset_ms` are APPENDED, last and in
+        // that order (key=value parsers are unaffected; every field above keeps its position).
+        // `type` is still the SHOT-TYPE bucket and `tempo` is the sub-bucket inside it, so the map
+        // key this verdict actually moved is `type/tempo`; onset_ms is the measurement the tempo
+        // was read from (-1 = the shot carried none, which files in `normal`). With
+        // ORION_BANNER_TRIM_TEMPO=0 every line reads `tempo=normal` and the keying is by type
+        // alone, exactly as it was on 2026-09-16.
+        "BANNER TRIM: verdict=%1 type=%2 trim_ms=%3%4 -> %5%6 recent=%7 user_lead=%8 "
+        "effective=%9 lead_base=%10 source=banner lead_offset_ms=%11 reason=%12")
+            .arg(timing.trimmed().toUpper().left(32),
+                 applied.type,
+                 deltaMs >= 0.0 ? QStringLiteral("+") : QStringLiteral("-"),
+                 QString::number(std::abs(deltaMs), 'f', 1),
+                 applied.afterMs >= 0.0 ? QStringLiteral("+") : QStringLiteral("-"),
+                 QString::number(std::abs(applied.afterMs), 'f', 1),
+                 applied.recent,
+                 QString::number(baseLeadMs, 'f', 0),
+                 QString::number(baseLeadMs + applied.afterMs, 'f', 0),
+                 userConfigured ? QStringLiteral("user") : QStringLiteral("auto"),
+                 // The GRADED shot's own bucket, not the live shot's: this line is about the
+                 // release the banner just judged, and appliedLeadOffsetByTypeMs() would answer
+                 // for whatever is on screen 2.5-3 s later.
+                 QString::number(leadOffsetMsForType(applied.type, applied.range), 'f', 1),
+                 applied.reason)
+        + biasSuffix + tempoSuffix);
+    emit bannerLeadTrimUpdated(bannerLeadTrim_.snapshot());
+}
+
+// == [ORION_RELEASE_ORACLE_TRIM 2026-09-15 owner] =======================================
+// The banner-free half. See BannerLeadTrim.h for the descent and for the 09-15 forensics
+// (retraction gap <= 3 px = EXCELLENT, >= 4 px = a miss, 27/27 vs panel_grade, 25/25 vs the
+// live banner). This is the engine's half: which oracles are attributable, how long a banner
+// may still claim the shot, and what one application logs.
+// =======================================================================================
+void AutomationEngine::observeReleaseOracle(quint64 releaseSeq, double gapPx,
+                                            const QString& verdictProxy)
+{
+    // The sweep runs first on every message: an oracle arriving now is proof that ~a shot ago
+    // has passed, which is exactly when the previous shot's grace has run out. Production also
+    // pumps it from process(), so the LAST shot of a session is not left parked forever.
+    flushExpiredReleaseOracles(nowMs());
+    if (!config_.bannerLeadTrim) {
+        return;   // the whole loop is off; not even a log line, exactly as a verdict gets none
+    }
+    const QString proxy = verdictProxy.trimmed().toLower();
+    const bool green = proxy == QLatin1String("green");
+    const bool miss = proxy == QLatin1String("miss");
+    QString shotType;
+    double onsetMs = -1.0;
+    orion::BannerLeadTrim::Range shotRange = orion::BannerLeadTrim::Range::Unknown;
+    const bool matched = peekBannerTrimRelease(releaseSeq, shotType, onsetMs, &shotRange);
+    const QString bucket = matched ? orion::BannerLeadTrim::bucketFor(shotType)
+                                   : QStringLiteral("-");
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] The sub-bucket this oracle would be filed in. "-" on
+    // an unattributed message, for the same reason `bucket` is: there is no shot to have a tempo.
+    const QString tempo = matched
+        ? orion::BannerLeadTrim::tempoName(
+              config_.bannerTrimTempoBuckets
+                  ? orion::BannerLeadTrim::tempoFor(shotType, onsetMs)
+                  : orion::BannerLeadTrim::Tempo::Normal)
+        : QStringLiteral("-");
+
+    // ONE LINE PER MESSAGE, drop or not, so a session log answers "did the reader grade this
+    // shot, and did the engine use it?" without inference. `reason` names the refusal.
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] `tempo` and `onset_ms` are APPENDED, last and in that
+    // order; every field before them keeps its position.
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17] ` range=` is APPENDED last; "-" on an unattributed
+    // message for the same reason `bucket` and `tempo` are.
+    const QString rangeWord =
+        matched ? orion::BannerLeadTrim::rangeName(
+                      config_.bannerTrimRangeBuckets
+                          ? orion::BannerLeadTrim::rangeFor(shotType, shotRange)
+                          : orion::BannerLeadTrim::Range::Unknown)
+                : QStringLiteral("-");
+    auto report = [&](bool used, const QString& reason) {
+        emit engineDiagnostic(QStringLiteral(
+            "ORACLE: epoch=%1 gap_px=%2 proxy=%3 bucket=%4 used=%5 reason=%6"
+            " tempo=%7 onset_ms=%8 range=%9")
+                .arg(releaseSeq)
+                .arg(QString::number(std::isfinite(gapPx) ? gapPx : -1.0, 'f', 1),
+                     proxy.isEmpty() ? QStringLiteral("-") : proxy.left(16),
+                     bucket)
+                .arg(used ? 1 : 0)
+                .arg(reason, tempo, QString::number(onsetMs, 'f', 0), rangeWord));
+    };
+
+    if (!green && !miss) {
+        // "unknown" is the reader saying it could not measure the retraction (a ghost meter, a
+        // clipped top strip, a shot whose meter never settled). Evidence of nothing: it must not
+        // enter the series, because a fabricated gap would move the median it is compared to.
+        report(false, QStringLiteral("unknown_proxy"));
+        return;
+    }
+    if (!std::isfinite(gapPx) || gapPx < 0.0) {
+        report(false, QStringLiteral("bad_gap"));
+        return;
+    }
+    if (!matched) {
+        // Same fence as the banner: an oracle for an epoch this engine did not release graded a
+        // shot that is not ours.
+        report(false, QStringLiteral("no_matching_release"));
+        return;
+    }
+    for (const PendingReleaseOracle& parked : pendingReleaseOracles_) {
+        if (parked.physicalShotEpoch == releaseSeq) {
+            report(false, QStringLiteral("already_parked"));
+            return;   // one oracle per release, the same fence the banner has
+        }
+    }
+
+    PendingReleaseOracle entry;
+    entry.physicalShotEpoch = releaseSeq;
+    entry.shotType = shotType;
+    entry.onsetMs = onsetMs;
+    entry.range = shotRange;
+    entry.gapPx = gapPx;
+    entry.green = green;
+    entry.dueMs = nowMs() + kReleaseOracleBannerGraceMs;
+    pendingReleaseOracles_.append(entry);
+    while (pendingReleaseOracles_.size() > kBannerTrimReleaseRing) {
+        pendingReleaseOracles_.removeFirst();
+    }
+    report(true, QStringLiteral("queued"));
+}
+
+void AutomationEngine::flushExpiredReleaseOracles(double atMs)
+{
+    // process() and observeReleaseOracle() both pump this queue. Enforce the
+    // switch at the consumer too, before any evidence or persisted trim moves.
+    if (!config_.bannerLeadTrim) {
+        pendingReleaseOracles_.clear();
+        bannerTrimReleases_.clear();
+        return;
+    }
+    if (pendingReleaseOracles_.isEmpty()) {
+        return;
+    }
+    const bool userConfigured = config_.userActuationLeadMs > 0.0;
+    const double baseLeadMs = userConfigured ? config_.userActuationLeadMs
+                                             : appliedLeadAutoSeedMs();
+    bool moved = false;
+    for (int i = 0; i < pendingReleaseOracles_.size();) {
+        const PendingReleaseOracle parked = pendingReleaseOracles_.at(i);
+        if (std::isfinite(atMs) && atMs < parked.dueMs) {
+            ++i;
+            continue;   // a banner may still claim this shot
+        }
+        pendingReleaseOracles_.removeAt(i);
+        // Spend the release only NOW. Between the oracle arriving and this moment the entry was
+        // still available to a banner verdict, which is what makes precedence real rather than a
+        // race.
+        QString shotType;
+        double onsetMs = -1.0;
+        orion::BannerLeadTrim::Range shotRange = orion::BannerLeadTrim::Range::Unknown;
+        if (!consumeBannerTrimRelease(parked.physicalShotEpoch, shotType, onsetMs, &shotRange)) {
+            emit engineDiagnostic(QStringLiteral(
+                "ORACLE: epoch=%1 gap_px=%2 proxy=%3 bucket=%4 used=0 reason=release_spent"
+                " tempo=%5 onset_ms=%6 range=%7")
+                    .arg(parked.physicalShotEpoch)
+                    .arg(QString::number(parked.gapPx, 'f', 1),
+                         parked.green ? QStringLiteral("green") : QStringLiteral("miss"),
+                         orion::BannerLeadTrim::bucketFor(parked.shotType),
+                         orion::BannerLeadTrim::tempoName(
+                             config_.bannerTrimTempoBuckets
+                                 ? orion::BannerLeadTrim::tempoFor(parked.shotType, parked.onsetMs)
+                                 : orion::BannerLeadTrim::Tempo::Normal),
+                         QString::number(parked.onsetMs, 'f', 0),
+                         orion::BannerLeadTrim::rangeName(
+                             config_.bannerTrimRangeBuckets
+                                 ? orion::BannerLeadTrim::rangeFor(parked.shotType, parked.range)
+                                 : orion::BannerLeadTrim::Range::Unknown)));
+            continue;
+        }
+        orion::BannerLeadTrimLimits limits;
+        limits.stepMs = config_.bannerTrimStepMs;
+        limits.maxMs = config_.bannerTrimMaxMs;
+        limits.holdShots = config_.bannerTrimHoldShots;
+        limits.tempoBuckets = config_.bannerTrimTempoBuckets;
+        limits.rangeBuckets = config_.bannerTrimRangeBuckets;
+        // [ORION_BANNER_TRIM_BIAS 2026-09-19] Same two limits on the oracle path: the
+        // integrator is a BANNER rule (the oracle is unsigned and has no votes to cast),
+        // but the limits travel with the struct so both paths read one config.
+        limits.biasWindow = config_.bannerTrimBiasWindow;
+        limits.biasVotes = config_.bannerTrimBiasVotes;
+        const orion::BannerLeadTrim::OracleApplication applied =
+            bannerLeadTrim_.observeOracle(shotType, parked.gapPx, parked.green, limits, onsetMs,
+                                          shotRange);
+        if (!applied.applied) {
+            continue;   // recorded as evidence; the batch, the deadband or the clamp refused it
+        }
+        moved = true;
+        const double deltaMs = applied.afterMs - applied.beforeMs;
+        emit engineDiagnostic(QStringLiteral(
+            // The SAME prefix and the SAME first eight fields as the banner line, so one grep
+            // reads both halves of the loop; `source=oracle` and the four descent fields after
+            // it are append-only. `verdict=` is GREEN/MISS, never LATE/EARLY: the oracle is
+            // unsigned and must not be readable as a direction.
+            // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] `lead_offset_ms` is APPENDED here too, for
+            // the same reason and with the same meaning as on the banner line: the fixed per-type
+            // term this bucket also carries, kept out of `effective` so the setting and the
+            // evidence stay separable.
+            // [ORION_BANNER_TRIM_TEMPO 2026-09-16] `tempo` and `onset_ms` are APPENDED last,
+            // the same two fields in the same order as on the banner-sourced line above.
+            "BANNER TRIM: verdict=%1 type=%2 trim_ms=%3%4 -> %5%6 recent=%7 user_lead=%8 "
+            "effective=%9 lead_base=%10 source=oracle gap_px=%11 median_gap_px=%12 dir=%13%14 "
+            "flip=%15 reason=%16 lead_offset_ms=%17 tempo=%18 onset_ms=%19 range=%20")
+                .arg(parked.green ? QStringLiteral("GREEN") : QStringLiteral("MISS"),
+                     applied.type,
+                     deltaMs >= 0.0 ? QStringLiteral("+") : QStringLiteral("-"),
+                     QString::number(std::abs(deltaMs), 'f', 1),
+                     applied.afterMs >= 0.0 ? QStringLiteral("+") : QStringLiteral("-"),
+                     QString::number(std::abs(applied.afterMs), 'f', 1),
+                     applied.recent,
+                     QString::number(baseLeadMs, 'f', 0),
+                     QString::number(baseLeadMs + applied.afterMs, 'f', 0),
+                     userConfigured ? QStringLiteral("user") : QStringLiteral("auto"))
+                .arg(QString::number(applied.gapPx, 'f', 1),
+                     QString::number(applied.medianGapPx, 'f', 1),
+                     applied.direction >= 0 ? QStringLiteral("+") : QStringLiteral("-"),
+                     QString::number(std::abs(applied.direction)),
+                     applied.flipped ? QStringLiteral("1") : QStringLiteral("0"),
+                     applied.reason,
+                     QString::number(leadOffsetMsForType(applied.type, applied.range), 'f', 1))
+                .arg(orion::BannerLeadTrim::tempoName(applied.tempo),
+                     QString::number(applied.onsetMs, 'f', 0),
+                     orion::BannerLeadTrim::rangeName(applied.range)));
+    }
+    if (moved) {
+        emit bannerLeadTrimUpdated(bannerLeadTrim_.snapshot());
+    }
 }
 
 double AutomationEngine::autonomousGreenCenterOffsetMs(double slopePctPerMs)
@@ -10719,8 +15773,12 @@ bool AutomationEngine::contestedTipDeadlineOutrunByMeasuredRunway(
         // IS the sampler, so proving runway from the sampler would be circular.
         return false;
     }
-    // Same width bar the flat guard uses. Two noisy points are not a measurement of motion.
-    if (fit.n < kMinSamplesToJudgeMeterMotion || !std::isfinite(fit.slopePctPerMs)
+    // Three is safe here (two is not): this source label is emitted only after the sampler has
+    // already passed liveMeterCrossingAuthoritative(), whose three-sample gate also requires a
+    // real >=8 ms span, physical slope, bounded residual, and a future crossing.  Requiring four
+    // here contradicted that upstream authority contract and killed live epoch 30 on its first
+    // authoritative three-frame fit even though the measured runway still exceeded the lead.
+    if (fit.n < kMinSamplesForContestedRunway || !std::isfinite(fit.slopePctPerMs)
         || fit.slopePctPerMs < kProvenRiseSlopePctPerMs
         // Upper bound mirrors liveMeterCrossingAuthoritative()'s physical plausibility ceiling:
         // a near-vertical "slope" is a detector artefact, and an artefact must never be able to
@@ -10794,7 +15852,22 @@ void AutomationEngine::updateAutonomousTipReservation(
         cancelAutonomousTipReservation(QStringLiteral("identity_changed"));
     }
 
-    const double fireAtMs = decision.tipAbsMs - leadMs;
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] The reservation plans against the SAME target the
+    // submission path will aim at, for the same reason it plans against the same lead: if the two
+    // disagreed about where the command is due, every runway/armable judgement below would be
+    // about a deadline that never gets armed. Inert (returns tipAbsMs unchanged) with the flag
+    // off or the shot's game-frame grid unlocked.
+    QString fireTargetMode;
+    double fireFrameOffsetMs = 0.0;
+    const double fireTargetMs =
+        phaseAlignedFireTargetMs(decision.tipAbsMs, &fireTargetMode, &fireFrameOffsetMs);
+    // [ORION_VISION_HOLD_BAND 2026-09-15] The reservation plans against the SAME instant the
+    // submission path will fire at, for exactly the reason it plans against the same lead and the
+    // same frame-centred target: if the two disagreed about where the command is due, every
+    // runway and armable judgement below would be about a deadline that never gets armed. The
+    // reservation's own tip_eta is deliberately NOT clamped -- that field is the PREDICTION, and
+    // the prediction is what the band exists to leave alone.
+    const double fireAtMs = clampVisionFireToHoldBand(fireTargetMs - leadMs, leadMs);
     const bool created = !tipReservation_.active;
     if (created) {
         const auto attestation = controllerDeliveryRouteAttestationSnapshot();
@@ -10856,10 +15929,19 @@ void AutomationEngine::updateAutonomousTipReservation(
             "fill_pct=%10 frame_age_ms=%11 physical_epoch=%12 shot_attempt=%13 updates=%14 "
             // [ORION_HORIZON_DEBIAS] APPEND-ONLY (key=value parsers are unaffected; existing
             // fields keep their positions). horizon_debias_ms = ms subtracted from the raw
-            // sampler crossing this decision. It pivots on lead_ms (field 6), so on the
-            // reservation that actually fires it must be ~0 — that is the check which proves
-            // the already-learned lead was not silently invalidated. Larger values appear only
-            // on early, long-horizon updates, which is exactly where the bias lives.
+            // sampler crossing this decision. It pivots on lead_ms (field 6).
+            // WHAT "~0 AT THE FIRE" ACTUALLY MEANS (measured live 2026-08-30, 47 delivered
+            // fires counterfactualed): on a SAMPLER-CARRYING fire the corrected crossing IS
+            // the deadline, so the fire arm sits at eta ~= the pivot lookahead and the
+            // correction self-consistently reads ~0 there — the learned lead is preserved.
+            // On a PHASE-PRIMARY fire (46/47 that day) this field is routinely LARGE
+            // (median +42ms: the raw sampler runs ~+90ms late vs the phase dating at the
+            // commit band, the 2K27 ease-in bias) and that is NOT a defect: the deadline is
+            // the phase tip, which this correction never touches. Its one live effect there
+            // is the corroboration-veto input — see the note at the veto in
+            // canonicalAutonomousTipDecision. Do NOT read a large value on a phase-primary
+            // arm as a mean shift; the 2026-08-30 counterfactual measured the delivered-
+            // deadline shift at exactly 0.0 for every phase-primary fire.
             "horizon_debias_ms=%15 "
             // [ORION_FUSION_TELEMETRY] APPEND-ONLY (key=value parsers unaffected; every field
             // above keeps its position). Both fusion members and the weight registration
@@ -10892,7 +15974,48 @@ void AutomationEngine::updateAutonomousTipReservation(
             // [ORION_LEAD_CONFLICT] APPEND-ONLY. lead_source names where lead_ms (field 6)
             // actually came from (user|seed|authority|none); lead_kind (field 5) names only the
             // authority the in-band Shot Lead may have replaced.
-            "phase_primary=%25 phase_anchor_pct=%26 lead_source=%27")
+            // [ORION_TIP_FRAME_NATIVE 2026-09-15] APPEND-ONLY (key=value parsers unaffected;
+            // every field above keeps its position). fire_target names which rule produced the
+            // instant command_eta_ms (field 4) was measured to -- "frame_centre" when the shot's
+            // game-frame grid was locked and the tip was resolvable to a frame, "instant"
+            // otherwise -- and frame_offset_ms is the signed ms that rule moved the target by.
+            // frame_offset_ms is bounded by half a console frame (+-8.3 ms) BY CONSTRUCTION, so a
+            // larger magnitude in a returned log is a defect, not a tuning observation.
+            "phase_primary=%25 phase_anchor_pct=%26 lead_source=%27 "
+            // [ORION_BANNER_LEAD_TRIM 2026-09-15] APPEND-ONLY, and deliberately LAST (key=value
+            // parsers are unaffected; every field above keeps its position). banner_trim_ms is
+            // the additive term the game's own TIMING banner contributed to lead_ms (field 6) on
+            // THIS decision, for this shot's type bucket. lead_ms - banner_trim_ms is therefore
+            // the owner's own Shot Lead plus every other term, which is what lets a graded batch
+            // separate "the slider was wrong" from "the loop moved it". 0 whenever the loop is
+            // off, whenever the trim is at zero, and on every lead that did NOT come from the
+            // user's setting (the trim rides the user lead only -- see
+            // measuredLeadForActuationMs).
+            // [ORION_LEAD_AUTO_SEED 2026-09-15] APPEND-ONLY, after the trim (key=value parsers
+            // are unaffected; every field above keeps its position). auto_seed_ms is the
+            // user-equivalent lead the seed contributed to lead_ms (field 6) on THIS decision --
+            // 0 on every shot that flew on the owner's own Shot Lead or on the bare authority --
+            // and auto_seed_kind names where that number came from ("measured" = this rig's
+            // posterior + aim_margin_ms, "placeholder" = the shipped factory value, empty = the
+            // seed was not armed). lead_source=auto on the same line is the same claim.
+            // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] APPEND-ONLY, and now the LAST field (key=value
+            // parsers are unaffected; every field above keeps its position). lead_offset_ms is the
+            // FIXED per-shot-type term this decision's own bucket is worth -- 8.0 on a fade at the
+            // shipped defaults, 0.0 on a Standstill, 0.0 with ORION_LEAD_OFFSET_BY_TYPE=0. Read it
+            // with lead_source on the same line, exactly as banner_trim_ms is read: the user, seed
+            // and auto branches SPEND it inside lead_ms (field 6) and the bare authority branch
+            // (lead_source=authority) does not, so on a user/seed/auto line
+            // lead_ms - banner_trim_ms - lead_offset_ms is the base the shot flew on. That is what
+            // lets a graded batch separate "the slider is wrong" from "the fade term is wrong"
+            // from "the loop moved it".
+            // [ORION_BANNER_TRIM_TEMPO 2026-09-16] APPEND-ONLY, and now the LAST field (key=value
+            // parsers are unaffected; every field above keeps its position). tempo is the sub-bucket
+            // banner_trim_ms (field 30) was read from for THIS decision -- quick|normal|slow, read
+            // off this shot's own meter onset -- so a graded batch can separate "the trim is wrong"
+            // from "the trim is right for a different animation class". Always `normal` with
+            // ORION_BANNER_TRIM_TEMPO=0, and `normal` on any shot whose meter had not appeared yet.
+            "fire_target=%28 frame_offset_ms=%29 banner_trim_ms=%30 "
+            "auto_seed_ms=%31 auto_seed_kind=%32 lead_offset_ms=%33 tempo=%34")
                                   .arg(created ? QStringLiteral("reservation_created")
                                                : QStringLiteral("reservation_updated"))
                                   .arg(decision.source.left(64))
@@ -10924,11 +16047,23 @@ void AutomationEngine::updateAutonomousTipReservation(
                                            ? effectiveTipPhaseConstantMs()
                                                + tipPhaseLevelAdjustmentMs(
                                                    shot_.fillPhaseAnchorLevelPct)
-                                               + tipPhaseTypeTrimMs(shot_.shotType)
+                                               + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs()
                                            : -1.0, 0, 'f', 3)
                                   .arg(decision.phasePrimary ? 1 : 0)
                                   .arg(shot_.fillPhaseAnchorLevelPct, 0, 'f', 1)
-                                  .arg(actuationLeadSourceLabel(leadMs)));
+                                  .arg(actuationLeadSourceLabel(leadMs))
+                                  .arg(fireTargetMode)
+                                  .arg(fireFrameOffsetMs, 0, 'f', 2)
+                                  .arg(appliedBannerLeadTrimMs(), 0, 'f', 1)
+                                  .arg(appliedLeadAutoSeedMs(), 0, 'f', 1)
+                                  .arg(leadAutoSeedActive_ && !leadAutoSeedKind_.isEmpty()
+                                           ? leadAutoSeedKind_ : QStringLiteral("none"))
+                                  .arg(appliedLeadOffsetByTypeMs(), 0, 'f', 1)
+                                  .arg(orion::BannerLeadTrim::tempoName(
+                                      config_.bannerTrimTempoBuckets
+                                          ? orion::BannerLeadTrim::tempoFor(shot_.shotType,
+                                                                            liveShotOnsetMs())
+                                          : orion::BannerLeadTrim::Tempo::Normal)));
     }
 }
 
@@ -10962,12 +16097,14 @@ AutomationEngine::canonicalAutonomousTipDecision(double atMs) const
     // missed (rejected by the existing deadline path), never emit a command guaranteed late;
     // pushing it later only buys the scheduler more margin.
     //
-    // THE PIVOT IS THE LEAD, and that choice is the whole safety argument. The command is
-    // submitted at fireAt = tip - lead, so at the instant that actually matters the remaining
-    // horizon IS the lead. Pivoting there makes the correction identically zero on the decision
-    // that fires, which is what leaves the already-learned lead valid; every EARLIER estimate
-    // (necessarily a longer horizon) gets pulled earlier, which stops the reservation's fireAt
-    // from creeping later as the horizon closes.
+    // THE PIVOT IS THE COMMIT HORIZON: effective lead + scheduling lookahead. The command is
+    // submitted at the deadline a token was (last) ARMED with, and that deadline is fixed by
+    // the decision at the final arm — fireAt = tip - effectiveLead — so the horizon at the
+    // decision that actually fires is effectiveLead + (fireAt - now at that arm). Pivoting
+    // there makes the correction identically zero on the decision that fires, which is what
+    // leaves the operator's already-tuned lead valid; every EARLIER estimate (necessarily a
+    // longer horizon) gets pulled earlier, which stops the reservation's fireAt from creeping
+    // later as the horizon closes.
     //
     // A first attempt pivoted on an EMA of the horizon over every authoritative frame. That is
     // wrong and the closed-loop suite caught it: a rise sweeps the horizon from ~500ms down to
@@ -10976,31 +16113,76 @@ AutomationEngine::canonicalAutonomousTipDecision(double atMs) const
     // past the cap (~15ms late). Averaging the whole sweep smuggles in exactly the mean shift
     // this correction is supposed to avoid.
     //
-    // SHIPPED OFF (samplerHorizonDebiasEnabled = false). The closed-loop suite proved that the
-    // pivot above is still not the operative one: twoStageLatencyCalibration* fires from a
-    // deadline SCHEDULED ~43ms before it executes (eta=42.9, crossing_eta=262.9, lead=220), so
-    // the horizon that actually carries the bias is lead + scheduling-lookahead, not lead. With
-    // the lead as pivot the correction came out ~9ms early at commit and both closed-loop cases
-    // landed EARLY (residual -0.97pp and -3.43pp) instead of mean-neutral.
+    // A second attempt pivoted on the bare lead. The closed-loop suite caught that too:
+    // twoStageLatencyCalibration* fires from a deadline SCHEDULED ~43ms before it executes
+    // (eta=42.9, crossing_eta=262.9, lead=220), so with the lead as pivot the correction came
+    // out ~9ms early at commit and both closed-loop cases landed EARLY (residual -0.97pp and
+    // -3.43pp) instead of mean-neutral.
     //
-    // That lookahead is exactly what the rolling authority lease just moved (promotion
-    // command_eta p50 ~28ms -> 67.2ms), which is why it cannot be pinned from offline replay:
-    // the replay has no scheduler. Calibrating it needs one live batch of the "Release landing:"
-    // evidence added alongside this change. Until then the correction stays inert — enabling it
-    // blind would add a mean EARLY shift to a system already firing early, which is the same
-    // regression it is meant to cure.
+    // The lookahead is now MEASURED LIVE (2026-08-30, 30 graded "Release landing:" shots paired
+    // to their delivered token's final "PRECISE FIRE ARM" eta_ms): median 38.2ms over all 30,
+    // median 52.4ms over the 8 sampler-carrying fires — the population whose deadline this
+    // correction actually moves. samplerHorizonDebiasPivotLookaheadMs carries that number.
+    //
+    // The lead term is measuredLeadForActuationMs() — the SAME accessor the fireAt computation
+    // subtracts (it honours the USER Shot Lead) — and deliberately NOT measuredLatencyAuthorityMs_:
+    // live sessions run lead_source=user (321ms) while the raw authority sits ~100ms lower
+    // (~223-228, run_orion.local.ps1), and pivoting on the authority would have fired every
+    // sampler-carrying commit ~0.22*100 = ~+22-33ms EARLY. The authority gates below are KEPT
+    // in full (the correction still requires a real measured authority — nothing is weakened);
+    // the effective lead only replaces the authority as the pivot VALUE, under its own band
+    // check, so every failure mode still lands on "correction refused", never "wrong pivot".
+    //
+    // THE SLOPE IS NOW A 2K27 MEASUREMENT (2026-08-30, k=0.45): the former blocker — a suspect
+    // ~0.11 quick log-telemetry slope — was refuted by the full replay re-measurement (real
+    // TemporalSampler over 47 clean 2K27 framedump rises, 1089 authoritative decision points;
+    // the ~0.11 is not reproducible from the same logs). The 2K27 bias is CONVEX in horizon;
+    // k carries the LOCAL slope at the fired-deadline band, and the far sweep rides the ±45ms
+    // clamp. The flag still defaults OFF in code (the closed-loop contract fixtures are linear,
+    // where the correct k is zero, and k is meter-shape-specific); the measured rig enables it
+    // via ORION_HORIZON_DEBIAS=1 in the launcher. Full table, instruments and arithmetic:
+    // header note at samplerHorizonDebiasEnabled.
+    // [ORION_RAMP_SHAPE] Known-shape correction of the sampler's remaining time (header note
+    // at RemapConfig::samplerRampShapeEnabled). Rescales the fit's horizon by the measured
+    // curvature still ahead of the current fill; never lengthens it, never crosses "now", and
+    // when enabled it replaces the linear horizon de-bias below outright.
+    if (config_.samplerRampShapeEnabled && decision.samplerAuthoritative
+        && std::isfinite(shot_.fillPct) && shot_.fillPct > 0.0
+        && std::isfinite(decision.samplerFit.crossingMs)) {
+        const double rawHorizonMs = decision.samplerFit.crossingMs - atMs;
+        if (std::isfinite(rawHorizonMs) && rawHorizonMs > 0.0) {
+            const double factor = rampShapeRemainingFactor(shot_.fillPct);
+            const double correctionMs = std::clamp(rawHorizonMs * (1.0 - factor), 0.0,
+                                                   config_.samplerRampShapeMaxCorrectionMs);
+            const double correctedMs = decision.samplerFit.crossingMs - correctionMs;
+            if (correctionMs > 0.0 && correctedMs > atMs) {
+                decision.samplerFit.crossingMs = correctedMs;
+                decision.horizonDebiasMs = correctionMs;
+            }
+        }
+    }
     const bool leadPivotUsable = std::isfinite(measuredLatencyAuthorityMs_)
         && measuredLatencyAuthorityKind_ != QLatin1String("none")
         && measuredLatencyAuthorityMs_ >= 30.0
         && measuredLatencyAuthorityMs_ <= 600.0;
-    if (config_.samplerHorizonDebiasEnabled
+    if (!config_.samplerRampShapeEnabled
+        && config_.samplerHorizonDebiasEnabled
         && decision.samplerAuthoritative
         && leadPivotUsable
         && std::isfinite(config_.samplerHorizonBiasMsPerMs)
-        && config_.samplerHorizonBiasMsPerMs != 0.0) {
-        const double pivotMs = measuredLatencyAuthorityMs_;
+        && config_.samplerHorizonBiasMsPerMs != 0.0
+        && std::isfinite(config_.samplerHorizonDebiasPivotLookaheadMs)
+        && config_.samplerHorizonDebiasPivotLookaheadMs >= 0.0
+        && config_.samplerHorizonDebiasPivotLookaheadMs <= 200.0) {
+        // Same accessor fireAt uses; evaluated only inside the enabled branch so the shipped
+        // (flag-off) build never pays for it and stays byte-identical.
+        const double effectiveLeadMs = measuredLeadForActuationMs();
+        const double pivotMs = effectiveLeadMs
+            + config_.samplerHorizonDebiasPivotLookaheadMs;
         const double rawHorizonMs = decision.samplerFit.crossingMs - atMs;
-        if (std::isfinite(rawHorizonMs)) {
+        if (std::isfinite(effectiveLeadMs)
+            && effectiveLeadMs >= 30.0 && effectiveLeadMs <= 600.0
+            && std::isfinite(rawHorizonMs)) {
             const double correctionMs = std::clamp(
                 config_.samplerHorizonBiasMsPerMs * (rawHorizonMs - pivotMs),
                 -config_.samplerHorizonDebiasMaxMs,
@@ -11129,9 +16311,28 @@ AutomationEngine::canonicalAutonomousTipDecision(double atMs) const
         decision.sigmaMs = shot_.regSigmaMs;
         decision.source = QStringLiteral("registration");
     } else if (decision.samplerAuthoritative) {
-        decision.tipAbsMs = decision.samplerFit.crossingMs;
-        decision.sigmaMs = samplerSigmaMs;
-        decision.source = QStringLiteral("sampler");
+        // [ORION_SAMPLER_REACH] PURE sampler -- no registration to fuse with or contradict it.
+        // Refuse it when its slope is physically impossible for its fill (the 2026-08-30 seq 15/28
+        // disasters: a 0.248/0.253 %/ms transient at ~16% fill) AND the PHASE member is also
+        // absent -- i.e. the fill is still below the dated anchor, so the sampler is genuinely the
+        // last line of defence with nothing to check it. When phase IS available (fill at/above
+        // the anchor) the existing phase-override / slow-meter-defer / corroboration machinery
+        // guards a rogue fast sampler, and this branch stays byte-identical to before. On refusal
+        // the source falls through to no decision (fail-closed) -- never to a low-fill blind fire.
+        const bool phaseMemberAvailable = config_.tipPhaseEnabled
+            && shot_.fillPhaseAnchorMs >= 0.0
+            && shot_.anchorValidMs >= 0.0
+            && std::isfinite(config_.tipPhaseSigmaMs) && config_.tipPhaseSigmaMs > 0.0
+            && std::isfinite(shot_.fillPct)
+            && shot_.fillPct >= config_.tipPhaseAnchorPct;
+        if (phaseMemberAvailable
+            || samplerSoleAuthoritySlopePlausible(decision.samplerFit, shot_.fillPct)) {
+            decision.tipAbsMs = decision.samplerFit.crossingMs;
+            decision.sigmaMs = samplerSigmaMs;
+            decision.source = QStringLiteral("sampler");
+        } else {
+            decision.samplerSoleSlopeRefused = true;
+        }
     }
 
     // === [ORION_TIP_PHASE] THE THIRD MEMBER, and the one that does not extrapolate ==========
@@ -11180,24 +16381,31 @@ AutomationEngine::canonicalAutonomousTipDecision(double atMs) const
         // dating. 0 for every type unless tip_phase_type_trim_enabled (default OFF).
         const double constantMs = effectiveTipPhaseConstantMs()
             + tipPhaseLevelAdjustmentMs(shot_.fillPhaseAnchorLevelPct)
-            + tipPhaseTypeTrimMs(shot_.shotType);
-        const double phaseTipAbsMs = shot_.fillPhaseAnchorMs + constantMs;
-        if (std::isfinite(constantMs) && constantMs > 0.0 && std::isfinite(phaseTipAbsMs)) {
+            + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs();
+        // [ORION_CURVE_MODEL] latched slow-meter stretch (1.0 unless latchPhaseRateStretch fired).
+        const double stretchedConstantMs = stretchedPhaseConstantMs(constantMs);
+        const double phaseTipAbsMs = shot_.fillPhaseAnchorMs + stretchedConstantMs;
+        // [ORION_TIP_PHASE_FIRST_SIGHT] The member's sigma for THIS shot. Returns exactly
+        // config_.tipPhaseSigmaMs unless the anchor was committed from the shot's first accepted
+        // sample instead of a witnessed rung, so every line below is byte-identical for every
+        // shot the ladder dates. See phaseFirstSightSigmaMs for the two added terms.
+        const double phaseSigmaMs = phaseAnchorSigmaMs();
+        if (std::isfinite(constantMs) && constantMs > 0.0 && std::isfinite(phaseTipAbsMs)
+            && std::isfinite(phaseSigmaMs) && phaseSigmaMs > 0.0) {
             decision.phaseAnchorMs = shot_.fillPhaseAnchorMs;
             decision.phaseTipAbsMs = phaseTipAbsMs;
-            decision.phaseSigmaMs = config_.tipPhaseSigmaMs;
+            decision.phaseSigmaMs = phaseSigmaMs;
             // Publish the weight this member WOULD carry against whatever the chain above
             // selected, so the log shows its influence the way reg_weight shows registration's.
             // Telemetry only -- no branch reads it back -- and guarded so a diagnostic is never
             // the thing that divides by zero.
             if (std::isfinite(decision.sigmaMs) && decision.sigmaMs > 0.0) {
-                const double phasePrecision = 1.0
-                    / (config_.tipPhaseSigmaMs * config_.tipPhaseSigmaMs);
+                const double phasePrecision = 1.0 / (phaseSigmaMs * phaseSigmaMs);
                 decision.phaseWeight = phasePrecision
                     / (phasePrecision + 1.0 / (decision.sigmaMs * decision.sigmaMs));
             }
             const double horizonMs = phaseTipAbsMs - atMs;
-            const bool horizonPlausible = horizonMs > 0.0 && horizonMs <= constantMs;
+            const bool horizonPlausible = horizonMs > 0.0 && horizonMs <= stretchedConstantMs;
             // THE LIVE METER'S VETO. See RemapConfig::tipPhaseCorroborationSigmas: a lookup is a
             // claim about one specific animation, and handed a meter that is not that animation it
             // is confidently wrong in both directions -- including the direction that HOLDS a
@@ -11206,15 +16414,39 @@ AutomationEngine::canonicalAutonomousTipDecision(double atMs) const
             // motion, so a gross disagreement is positive evidence that the constant does not
             // describe what is on screen. Same disagreement^2 <= k^2*(varA+varB) shape as the
             // reg/sampler compatibility test above.
+            // [ORION_HORIZON_DEBIAS x VETO — LOAD-BEARING, measured 2026-08-30] The crossing
+            // this veto reads is the DE-BIASED one (the correction runs above, before this
+            // block). That interaction is deliberate and is the debias's main live effect on
+            // 2K27: at the commit band the raw sampler runs ~+90ms LATE vs the phase dating
+            // (ease-in bias, convex — header table), so a symmetric veto fed the RAW crossing
+            // demotes a healthy phase member on the sampler's own known bias direction. On the
+            // 2026-08-30 sessions the de-biased crossing kept phase primary on 15 of 47
+            // delivered fires whose RAW disagreement exceeded 3 sigma (all in the sampler-
+            // later direction); the no-debias counterfactual hands those deadlines to a
+            // sampler running +89..+199ms later — the deadline-missed-abort / guaranteed-late
+            // catalog this veto's own header describes. Do not "fix" the debias pivot so the
+            // correction reads ~0 at phase-primary final arms: that zeroes exactly this
+            // rescue while leaving those deadlines (phase-owned) unchanged — strictly worse.
+            // Pinned by horizonDebiasRescuesPhaseFromTheSamplersLateBiasVeto.
             bool contradictedByLiveMeter = false;
             double disagreementMs = 0.0;
             if (decision.samplerAuthoritative && samplerSigmaMs > 0.0
                 && std::isfinite(decision.samplerFit.crossingMs)
                 && std::isfinite(config_.tipPhaseCorroborationSigmas)
                 && config_.tipPhaseCorroborationSigmas > 0.0) {
-                disagreementMs = decision.samplerFit.crossingMs - phaseTipAbsMs;
+                // [ORION_CURVE_MODEL] The linear sampler over-extrapolates a convex meter at
+                // low fill (10-16% too much runway at 20-35%), which read as "the meter says
+                // later" and vetoed a correct phase on every No Dip (live e138/e142/e143).
+                // Compare the phase against the sampler's crossing corrected by the curve's
+                // linear-bias factor instead of the raw straight line.
+                const double samplerRunwayMs = decision.samplerFit.crossingMs - atMs;
+                const double correctedCrossingMs = config_.curveModelEnabled
+                        && std::isfinite(samplerRunwayMs) && samplerRunwayMs > 0.0
+                    ? atMs + samplerRunwayMs * curveLinearBiasFactor(shot_.fillPct)
+                    : decision.samplerFit.crossingMs;
+                disagreementMs = correctedCrossingMs - phaseTipAbsMs;
                 const double combinedVar = samplerSigmaMs * samplerSigmaMs
-                    + config_.tipPhaseSigmaMs * config_.tipPhaseSigmaMs;
+                    + phaseSigmaMs * phaseSigmaMs;
                 const double k = config_.tipPhaseCorroborationSigmas;
                 contradictedByLiveMeter =
                     disagreementMs * disagreementMs > k * k * combinedVar;
@@ -11251,14 +16483,45 @@ AutomationEngine::canonicalAutonomousTipDecision(double atMs) const
                 && disagreementMs < 0.0) {
                 contradictedByLiveMeter = false;
             }
-            if (horizonPlausible && !contradictedByLiveMeter
-                && !registrationSoloContradictedByFlatMeter(decision.samplerFit)) {
+            // [ORION_TIP_PHASE_SOLO 2026-09-11] The whole change is this condition. With solo on,
+            // a dated phase member with a plausible horizon IS the decision; the extrapolating
+            // sampler no longer gets to withdraw it. See RemapConfig::tipPhaseSolo for the
+            // measurements. horizonPlausible is deliberately still required -- that is the guard
+            // that keeps a stale or wrong-animation constant from arming a nonsense deadline.
+            const bool samplerMayVeto = !config_.tipPhaseSolo;
+            if (horizonPlausible
+                && (!samplerMayVeto
+                    || (!contradictedByLiveMeter
+                        && !registrationSoloContradictedByFlatMeter(decision.samplerFit)))) {
                 decision.tipAbsMs = phaseTipAbsMs;
-                decision.sigmaMs = config_.tipPhaseSigmaMs;
-                decision.source = QStringLiteral("phase");
+                decision.sigmaMs = phaseSigmaMs;
+                // [ORION_TIP_PHASE_FIRST_SIGHT] A DISTINCT label with the SAME prefix. Every
+                // consumer that gates on the phase family tests startsWith("phase") (the tick's
+                // imminent hold and its subtick mirror) or contains("phase") (the steal guard's
+                // armed-member-alive test), so those all continue to see a phase member. The two
+                // that test the label EXACTLY -- the anchor-commit ride in the tick's authority
+                // fence and armedPhaseTokenCarriesAnchorAuthority() -- deliberately do NOT: that
+                // privilege lets a token outlive its rolling video lease on the strength of an
+                // ALREADY-WITNESSED crossing, and a first-sight date is not one. A
+                // phase_firstsight token therefore keeps every ordinary fence, which is the
+                // fail-closed direction (it can be retired, never ridden).
+                decision.source = shot_.phaseAnchorFromFirstSight
+                    ? QStringLiteral("phase_firstsight")
+                    : QStringLiteral("phase");
                 decision.phasePrimary = true;
             }
         }
+    }
+    // [ORION_OWNERSHIP_PROOF_LENIENCY 2026-09-14] A shot owned on a forgiven (geometry-break
+    // restarted) proof pays for it here, on whichever member ended up speaking. The padding is
+    // ADDED, not combined in quadrature: it is not an independent measurement noise, it is a
+    // stated discount on how much of this episode the engine actually witnessed, and the honest
+    // way to express that is to make every downstream cap and steal comparison see a worse
+    // number. 0 for every normally-proved shot, so their decisions are byte-identical.
+    if (std::isfinite(decision.sigmaMs) && decision.sigmaMs > 0.0
+        && std::isfinite(shot_.ownershipLenientSigmaPaddingMs)
+        && shot_.ownershipLenientSigmaPaddingMs > 0.0) {
+        decision.sigmaMs += shot_.ownershipLenientSigmaPaddingMs;
     }
     // [ORION_USER_LEAD_AUTHORITY] effective (not raw): under user-lead authority the raw sd is
     // 0.0, which would land in the 100.0 fallback and push combinedSigmaMs past the validity
@@ -11479,6 +16742,26 @@ bool AutomationEngine::slowMeterDeferBinds(const AutonomousTipDecision& decision
     // Measured populations (arm-time undercut, 120 releases): normal max +0.9ms, slow-regime
     // minimum +88.7ms. The 45ms default sits mid-gap; see the RemapConfig comment.
     return undercutMs > config_.slowMeterDeferUndercutMs;
+}
+
+bool AutomationEngine::samplerSoleAuthoritySlopePlausible(
+    const TemporalSampler::CrossingFit& fit, double fillPct) noexcept
+{
+    // See the header note. This runs only for the PURE-sampler branch (no registration present),
+    // and only ever WITHDRAWS that branch's authority -- the fit has already cleared
+    // liveMeterCrossingAuthoritative(). It never manufactures a deadline.
+    //
+    // The ceiling RISES with fill because the 2K27 meter accelerates: a single flat ceiling would
+    // either admit the low-fill disaster transients (0.248 at 16%) or reject genuine near-tip fits
+    // (~0.265 near the cap). A fit slope at or below its fill's ceiling is a plausible live rise; a
+    // slope above it is a low-sample transient extrapolator and is refused.
+    if (!std::isfinite(fillPct) || !std::isfinite(fit.slopePctPerMs)) {
+        return false;   // missing evidence -> fail closed
+    }
+    const double clampedFill = std::clamp(fillPct, 0.0, 100.0);
+    const double ceilPctPerMs = kSamplerImpliedSlopeCeilBasePctPerMs
+        + kSamplerImpliedSlopeCeilPerFillPct * clampedFill;
+    return fit.slopePctPerMs <= ceilPctPerMs;
 }
 
 bool AutomationEngine::liveMeterCrossingAuthoritative(
@@ -11828,6 +17111,7 @@ bool AutomationEngine::scheduleFire(double deadlineMs, double now, double horizo
     }
     // The deadline must satisfy the same min-hold floor the in-tick release path enforces.
     if (authority != ScheduledFireAuthority::AutonomousMeterVision
+        && authority != ScheduledFireAuthority::InputTimed
         && shot_.holdStartMs > 0.0
         && (deadlineMs - shot_.holdStartMs) < config_.minHoldMs) {
         return rejectGate(ArmGate::MinHold);
@@ -11837,7 +17121,15 @@ bool AutomationEngine::scheduleFire(double deadlineMs, double now, double horizo
     const bool requiresPoseFrame = authority == ScheduledFireAuthority::Pose;
     double authorityExpiryMs = requiresGenuineFrame
         ? meterAuthorityExpiryMs()
-        : (requiresPoseFrame ? poseAuthorityExpiryMs() : -1.0);
+        : (requiresPoseFrame ? poseAuthorityExpiryMs()
+            : (authority == ScheduledFireAuthority::InputTimed
+                ? noMeterBackstop_.deadlineMs + kInputTimedLateLimitMs : -1.0));
+    if (authority == ScheduledFireAuthority::InputTimed
+        && (!inputTimedAuthorityCurrent(now)
+            || std::abs(deadlineMs - noMeterBackstop_.deadlineMs) > 1e-6
+            || (controllerRouteBindingRequired_ && !routeAttestation.valid()))) {
+        return rejectGate(ArmGate::NoAuthority);
+    }
     if (authority == ScheduledFireAuthority::AutonomousMeterVision
         && measuredLeadLastUpdateMs_ >= 0.0
         && std::isfinite(config_.measuredLeadFreshnessMs)) {
@@ -11912,7 +17204,7 @@ bool AutomationEngine::scheduleFire(double deadlineMs, double now, double horizo
     //
     // INERT UNTIL MEASURED. tickPhaseAuthoritative() is false without a trustworthy probe-run
     // phase fit, so with today's telemetry this branch never runs and scheduling is byte-identical.
-    if (tickPhaseAuthoritative(now)) {
+    if (authority != ScheduledFireAuthority::InputTimed && tickPhaseAuthoritative(now)) {
         const double kTickMs = 1000.0 / 60.0;
         // Convert the probe-fit EDGE phase (press-EPOCH ms mod P) onto the engine clock with a
         // DIRECT clock read, never the capture bridge: epochToEngineOffsetMs_ carries the
@@ -11970,12 +17262,73 @@ bool AutomationEngine::scheduleFire(double deadlineMs, double now, double horizo
             deadlineMs = displaced;
         }
     }
+    // [ORION_CAPTURE_PHASE_LOCK] Same single choke point. The fire phase is logged on every
+    // scheduled fire so verdict-labelled batches can tune the target; the rounding itself is
+    // opt-in. Symmetric nearest-phase (shift in (-P/2, +P/2], zero mean) so the aim is unchanged
+    // on average; a later shift the authority lease cannot cover folds back one period.
+    schedFireCapturePhaseShiftMs_ = 0.0;
+    {
+        constexpr double kCyclePeriodMs = 1000.0 / 60.0;
+        double phase0 = 0.0, coherence = 0.0;
+        const bool phaseKnown = capturePhaseEstimate(capturePhaseRingMs_, kCyclePeriodMs, &phase0, &coherence)
+            && capturePhaseRingMs_.size() >= config_.capturePhaseLockMinSamples
+            && coherence >= config_.capturePhaseLockMinCoherence;
+        double deadlinePhase = std::numeric_limits<double>::quiet_NaN();
+        int lockSuppressed = 0;                       // 2 = would be past (lease is judged at submit)
+        if (phaseKnown) {
+            deadlinePhase = std::fmod(deadlineMs - phase0, kCyclePeriodMs);
+            if (deadlinePhase < 0.0) deadlinePhase += kCyclePeriodMs;
+        }
+        if (phaseKnown && config_.capturePhaseLockEnabled
+            && authority == ScheduledFireAuthority::AutonomousMeterVision
+            && !shot_.latencyCalibrationProbe) {
+            double locked = nearestPhaseTimeMs(deadlineMs, phase0, config_.capturePhaseLockTargetMs,
+                                               kCyclePeriodMs);
+            // The lease of THIS arm is the local `authorityExpiryMs`; the member still holds the
+            // previous arm's (already-past) expiry until the assignment below, so comparing
+            // against it folded EVERY lock back one period (batch 2026-09-10: shifts -10..-23 ms
+            // on all locked shots = a hidden +15 ms lead, not a phase lock). A forward rounding the
+            // lease cannot cover does not fold back either (that is a -P/2..-P shift, the same
+            // bias): it leaves the deadline where the aim put it and says so in the log.
+            // No lease guard here. Batch 2026-09-10 01:03Z: the deadline is armed 80-120 ms out
+            // while the rolling lease is ~30 ms at that instant, so a lease comparison suppressed
+            // 20 of 25 locks (one shot shifted). `deadline <= lease` is a SUBMIT-TIME invariant
+            // ([ORION_ROLLING_LEASE]); the worker judges the locked deadline exactly as it judges
+            // the unlocked one. Only a guaranteed-past lock is refused.
+            if (locked <= now) {
+                locked = deadlineMs;                  // never a guaranteed-past deadline
+                lockSuppressed = 2;
+            }
+            schedFireCapturePhaseShiftMs_ = locked - deadlineMs;
+            deadlineMs = locked;
+        }
+        emit engineDiagnostic(QStringLiteral(
+            "CAPTURE PHASE: deadline_eta_ms=%1 cycle_phase_ms=%2 coherence=%3 n=%4 lock=%5 "
+            "target_ms=%6 shift_ms=%7 shot_attempt=%8 lease_eta_ms=%9 suppressed=%10")
+                                  .arg(deadlineMs - now, 0, 'f', 2)
+                                  .arg(deadlinePhase, 0, 'f', 2)
+                                  .arg(coherence, 0, 'f', 3)
+                                  .arg(capturePhaseRingMs_.size())
+                                  .arg(config_.capturePhaseLockEnabled ? 1 : 0)
+                                  .arg(config_.capturePhaseLockTargetMs, 0, 'f', 2)
+                                  .arg(schedFireCapturePhaseShiftMs_, 0, 'f', 2)
+                                  .arg(shot_.armToken)
+                                  .arg(authorityExpiryMs >= 0.0 ? authorityExpiryMs - now : -1.0, 0, 'f', 2)
+                                  .arg(lockSuppressed));
+    }
     schedFireDeadlineMs_ = deadlineMs;
+    schedFireArmedPhaseRateStretch_ = shot_.phaseRateStretch;
+    schedFireArmedPhasePhysicalMs_ = effectiveTipPhaseConstantMs()
+        + tipPhaseLevelAdjustmentMs(shot_.fillPhaseAnchorLevelPct)
+        + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs() - phaseAimOffsetMs();
     ++schedFireToken_;
     schedFireConfirmedToken_ = 0;
     schedFireFailedToken_ = 0;
     schedFireActualMs_ = -1.0;
     schedFireRequiresGenuineFrame_ = requiresGenuineFrame;
+    // [ORION_BLIND_WAITER 2026-09-15] Stamped on every arm (not only the blind one) so the flag
+    // can never survive onto a token of a different authority.
+    schedFireBlindInputTimed_ = authority == ScheduledFireAuthority::InputTimed;
     schedFireVisionEpoch_ = requiresGenuineFrame ? shot_.visionEpoch : -1;
     schedFireRequiresPoseFrame_ = requiresPoseFrame;
     schedFirePoseEpoch_ = requiresPoseFrame ? pose_.authorityEpoch : -1;
@@ -11990,9 +17343,16 @@ bool AutomationEngine::scheduleFire(double deadlineMs, double now, double horizo
     // synchronous call, no tick can interleave); every other authority leaves it absent so a
     // prior live-tip attribution can never leak onto a feedforward/pose/fused token.
     schedFireArmedSource_.clear();
+    // [ORION_TIP_FRAME_NATIVE 2026-09-17] Every new token starts UN-SNAPPED for the same
+    // reason it starts unattributed: only the two vision arm sites know whether this
+    // deadline carries a frame-centre offset, and a stale offset would let a later token
+    // claim a snap it never had.
+    schedFireArmedFrameOffsetMs_ = 0.0;
     schedFireArmedSigmaMs_ = -1.0;
     schedFireArmedFillPct_ = -1.0;
     schedFireArmedCommandEtaMs_ = -1.0;
+    schedFireArmedFillEstimatorMode_.clear();
+    schedFireArmedFillEstimatorGeneration_ = 0;
     return true;
 }
 
@@ -12103,6 +17463,13 @@ void AutomationEngine::invalidateVisionScheduleForDropout(double atMs)
     if (autonomousVisionScheduleLeaseCurrent(atMs)) {
         return;
     }
+    // [ORION_PHASE_ANCHOR_COMMIT 2026-08-31] Mirror the tick fence: intake-side dropout may not
+    // erase a phase deadline derived from an already-witnessed anchor. See the declaration for
+    // the physical identity, route, provenance, and original-runway bounds.
+    if (armedPhaseTokenCarriesAnchorAuthority(atMs)) {
+        notePhaseAnchorCommitRide("dropout_phase_anchor_commit", atMs);
+        return;
+    }
     invalidateUnconfirmedVisionSchedule("dropout");
 }
 
@@ -12117,6 +17484,8 @@ void AutomationEngine::invalidateUnconfirmedPoseSchedule()
 void AutomationEngine::clearScheduledFire()
 {
     schedFireDeadlineMs_ = -1.0;
+    schedFireArmedPhaseRateStretch_ = 1.0;
+    schedFireArmedPhasePhysicalMs_ = -1.0;
     schedFireAppliedDevOffsetMs_ = 0.0;        // [ORION_DEV_FIRE_OFFSET]
     schedFireConfirmedToken_ = 0;
     schedFireFailedToken_ = 0;
@@ -12129,6 +17498,7 @@ void AutomationEngine::clearScheduledFire()
     schedFireReason_.clear();
     schedFireCode_.clear();
     schedFireRequiresGenuineFrame_ = false;
+    schedFireBlindInputTimed_ = false;   // [ORION_BLIND_WAITER 2026-09-15]
     schedFireVisionEpoch_ = -1;
     schedFireRequiresPoseFrame_ = false;
     schedFirePoseEpoch_ = -1;
@@ -12138,9 +17508,16 @@ void AutomationEngine::clearScheduledFire()
     // calling here, so clearing is safe on the fire path and prevents a torn-down token's
     // attribution from being inherited by whatever arms next.
     schedFireArmedSource_.clear();
+    // [ORION_TIP_FRAME_NATIVE 2026-09-17] Every new token starts UN-SNAPPED for the same
+    // reason it starts unattributed: only the two vision arm sites know whether this
+    // deadline carries a frame-centre offset, and a stale offset would let a later token
+    // claim a snap it never had.
+    schedFireArmedFrameOffsetMs_ = 0.0;
     schedFireArmedSigmaMs_ = -1.0;
     schedFireArmedFillPct_ = -1.0;
     schedFireArmedCommandEtaMs_ = -1.0;
+    schedFireArmedFillEstimatorMode_.clear();
+    schedFireArmedFillEstimatorGeneration_ = 0;
     // [ORION_TRANSIENT_INVALID] No armed token means no transient to time. Resetting here keeps
     // a stale grace window from being inherited by the NEXT token this shot arms.
     tipPredictionInvalidSinceMs_ = -1.0;
@@ -12171,6 +17548,13 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
     if (config_.noMeterEnabled || !shot_.meterSeenThisShot) {
         return;
     }
+    // updateDetection has fenced the contradictory token and seeded a replacement
+    // trajectory, but the first replacement frame is not yet proof.  The 4 ms tick
+    // owns the bounded hold/pass-through decision while recovery is active; this
+    // reschedule-only mirror must not arm from that single frame in between ticks.
+    if (shot_.fillRollbackRecoveryActive) {
+        return;
+    }
     // [ORION_FUSED_FIRE] a fused-owned deadline is re-evaluated by the fused block on the 4ms
     // tick (later AND earlier moves, its own sigma math) — this earlier-only legacy mirror
     // must not touch it.
@@ -12190,7 +17574,15 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
         return;
     }
     lastFreshReevalMs_ = now;
-    if (autonomousLiveMeterTimingEnabled()) {
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] THE VISION ARM SITE, and in production it
+    // is the ONLY one: across four graded sessions every single arm was arm_site=subtick and not
+    // one came from the 4 ms tick. Opening NO METER to vision therefore means opening exactly
+    // this block — everything inside it (the tip decision, the lead, the steal/imminent/defer
+    // refusals, the token fences, scheduleFire's own AutonomousMeterVision authority) is
+    // consumed unchanged, which is what "locked and owned exactly as in meter mode" has to mean
+    // if it is to mean anything. The blind deadline is handled in processInputTimedHolding and
+    // touches nothing here: an armed vision token simply outranks it there.
+    if (autonomousLiveMeterTimingEnabled() || noMeterVisionAssistShotActive()) {
         if (shot_.latencyCalibrationProbe) {
             return; // calibration releases only on the authoritative input tick
         }
@@ -12205,6 +17597,7 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
             return;
         }
         constexpr double kTipTargetPct = 100.0;
+        maybeLatchFadeWindowLeadPolicy(true);
         const AutonomousTipDecision tipDecision =
             canonicalAutonomousTipDecision(now);
         if (!tipDecision.valid) {
@@ -12219,7 +17612,29 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
         // Both entry points consume the same registration/sampler decision. The
         // capture-aligned absolute tip already includes decoder/IPC age.
         const double effectiveLeadMs = measuredLeadForActuationMs();
-        const double fireAtMs = tipDecision.tipAbsMs - effectiveLeadMs;
+        // [ORION_TIP_FRAME_NATIVE 2026-09-15] THE one arm site in production (every graded
+        // session armed here, never on the 4 ms tick), so this is where the frame-centred target
+        // actually reaches the console. tipDecision.tipAbsMs is deliberately NOT modified: the
+        // predicted tip is what every horizon, veto, steal and learner term downstream reads, and
+        // only the instant we AIM the release at moves. Inert with the flag off or the grid
+        // unlocked, in which case fireTargetMs IS tipAbsMs (same double).
+        QString fireTargetMode;
+        double fireFrameOffsetMs = 0.0;
+        // Match the input tick: the optional current-shot green displacement is
+        // applied BEFORE frame alignment. Applying it in only one writer makes
+        // fresh-frame tokens lose their target when the 4 ms tick re-evaluates.
+        const double greenCenterOffsetMs =
+            autonomousGreenCenterOffsetMs(tipDecision.velocityPctPerMs);
+        const double fireTargetMs = phaseAlignedFireTargetMs(
+            tipDecision.tipAbsMs - greenCenterOffsetMs,
+            &fireTargetMode, &fireFrameOffsetMs);
+        // [ORION_VISION_HOLD_BAND 2026-09-15] THE production arm site (every graded session armed
+        // here, never on the 4 ms tick), so this is where the band actually reaches the console.
+        // tipDecision.tipAbsMs is untouched for the same reason frame-native firing leaves it
+        // alone: the predicted tip is what every horizon, veto, steal and learner downstream
+        // reads, and only the instant we AIM the release at may move.
+        const double fireAtMs =
+            clampVisionFireToHoldBand(fireTargetMs - effectiveLeadMs, effectiveLeadMs);
         shot_.targetPct = kTipTargetPct;
         shot_.targetModeAtRelease = QStringLiteral("meter_tip_%1")
             .arg(tipDecision.source);
@@ -12303,6 +17718,39 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
             || (config_.gotoTipParity && shot_.mode == ShotMode::GoToStick);
         const bool deferUndercuttingCandidate = ownedHold
             && slowMeterDeferBinds(tipDecision, fireAtMs, effectiveLeadMs, now);
+        // [ORION_TIP_PHASE_IMMINENT] MIRROR of the tick's imminent hold, and it is the SAME
+        // parity bug the two comments above describe -- this one just went unnoticed for longer
+        // because the guard it duplicates looks alive in the source.
+        //
+        // MEASURED 2026-08-31, four graded sessions (20260830_191051 / 20260830_201954 /
+        // 20260831_114137 / 20260831_131603). Every arm in the corpus is arm_site=subtick:
+        // 96 phase + 16 registration+sampler_far, and ZERO from the 4 ms tick. So the tick's
+        // guard -- written against exactly this failure on 2026-08-04, and reasoned about at
+        // length at its own site -- has never once fired in production. The 16 fallback arms it
+        // was meant to stop landed at fill 11.3-19.9, i.e. below the base anchor (20), and 12 of
+        // them inside tipPhaseImminentHoldBandPct (6 pp) of it. The phase member then armed at
+        // fill 20.02-45.89 on every other shot, so the race the guard describes is not
+        // hypothetical: the fallback simply wins it on the mirror every time.
+        //
+        // WHAT IT COST. Of the 95 fires whose reader tracked the whole plateau, three kept a
+        // fallback arm through to the release (Outcome identity armed_source = sampler or
+        // registration+sampler_far). They landed at peak_fill 61.5, 72.7 and 73.0 against green
+        // windows starting at 93.6-95.1 -- ~100 ms early, three giveaways, no recovery. Every
+        // other fire armed on phase and landed at a median 95.19.
+        //
+        // REFUSAL ONLY, and placed deliberately AFTER the mirror's teardown/fence block and
+        // BEFORE invalidateUnconfirmedVisionSchedule: it declines to CREATE or MOVE a schedule
+        // and touches nothing else. It cannot destroy an armed token, cannot fire, cannot hasten
+        // a fire, and cannot make one late -- every arm it removes was early. The 4 ms tick
+        // remains authoritative and applies its own (identical) hold within 4 ms, bounded by the
+        // same maxHoldMs ceiling, so an anchor that never arrives still returns physical control.
+        const double imminentHeldMs = shot_.holdStartMs > 0.0 ? now - shot_.holdStartMs : 0.0;
+        const bool phaseAnchorImminentRefusal = ownedHold
+            && config_.tipPhaseEnabled
+            && !tipDecision.source.startsWith(QStringLiteral("phase"))
+            && shot_.fillPhaseAnchorMs < 0.0
+            && imminentHeldMs < std::max(1.0, config_.maxHoldMs)
+            && phaseAnchorImminent(shot_.fillPct, tipDecision.samplerFit.slopePctPerMs);
         // [ORION_DEV_FIRE_OFFSET] undisplaced comparison (offset 0 when disarmed).
         const double armedBaseMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
         // [ORION_SOURCE_STEAL_GUARD 2026-08-13] Quality gate, mirror of the tick site's. This
@@ -12322,8 +17770,22 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
                                       .arg(schedFireDeadlineMs_ - now, 0, 'f', 3)
                                       .arg(schedFireToken_));
         }
-        if (schedFireDeadlineMs_ >= 0.0
+        // [ORION_BLIND_WAITER 2026-09-15 owner] A hybrid NO METER shot now ALWAYS has a token
+        // armed here — the blind timer's, handed to the worker at the press so a GUI stall cannot
+        // lose the release. None of the guards below describe it: they compare tip-decision
+        // sigmas and deadlines between two VISION estimates, and the blind deadline is neither an
+        // estimate nor a competing instrument. It gets the rule it already had —
+        // blindWaiterStealableByVision() — which is the same kBlindPreArmHorizonMs boundary that
+        // used to be expressed by the token simply not existing yet. Vision owns the shot until
+        // the blind release is 24 ms out; from there the blind release is committed.
+        const bool blindTokenHeld = blindWaiterArmed();
+        if (blindTokenHeld && !blindWaiterStealableByVision(now)) {
+            return;
+        }
+        if (schedFireDeadlineMs_ >= 0.0 && !blindTokenHeld
             && (std::abs(fireAtMs - armedBaseMs) <= tokenDeadlineDriftToleranceMs()
+                || frameBoundaryNoiseKeepsToken(tipDecision, fireAtMs, fireTargetMode,
+                                                fireFrameOffsetMs, "subtick")
                 || armedTokenIrreplaceable(now)
                 || armedTokenSubmitInFlight(now)
                 || qualityStealRefused
@@ -12335,6 +17797,42 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
             // No arm and no teardown: an existing token (necessarily at/after the candidate
             // here) stays armed untouched; with none, the tick decides hold-vs-arm within 4ms.
             return;
+        }
+        if (phaseAnchorImminentRefusal) {
+            if (subtickImminentRefusedLoggedEpoch_ != physicalShotEpoch_) {
+                subtickImminentRefusedLoggedEpoch_ = physicalShotEpoch_;
+                const double nextLevelPct = phaseAnchorImminentTargetLevelPct(shot_.fillPct);
+                const double belowByPct = nextLevelPct - shot_.fillPct;
+                const double slopePctPerMs = tipDecision.samplerFit.slopePctPerMs;
+                emit engineDiagnostic(QStringLiteral(
+                    "TIP PHASE IMMINENT HOLD: site=subtick source=%1 fill_pct=%2 anchor_pct=%3 "
+                    "below_by_pct=%4 slope_pct_ms=%5 eta_to_anchor_ms=%6 fit_n=%7 held_ms=%8")
+                                          .arg(tipDecision.source.left(64))
+                                          .arg(shot_.fillPct, 0, 'f', 2)
+                                          .arg(nextLevelPct, 0, 'f', 1)
+                                          .arg(belowByPct, 0, 'f', 2)
+                                          .arg(slopePctPerMs, 0, 'f', 4)
+                                          .arg(slopePctPerMs > 0.0 ? belowByPct / slopePctPerMs
+                                                                   : -1.0, 0, 'f', 1)
+                                          .arg(tipDecision.samplerFit.n)
+                                          .arg(imminentHeldMs, 0, 'f', 1));
+            }
+            // Same contract as the defer refusal directly above: no arm, no teardown.
+            return;
+        }
+        if (curvePrematureArm(tipDecision.source, fireAtMs, now,
+                              adaptiveAutonomousSchedulerHorizonMs())) {
+            return;
+        }
+        // [ORION_BLIND_WAITER 2026-09-15] invalidateUnconfirmedVisionSchedule only ever kills a
+        // GENUINE-FRAME token, so the blind timer's token needs its own (identically fenced)
+        // teardown. It is placed here, immediately before the vision arm and after every refusal
+        // above, so a blind release is never given up for a vision token that is then refused.
+        if (blindTokenHeld) {
+            invalidateUnconfirmedSchedule(true, "no_meter_vision_owns");
+            if (schedFireDeadlineMs_ >= 0.0) {
+                return;   // the fence raced a confirmed physical submit
+            }
         }
         invalidateUnconfirmedVisionSchedule("subtick_reschedule");
         if (schedFireDeadlineMs_ >= 0.0) {
@@ -12351,9 +17849,41 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
             schedFireArmedSigmaMs_ = tipDecision.combinedSigmaMs;
             schedFireArmedFillPct_ = shot_.fillPct;
             schedFireArmedCommandEtaMs_ = fireAtMs - now;
+            // [ORION_TIP_FRAME_NATIVE 2026-09-15] Stamped with the rest of the attribution, on a
+            // SUCCESSFUL arm only, so the fields describe the token that will actually fire
+            // rather than the last evaluation that merely considered one.
+            shot_.fireTargetMode = fireTargetMode;
+            shot_.fireTargetFrameOffsetMs = fireFrameOffsetMs;
+            // [ORION_TIP_FRAME_NATIVE 2026-09-17] Both instants, same rule as the tick site.
+            shot_.fireAlignedFireAtMs = fireAtMs;
+            shot_.fireUnalignedFireAtMs = tipDecision.tipAbsMs - effectiveLeadMs;
+            schedFireArmedFrameOffsetMs_ = fireAtMs - shot_.fireUnalignedFireAtMs;
+            schedFireArmedFillEstimatorMode_ = shot_.lastGenuineFillEstimatorMode;
+            schedFireArmedFillEstimatorGeneration_ =
+                shot_.lastGenuineFillEstimatorGeneration;
+            // Sub-tick mirror of the tick arm site: publish the committed phase lease before
+            // OrionAppController can copy this token into the precise-fire worker.
+            commitArmedPhaseTokenAuthority(now);
             shot_.releasePlan = QStringLiteral("Live meter tip scheduled");
             shot_.releaseReason = QStringLiteral("release_scheduled");
             shot_.releaseReasonCode = QStringLiteral("release_scheduled");
+            // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] The handover line. Once a vision
+            // token stands, processInputTimedHolding's blind branch is unreachable (it returns on
+            // schedFireDeadlineMs_ >= 0), so the blind deadline is cancelled by construction
+            // rather than by a flag — and if this token is ever fenced, the blind deadline is
+            // still there to answer the press. One line per arm token, not per re-arm.
+            if (shot_.inputTimedShot
+                && inputTimedVisionOwnedLoggedToken_ != shot_.armToken) {
+                inputTimedVisionOwnedLoggedToken_ = shot_.armToken;
+                emit engineDiagnostic(QStringLiteral(
+                    "NO METER: vision owns the release (tip_eta=%1 lead=%2 source=%3 fill=%4), "
+                    "blind deadline %5 cancelled")
+                                          .arg(tipDecision.tipAbsMs - now, 0, 'f', 1)
+                                          .arg(effectiveLeadMs, 0, 'f', 1)
+                                          .arg(tipDecision.source.left(64))
+                                          .arg(shot_.fillPct, 0, 'f', 1)
+                                          .arg(noMeterBackstop_.deadlineMs - now, 0, 'f', 1));
+            }
             // [ORION_SILENT_FAIL] MIRROR of the tick arm site's promotion emit. This subtick
             // mirror is the DOMINANT arm path live (it reaches a killed token first on every
             // sidecar payload), yet it never marked the reservation promoted -- so half the
@@ -12369,7 +17899,7 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
                     "command_eta_ms=%2 lead_kind=%3 lead_ms=%4 predictor_sigma_ms=%5 "
                     "fill_pct=%6 physical_epoch=%7 shot_attempt=%8 schedule_token=%9 "
                     "reservation_age_ms=%10 reservation_updates=%11 first_fill=%12 "
-                    "arm_site=subtick")
+                    "arm_site=subtick rate_stretch=%13")
                                           .arg(tipDecision.source.left(64))
                                           .arg(fireAtMs - now, 0, 'f', 3)
                                           .arg(measuredLatencyAuthorityKind_.left(16))
@@ -12383,8 +17913,16 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
                                                    ? now - tipReservation_.createdMs : -1.0,
                                                0, 'f', 3)
                                           .arg(tipReservation_.updates)
-                                          .arg(tipReservation_.firstFillPct, 0, 'f', 2));
+                                          .arg(tipReservation_.firstFillPct, 0, 'f', 2)
+                                          .arg(shot_.phaseRateStretch, 0, 'f', 3));
             }
+        }
+        // [ORION_BLIND_WAITER 2026-09-15] The vision arm was refused AFTER the blind token was
+        // released to make room for it. Put the blind release straight back on the worker: the
+        // next 4 ms tick would re-arm it too, but surviving a stalled GUI thread is the entire
+        // point of arming it at all, so it may not depend on one.
+        if (schedFireDeadlineMs_ < 0.0 && blindTokenHeld && shot_.inputTimedShot) {
+            armBlindPreciseFire(noMeterBackstop_.deadlineMs, now);
         }
         return;
     }
@@ -13134,6 +18672,9 @@ void AutomationEngine::startPostReleaseMeterCapture(double now)
     meterCapDeadlineMs_ = now + config_.postReleaseWindowMs;        // soft: grade once settled
     meterCapHardDeadlineMs_ = now + config_.postReleaseMaxWindowMs; // hard: grade-or-skip regardless
     meterCapPeakFillPct_ = maxFillThisShot_;   // peak the meter reached this shot (recede/LATE)
+    meterCapRawPeakFillPct_ = maxRawFillThisShot_;   // [ORION_RAW_TOP]
+    meterCapTopFirstMs_ = -1.0;
+    meterCapTopLastMs_ = -1.0;
     // Snapshot the fill the meter was showing when the command was SUBMITTED. The command then
     // travels for a whole lead (~220-310ms) during which the meter keeps climbing ~0.2%/ms, so
     // submit-fill and landing-fill are ~50pp apart and only the pair identifies the landing.
@@ -13145,6 +18686,13 @@ void AutomationEngine::startPostReleaseMeterCapture(double now)
     // submit fill and the detector below resumes exactly where the offline one would be.
     meterCapPhaseAnchorMs_ = shot_.fillPhaseAnchorMs;
     meterCapPhaseAnchorLevelPct_ = shot_.fillPhaseAnchorLevelPct;
+    // [ORION_TIP_PHASE_FIRST_SIGHT] and HOW that level was obtained, for the learner's fence.
+    meterCapPhaseAnchorFirstSight_ = shot_.phaseAnchorFromFirstSight;
+    meterCapFadePhaseCatchup_ = shot_.fadePhaseCatchupAppliedMs < 0.0;
+    meterCapPressLatencyTrimMs_ = pressLatencyTrimMs();   // [ORION_PRESS_LATENCY_TRIM]
+    // The capture can outlive this shot: normalize with its applied trim, never
+    // the next shot's window policy or a subsequently edited setting.
+    meterCapPhaseTypeTrimMs_ = tipPhaseTypeTrimMs(shot_.shotType);
     meterCapPhaseRunMaxPct_ = shot_.fillPct;
     meterCapPhaseStopMs_ = -1.0;
     meterCapPhaseStopConfirmed_ = false;
@@ -13159,6 +18707,38 @@ void AutomationEngine::startPostReleaseMeterCapture(double now)
                             && pressWallEpoch_ == shot_.physicalShotEpoch
                             && pressWallMsForEpoch_ >= 0.0)
         ? pressWallMsForEpoch_ : -1.0;
+    // [ORION_NO_METER_V2 2026-09-14] And the RELEASE, on the same clock and in the same
+    // sample-and-hold. `now` here is the instant the command was submitted, so
+    // (this - meterCapPressWallMs_) is exactly the Square hold the console saw — the blind
+    // path's only ground truth. Snapshotted beside the press so the pair can never be
+    // re-paired with a later press.
+    meterCapReleaseWallMs_ = now;
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] ...and WHETHER THIS RELEASE WAS BLIND, in the
+    // same sample-and-hold and for the same reason. Before the hybrid this could not arise: NO
+    // METER admitted no video at all, so a blind release's capture window was always empty and
+    // graded nothing. Now a blind release can happen with the meter plainly on screen, and every
+    // learner hanging off this window would happily take it — teaching the press->release hold
+    // back the number the engine commanded, and the phase constant a "stop" that is our own
+    // release seen through the video. Both are circular. Fenced at each learner, once, on this.
+    meterCapBlindRelease_ = shot_.inputTimedShot && !shot_.noMeterVisionRelease;
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] ...and how late this release was issued, for the
+    // same reason and by the same rule the dev sweep offset already follows: a release the engine
+    // KNOWS it displaced cannot be evidence about where the release should go. A fired_late shot
+    // is still graded and still counted in the banner tally (the owner must see it); it simply
+    // teaches nothing. Subtracting the lateness inside recordPhaseConstantSample was the
+    // alternative and was rejected: the sign convention of the trim it would have to join
+    // (tipPhaseTypeTrimMs + meterCapPressLatencyTrimMs_) is not independently verifiable here,
+    // and a sign error there walks the owner's aim on live shots. Losing a handful of samples is
+    // strictly cheaper than that.
+    meterCapLateFireMs_ = shot_.lateFireLatenessMs;
+    // [ORION_VISION_HOLD_BAND 2026-09-15] ...and whether the band displaced this release, in the
+    // same sample-and-hold and for the same reason. The fence it buys is sharper than the
+    // late-fire one: the press->release hold learner (no_meter_hold_by_type) is the source of the
+    // very law the band clamps to, so a clamped hold fed back into it would teach the law its own
+    // clamp and the pair would converge on each other instead of on the animation. The aim
+    // learners are fenced for the ordinary reason -- the stop they date rides a release the
+    // engine knowingly moved.
+    meterCapHoldBandKind_ = shot_.holdBandKind;
     // And the delay that was riding the video at submit — the tip lands within ~200-400ms of
     // it, long before the post-shot ramp can move (a grade-time read could see a decayed
     // ramp and mis-date the wall-time tip by the whole delta).
@@ -13181,7 +18761,9 @@ void AutomationEngine::startPostReleaseMeterCapture(double now)
     meterCapSamples_.clear();
 }
 
-void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs)
+void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs,
+                                             const QString& fillEstimatorMode,
+                                             quint64 fillEstimatorGeneration)
 {
     // [ORION_TIP_PHASE] Date this shot's animation by its first UPWARD crossing of the anchor.
     //
@@ -13198,7 +18780,39 @@ void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs)
     if (!config_.tipPhaseEnabled || !std::isfinite(fillPct) || !std::isfinite(captureMs)) {
         return;
     }
+    // Source order is a property of the whole observation, not just the
+    // straddle predicate below. A rejected old fill must not replace the pair
+    // origin or reset the frame grid before the next genuine crossing arrives.
+    if (shot_.phasePrevCaptureMs >= 0.0 && captureMs <= shot_.phasePrevCaptureMs) {
+        return;
+    }
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] Feed the shot's game-frame grid FIRST, so the edge this
+    // sample may be about to date is already inside the fit. Configured on every sample rather
+    // than at beginShot: configure() only installs three scalars and never touches the collected
+    // edges, and doing it here means the grid can never be left on a stale console period by a
+    // ShotContext reset that ran between applyConfig and the first sample. Feeding is deliberately
+    // unconditional on tipFrameNative -- the grid is a measurement, the flag governs whether
+    // anything CONSUMES it, and the FRAME PHASE line is worth having on a benched build too.
+    shot_.framePhase.configure(config_.consoleFrameMs, config_.tipFrameNativeMinEdges,
+                               config_.tipFrameNativeMaxSdMs);
     const double anchorPct = config_.tipPhaseAnchorPct;
+    const QString estimatorMode = fillEstimatorMode.trimmed().toLower();
+    const bool estimatorValid = fillEstimatorGeneration != 0
+        && (estimatorMode == QLatin1String("coarse")
+            || estimatorMode == QLatin1String("subpixel"));
+    const bool sameEstimatorGeneration = estimatorValid
+        && shot_.phasePrevFillEstimatorGeneration != 0
+        && shot_.phasePrevFillEstimatorGeneration == fillEstimatorGeneration
+        && shot_.phasePrevFillEstimatorMode == estimatorMode;
+    // Fill discontinuities across rulers are not elapsed console frames. Keep
+    // an already witnessed anchor intact, but reacquire this measurement-only
+    // grid instead of teaching it a fictitious step/skip from incompatible fill.
+    if (!sameEstimatorGeneration && shot_.phasePrevCaptureMs >= 0.0) {
+        shot_.framePhase.reset();
+    }
+    if (estimatorValid) {
+        shot_.framePhase.note(fillPct, captureMs);
+    }
     // [ORION_TIP_PHASE] THE STRADDLE MUST BE A CROSSING, NOT A JUMP. See
     // RemapConfig::tipPhaseAnchorMaxOvershootPct: the straddling-pair requirement above stops a
     // meter first seen HIGH from being dated, but a carryover only has to be sampled once below
@@ -13225,8 +18839,40 @@ void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs)
     const double ladderStep = config_.tipPhaseAnchorLadderStepPct;
     const bool ladderUsable = ladderCount > 0
         && std::isfinite(ladderStep) && ladderStep > 0.0;
-    if (shot_.fillPhaseAnchorMs < 0.0
+    const bool seekingInitialAnchor = shot_.fillPhaseAnchorMs < 0.0;
+    const bool consensusRulerMatches =
+        shot_.phaseAnchorConsensusEstimatorGeneration == fillEstimatorGeneration
+        && shot_.phaseAnchorConsensusEstimatorMode == estimatorMode;
+    const bool consensusProposalPending = shot_.phaseAnchorRefinement.valid();
+    const bool seekingC30Consensus = shot_.phaseAnchorConsensusStagePct == 0
+        && !consensusProposalPending;
+    const bool seekingC35Consensus = shot_.phaseAnchorConsensusStagePct == 30
+        && shot_.phaseAnchorConsensusApplied
+        && std::isfinite(shot_.phaseAnchorConsensusC30Ms)
+        && shot_.phaseAnchorConsensusC30Ms >= 0.0
+        && !consensusProposalPending;
+    const bool consensusAnchorIsBase20 =
+        std::abs(anchorPct - kAnchorBase20RungOffsets[0].levelPct) <= 1e-6
+        && std::abs(shot_.fillPhaseAnchorLevelPct
+                    - kAnchorBase20RungOffsets[0].levelPct) <= 1e-6;
+    // A meter first acquired between 20 and 25 has already lost c20, but c25/c30/c35 are
+    // still three independent observations of the same known-shape animation clock. Keep
+    // that late-acquisition rescue separate from the ordinary c20/c25/c30 path: it needs
+    // rung 35 to obtain three witnesses and it must retain level=25 when the normalized
+    // base-20 clock is committed (otherwise the level adjustment would be applied twice).
+    const bool consensusAnchorIsLate25 =
+        std::abs(anchorPct - kAnchorBase20RungOffsets[0].levelPct) <= 1e-6
+        && std::abs(shot_.fillPhaseAnchorLevelPct
+                    - kAnchorBase20RungOffsets[1].levelPct) <= 1e-6;
+    const bool seekingLate25Consensus = seekingC30Consensus
+        && consensusAnchorIsLate25;
+    const bool seekingBase20Consensus = config_.tipPhaseAnchorConsensus
+        && config_.anchorBase20 && (seekingC30Consensus || seekingC35Consensus)
+        && (consensusAnchorIsBase20 || seekingLate25Consensus)
+        && consensusRulerMatches;
+    if ((seekingInitialAnchor || seekingBase20Consensus)
         && std::isfinite(anchorPct) && anchorPct > 0.0
+        && sameEstimatorGeneration
         && shot_.phasePrevCaptureMs >= 0.0
         && shot_.phasePrevFillPct >= 0.0
         && fillPct > shot_.phasePrevFillPct
@@ -13234,10 +18880,19 @@ void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs)
         // Find the LOWEST level this pair straddles. That level, and only that level, is the
         // crossing the pair actually witnesses -- the meter reached it first on the way up.
         double crossedLevelPct = -1.0;
-        for (int step = 0; step <= (ladderUsable ? ladderCount : 0); ++step) {
+        const int firstStep = seekingInitialAnchor ? 0 : 1;
+        const int lastStep = seekingInitialAnchor
+            ? (ladderUsable ? ladderCount : 0)
+            : std::min((seekingC35Consensus || seekingLate25Consensus) ? 3 : 2,
+                       ladderUsable ? ladderCount : 0);
+        for (int step = firstStep; step <= lastStep; ++step) {
             const double levelPct = anchorPct + static_cast<double>(step) * ladderStep;
             if (!std::isfinite(levelPct) || levelPct <= 0.0 || levelPct >= 100.0) {
                 break;
+            }
+            if (!seekingInitialAnchor
+                && (shot_.phaseAnchorBase20WitnessMask & (quint8{1} << step)) != 0) {
+                continue;
             }
             if (shot_.phasePrevFillPct < levelPct && fillPct >= levelPct) {
                 crossedLevelPct = levelPct;
@@ -13257,18 +18912,622 @@ void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs)
         const bool straddleOvershootPlausible = !std::isfinite(maxOvershootPct)
             || maxOvershootPct <= 0.0
             || fillPct - crossedLevelPct <= maxOvershootPct;
-        if (crossedLevelPct >= 0.0 && straddleOvershootPlausible) {
+        // Refinement is allowed to improve an already-proven anchor, never to turn a
+        // detector/ruler jump into a new clock. The ordinary acquisition gate is left
+        // byte-identical; only the optional consensus path adds this whole-pair bound.
+        const bool refinementStepPlausible = seekingInitialAnchor
+            || !std::isfinite(maxOvershootPct) || maxOvershootPct <= 0.0
+            || fillPct - shot_.phasePrevFillPct <= maxOvershootPct;
+        if (crossedLevelPct >= 0.0 && straddleOvershootPlausible
+            && refinementStepPlausible) {
             const double frac = std::clamp(
                 (crossedLevelPct - shot_.phasePrevFillPct)
                     / (fillPct - shot_.phasePrevFillPct),
                 0.0, 1.0);
-            shot_.fillPhaseAnchorMs = shot_.phasePrevCaptureMs
+            const double interpolatedCrossingMs = shot_.phasePrevCaptureMs
                 + frac * (captureMs - shot_.phasePrevCaptureMs);
-            shot_.fillPhaseAnchorLevelPct = crossedLevelPct;
+            // [ORION_TIP_FRAME_NATIVE 2026-09-15] Re-date onto the shot's fitted game-frame grid
+            // when the grid is locked. Returns the interpolation UNCHANGED (same double, not a
+            // recomputation) with the flag off or the grid unlocked, so every rung, every witness
+            // and every consensus median below is byte-identical on a benched build.
+            bool crossingFrameDated = false;
+            const double crossingMs = frameNativeCrossingMs(
+                interpolatedCrossingMs, captureMs, fillPct, crossedLevelPct, &crossingFrameDated);
+            if (seekingInitialAnchor) {
+                shot_.fillPhaseAnchorMs = crossingMs;
+                shot_.fillPhaseAnchorLevelPct = crossedLevelPct;
+                shot_.phaseAnchorFrameDated = crossingFrameDated;
+                shot_.phaseAnchorFrameCorrectionMs = crossingMs - interpolatedCrossingMs;
+                emitFramePhaseDiagnostic(crossingMs,
+                                         crossingFrameDated ? "phase_frame" : "phase");
+                // [ORION_PRESS_LATENCY_TRIM] the first dated anchor of the shot is the
+                // measurement; consensus refinements move it by <= 3 ms and do not re-decide.
+                decidePressLatencyTrim(crossingMs, crossedLevelPct);
+                int initialWitnessIndex = -1;
+                if (config_.tipPhaseAnchorConsensus && config_.anchorBase20
+                    && std::abs(anchorPct
+                                - kAnchorBase20RungOffsets[0].levelPct) <= 1e-6) {
+                    // Seed either c20 or the first recoverable late rung, c25. An initial
+                    // c30/c35 remains a single late observation and is intentionally not
+                    // promoted into a two-witness guess.
+                    for (int i = 0; i <= 1; ++i) {
+                        if (std::abs(crossedLevelPct
+                                     - kAnchorBase20RungOffsets[i].levelPct) <= 1e-6) {
+                            initialWitnessIndex = i;
+                            break;
+                        }
+                    }
+                }
+                if (initialWitnessIndex >= 0) {
+                    shot_.phaseAnchorBase20WitnessMs[
+                        static_cast<std::size_t>(initialWitnessIndex)] =
+                        crossingMs + tipPhaseLevelAdjustmentMs(crossedLevelPct);
+                    shot_.phaseAnchorBase20WitnessMask =
+                        quint8{1} << initialWitnessIndex;
+                    shot_.phaseAnchorConsensusEstimatorMode = estimatorMode;
+                    shot_.phaseAnchorConsensusEstimatorGeneration = fillEstimatorGeneration;
+                }
+            } else {
+                int witnessIndex = -1;
+                for (int i = 1; i < 4; ++i) {
+                    if (std::abs(crossedLevelPct
+                                 - kAnchorBase20RungOffsets[i].levelPct) <= 1e-6) {
+                        witnessIndex = i;
+                        break;
+                    }
+                }
+                if (witnessIndex >= 1) {
+                    shot_.phaseAnchorBase20WitnessMs[static_cast<std::size_t>(witnessIndex)] =
+                        crossingMs + tipPhaseLevelAdjustmentMs(crossedLevelPct);
+                    shot_.phaseAnchorBase20WitnessMask |= quint8{1} << witnessIndex;
+                }
+                const bool c30Ready = seekingC30Consensus
+                    && ((consensusAnchorIsBase20
+                         && (shot_.phaseAnchorBase20WitnessMask & quint8{0x07})
+                             == quint8{0x07})
+                        || (consensusAnchorIsLate25
+                            && (shot_.phaseAnchorBase20WitnessMask & quint8{0x0e})
+                                == quint8{0x0e}));
+                const bool c35Ready = seekingC35Consensus
+                    && (shot_.phaseAnchorBase20WitnessMask & quint8{0x0f}) == quint8{0x0f};
+                if (c30Ready || c35Ready) {
+                    const auto rawWitnesses = shot_.phaseAnchorBase20WitnessMs;
+                    const int stagePct = c35Ready ? 35 : 30;
+                    const bool late25Rescue = c30Ready && consensusAnchorIsLate25;
+                    const std::array<double, 3> stage30Witnesses = late25Rescue
+                        ? std::array<double, 3>{{
+                              rawWitnesses[1], rawWitnesses[2], rawWitnesses[3]}}
+                        : std::array<double, 3>{{
+                              rawWitnesses[0], rawWitnesses[1], rawWitnesses[2]}};
+                    double refinedBase20Ms = -1.0;
+                    if (stagePct == 30) {
+                        auto c30Witnesses = stage30Witnesses;
+                        std::sort(c30Witnesses.begin(), c30Witnesses.end());
+                        refinedBase20Ms = c30Witnesses[1];
+                    } else {
+                        // Held-out winner: refine the already-committed robust c30 clock with
+                        // the newly observed normalized c35 witness. This is intentionally NOT
+                        // median(all four): midpoint(c30, e35) measured the lower p90 error.
+                        refinedBase20Ms = 0.5
+                            * (shot_.phaseAnchorConsensusC30Ms + rawWitnesses[3]);
+                    }
+                    const auto c30MinMax = std::minmax_element(
+                        stage30Witnesses.begin(), stage30Witnesses.end());
+                    const double c30WitnessRangeMs = *c30MinMax.second - *c30MinMax.first;
+                    const double anchorLevelAdjustmentMs =
+                        tipPhaseLevelAdjustmentMs(shot_.fillPhaseAnchorLevelPct);
+                    const double originalBase20Ms =
+                        shot_.fillPhaseAnchorMs + anchorLevelAdjustmentMs;
+                    const double refinedAnchorMs =
+                        refinedBase20Ms - anchorLevelAdjustmentMs;
+                    const double correctionMs = refinedBase20Ms - originalBase20Ms;
+                    const double engineNow = nowMs();
+                    const double correctionLimitMs = stagePct == 30
+                        ? config_.tipPhaseConsensusC30MaxCorrectionMs
+                        : config_.tipPhaseConsensusC35MaxCorrectionMs;
+
+                    auto finalizeWithoutToken = [&]() {
+                        shot_.fillPhaseAnchorMs = refinedAnchorMs;
+                        shot_.phaseAnchorConsensusStagePct = stagePct;
+                        if (stagePct == 30) {
+                            shot_.phaseAnchorConsensusApplied = true;
+                            shot_.phaseAnchorConsensusC30Ms = refinedBase20Ms;
+                        }
+                        emit engineDiagnostic(QStringLiteral(
+                            "TIP PHASE ANCHOR CONSENSUS: disposition=applied_unarmed "
+                            "stage=%1 correction_ms=%2 w20_ms=%3 w25_ms=%4 w30_ms=%5 "
+                            "w35_ms=%6 witness_range_ms=%7")
+                                                  .arg(stagePct)
+                                                  .arg(correctionMs, 0, 'f', 3)
+                                                  .arg(rawWitnesses[0], 0, 'f', 3)
+                                                  .arg(rawWitnesses[1], 0, 'f', 3)
+                                                  .arg(rawWitnesses[2], 0, 'f', 3)
+                                                  .arg(rawWitnesses[3], 0, 'f', 3)
+                                                  .arg(c30WitnessRangeMs, 0, 'f', 3));
+                    };
+                    auto refuse = [&](const QString& reason, double refinedEtaMs) {
+                        shot_.phaseAnchorConsensusStagePct = stagePct;
+                        emit engineDiagnostic(QStringLiteral(
+                            "TIP PHASE ANCHOR CONSENSUS: disposition=refused_%1 stage=%2 "
+                            "correction_ms=%3 correction_limit_ms=%4 "
+                            "refined_deadline_eta_ms=%5 retarget_guard_ms=%6 "
+                            "w20_ms=%7 w25_ms=%8 w30_ms=%9 w35_ms=%10 "
+                            "witness_range_ms=%11 witness_range_limit_ms=%12")
+                                                  .arg(reason)
+                                                  .arg(stagePct)
+                                                  .arg(correctionMs, 0, 'f', 3)
+                                                  .arg(correctionLimitMs, 0, 'f', 3)
+                                                  .arg(refinedEtaMs, 0, 'f', 3)
+                                                  .arg(phaseAnchorRetargetGuardMs(), 0, 'f', 3)
+                                                  .arg(rawWitnesses[0], 0, 'f', 3)
+                                                  .arg(rawWitnesses[1], 0, 'f', 3)
+                                                  .arg(rawWitnesses[2], 0, 'f', 3)
+                                                  .arg(rawWitnesses[3], 0, 'f', 3)
+                                                  .arg(c30WitnessRangeMs, 0, 'f', 3)
+                                                  .arg(config_.tipPhaseConsensusC30MaxWitnessRangeMs,
+                                                       0, 'f', 3));
+                    };
+
+                    const bool witnessRangeBounded = stagePct != 30
+                        || (std::isfinite(c30WitnessRangeMs)
+                            && std::isfinite(
+                                config_.tipPhaseConsensusC30MaxWitnessRangeMs)
+                            && config_.tipPhaseConsensusC30MaxWitnessRangeMs >= 0.0
+                            && c30WitnessRangeMs
+                                <= config_.tipPhaseConsensusC30MaxWitnessRangeMs + 1e-6);
+                    const bool innovationBounded = std::isfinite(correctionMs)
+                        && std::isfinite(correctionLimitMs) && correctionLimitMs >= 0.0
+                        && std::abs(correctionMs) <= correctionLimitMs;
+                    if (!witnessRangeBounded && !config_.tipPhaseConsensusApplyOnSpread) {
+                        // A median can sit close to w20 even when the three clocks fan out in
+                        // opposite directions.  That is disagreement, not precision.  Finalize
+                        // the stage and retain the independently observed first clock.
+                        // [ORION_ANCHOR_CONSENSUS_APPLY_ON_SPREAD] measured the opposite live:
+                        // the retained w20 is the reader-lagged clock and those shots go late
+                        // 67 % of the time; default is now to apply the median (below).
+                        refuse(QStringLiteral("witness_spread"), -1.0);
+                    } else if (!innovationBounded) {
+                        // A late rung that disagrees this much is a measurement-integrity alarm,
+                        // not permission to drag a tuned token. Finalize the stage so the same
+                        // outlier cannot repeatedly race the worker on later frames.
+                        refuse(QStringLiteral("innovation"), -1.0);
+                    } else if (stagePct == 35 && !config_.tipPhaseConsensusC35Live) {
+                        // Keep collecting/logging c35, but leave the robust committed c30 clock
+                        // untouched until a labelled outcome A/B proves this single witness helps.
+                        refuse(QStringLiteral("c35_shadow"), -1.0);
+                    } else if (schedFireDeadlineMs_ < 0.0) {
+                        // No copied or engine-owned token exists, so changing the anchor before
+                        // the normal fresh-sample evaluation is intrinsically transactional.
+                        finalizeWithoutToken();
+                    } else {
+                        const double refinedDeadlineMs = schedFireDeadlineMs_ + correctionMs;
+                        const double armedEtaMs = schedFireDeadlineMs_ - engineNow;
+                        const double refinedEtaMs = refinedDeadlineMs - engineNow;
+                        // Unlike destructive source replacement, this path changes the exact
+                        // waiting token in place while submitMutex_ + the worker mutex serialize
+                        // it against the physical edge. A whole video cadence here discarded
+                        // valid c35 evidence 5-16 ms before fire. Three milliseconds still leaves
+                        // 1.8 ms ahead of the worker's 1.2 ms final-spin claim; the mailbox itself
+                        // refuses atomically if that claim has already won.
+                        const double replaceWindowMs = phaseAnchorRetargetGuardMs();
+                        const bool fullRunway = armedEtaMs > replaceWindowMs
+                            && refinedEtaMs > replaceWindowMs;
+                        const bool phaseTokenOwnsShot =
+                            armedPhaseTokenCarriesAnchorAuthority(engineNow)
+                            && schedFireConfirmedToken_ != schedFireToken_
+                            && schedFirePhysicalShotEpoch_ == shot_.physicalShotEpoch
+                            && schedFireShotAttempt_ == shot_.armToken;
+                        const double originalRunwayBoundMs = schedFireArmedCommandEtaMs_
+                            + std::max(0.0, schedFireAppliedDevOffsetMs_);
+                        const bool boundedByOriginalArm = std::isfinite(originalRunwayBoundMs)
+                            && originalRunwayBoundMs > 0.0
+                            && refinedEtaMs <= originalRunwayBoundMs + 1e-6;
+                        if (!fullRunway) {
+                            refuse(QStringLiteral("imminent"), refinedEtaMs);
+                        } else if (!phaseTokenOwnsShot || !boundedByOriginalArm) {
+                            refuse(QStringLiteral("token_identity"), refinedEtaMs);
+                        } else {
+                            if (++phaseAnchorRefinementSerial_ == 0) {
+                                ++phaseAnchorRefinementSerial_;
+                            }
+                            PhaseAnchorRefinementProposal proposal;
+                            proposal.id = phaseAnchorRefinementSerial_;
+                            proposal.stagePct = stagePct;
+                            proposal.expectedAnchorMs = shot_.fillPhaseAnchorMs;
+                            proposal.refinedAnchorMs = refinedAnchorMs;
+                            proposal.scheduleToken = schedFireToken_;
+                            proposal.expectedDeadlineMs = schedFireDeadlineMs_;
+                            proposal.refinedDeadlineMs = refinedDeadlineMs;
+                            const double graceMs = std::isfinite(config_.schedulerGraceMs)
+                                ? std::max(0.0, config_.schedulerGraceMs) : 0.0;
+                            proposal.refinedAuthorityExpiryMs = std::max(
+                                schedFireAuthorityExpiryMs_, refinedDeadlineMs + graceMs);
+                            proposal.physicalShotEpoch = shot_.physicalShotEpoch;
+                            proposal.shotAttempt = shot_.armToken;
+                            proposal.routeGeneration = schedFireRouteGeneration_;
+                            proposal.route = schedFireRoute_;
+                            if (!proposal.valid()) {
+                                refuse(QStringLiteral("proposal_invalid"), refinedEtaMs);
+                            } else {
+                                shot_.phaseAnchorRefinement = proposal;
+                                emit engineDiagnostic(QStringLiteral(
+                                    "TIP PHASE ANCHOR CONSENSUS: disposition=proposed stage=%1 "
+                                    "proposal=%2 token=%3 correction_ms=%4 armed_eta_ms=%5 "
+                                    "refined_deadline_eta_ms=%6 w20_ms=%7 w25_ms=%8 "
+                                    "w30_ms=%9 w35_ms=%10 witness_range_ms=%11")
+                                                          .arg(stagePct)
+                                                          .arg(proposal.id)
+                                                          .arg(proposal.scheduleToken)
+                                                          .arg(correctionMs, 0, 'f', 3)
+                                                          .arg(armedEtaMs, 0, 'f', 3)
+                                                          .arg(refinedEtaMs, 0, 'f', 3)
+                                                          .arg(rawWitnesses[0], 0, 'f', 3)
+                                                          .arg(rawWitnesses[1], 0, 'f', 3)
+                                                          .arg(rawWitnesses[2], 0, 'f', 3)
+                                                          .arg(rawWitnesses[3], 0, 'f', 3)
+                                                          .arg(c30WitnessRangeMs, 0, 'f', 3));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+    // [ORION_TIP_PHASE_FIRST_SIGHT] Strictly AFTER the ladder has had this pair: a witnessed rung
+    // always wins, and the helper stands down the moment fillPhaseAnchorMs exists. Strictly
+    // BEFORE the prev-sample store, because "this is the shot's first accepted sample" IS
+    // shot_.phasePrevFillPct < 0 -- the same field, and the same re-lock reset, the straddle uses.
+    noteFirstSightPhaseAnchor(fillPct, captureMs, estimatorMode, fillEstimatorGeneration,
+                              estimatorValid);
     shot_.phasePrevFillPct = fillPct;
     shot_.phasePrevCaptureMs = captureMs;
+    shot_.phasePrevFillEstimatorMode = estimatorValid ? estimatorMode : QString{};
+    shot_.phasePrevFillEstimatorGeneration = estimatorValid
+        ? fillEstimatorGeneration : 0;
+}
+
+void AutomationEngine::noteFirstSightPhaseAnchor(double fillPct, double captureMs,
+                                                 const QString& estimatorMode,
+                                                 quint64 fillEstimatorGeneration,
+                                                 bool estimatorValid)
+{
+    // [ORION_TIP_PHASE_FIRST_SIGHT] Contract and the measurement are on RemapConfig.
+    //
+    // THE RUNG LADDER ALWAYS WINS. This helper is a pure no-op while a rung date exists or can
+    // still be witnessed, so every shot the engine dates today is dated identically today.
+    const auto clearCandidate = [&]() {
+        shot_.phaseFirstSightFillPct = -1.0;
+        shot_.phaseFirstSightCaptureMs = -1.0;
+        shot_.phaseFirstSightEstimatorMode.clear();
+        shot_.phaseFirstSightEstimatorGeneration = 0;
+        shot_.phaseFirstSightMissedRungs = 0;
+    };
+    if (!config_.tipPhaseFirstSightAnchor || shot_.fillPhaseAnchorMs >= 0.0) {
+        clearCandidate();
+        return;
+    }
+    const double topLevelPct = phaseAnchorTopWitnessableLevelPct();
+    if (!std::isfinite(topLevelPct)) {
+        clearCandidate();
+        return;
+    }
+
+    if (shot_.phaseFirstSightCaptureMs < 0.0) {
+        // ACQUISITION. Only the shot's FIRST accepted sample may become the candidate: the whole
+        // claim is "the meter was not visible before this", and the second sample of a stream
+        // that started lower is not evidence of that -- it is a sample whose own rung crossing
+        // the straddle above has already adjudicated.
+        if (shot_.phasePrevFillPct >= 0.0 || shot_.phasePrevCaptureMs >= 0.0) {
+            return;
+        }
+        // Provenance, exactly the straddle's: a sample with no sidecar ruler cannot date
+        // anything. And the fill must genuinely be past every witnessable rung -- at or below
+        // the top rung the ladder still has a crossing coming and must be left to take it.
+        if (!estimatorValid || !(fillPct > topLevelPct)
+            || fillPct > kPhaseFirstSightMaxFillPct) {
+            return;
+        }
+        shot_.phaseFirstSightFillPct = fillPct;
+        shot_.phaseFirstSightCaptureMs = captureMs;
+        shot_.phaseFirstSightEstimatorMode = estimatorMode;
+        shot_.phaseFirstSightEstimatorGeneration = fillEstimatorGeneration;
+        const double basePct = config_.tipPhaseAnchorPct;
+        const double stepPct = config_.tipPhaseAnchorLadderStepPct;
+        const int ladderCount = std::max(0, config_.tipPhaseAnchorLadderCount);
+        const bool ladderUsable = ladderCount > 0
+            && std::isfinite(stepPct) && stepPct > 0.0;
+        int missed = 0;
+        for (int step = 0; step <= (ladderUsable ? ladderCount : 0); ++step) {
+            const double levelPct = basePct + static_cast<double>(step) * stepPct;
+            if (!std::isfinite(levelPct) || levelPct <= 0.0 || levelPct >= 100.0) {
+                break;
+            }
+            if (fillPct >= levelPct) {
+                ++missed;
+            }
+        }
+        shot_.phaseFirstSightMissedRungs = missed;
+        return;
+    }
+
+    // RETRACTION. A fill DROP is the reader's own carryover -> real discriminator: the spent
+    // meter is being preempted by a fresh low one, whose rung crossings the ladder will witness
+    // normally. Dropping back to or below the top rung is the same statement in the other
+    // direction -- a witnessable crossing exists again. Either way the candidate is not this
+    // shot's first sight and must not become its clock.
+    if (fillPct < shot_.phaseFirstSightFillPct - kPhaseFirstSightDropBreakPct
+        || fillPct <= topLevelPct) {
+        clearCandidate();
+        return;
+    }
+    // COMMIT, on a same-ruler RISE out of the candidate. This is the fail-closed half: a frozen
+    // carryover (the live 2026-08 failure: a meter parked at ~50 % since the previous shot's
+    // abort) produces no rise and is never dated, and a deflating one was retracted above. It is
+    // the same evidence the reader's episode machinery demands of an episode first seen high,
+    // and the decision path independently re-demands that proof as shot_.anchorValidMs.
+    const bool sameRuler = estimatorValid
+        && shot_.phaseFirstSightEstimatorGeneration != 0
+        && shot_.phaseFirstSightEstimatorGeneration == fillEstimatorGeneration
+        && shot_.phaseFirstSightEstimatorMode == estimatorMode;
+    if (!sameRuler || !(fillPct > shot_.phaseFirstSightFillPct)
+        || !(captureMs > shot_.phaseFirstSightCaptureMs)) {
+        return;
+    }
+    const double anchorFillPct = shot_.phaseFirstSightFillPct;
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] The same re-dating, for the same reason. In practice
+    // this is inert here and is written for uniformity rather than effect: a first-sight commit
+    // happens on the shot's SECOND accepted sample, so the grid has at most two edges and cannot
+    // be locked. It becomes live only if the lock gate is ever lowered, and it is a no-op
+    // (level == fill, correction exactly 0) even then beyond snapping to the grid.
+    bool firstSightFrameDated = false;
+    const double anchorMs = frameNativeCrossingMs(
+        shot_.phaseFirstSightCaptureMs, shot_.phaseFirstSightCaptureMs, anchorFillPct,
+        anchorFillPct, &firstSightFrameDated);
+    const int missedRungs = shot_.phaseFirstSightMissedRungs;
+    shot_.fillPhaseAnchorMs = anchorMs;
+    shot_.phaseAnchorFrameDated = firstSightFrameDated;
+    shot_.phaseAnchorFrameCorrectionMs = anchorMs - shot_.phaseFirstSightCaptureMs;
+    emitFramePhaseDiagnostic(anchorMs, firstSightFrameDated ? "firstsight_frame" : "firstsight");
+    shot_.fillPhaseAnchorLevelPct = anchorFillPct;
+    shot_.phaseAnchorFromFirstSight = true;
+    clearCandidate();
+    // [ORION_PRESS_LATENCY_TRIM] deliberately NOT decided here. That trim is a per-type median of
+    // press -> base-20-anchor delays, and a first-sight date measures when the DETECTOR acquired
+    // the meter, not when the meter crossed a level; feeding it would teach the trim this court's
+    // acquisition latency and then charge that to every rung-dated shot. The shot therefore fires
+    // with trim 0, which is what an untrimmed shot has always done.
+
+    // The one line this feature owes the log. Everything in it is the value actually committed,
+    // so a returned log answers "did first-sight date this shot, and at what cost in sigma".
+    const double constantMs = effectiveTipPhaseConstantMs()
+        + tipPhaseLevelAdjustmentMs(anchorFillPct)
+        + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs();
+    const double tipEtaMs = anchorMs + stretchedPhaseConstantMs(constantMs) - captureMs;
+    emit engineDiagnostic(QStringLiteral(
+        "PHASE FIRST-SIGHT ANCHOR: first_fill=%1 missed_rungs=%2 tip_eta=%3 sigma=%4 "
+        "top_rung_pct=%5 anchor_ms=%6 rise_fill=%7 physical_epoch=%8 shot_attempt=%9")
+                              .arg(anchorFillPct, 0, 'f', 2)
+                              .arg(missedRungs)
+                              .arg(tipEtaMs, 0, 'f', 1)
+                              .arg(phaseFirstSightSigmaMs(anchorFillPct), 0, 'f', 2)
+                              .arg(topLevelPct, 0, 'f', 1)
+                              .arg(anchorMs, 0, 'f', 1)
+                              .arg(fillPct, 0, 'f', 2)
+                              .arg(shot_.physicalShotEpoch)
+                              .arg(shot_.armToken));
+}
+
+
+void AutomationEngine::noteFadePhaseCatchup(const DetectionResult& result, double captureMs)
+{
+    // This is intentionally narrower than a new predictor: only witnessed c20 fades on
+    // the existing un-stretched phase clock. Consensus/first-sight/other shot types retain
+    // their own policies. Do not reinterpret a slow animation or change any lead.
+    const bool fade = shot_.shotType == QLatin1String("Left Fade")
+        || shot_.shotType == QLatin1String("Right Fade");
+    if (!config_.fadePhaseCatchup || !config_.tipPhaseEnabled || !config_.anchorBase20
+        || !autonomousLiveMeterTimingEnabled() || !fade || config_.tipPhaseAnchorConsensus
+        || shot_.phaseAnchorFromFirstSight || shot_.fillPhaseAnchorMs < 0.0
+        || std::abs(shot_.fillPhaseAnchorLevelPct - 20.0) > 1e-6
+        || !std::isfinite(shot_.phaseRateStretch)
+        || std::abs(shot_.phaseRateStretch - 1.0) > 1e-6
+        || shot_.phaseAnchorRefinement.valid()
+        || (shot_.state != HoldState::Holding && shot_.state != HoldState::GreenWindow)
+        || !shot_.lastSampleGenuineAccept || result.staleFrame || result.ghostFrame
+        || result.fillEstimatorMode != QLatin1String("subpixel")
+        || result.detectorSource.isEmpty() || shot_.fadePhaseCatchupSourceBroken
+        || !result.gameplayStructureVerified || shot_.physicalShotEpoch == 0
+        || shot_.physicalShotEpoch != physicalShotEpoch_
+        || result.gameplayStructureEpoch != shot_.physicalShotEpoch
+        || !std::isfinite(result.frameAgeMs) || result.frameAgeMs < 0.0
+        || result.frameAgeMs > 50.0
+        || !std::isfinite(result.measurementCaptureTsMs) || result.measurementCaptureTsMs <= 0.0) {
+        shot_.fadePhaseCatchup.clearEvidence();
+        return;
+    }
+    if (shot_.fadePhaseCatchupSource.isEmpty()) {
+        shot_.fadePhaseCatchupSource = result.detectorSource;
+    } else if (shot_.fadePhaseCatchupSource != result.detectorSource) {
+        shot_.fadePhaseCatchupSourceBroken = true;
+        shot_.fadePhaseCatchup.clearEvidence();
+        return;
+    }
+    fade_phase_catchup::Observation observation;
+    observation.captureMs = captureMs;
+    observation.fillPct = result.fillPct;
+    observation.coarsePct = result.coarseFillPct;
+    observation.referenceMs = curveOffsetFromBase20Ms(result.fillPct);
+    observation.coarseReferenceMs = curveOffsetFromBase20Ms(result.coarseFillPct);
+    observation.frame = result.frameNumber;
+    observation.ruler = result.fillEstimatorGeneration;
+    observation.x = result.x; observation.y = result.y;
+    observation.width = result.width; observation.height = result.height;
+    const double correctionMs = shot_.fadePhaseCatchup.observe(
+        observation, shot_.fillPhaseAnchorMs, config_.consoleFrameMs);
+    if (correctionMs == 0.0) return;
+
+    // Capture-time evidence is not receipt-time runway. Refuse too-late corrections
+    // WITHOUT tearing down, re-arming or consuming the already useful fallback token.
+    const double engineNow = nowMs();
+    const double refinedDeadline = schedFireDeadlineMs_ + correctionMs;
+    const double refinedAnchor = shot_.fillPhaseAnchorMs + correctionMs;
+    const double eta = refinedDeadline - engineNow;
+    if (!armedPhaseTokenCarriesAnchorAuthority(engineNow)
+        || schedFireConfirmedToken_ == schedFireToken_
+        || schedFireFailedToken_ == schedFireToken_
+        || eta <= phaseAnchorRetargetGuardMs() || refinedAnchor < 0.0) {
+        emit engineDiagnostic(QStringLiteral(
+            "FADE PHASE CATCHUP: disposition=kept_fallback reason=identity_or_runway "
+            "correction_ms=%1 eta_ms=%2").arg(correctionMs, 0, 'f', 3).arg(eta, 0, 'f', 3));
+        return;
+    }
+    if (++phaseAnchorRefinementSerial_ == 0) ++phaseAnchorRefinementSerial_;
+    PhaseAnchorRefinementProposal proposal;
+    proposal.kind = PhaseAnchorRefinementKind::FadeProgressionCatchup;
+    proposal.id = phaseAnchorRefinementSerial_;
+    proposal.proofFrame = result.frameNumber;
+    proposal.proofCaptureTsMs = result.captureTsMs;
+    proposal.proofRuler = result.fillEstimatorGeneration;
+    proposal.expectedAnchorMs = shot_.fillPhaseAnchorMs;
+    proposal.refinedAnchorMs = refinedAnchor;
+    proposal.scheduleToken = schedFireToken_;
+    proposal.expectedDeadlineMs = schedFireDeadlineMs_;
+    proposal.refinedDeadlineMs = refinedDeadline;
+    proposal.refinedAuthorityExpiryMs = schedFireAuthorityExpiryMs_;
+    proposal.physicalShotEpoch = shot_.physicalShotEpoch;
+    proposal.shotAttempt = shot_.armToken;
+    proposal.routeGeneration = schedFireRouteGeneration_;
+    proposal.route = schedFireRoute_;
+    if (!proposal.valid()) return;
+    shot_.phaseAnchorRefinement = proposal;
+    emit engineDiagnostic(QStringLiteral(
+        "FADE PHASE CATCHUP: disposition=proposed proposal=%1 token=%2 "
+        "correction_ms=%3 eta_ms=%4 physical_epoch=%5")
+        .arg(proposal.id).arg(proposal.scheduleToken).arg(correctionMs, 0, 'f', 3)
+        .arg(eta, 0, 'f', 3).arg(proposal.physicalShotEpoch));
+}
+
+bool AutomationEngine::commitPhaseAnchorRefinement(
+    quint64 proposalId, quint64 scheduleToken, double refinedDeadlineMs)
+{
+    const PhaseAnchorRefinementProposal proposal = shot_.phaseAnchorRefinement;
+    if (!proposal.valid() || proposal.id != proposalId
+        || proposal.scheduleToken != scheduleToken || scheduleToken == 0
+        || std::abs(proposal.refinedDeadlineMs - refinedDeadlineMs) > 1e-6) {
+        return false;
+    }
+    const bool catchup = proposal.kind == PhaseAnchorRefinementKind::FadeProgressionCatchup;
+    const double correctionMs = proposal.refinedAnchorMs - proposal.expectedAnchorMs;
+    const bool catchupProofValid = catchup && config_.fadePhaseCatchup
+        && config_.tipPhaseEnabled && config_.anchorBase20 && autonomousLiveMeterTimingEnabled()
+        && !config_.tipPhaseAnchorConsensus && !shot_.phaseAnchorFromFirstSight
+        && std::abs(shot_.fillPhaseAnchorLevelPct - 20.0) <= 1e-6
+        && std::isfinite(shot_.phaseRateStretch) && std::abs(shot_.phaseRateStretch - 1.0) <= 1e-6
+        && (shot_.shotType == QLatin1String("Left Fade") || shot_.shotType == QLatin1String("Right Fade"))
+        && shot_.fadePhaseCatchup.attempted() && shot_.fadePhaseCatchupAppliedMs == 0.0
+        && !shot_.fadePhaseCatchupSourceBroken && shot_.lastSampleGenuineAccept
+        && lastDetectorFrameNumber_ == proposal.proofFrame
+        && std::abs(lastDetectorCaptureTsMs_ - proposal.proofCaptureTsMs) < 1e-6
+        && shot_.lastGenuineFillEstimatorGeneration == proposal.proofRuler
+        && shot_.lastGenuineFillEstimatorMode == QLatin1String("subpixel")
+        && correctionMs <= -config_.consoleFrameMs && correctionMs >= -2.5 * config_.consoleFrameMs
+        && std::abs(proposal.refinedDeadlineMs - proposal.expectedDeadlineMs - correctionMs) < 1e-6;
+    const bool stageTransitionValid = catchup ? catchupProofValid : proposal.stagePct == 30
+        ? (shot_.phaseAnchorConsensusStagePct == 0
+           && !shot_.phaseAnchorConsensusApplied)
+        : (shot_.phaseAnchorConsensusStagePct == 30
+           && shot_.phaseAnchorConsensusApplied
+           && std::isfinite(shot_.phaseAnchorConsensusC30Ms)
+           && shot_.phaseAnchorConsensusC30Ms >= 0.0);
+    const double engineNow = nowMs();
+    const double currentEtaMs = schedFireDeadlineMs_ - engineNow;
+    const double refinedEtaMs = refinedDeadlineMs - engineNow;
+    // Recheck the same dedicated in-place-retarget runway at commit time. Do not reuse
+    // imminentTokenWindowMs(): its one-frame fence belongs to invalidate/re-arm paths.
+    const double replaceWindowMs = phaseAnchorRetargetGuardMs();
+    const double originalRunwayBoundMs = schedFireArmedCommandEtaMs_
+        + std::max(0.0, schedFireAppliedDevOffsetMs_);
+    const bool identityValid = stageTransitionValid
+        && schedFireDeadlineMs_ >= 0.0
+        && schedFireToken_ == scheduleToken
+        && schedFireConfirmedToken_ != scheduleToken
+        && schedFireFailedToken_ != scheduleToken
+        && std::abs(schedFireDeadlineMs_ - proposal.expectedDeadlineMs) <= 1e-6
+        && std::abs(shot_.fillPhaseAnchorMs - proposal.expectedAnchorMs) <= 1e-6
+        && shot_.physicalShotEpoch == proposal.physicalShotEpoch
+        && shot_.armToken == proposal.shotAttempt
+        && schedFirePhysicalShotEpoch_ == proposal.physicalShotEpoch
+        && schedFireShotAttempt_ == proposal.shotAttempt
+        && schedFireRouteGeneration_ == proposal.routeGeneration
+        && schedFireRoute_ == proposal.route
+        && controllerDeliveryRouteAttestationExpected(
+            proposal.routeGeneration, proposal.route)
+        && armedPhaseTokenCarriesAnchorAuthority(engineNow);
+    const bool deadlineValid = std::isfinite(refinedDeadlineMs)
+        && currentEtaMs > replaceWindowMs
+        && refinedEtaMs > replaceWindowMs
+        && std::isfinite(originalRunwayBoundMs)
+        && originalRunwayBoundMs > 0.0
+        && refinedEtaMs <= originalRunwayBoundMs + 1e-6
+        && std::isfinite(proposal.refinedAuthorityExpiryMs)
+        && proposal.refinedAuthorityExpiryMs >= refinedDeadlineMs;
+    if (!identityValid || !deadlineValid) {
+        return false;
+    }
+
+    shot_.fillPhaseAnchorMs = proposal.refinedAnchorMs;
+    schedFireDeadlineMs_ = refinedDeadlineMs;
+    schedFireAuthorityExpiryMs_ = std::max(
+        schedFireAuthorityExpiryMs_, proposal.refinedAuthorityExpiryMs);
+    if (catchup) {
+        shot_.fadePhaseCatchupAppliedMs = correctionMs;
+        emit engineDiagnostic(QStringLiteral(
+            "FADE PHASE CATCHUP: disposition=committed proposal=%1 token=%2 correction_ms=%3")
+            .arg(proposal.id).arg(proposal.scheduleToken).arg(correctionMs, 0, 'f', 3));
+    } else {
+        shot_.phaseAnchorConsensusStagePct = proposal.stagePct;
+    }
+    if (!catchup && proposal.stagePct == 30) {
+        shot_.phaseAnchorConsensusApplied = true;
+        // This field is always normalized to the base-20 clock. Usually level=20 so it is
+        // numerically identical to refinedAnchorMs; the late-c25 rescue deliberately keeps
+        // its physical anchor at c25 and therefore needs the level adjustment here.
+        shot_.phaseAnchorConsensusC30Ms = proposal.refinedAnchorMs
+            + tipPhaseLevelAdjustmentMs(shot_.fillPhaseAnchorLevelPct);
+    }
+    shot_.phaseAnchorRefinement = {};
+    // Re-evaluate the exact phase-token lease after the deadline moved. This may only extend
+    // the finite expiry through the new deadline + the already-existing submit grace.
+    commitArmedPhaseTokenAuthority(engineNow);
+    return true;
+}
+
+void AutomationEngine::rejectPhaseAnchorRefinement(
+    quint64 proposalId, const QString& reason)
+{
+    const PhaseAnchorRefinementProposal proposal = shot_.phaseAnchorRefinement;
+    if (!proposal.valid() || proposal.id != proposalId) {
+        return;
+    }
+    if (proposal.kind == PhaseAnchorRefinementKind::FadeProgressionCatchup) {
+        shot_.phaseAnchorRefinement = {};
+        emit engineDiagnostic(QStringLiteral(
+            "FADE PHASE CATCHUP: disposition=retarget_rejected proposal=%1 token=%2 reason=%3")
+            .arg(proposal.id).arg(proposal.scheduleToken).arg(reason.left(64)));
+        return; // attempt stays consumed, old anchor/deadline stay untouched
+    }
+    // Finalize only this stage. A rung-35 rejection deliberately preserves the already-
+    // committed rung-30 anchor; a rung-30 rejection leaves the original c20 anchor intact and
+    // prevents a still-later rung from becoming a back door around the failed transaction.
+    shot_.phaseAnchorConsensusStagePct = proposal.stagePct;
+    shot_.phaseAnchorRefinement = {};
+    emit engineDiagnostic(QStringLiteral(
+        "TIP PHASE ANCHOR CONSENSUS: disposition=retarget_rejected stage=%1 "
+        "proposal=%2 token=%3 reason=%4")
+                              .arg(proposal.stagePct)
+                              .arg(proposal.id)
+                              .arg(proposal.scheduleToken)
+                              .arg(reason.left(64)));
 }
 
 double AutomationEngine::phaseAnchorImminentTargetLevelPct(double fillPct) const noexcept
@@ -13336,9 +19595,22 @@ bool AutomationEngine::phaseAnchorImminent(double fillPct,
         return false;
     }
     const double belowByPct = targetPct - fillPct;
-    // Strictly BELOW the target: at or above it the crossing has already happened (or the meter
-    // was first seen high, which is the ladder's problem, not this one).
-    return belowByPct > 0.0 && belowByPct <= bandPct;
+    if (belowByPct > 0.0 && belowByPct <= bandPct) {
+        return true;   // strictly BELOW the target: the crossing is one or two frames away
+    }
+    // [ORION_ABOVE_ANCHOR_HOLD 2026-09-01] Just ABOVE the base anchor while the phase anchor is
+    // still undated (every caller checks shot_.fillPhaseAnchorMs < 0 first): the straddle at
+    // the base level was missed (a jump over it, or the first sample landed on it) and the next
+    // ladder rung will date the shot within a frame or two. Measured 2026-09-01: non-phase arms
+    // promoted at fill 20-27 with a ~25 ms deadline fired at fill 27 and landed 82-85, guaranteed
+    // misses (4 of ~380 releases); the phase member arrived ~30 ms later each time, too late to
+    // replace an irreplaceable token. Same refusal-only contract as the band below the anchor:
+    // no command is created and the maxHoldMs ceiling still returns physical control.
+    const double basePct = config_.tipPhaseAnchorPct;
+    if (std::isfinite(basePct) && fillPct >= basePct && fillPct < basePct + bandPct) {
+        return true;
+    }
+    return false;
 }
 
 double AutomationEngine::tipPhaseLevelAdjustmentMs(double levelPct) const noexcept
@@ -13369,7 +19641,8 @@ double AutomationEngine::tipPhaseLevelAdjustmentMs(double levelPct) const noexce
         const auto& a = kAnchorBase20RungOffsets[hi - 1];
         const auto& b = kAnchorBase20RungOffsets[hi];
         const double secant = (b.offsetMs - a.offsetMs) / (b.levelPct - a.levelPct);
-        return -(a.offsetMs + secant * (levelPct - a.levelPct));
+        const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+        return -(a.offsetMs + secant * (levelPct - a.levelPct)) * scale;
     }
     const double slope = config_.tipPhaseConstantSlopeMsPerPct;
     if (!std::isfinite(slope)) {
@@ -13378,12 +19651,940 @@ double AutomationEngine::tipPhaseLevelAdjustmentMs(double levelPct) const noexce
     return slope * (levelPct - basePct);
 }
 
+double AutomationEngine::phaseAnchorTopWitnessableLevelPct() const noexcept
+{
+    // The HIGHEST level notePhaseAnchorSample's straddle loop can still enumerate. Written as
+    // the same enumeration (base + k*step, k <= ladderCount, finite and inside (0, 100)) and in
+    // the same order, so the two can never disagree about which rungs exist -- the disagreement
+    // would silently either strand a datable shot on the sampler or steal a rung crossing the
+    // ladder was about to witness.
+    const double basePct = config_.tipPhaseAnchorPct;
+    if (!std::isfinite(basePct) || basePct <= 0.0 || basePct >= 100.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double stepPct = config_.tipPhaseAnchorLadderStepPct;
+    const int ladderCount = std::max(0, config_.tipPhaseAnchorLadderCount);
+    const bool ladderUsable = ladderCount > 0
+        && std::isfinite(stepPct) && stepPct > 0.0;
+    double topPct = basePct;
+    for (int step = 1; step <= (ladderUsable ? ladderCount : 0); ++step) {
+        const double levelPct = basePct + static_cast<double>(step) * stepPct;
+        if (!std::isfinite(levelPct) || levelPct <= 0.0 || levelPct >= 100.0) {
+            break;
+        }
+        topPct = levelPct;
+    }
+    return topPct;
+}
+
+double AutomationEngine::phaseFirstSightSigmaMs(double anchorFillPct) const noexcept
+{
+    // [ORION_TIP_PHASE_FIRST_SIGHT] See the declaration. tipPhaseSigmaMs is deliberately FLAT
+    // ("Fixed, because it MEASURED fixed: rMAD 9.6-13.4 at every anchor from 20% to 50%"), and
+    // that measurement is about a WITNESSED crossing of a known level. The two terms added here
+    // are exactly the two things a first-sight anchor has that such a crossing does not; both
+    // are computed from functions that already exist, neither is a new timing law, and both are
+    // conservative in the only direction that matters (a wider sigma can withdraw a deadline
+    // through the combined-sigma validity cap and can lose a steal contest -- it can never
+    // create or hasten a fire).
+    const double baseSigmaMs = config_.tipPhaseSigmaMs;
+    if (!std::isfinite(baseSigmaMs) || baseSigmaMs <= 0.0
+        || !std::isfinite(anchorFillPct) || anchorFillPct <= 0.0 || anchorFillPct >= 100.0) {
+        return baseSigmaMs;
+    }
+    // (1) The anchor's FILL is a measurement, not a rung. Its error becomes clock error at the
+    // meter's local rate, which the curve table already knows.
+    const double ratePctPerMs = curveStandardRatePctPerMs(anchorFillPct);
+    const double fillTermMs = std::isfinite(ratePctPerMs) && ratePctPerMs > 0.0
+        ? kPhaseFirstSightFillSigmaPct / ratePctPerMs : 0.0;
+    // (2) The level adjustment at that fill is the rung secant table beyond its top knot. Its
+    // uncertainty is its disagreement with the independently measured curve table at the same
+    // fill -- identically 0 wherever the two agree (the whole 20-40 ladder), growing only where
+    // one of them is extrapolating.
+    const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+    const double basePct = config_.tipPhaseAnchorPct;
+    const double curveAdjMs = std::isfinite(basePct) && basePct > 0.0
+        ? -scale * (curveOffsetFromBase20Ms(anchorFillPct) - curveOffsetFromBase20Ms(basePct))
+        : 0.0;
+    const double rungAdjMs = tipPhaseLevelAdjustmentMs(anchorFillPct);
+    const double modelTermMs = std::isfinite(curveAdjMs) && std::isfinite(rungAdjMs)
+        ? std::abs(rungAdjMs - curveAdjMs) : 0.0;
+    const double widened = std::sqrt(baseSigmaMs * baseSigmaMs
+                                     + fillTermMs * fillTermMs
+                                     + modelTermMs * modelTermMs);
+    return std::isfinite(widened) && widened > baseSigmaMs ? widened : baseSigmaMs;
+}
+
+double AutomationEngine::frameNativeCrossingMs(double interpolatedMs, double edgeCaptureMs,
+                                               double edgeFillPct, double levelPct,
+                                               bool* frameDatedOut) const noexcept
+{
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] DATE THE CROSSING TO THE GAME FRAME IT HAPPENED IN.
+    //
+    // The straddling pair says "the fill was below the rung at capture sample k-1 and at or above
+    // it at sample k". Sample k is a STEP EDGE -- the first sighting of a new game frame -- so the
+    // crossing happened inside THAT frame, and the frame's boundary is a point on the grid the
+    // shot's own step edges have already fitted. The crossing itself is not the boundary: the fill
+    // at the edge already overshoots the rung by (edgeFillPct - levelPct), which the curve table
+    // prices in milliseconds exactly the way tipPhaseLevelAdjustmentMs prices a rung offset. So:
+    //
+    //     crossing = grid_boundary_of(edge) - [ t(20 -> edgeFill) - t(20 -> level) ] * scale
+    //
+    // The subtraction is what keeps this CONTINUOUS. Without it a one-frame error in which edge
+    // was picked (reader fill noise near a rung) would be a whole 16.7 ms error; with it, picking
+    // the next edge also raises edgeFillPct by one frame's worth of fill and the two cancel.
+    //
+    // WHAT THIS IS WORTH, MEASURED 2026-09-15 (model + shipped curve table): against the true
+    // continuous crossing the interpolation is ALREADY unbiased, sd 0.08 ms over a full sweep of
+    // the animation's sub-frame phase. The gain here is not the accuracy of the RULE, it is that
+    // the timestamp comes from a least-squares fit over every step edge of the shot instead of one
+    // raw pair -- sd 2.23 vs 2.77 ms at 3 ms of per-sample timestamp jitter. Do not read more into
+    // it than that: the "+-8 ms capture-phase error" this was meant to remove does not exist (see
+    // RemapConfig::tipFrameNative for the refutation).
+    //
+    // FAIL-CLOSED, and it can only ever DECLINE to move the anchor:
+    //   * flag off, or the grid not locked (fewer than tipFrameNativeMinEdges edges, or residual
+    //     sd above tipFrameNativeMaxSdMs) -> the interpolation, returned as the same double;
+    //   * a non-finite input, or a grid that cannot produce a boundary -> the interpolation;
+    //   * a correction larger than one console frame -> the interpolation. That bound is the real
+    //     guard: it says this rule may REFINE a date, never RELOCATE it, so no lock failure and no
+    //     curve-table disagreement can walk an armed shot's aim by a frame or more.
+    if (frameDatedOut) {
+        *frameDatedOut = false;
+    }
+    if (!config_.tipFrameNative || !std::isfinite(interpolatedMs)
+        || !std::isfinite(edgeCaptureMs) || !std::isfinite(edgeFillPct)
+        || !std::isfinite(levelPct)) {
+        return interpolatedMs;
+    }
+    const game_frame_phase::Estimate grid = shot_.framePhase.estimate();
+    if (!grid.locked || !grid.valid()) {
+        return interpolatedMs;
+    }
+    // NEAREST, not at-or-before. A step edge IS the first sample of a new game frame, so its own
+    // boundary is the closest one -- and the timestamp carries noise in BOTH directions, so an
+    // at-or-before snap turns a +3 ms jittered edge into a whole-frame error. Measured on the
+    // synthetic rig: at-or-before spread a whole 16.8 ms across four jitter realisations of one
+    // shot, nearest spread 0.1. Robust for any jitter under half a frame, which is the same
+    // condition the lock gate already enforces far more tightly.
+    const double boundaryMs = shot_.framePhase.nearestBoundary(edgeCaptureMs);
+    if (!std::isfinite(boundaryMs)) {
+        return interpolatedMs;
+    }
+    const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+    const double overshootMs =
+        (curveOffsetFromBase20Ms(edgeFillPct) - curveOffsetFromBase20Ms(levelPct)) * scale;
+    if (!std::isfinite(overshootMs)) {
+        return interpolatedMs;
+    }
+    const double candidateMs = boundaryMs - overshootMs;
+    if (!std::isfinite(candidateMs)
+        || std::abs(candidateMs - interpolatedMs) > grid.periodMs) {
+        return interpolatedMs;
+    }
+    if (frameDatedOut) {
+        *frameDatedOut = true;
+    }
+    return candidateMs;
+}
+
+void AutomationEngine::emitFramePhaseDiagnostic(double anchorMs, const char* datingSource)
+{
+    // ONE LINE PER SHOT, at the instant the anchor is dated -- not per frame, and not per rung
+    // refinement. Everything a returned log needs to answer "was this shot's grid real, and did it
+    // date the anchor": how many step edges the fit had, the grid's phase inside one frame, its
+    // residual sd, whether that cleared the lock gate, how many capture frames the fill proved
+    // were skipped, and how far the re-dating actually moved the anchor.
+    if (shot_.framePhaseLogged) {
+        return;
+    }
+    shot_.framePhaseLogged = true;
+    const game_frame_phase::Estimate grid = shot_.framePhase.estimate();
+    emit engineDiagnostic(QStringLiteral(
+        "FRAME PHASE: edges=%1 phase_ms=%2 sd=%3 lock=%4 period_ms=%5 skips=%6 source=%7 "
+        "correction_ms=%8 step_pct=%9 anchor_ms=%10 physical_epoch=%11 shot_attempt=%12")
+                              .arg(grid.edges)
+                              .arg(grid.phaseResidueMs(), 0, 'f', 2)
+                              .arg(grid.sdMs, 0, 'f', 2)
+                              .arg(grid.locked ? 1 : 0)
+                              .arg(grid.periodMs, 0, 'f', 3)
+                              .arg(grid.skips)
+                              .arg(QLatin1String(datingSource))
+                              .arg(shot_.phaseAnchorFrameCorrectionMs, 0, 'f', 2)
+                              .arg(shot_.framePhase.nominalStepPct(), 0, 'f', 2)
+                              .arg(anchorMs, 0, 'f', 1)
+                              .arg(shot_.physicalShotEpoch)
+                              .arg(shot_.armToken));
+}
+
+double AutomationEngine::phaseAlignedFireTargetMs(double tipAbsMs, QString* modeOut,
+                                                  double* frameOffsetOut) const noexcept
+{
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] AIM AT THE MIDDLE OF THE FRAME, NOT AT A POINT IN IT.
+    //
+    // The console samples the pad ONCE PER FRAME and judges the release on the frame it samples
+    // in, so the release quantises onto this grid whatever we do. A target sitting at a random
+    // phase inside the tip's frame is one jitter-width from landing in the neighbouring frame; a
+    // target at the frame's CENTRE has the maximum possible margin, +-half a frame, before that
+    // happens. Modelled over 200k trials per cell: P(the release lands in the intended frame) at
+    // predictor sigma 11.7 / 8.0 / 5.0 ms is 49.0 / 62.3 / 76.0 % for a uniformly-phased target
+    // and 52.2 / 70.2 / 90.6 % for a frame-centred one. On a contested shot whose green window is
+    // one frame wide, that difference IS the shot.
+    //
+    // THE LEAD IS UNCHANGED AND STILL MEANS THE SAME THING. This moves the TARGET, never the lead:
+    // the scheduler still fires at (target - lead). Relative to the old instant target the mean
+    // release therefore shifts by AT MOST HALF A FRAME (+-8.3 ms), once, in a direction the game's
+    // own TIMING banner shows directly -- and the Shot Lead absorbs it exactly as it absorbs every
+    // other constant in the video path. The owner's tuned number is still the right number.
+    //
+    // FAIL-CLOSED, both ways:
+    //   * flag off, no locked grid, or a non-finite tip -> the tip instant, unchanged;
+    //   * the NEAR-BOUNDARY GUARD: if the predicted tip sits within tipFrameNativeNearBoundaryMs
+    //     of a frame boundary AND the grid's own sd is worse than tipFrameNativeGuardSdMs, then
+    //     which frame the tip belongs to is a coin flip the grid is not good enough to call.
+    //     Guessing it would move the target by a whole frame in the wrong direction, so the target
+    //     falls back to the instant. Note the AND: a tight grid (sd <= guard) is trusted right up
+    //     to the boundary, because there the two candidate centres sit half a frame either side of
+    //     a tip we have located to well under a millisecond.
+    if (modeOut) {
+        *modeOut = QStringLiteral("instant");
+    }
+    if (frameOffsetOut) {
+        *frameOffsetOut = 0.0;
+    }
+    if (!config_.tipFrameNative || !std::isfinite(tipAbsMs)) {
+        return tipAbsMs;
+    }
+    const game_frame_phase::Estimate grid = shot_.framePhase.estimate();
+    if (!grid.locked || !grid.valid()) {
+        return tipAbsMs;
+    }
+    const double distanceMs = shot_.framePhase.distanceToNearestBoundaryMs(tipAbsMs);
+    if (!std::isfinite(distanceMs)) {
+        return tipAbsMs;
+    }
+    if (distanceMs < config_.tipFrameNativeNearBoundaryMs
+        && grid.sdMs > config_.tipFrameNativeGuardSdMs) {
+        return tipAbsMs;
+    }
+    const double centreMs = shot_.framePhase.frameCentreContaining(tipAbsMs);
+    if (!std::isfinite(centreMs) || std::abs(centreMs - tipAbsMs) > grid.periodMs) {
+        return tipAbsMs;
+    }
+    if (modeOut) {
+        *modeOut = QStringLiteral("frame_centre");
+    }
+    if (frameOffsetOut) {
+        *frameOffsetOut = centreMs - tipAbsMs;
+    }
+    return centreMs;
+}
+
+double AutomationEngine::phaseAnchorSigmaMs() const noexcept
+{
+    const double baseSigmaMs = !shot_.phaseAnchorFromFirstSight
+        ? config_.tipPhaseSigmaMs   // byte-identical for every rung-dated shot
+        : phaseFirstSightSigmaMs(shot_.fillPhaseAnchorLevelPct);
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] THE SIGMA CREDIT, AND WHY IT SHIPS AT ZERO.
+    //
+    // A frame-dated anchor is entitled to report a tighter sigma only to the extent that it
+    // actually removed an error term -- and the term it was SUPPOSED to remove, the straddling
+    // pair's "capture-phase" error, was measured on 2026-09-15 and does not exist (the refutation
+    // is in RemapConfig::tipFrameNative and GameFramePhase.h). So the credit is 0 and this whole
+    // block is a no-op returning the same double every shot has always returned.
+    //
+    // THE ZERO IS THE SAFE SIDE, NOT THE LAZY ONE. A narrower sigma relaxes the combined-sigma
+    // validity cap, wins steal contests against other members, and loosens the deadline logic --
+    // it can CREATE or HASTEN a fire and can never withdraw one. This project's standing rule is
+    // that a flag which changes live release timing ships behind a counted live batch; a sigma
+    // credit changes it for every phase-primary shot at once. The mechanism is here, exact and
+    // tested, so that batch can price it without another engine change: set the credit to the
+    // measured interpolation error and the lock's OWN sd is added straight back in quadrature,
+    // so a sloppy grid never buys the discount it did not earn.
+    if (!shot_.phaseAnchorFrameDated || !std::isfinite(config_.tipFrameNativeSigmaCreditMs)
+        || config_.tipFrameNativeSigmaCreditMs <= 0.0 || !std::isfinite(baseSigmaMs)
+        || baseSigmaMs <= 0.0) {
+        return baseSigmaMs;
+    }
+    const game_frame_phase::Estimate grid = shot_.framePhase.estimate();
+    if (!grid.locked || !std::isfinite(grid.sdMs) || grid.sdMs < 0.0) {
+        return baseSigmaMs;
+    }
+    const double creditMs = config_.tipFrameNativeSigmaCreditMs;
+    const double creditedVar = std::max(1.0, baseSigmaMs * baseSigmaMs - creditMs * creditMs);
+    const double widened = std::sqrt(creditedVar + grid.sdMs * grid.sdMs);
+    return std::isfinite(widened) && widened > 0.0 ? std::min(widened, baseSigmaMs) : baseSigmaMs;
+}
+
+double rampShapeRemainingFactor(double fillPct) noexcept
+{
+    // [ORION_RAMP_SHAPE] g(f) = meter speed at fill f in %/ms, 2K27, measured 2026-09-01:
+    // linear 0.16 + 0.0013 f up to the knee, then held at kTop (no clean data above the knee;
+    // 0.24 sits between the last measured bucket, 0.235-0.267, and the slower value that best
+    // matched the sampler-armed shots' actual lateness). The straight-line fit's slope is the
+    // speed a few pp BEHIND the newest sample (the weighted centroid of a ~180 ms window),
+    // hence the anchor lag.
+    constexpr double kBase = 0.16;
+    constexpr double kSlope = 0.0013;
+    constexpr double kKneePct = 85.0;
+    constexpr double kTop = 0.24;
+    constexpr double kAnchorLagPct = 5.0;
+    if (!std::isfinite(fillPct) || fillPct <= 0.0 || fillPct >= kKneePct) {
+        return 1.0;
+    }
+    const auto g = [&](double f) { return kBase + kSlope * f; };
+    const double anchorFill = std::max(0.0, fillPct - kAnchorLagPct);
+    // integral_f^knee df'/g(f') has the closed form ln(g(knee)/g(f)) / kSlope.
+    const double toKneeMs = (std::log(g(kKneePct)) - std::log(g(fillPct))) / kSlope;
+    const double aboveKneeMs = (100.0 - kKneePct) / kTop;
+    const double linearMs = (100.0 - fillPct) / g(anchorFill);
+    if (!(linearMs > 0.0) || !std::isfinite(toKneeMs)) {
+        return 1.0;
+    }
+    return std::clamp((toKneeMs + aboveKneeMs) / linearMs, 0.5, 1.0);
+}
+
 double AutomationEngine::phasePriorShiftMs() const noexcept
 {
     // [ORION_ANCHOR_BASE20] learning.json's learned_phase_physical_ms is ALWAYS stored at base
     // anchor 30 (the pre-migration convention), so a prior learned under either regime reads
     // back correctly under either regime. Restore adds this; persist subtracts it.
-    return config_.anchorBase20 ? kAnchorBase20ShiftMs : 0.0;
+    return config_.anchorBase20
+        ? kAnchorBase20ShiftMs * (config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0)
+        : 0.0;
+}
+
+namespace {
+struct CurveNode { double fillPct; double offsetMs; };
+// t(20 -> f) in ms. 20..40 = kAnchorBase20RungOffsets (shipped ladder). 40..100 = the 60 fps
+// 2K27 crossings (scratchpad curve_crossings.py, 48 clean shots, 09-02/09-03 detframes:
+// 40->50 49.8, 50->60 46.4, 60->70 44.8, 70->80 43.8, 80->90 40.9 ms; 90->100 extrapolated at
+// 0.245 pp/ms) scaled by 1.027 so the measured 20->40 (109.6) meets the ladder's 112.58.
+constexpr CurveNode kCurveOffsets[] = {
+    {20.0, 0.0},    {25.0, 29.42},  {30.0, 58.30},  {35.0, 86.22},  {40.0, 112.58},
+    {50.0, 163.7},  {60.0, 211.4},  {70.0, 257.4},  {80.0, 302.4},  {90.0, 344.4},
+    {100.0, 385.5}};
+constexpr double kCurveLowRatePctPerMs = 0.158;   // measured 10->20 local rate
+constexpr double kCurveHighRatePctPerMs = 10.0 / (385.5 - 344.4);  // the 90->100 segment
+}  // namespace
+
+double AutomationEngine::curveOffsetFromBase20Ms(double fillPct) noexcept
+{
+    if (!std::isfinite(fillPct)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    constexpr int n = static_cast<int>(std::size(kCurveOffsets));
+    if (fillPct <= kCurveOffsets[0].fillPct) {
+        return -(kCurveOffsets[0].fillPct - fillPct) / kCurveLowRatePctPerMs;
+    }
+    if (fillPct >= kCurveOffsets[n - 1].fillPct) {
+        return kCurveOffsets[n - 1].offsetMs
+            + (fillPct - kCurveOffsets[n - 1].fillPct) / kCurveHighRatePctPerMs;
+    }
+    int hi = 1;
+    while (hi < n - 1 && fillPct > kCurveOffsets[hi].fillPct) {
+        ++hi;
+    }
+    const CurveNode& a = kCurveOffsets[hi - 1];
+    const CurveNode& b = kCurveOffsets[hi];
+    return a.offsetMs + (b.offsetMs - a.offsetMs) * (fillPct - a.fillPct) / (b.fillPct - a.fillPct);
+}
+
+double AutomationEngine::curveStandardRatePctPerMs(double fillPct) noexcept
+{
+    if (!std::isfinite(fillPct)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    constexpr int n = static_cast<int>(std::size(kCurveOffsets));
+    if (fillPct < kCurveOffsets[0].fillPct) {
+        return kCurveLowRatePctPerMs;
+    }
+    if (fillPct >= kCurveOffsets[n - 1].fillPct) {
+        return kCurveHighRatePctPerMs;
+    }
+    int hi = 1;
+    while (hi < n - 1 && fillPct >= kCurveOffsets[hi].fillPct) {
+        ++hi;
+    }
+    const CurveNode& a = kCurveOffsets[hi - 1];
+    const CurveNode& b = kCurveOffsets[hi];
+    return (b.fillPct - a.fillPct) / (b.offsetMs - a.offsetMs);
+}
+
+double AutomationEngine::curveLinearBiasFactor(double fillPct) noexcept
+{
+    // remaining time on the curve / remaining time a straight line at the local rate predicts.
+    if (!std::isfinite(fillPct) || fillPct <= 0.0 || fillPct >= 100.0) {
+        return 1.0;
+    }
+    const double curveRemainingMs =
+        curveOffsetFromBase20Ms(100.0) - curveOffsetFromBase20Ms(fillPct);
+    const double linearRemainingMs = (100.0 - fillPct) / curveStandardRatePctPerMs(fillPct);
+    if (!std::isfinite(curveRemainingMs) || !std::isfinite(linearRemainingMs)
+        || linearRemainingMs <= 0.0) {
+        return 1.0;
+    }
+    return std::clamp(curveRemainingMs / linearRemainingMs, 0.5, 1.0);
+}
+
+double AutomationEngine::meterTimeScaleFromEnv() noexcept
+{
+    // Re-read on every call site that needs it at config time (cheap; applyConfig is rare) so a
+    // test can set/unset it around one applyConfig without a process-wide cache.
+    if (!qEnvironmentVariableIsSet("ORION_METER_TIME_SCALE")) {
+        return 1.0;
+    }
+    bool ok = false;
+    const double v = qEnvironmentVariable("ORION_METER_TIME_SCALE").trimmed().toDouble(&ok);
+    if (!ok || !std::isfinite(v) || v < 0.5 || v > 3.0) {
+        return 1.0;
+    }
+    return v;
+}
+
+double AutomationEngine::curveTipEtaMs(double fillPct, double frameAgeMs) const noexcept
+{
+    if (!config_.tipPhaseEnabled || !std::isfinite(fillPct) || fillPct <= 0.0
+        || fillPct >= 100.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double constantMs = effectiveTipPhaseConstantMs() + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs();
+    if (!std::isfinite(constantMs) || constantMs <= 0.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double age = std::isfinite(frameAgeMs) && frameAgeMs > 0.0 ? frameAgeMs : 0.0;
+    // The constant is anchor(tipPhaseAnchorPct) -> tip; the table is dated from 20. A base-30
+    // engine (AppConfig default) must not read 58.3 ms early (Sol, review #52).
+    const double anchorPct = config_.tipPhaseAnchorPct;
+    const double anchorOffsetMs = std::isfinite(anchorPct) && anchorPct > 0.0
+        ? curveOffsetFromBase20Ms(anchorPct) : 0.0;
+    const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+    return constantMs + scale * (anchorOffsetMs - curveOffsetFromBase20Ms(fillPct)) - age;
+}
+
+double AutomationEngine::computePressLatencyTrimMs(
+    double pressToAnchor20Ms, const QVector<double>& history, const RemapConfig& cfg,
+    double* excessOut, double* normOut, double* spreadOut) noexcept
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    if (excessOut) *excessOut = nan;
+    if (normOut) *normOut = nan;
+    if (spreadOut) *spreadOut = nan;
+    if (!cfg.pressLatencyTrimEnabled || !std::isfinite(pressToAnchor20Ms)
+        || history.size() < std::max(3, cfg.pressLatencyTrimMinN)) {
+        return 0.0;
+    }
+    QVector<double> sorted;
+    sorted.reserve(history.size());
+    for (double v : history) {
+        if (std::isfinite(v)) sorted.push_back(v);
+    }
+    if (sorted.size() < std::max(3, cfg.pressLatencyTrimMinN)) {
+        return 0.0;
+    }
+    std::sort(sorted.begin(), sorted.end());
+    const auto median = [](QVector<double> v) {
+        const int n = v.size();
+        return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    };
+    const double norm = median(sorted);
+    QVector<double> dev;
+    dev.reserve(sorted.size());
+    for (double v : sorted) dev.push_back(std::abs(v - norm));
+    std::sort(dev.begin(), dev.end());
+    const double spread = 1.4826 * median(dev);
+    const double excess = pressToAnchor20Ms - norm;
+    if (excessOut) *excessOut = excess;
+    if (normOut) *normOut = norm;
+    if (spreadOut) *spreadOut = spread;
+    // a type whose appearance delay is not stable (fade wind-ups) carries no latency signal
+    if (!std::isfinite(spread) || spread > cfg.pressLatencyTrimMaxSpreadMs) {
+        return 0.0;
+    }
+    // beyond the window the excess is a wind-up (the whole animation moved, harmless)
+    if (std::abs(excess) > cfg.pressLatencyTrimWindowMs) {
+        return 0.0;
+    }
+    // an EARLY appearance is not evidence of a shorter release latency (09-09: the one such
+    // correction produced a red late); only a late appearance is trimmed
+    if (cfg.pressLatencyTrimPositiveOnly && excess <= 0.0) {
+        return 0.0;
+    }
+    const double cap = std::max(0.0, cfg.pressLatencyTrimCapMs);
+    return -std::clamp(cfg.pressLatencyTrimGain * excess, -cap, cap);
+}
+
+double AutomationEngine::pressLatencyTrimMs() const noexcept
+{
+    if (!config_.pressLatencyTrimEnabled || !std::isfinite(shot_.pressLatencyTrimMs)) {
+        return 0.0;
+    }
+    return shot_.pressLatencyTrimMs;
+}
+
+void AutomationEngine::decidePressLatencyTrim(double anchorMs, double anchorLevelPct)
+{
+    shot_.pressLatencyTrimMs = 0.0;
+    shot_.pressLatencyExcessMs = std::numeric_limits<double>::quiet_NaN();
+    shot_.pressToAnchor20Ms = std::numeric_limits<double>::quiet_NaN();
+    if (!config_.pressLatencyTrimEnabled || !(shot_.physicalPressMs > 0.0)
+        || !std::isfinite(anchorMs) || !std::isfinite(anchorLevelPct) || anchorLevelPct <= 0.0) {
+        return;
+    }
+    // normalise the observed rung to the base-20 clock with the curve table (the same offsets
+    // the ladder uses), so a c25/c30 initial anchor measures the same physical delay
+    const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+    const double toBase20Ms = scale * curveOffsetFromBase20Ms(anchorLevelPct);
+    const double pressToAnchor20Ms = (anchorMs - shot_.physicalPressMs) - toBase20Ms;
+    // a delay outside the physical range is a mis-dated press or a ghost meter, never a sample
+    if (!std::isfinite(pressToAnchor20Ms) || pressToAnchor20Ms < 120.0 || pressToAnchor20Ms > 1500.0) {
+        return;
+    }
+    const QString key = shot_.shotType.trimmed();
+    QVector<double>& hist = pressAnchorHistMs_[key];
+    double excess = 0.0, norm = 0.0, spread = 0.0;
+    const double trimMs = computePressLatencyTrimMs(pressToAnchor20Ms, hist, config_,
+                                                    &excess, &norm, &spread);
+    shot_.pressToAnchor20Ms = pressToAnchor20Ms;
+    shot_.pressLatencyExcessMs = excess;
+    shot_.pressLatencyTrimMs = trimMs;
+    // the history learns from every dated shot, including the ones the window refused; a
+    // wind-up that repeats becomes the new norm, a one-off is outvoted by the median
+    hist.push_back(pressToAnchor20Ms);
+    constexpr int kPressAnchorHistMax = 12;
+    while (hist.size() > kPressAnchorHistMax) {
+        hist.pop_front();
+    }
+    emit engineDiagnostic(QStringLiteral(
+        "PRESS LATENCY TRIM: type=%1 level=%2 press_to_anchor20_ms=%3 norm_ms=%4 n=%5 "
+        "spread_ms=%6 excess_ms=%7 trim_ms=%8 applied=%9 physical_epoch=%10 shot_attempt=%11")
+                              .arg(key)
+                              .arg(anchorLevelPct, 0, 'f', 0)
+                              .arg(pressToAnchor20Ms, 0, 'f', 1)
+                              .arg(norm, 0, 'f', 1)
+                              .arg(hist.size() - 1)
+                              .arg(spread, 0, 'f', 1)
+                              .arg(excess, 0, 'f', 1)
+                              .arg(trimMs, 0, 'f', 1)
+                              .arg(trimMs != 0.0 ? 1 : 0)
+                              .arg(shot_.physicalShotEpoch)
+                              .arg(shot_.armToken));
+}
+
+double AutomationEngine::nearestPhaseTimeMs(double tMs, double phase0Ms, double targetMs,
+                                            double periodMs) noexcept
+{
+    // the instant nearest to tMs whose phase (mod period, relative to phase0) equals target
+    if (!std::isfinite(tMs) || !std::isfinite(phase0Ms) || !(periodMs > 0.0)) {
+        return tMs;
+    }
+    const double half = 0.5 * periodMs;
+    double k = std::fmod(tMs + half - phase0Ms - targetMs, periodMs);
+    if (k < 0.0) k += periodMs;
+    return tMs + half - k;
+}
+
+bool AutomationEngine::capturePhaseEstimate(const QVector<double>& stamps, double periodMs,
+                                            double* phase0Out, double* coherenceOut)
+{
+    if (phase0Out) *phase0Out = 0.0;
+    if (coherenceOut) *coherenceOut = 0.0;
+    if (stamps.size() < 8 || !(periodMs > 0.0)) {
+        return false;
+    }
+    constexpr double kTwoPi = 6.283185307179586;
+    double cx = 0.0, sy = 0.0;
+    int n = 0;
+    for (double t : stamps) {
+        if (!std::isfinite(t)) continue;
+        const double a = kTwoPi * (std::fmod(t, periodMs) / periodMs);
+        cx += std::cos(a);
+        sy += std::sin(a);
+        ++n;
+    }
+    if (n < 8) {
+        return false;
+    }
+    cx /= n; sy /= n;
+    const double R = std::hypot(cx, sy);
+    double phase0 = std::atan2(sy, cx) / kTwoPi * periodMs;
+    phase0 = std::fmod(phase0, periodMs);
+    if (phase0 < 0.0) phase0 += periodMs;
+    if (phase0Out) *phase0Out = phase0;
+    if (coherenceOut) *coherenceOut = R;
+    return true;
+}
+
+void AutomationEngine::noteCapturePhaseSample(double captureMs)
+{
+    if (!std::isfinite(captureMs)) {
+        return;
+    }
+    constexpr int kRing = 90;
+    if (capturePhaseRingMs_.size() < kRing) {
+        capturePhaseRingMs_.push_back(captureMs);
+        return;
+    }
+    capturePhaseRingMs_[capturePhaseRingHead_] = captureMs;
+    capturePhaseRingHead_ = (capturePhaseRingHead_ + 1) % kRing;
+}
+
+double AutomationEngine::phaseAimOffsetMs() const noexcept
+{
+    return std::isfinite(config_.tipPhaseSeedPhysicalMs)
+        ? config_.tipPhaseConstantMs - config_.tipPhaseSeedPhysicalMs
+        : 0.0;
+}
+
+double AutomationEngine::stretchedPhaseConstantMs(double constantMs) const noexcept
+{
+    if (!config_.curveModelEnabled || !std::isfinite(constantMs)
+        || !std::isfinite(shot_.phaseRateStretch) || shot_.phaseRateStretch <= 1.0) {
+        return constantMs;
+    }
+    const double aimOffsetMs = phaseAimOffsetMs();
+    const double physicalMs = std::isfinite(aimOffsetMs) ? constantMs - aimOffsetMs : constantMs;
+    if (!std::isfinite(physicalMs) || physicalMs <= 0.0) {
+        return constantMs;
+    }
+    return constantMs + physicalMs * (shot_.phaseRateStretch - 1.0);
+}
+
+void AutomationEngine::addMeterTimingSample(double fillPct, double captureMs,
+                                              const QString& fillEstimatorMode,
+                                              quint64 fillEstimatorGeneration)
+{
+    // Preserve addSample's temporal boundary BEFORE any reset can erase its tail.
+    // Raw frame identity may advance while callback age makes the aligned time regress.
+    if (!std::isfinite(fillPct) || !sampler_.timestampAdvances(captureMs)) {
+        return;
+    }
+    noteCapturePhaseSample(captureMs);   // [ORION_CAPTURE_PHASE_LOCK] every advancing frame
+    const QString normalizedMode = fillEstimatorMode.trimmed().toLower();
+    const bool rulerKnown = fillEstimatorGeneration != 0
+        && (normalizedMode == QLatin1String("coarse")
+            || normalizedMode == QLatin1String("subpixel"));
+    // Legacy sidecars without provenance retain their own homogeneous stream. They may
+    // never bridge a known ruler (in either direction); unknown is not a wildcard match.
+    const QString mode = rulerKnown ? normalizedMode : QString();
+    const quint64 generation = rulerKnown ? fillEstimatorGeneration : 0;
+    if (shot_.samplerRulerInitialized
+        && (mode != shot_.samplerFillEstimatorMode
+            || generation != shot_.samplerFillEstimatorGeneration)) {
+        // The armed-token integrity fence already ran before the live feed. Its accepted
+        // ruler tolerance permits a token to keep a witnessed crossing; it does NOT make
+        // the old/new fill coordinates interchangeable in a regression fit. In particular,
+        // the first 5-point fit must not turn a ruler rebase into a permanent slow-meter
+        // stretch. Seed replay needs exactly the same boundary even before any token exists.
+        const double oldStretch = shot_.phaseRateStretch;
+        sampler_.reset();
+        shot_.phaseRateStretch = 1.0;
+        shot_.phaseRateStretchLatched = false;
+        shot_.phaseRateReferenceDiagnosticLogged = false;
+        shot_.phaseRateStretchSlopePctPerMs = 0.0;
+        shot_.phaseRateRecoveryLastSampleMs = -1.0;
+        emit engineDiagnostic(QStringLiteral(
+            "TIP SAMPLER RULER RESET: old_mode=%1 old_generation=%2 "
+            "new_mode=%3 new_generation=%4 old_stretch=%5 "
+            "physical_epoch=%6 shot_attempt=%7")
+                                  .arg(shot_.samplerFillEstimatorMode.isEmpty()
+                                           ? QStringLiteral("unknown")
+                                           : shot_.samplerFillEstimatorMode)
+                                  .arg(shot_.samplerFillEstimatorGeneration)
+                                  .arg(mode.isEmpty() ? QStringLiteral("unknown") : mode)
+                                  .arg(generation)
+                                  .arg(oldStretch, 0, 'f', 3)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(shot_.armToken));
+    }
+    shot_.samplerRulerInitialized = true;
+    shot_.samplerFillEstimatorMode = mode;
+    shot_.samplerFillEstimatorGeneration = generation;
+    sampler_.addSample(fillPct, captureMs);
+}
+
+void AutomationEngine::latchPhaseRateStretch(double fillPct, double captureMs)
+{
+    // The legacy clock keeps its once/ruler behavior. In normalized mode the
+    // first slow-rate estimate is a provisional upper bound: later coherent
+    // evidence may conservatively recover it, never re-expand it or go below 1.
+    if (!config_.curveModelEnabled || !config_.tipPhaseEnabled
+        || (shot_.phaseRateStretchLatched
+            && (!referenceRateClockEnabled_ || shot_.phaseRateStretch <= 1.0))) {
+        return;
+    }
+    if (!std::isfinite(fillPct) || fillPct < 15.0 || fillPct > 45.0) {
+        return;
+    }
+    const auto fit = sampler_.predictCrossing(100.0);
+    if (fit.n < 5 || fit.usedQuad || !std::isfinite(fit.slopePctPerMs)
+        || fit.slopePctPerMs <= 0.02 || !liveMeterCrossingAuthoritative(fit, captureMs)) {
+        return;
+    }
+    const double standardRate = curveStandardRatePctPerMs(fillPct)
+        / (config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0);
+    if (!std::isfinite(standardRate) || standardRate <= 0.0) {
+        return;
+    }
+    // Compare like with like. The percent/ms fit summarizes a whole history
+    // window, whereas standardRate is the derivative at the NEWEST fill. On the
+    // accelerating reference curve that mismatch manufactures a slow-rate deficit
+    // at each rung even when the animation's actual time scale is unchanged.
+    // Regress reference curve time over the exact same accepted samples/weights;
+    // a uniformly time-scaled reference then measures the same deficit at every
+    // acquisition fill, sample count and curve-segment boundary.
+    const auto referenceFit = sampler_.referenceClockFit(&curveOffsetFromBase20Ms);
+    const double referenceRate = referenceFit.rate;
+    const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+    const double referenceDeficit = std::isfinite(referenceRate) && referenceRate > 0.0
+        ? 1.0 / (scale * referenceRate) - 1.0
+        : std::numeric_limits<double>::quiet_NaN();
+    const double legacyDeficit = standardRate / fit.slopePctPerMs - 1.0;
+    const auto scaleForDeficit = [&](double candidateDeficit) {
+        return std::isfinite(candidateDeficit)
+                && candidateDeficit >= config_.curveRateStretchMinDeficit
+            ? 1.0 + std::min(config_.curveRateStretchMax,
+                              config_.curveRateStretchAlpha * candidateDeficit)
+            : 1.0;
+    };
+    const double legacyStretch = scaleForDeficit(legacyDeficit);
+    const double referenceStretch = scaleForDeficit(referenceDeficit);
+    if (shot_.phaseRateStretchLatched) {
+        // Recovery is not permission to reuse a duplicate, an older timestamp,
+        // held overlay, unknown ruler or another shot's fit. The caller's genuine
+        // sample and the sampler's accepted tail must name exactly this observation.
+        if (!shot_.lastSampleGenuineAccept || !shot_.samplerRulerInitialized
+            || shot_.samplerFillEstimatorGeneration == 0
+            || (shot_.samplerFillEstimatorMode != QLatin1String("coarse")
+                && shot_.samplerFillEstimatorMode != QLatin1String("subpixel"))
+            || shot_.lastGenuineFillEstimatorGeneration != shot_.samplerFillEstimatorGeneration
+            || shot_.lastGenuineFillEstimatorMode != shot_.samplerFillEstimatorMode
+            || !std::isfinite(captureMs)
+            || std::abs(referenceFit.latestCaptureMs - captureMs) > 1e-6
+            || captureMs <= shot_.phaseRateRecoveryLastSampleMs) {
+            return;
+        }
+        shot_.phaseRateRecoveryLastSampleMs = captureMs;
+        // Two standard errors form a conservative model-support band, not a
+        // claim of calibrated 95% coverage for correlated video samples. Faster
+        // evidence must clear its own residual uncertainty before shortening a
+        // plan. The configured deficit threshold/alpha/cap stay unchanged.
+        constexpr double kRecoverySupportStdErrors = 2.0;
+        const double lowerRate = referenceRate
+            - kRecoverySupportStdErrors * referenceFit.slopeStdError;
+        if (!std::isfinite(lowerRate) || lowerRate <= 0.0) {
+            return;
+        }
+        const double conservativeDeficit = 1.0 / (scale * lowerRate) - 1.0;
+        const double recoveredStretch = std::min(
+            shot_.phaseRateStretch, scaleForDeficit(conservativeDeficit));
+        if (!(recoveredStretch < shot_.phaseRateStretch - 1e-9)) {
+            return;
+        }
+        const double now = nowMs(); // receipt/worker clock, never the older capture clock
+        // The tick grid is nonlinear: subtracting from an already-snapped token
+        // does not predict where a replacement will snap. Offset experiments can
+        // also clamp at now. Keep those existing policies, but do not recover a
+        // model while either transformation can apply to its replacement.
+        if (tickPhaseAuthoritative(now) || devFireOffsetArmed_
+            || schedFireAppliedDevOffsetMs_ != 0.0) {
+            return;
+        }
+        double proposedDeadlineMs = -1.0;
+        if (schedFireDeadlineMs_ >= 0.0) {
+            // A model update is not an atomic worker retarget. Only an unclaimed,
+            // replaceable phase plan with the same anchor/shot/ruler/route may
+            // change; the existing scheduler still performs cancel/rearm itself.
+            if (schedFireToken_ == 0 || schedFireConfirmedToken_ == schedFireToken_
+                || schedFireFailedToken_ == schedFireToken_
+                || armedTokenIrreplaceable(now) || armedTokenSubmitInFlight(now)
+                || !armedPhaseTokenCarriesAnchorAuthority(now)
+                || shot_.physicalShotEpoch == 0 || shot_.armToken == 0
+                || schedFireVisionEpoch_ != shot_.visionEpoch
+                || schedFireArmedFillEstimatorGeneration_ != shot_.samplerFillEstimatorGeneration
+                || schedFireArmedFillEstimatorMode_ != shot_.samplerFillEstimatorMode
+                || !controllerDeliveryRouteAttestationExpected(
+                    schedFireRouteGeneration_, schedFireRoute_)
+                || !std::isfinite(shot_.fillPhaseAnchorMs) || shot_.fillPhaseAnchorMs < 0.0) {
+                return;
+            }
+            const double physicalConstantMs = effectiveTipPhaseConstantMs()
+                + tipPhaseLevelAdjustmentMs(shot_.fillPhaseAnchorLevelPct)
+                + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs() - phaseAimOffsetMs();
+            // A prior decrease can remain provisional while an immutable token
+            // survives. Always project from its arm-time model, including when
+            // the initial stretch was learned after a nominal token was armed.
+            const double leadMs = measuredLeadForActuationMs();
+            // [ORION_TIP_FRAME_NATIVE 2026-09-17] ...plus the displacement the arm site applied
+            // to this exact token. A frame-centred deadline sits up to half a console frame off
+            // the bare model BY DESIGN, so without this term the reproduction below failed on
+            // every frame-centred shot and the recovery was unreachable in production. 0 with the
+            // flag off, the grid unlocked, or on any token no vision arm site stamped.
+            const double currentArmedModelDeadlineMs = shot_.fillPhaseAnchorMs
+                + physicalConstantMs + phaseAimOffsetMs()
+                + physicalConstantMs * (schedFireArmedPhaseRateStretch_ - 1.0) - leadMs
+                + schedFireArmedFrameOffsetMs_;
+            const double reductionMs = schedFireArmedPhasePhysicalMs_
+                * (schedFireArmedPhaseRateStretch_ - recoveredStretch);
+            proposedDeadlineMs = schedFireDeadlineMs_ - reductionMs;
+            if (!std::isfinite(physicalConstantMs) || physicalConstantMs <= 0.0
+                || !std::isfinite(schedFireArmedPhasePhysicalMs_)
+                || std::abs(physicalConstantMs - schedFireArmedPhasePhysicalMs_) > 1e-6
+                || !std::isfinite(schedFireArmedPhaseRateStretch_)
+                || !std::isfinite(schedFireArmedFrameOffsetMs_)
+                || !std::isfinite(leadMs) || leadMs <= 0.0
+                // Same route is not the same command mapping: a live lead/aim
+                // edit, uncommitted anchor move or older tick snap can invalidate
+                // a subtraction from the stored deadline. Reproduce the CURRENT
+                // token from its arm scale before projecting any replacement.
+                || !std::isfinite(currentArmedModelDeadlineMs)
+                || std::abs(currentArmedModelDeadlineMs - schedFireDeadlineMs_) > 1e-6
+                || !std::isfinite(proposedDeadlineMs)
+                || reductionMs <= tokenDeadlineDriftToleranceMs()
+                || proposedDeadlineMs - now <= imminentTokenWindowMs()) {
+                return;
+            }
+        } else if (std::isfinite(shot_.fillPhaseAnchorMs) && shot_.fillPhaseAnchorMs >= 0.0) {
+            // An unarmed reservation cannot acquire an already-imminent/past
+            // phase plan merely because the model's provisional scale recovers.
+            const double constantMs = effectiveTipPhaseConstantMs()
+                + tipPhaseLevelAdjustmentMs(shot_.fillPhaseAnchorLevelPct)
+                + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs();
+            const double leadMs = measuredLeadForActuationMs();
+            proposedDeadlineMs = shot_.fillPhaseAnchorMs + constantMs
+                + (constantMs - phaseAimOffsetMs()) * (recoveredStretch - 1.0) - leadMs;
+            if (!std::isfinite(leadMs) || leadMs <= 0.0
+                || !std::isfinite(proposedDeadlineMs)
+                || proposedDeadlineMs - now <= imminentTokenWindowMs()) {
+                return;
+            }
+        }
+        const double oldStretch = shot_.phaseRateStretch;
+        shot_.phaseRateStretch = recoveredStretch;
+        shot_.phaseRateStretchSlopePctPerMs = fit.slopePctPerMs;
+        // Keep phaseRateStretchLatched set: a noisy later frame cannot re-expand
+        // a recovered plan. Every existing ruler/shot reset clears the policy.
+        emit engineDiagnostic(QStringLiteral(
+            "TIP PHASE RATE RECOVERY: old_stretch=%1 new_stretch=%2 reference_rate=%3 "
+            "rate_se=%4 conservative_deficit=%5 projected_deadline_ms=%6 "
+            "physical_epoch=%7 shot_attempt=%8 estimator_generation=%9")
+                .arg(oldStretch, 0, 'f', 6).arg(recoveredStretch, 0, 'f', 6)
+                .arg(referenceRate, 0, 'f', 6).arg(referenceFit.slopeStdError, 0, 'f', 6)
+                .arg(conservativeDeficit, 0, 'f', 6).arg(proposedDeadlineMs, 0, 'f', 3)
+                .arg(shot_.physicalShotEpoch).arg(shot_.armToken)
+                .arg(shot_.samplerFillEstimatorGeneration));
+        return;
+    }
+    if (!shot_.phaseRateReferenceDiagnosticLogged
+        && (legacyStretch > 1.0 || referenceStretch > 1.0)) {
+        shot_.phaseRateReferenceDiagnosticLogged = true;
+        // Shadow is one bounded record per continuous ruler/shot and never changes
+        // a token. The delta names a base-20 CANDIDATE, not a committed deadline.
+        const double base20PhysicalMs = effectiveTipPhaseConstantMs()
+            + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs() - phaseAimOffsetMs();
+        emit engineDiagnostic(QStringLiteral(
+            "TIP PHASE RATE REFERENCE: enabled=%1 legacy_deficit=%2 reference_deficit=%3 "
+            "legacy_stretch=%4 reference_stretch=%5 base20_candidate_delta_ms=%6 "
+            "reference_clock_rate=%7 fit_n=%8 physical_epoch=%9 shot_attempt=%10 "
+            "estimator_generation=%11")
+                                  .arg(referenceRateClockEnabled_ ? 1 : 0)
+                                  .arg(legacyDeficit, 0, 'f', 6)
+                                  .arg(referenceDeficit, 0, 'f', 6)
+                                  .arg(legacyStretch, 0, 'f', 6)
+                                  .arg(referenceStretch, 0, 'f', 6)
+                                  .arg(base20PhysicalMs * (referenceStretch - legacyStretch),
+                                       0, 'f', 3)
+                                  .arg(referenceRate, 0, 'f', 6)
+                                  .arg(fit.n)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(shot_.armToken)
+                                  .arg(shot_.samplerFillEstimatorGeneration));
+    }
+    const double deficit = referenceRateClockEnabled_ ? referenceDeficit : legacyDeficit;
+    if (!std::isfinite(deficit) || deficit < config_.curveRateStretchMinDeficit) {
+        return;
+    }
+    const double stretch = 1.0 + std::min(config_.curveRateStretchMax,
+                                          config_.curveRateStretchAlpha * deficit);
+    shot_.phaseRateStretch = stretch;
+    shot_.phaseRateStretchLatched = true;
+    shot_.phaseRateStretchSlopePctPerMs = fit.slopePctPerMs;
+    shot_.phaseRateRecoveryLastSampleMs = captureMs;
+    const double constantMs = effectiveTipPhaseConstantMs() + tipPhaseTypeTrimMs(shot_.shotType) + pressLatencyTrimMs();
+    emit engineDiagnostic(QStringLiteral(
+        "TIP PHASE RATE STRETCH: fill_pct=%1 slope_pct_ms=%2 standard_rate_pct_ms=%3 "
+        "deficit=%4 stretch=%5 constant_ms=%6 stretched_constant_ms=%7 fit_n=%8 "
+        "physical_epoch=%9 shot_attempt=%10 aim_offset_ms=%11 reference_clock_rate=%12")
+                              .arg(fillPct, 0, 'f', 2)
+                              .arg(fit.slopePctPerMs, 0, 'f', 4)
+                              .arg(standardRate, 0, 'f', 4)
+                              .arg(deficit, 0, 'f', 3)
+                              .arg(stretch, 0, 'f', 3)
+                              .arg(constantMs, 0, 'f', 1)
+                              .arg(stretchedPhaseConstantMs(constantMs), 0, 'f', 1)
+                              .arg(fit.n)
+                              .arg(shot_.physicalShotEpoch)
+                              .arg(shot_.armToken)
+                              .arg(phaseAimOffsetMs(), 0, 'f', 1)
+                              .arg(referenceRate, 0, 'f', 6));
+}
+
+bool AutomationEngine::curveModelApplicable() const noexcept
+{
+    if (!config_.curveModelEnabled || !config_.tipPhaseEnabled) {
+        return false;
+    }
+    const double constantMs = effectiveTipPhaseConstantMs();
+    const double scale = config_.meterTimeScale > 0.0 ? config_.meterTimeScale : 1.0;
+    return std::isfinite(constantMs) && constantMs >= 300.0 * scale && constantMs <= 480.0 * scale;
+}
+
+bool AutomationEngine::curvePreAnchorRegime(double fillPct) const noexcept
+{
+    constexpr double kBandPct = 5.0;
+    const double anchorPct = config_.tipPhaseAnchorPct;
+    return std::isfinite(fillPct) && fillPct > 0.0 && std::isfinite(anchorPct)
+        && fillPct < anchorPct + kBandPct;
+}
+
+bool AutomationEngine::curvePrematureArm(const QString& source, double fireAtMs, double now,
+                                         double horizonMs)
+{
+    // Bound on the direct discrepancy (curve command ETA - candidate command ETA) with the
+    // horizon as provenance: the gate only speaks when the curve says the command cannot be
+    // due inside the arming horizon at all, so a merely fast meter is never refused. Sampler
+    // family + pre-anchor only: that is the e125 shape (3-sample fit at fill 10.84, ETA 47 ms,
+    // landing 68.6); a phase or registration candidate is answered elsewhere.
+    if (!curveModelApplicable() || !curvePreAnchorRegime(shot_.fillPct)
+        || !source.startsWith(QStringLiteral("sampler"))) {
+        return false;
+    }
+    const double curveTipEta = curveTipEtaMs(shot_.fillPct, shot_.frameAgeMs);
+    const double curveCommandEta = curveTipEta - measuredLeadForActuationMs();
+    const double candidateCommandEta = fireAtMs - now;
+    // Direct discrepancy only (Sol, review #52): the candidate must be less than HALF the curve's
+    // command ETA and short of it by more than the margin. A fast meter is 5-15% fast, never 2x;
+    // the scheduler horizon is logged as provenance and plays no part in the decision.
+    if (!std::isfinite(curveCommandEta) || curveCommandEta <= 0.0
+        || candidateCommandEta >= 0.5 * curveCommandEta
+        || curveCommandEta - candidateCommandEta <= config_.curveArmGateMarginMs) {
+        return false;
+    }
+    emit engineDiagnostic(QStringLiteral(
+        "SCHEDULE FIRE CURVE GATE: gate=curve_premature source=%1 candidate_command_eta_ms=%2 "
+        "curve_command_eta_ms=%3 curve_tip_eta_ms=%4 margin_ms=%5 horizon_ms=%6 fill_pct=%7 "
+        "frame_age_ms=%8 physical_epoch=%9 shot_attempt=%10")
+                              .arg(source.left(64))
+                              .arg(candidateCommandEta, 0, 'f', 3)
+                              .arg(curveCommandEta, 0, 'f', 3)
+                              .arg(curveTipEta, 0, 'f', 3)
+                              .arg(config_.curveArmGateMarginMs, 0, 'f', 1)
+                              .arg(horizonMs, 0, 'f', 3)
+                              .arg(shot_.fillPct, 0, 'f', 2)
+                              .arg(shot_.frameAgeMs, 0, 'f', 2)
+                              .arg(shot_.physicalShotEpoch)
+                              .arg(shot_.armToken));
+    return true;
 }
 
 double AutomationEngine::effectiveTipPhaseConstantMs() const noexcept
@@ -13596,6 +20797,883 @@ double AutomationEngine::pressAnchoredLearnedWeight(const QString& shotType) con
     return config_.pressAnchoredTipN.value(shotType, 0.0);
 }
 
+// === [ORION_NO_METER_V2 2026-09-14 owner] THE BLIND RELEASE LAW =============================
+//
+// ONE hold function, TWO callers: processInputTimedIdle (NO METER mode) and
+// maybeFireMeterBlindBackstop (the meter path's blind backstop). They are the same
+// physical act — let go of Square at a time chosen without looking at the meter — so they must
+// not be allowed to drift apart, and the floor has exactly one implementation.
+//
+//     hold(type, mode) = max(450, H_ref + Δ(type) + R(mode))
+//
+// See AutomationEngine.h (kBlindReleaseMinHoldMs) and docs/NO_METER_V2_DESIGN.md for the
+// measurement behind every term.
+
+double AutomationEngine::blindReleaseTableDeltaMs(const QString& shotType)
+{
+    // Keyed on the EXACT strings classifyShotType emits ("Standstill", "Left Fade",
+    // "Right Fade", "No Dip", "Post Fade", "Go-To"). Measured this rig, ButtonShot:
+    //   Left Fade  927.1 - 651.3 = +275.8  -> +276   (n=83,  strong)
+    //   Right Fade 955.3 - 651.3 = +304.0  -> +304   (n=66,  strong)
+    //   No Dip     636.4 - 651.3 =  -14.9  ->    0   (n=9 and TempoSquare-only: too weak to
+    //                                                 ship as measured, so it is seeded from
+    //                                                 Standstill until its own holds arrive)
+    // An unlisted type (Post Fade, or anything a future classifier adds) resolves to 0, i.e.
+    // it is timed as a Standstill. That is the right degradation for a BLIND path: a wrong
+    // sign is worse than no correction, and the floor still protects the short side.
+    static const QMap<QString, double> kTable{
+        {QStringLiteral("Standstill"), 0.0},
+        {QStringLiteral("Left Fade"), 276.0},
+        {QStringLiteral("Right Fade"), 304.0},
+        {QStringLiteral("No Dip"), 0.0},
+    };
+    return kTable.value(shotType, 0.0);
+}
+
+bool AutomationEngine::blindReleaseTypeAllowed(const QString& shotType)
+{
+    // An unclassified press has no Δ and no business firing blind.
+    if (shotType.isEmpty()) {
+        return false;
+    }
+    // Go-To is EXCLUDED, and not for lack of data: n=37, hold median 2093.4 ms, but hIQR
+    // 71-282 ms because the wind-up animation itself is variable. No fixed hold can time it,
+    // so a blind Go-To release is a coin flip with a 2-second setup. It is also a stick shot,
+    // which rarely reaches the Square-press arm at all. Same exclusion pressAnchoredTipMs's
+    // factory bootstrap already applies.
+    return shotType != QLatin1String("Go-To");
+}
+
+AutomationEngine::BlindReleaseHold AutomationEngine::blindReleaseHold(const QString& shotType,
+                                                                     bool rhythmMode) const
+{
+    BlindReleaseHold out;
+    out.hRefMs = config_.noMeterHoldMs;
+    out.deltaTableMs = blindReleaseTableDeltaMs(shotType);
+    // === [ORION_NO_METER_HOLD_BLEND 2026-09-14 owner] Δ, BY SHRINKAGE, NOT BY CLIFF ==========
+    //
+    // Δ is a DIFFERENCE of holds, so every constant latency — V, the command travel, the capture
+    // pipeline — cancels out of it exactly; that is what makes a learned Δ safe to adopt at all
+    // while an absolute hold would not be. What was NOT safe was adopting it WHOLE at n = 8.
+    //
+    // The evidence that it was not safe is tonight's own learner state: Left Fade 895.8 on n=11
+    // and Right Fade 964.8 on n=10 were already overriding a table measured over 83 and 66 shots,
+    // on a quantity whose rMAD is 48-50 ms. The standard error of a median at n=10 on that spread
+    // is ~19 ms — more than a whole green window — so the "learned" Δ moved by more than the
+    // thing it was correcting, every few shots. That jitter IS part of "fades are janky".
+    //
+    //     Δ_used = (n * Δ_learned + k * Δ_table) / (n + k),   k = kNoMeterHoldPriorWeight (25)
+    //
+    // n=0 -> the table exactly. n=10 -> 10/35 ≈ 29 % of the way to the owner's own number.
+    // n=25 -> half. n=100 -> within 20 % of it. No threshold to sit on, no step to cross, and
+    // the shipped table (hundreds of shots) is treated as the evidence it is rather than as a
+    // placeholder to be discarded by the eighth sample.
+    //
+    // The Standstill REFERENCE still needs its own kNoMeterHoldLearnMinN samples before any
+    // learned Δ carries weight: Δ is measured against it, so a reference median built from two
+    // holds would inject its own error into every type at once. Standstill's own Δ is 0 by
+    // construction under both laws and is not blended.
+    if (shotType != QLatin1String("Standstill")) {
+        const NoMeterHoldRecord ref =
+            config_.noMeterHoldByType.value(QStringLiteral("Standstill"));
+        const NoMeterHoldRecord own = config_.noMeterHoldByType.value(shotType);
+        const bool referenceUsable = ref.n >= kNoMeterHoldLearnMinN
+            && std::isfinite(ref.medianMs);
+        const bool ownUsable = own.n > 0 && std::isfinite(own.medianMs);
+        if (referenceUsable && ownUsable) {
+            const double n = static_cast<double>(own.n);
+            out.deltaLearnedMs = own.medianMs - ref.medianMs;
+            out.deltaLearnedN = own.n;
+            out.deltaMs = (n * out.deltaLearnedMs
+                           + kNoMeterHoldPriorWeight * out.deltaTableMs)
+                / (n + kNoMeterHoldPriorWeight);
+            out.deltaLearned = true;
+        } else {
+            out.deltaMs = out.deltaTableMs;
+        }
+    }
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14 owner] "standstill shots are basically perfect but
+    // fades need work". The trim rides on TOP of whichever Δ is in force — shipped table or the
+    // owner's own learned difference — because it corrects the same quantity either one
+    // estimates: how much longer than a Standstill this rig's fade animation holds. It applies
+    // to the two fades and to nothing else, so a Standstill (Δ = 0 by construction) is
+    // bit-for-bit unaffected at every trim setting.
+    if (shotType == QLatin1String("Left Fade") || shotType == QLatin1String("Right Fade")) {
+        out.fadeTrimMs = std::isfinite(config_.noMeterFadeTrimMs)
+            ? std::clamp(config_.noMeterFadeTrimMs, AppConfigData::kNoMeterFadeTrimMinMs,
+                         AppConfigData::kNoMeterFadeTrimMaxMs)
+            : 0.0;
+        out.deltaMs += out.fadeTrimMs;
+    }
+    // === [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] THE CONSOLE'S FRAME GRID ============
+    //
+    // The console samples the pad ONCE PER FRAME and judges the release on that frame. At 60 Hz
+    // the grid is 1000/60 ms and the green window is worth ~16 ms of hold — ONE frame. So a hold
+    // that is not a whole number of frames puts the release ON a boundary and coin-flips between
+    // frame N and N+1: the owner's 641 ms is 38.46 frames ("inconsistent"), 650 ms is 39.00
+    // ("basically perfect"). That is not a tuning observation, it is the sampling theorem.
+    out.frameMs = clampedConsoleFrameMs(config_.consoleFrameMs);
+    out.quantized = config_.noMeterFrameQuantize;
+    // R is a whole number of frames under the snap for the same reason the total is (see
+    // kBlindReleaseRhythmFrames); with the snap off it is the legacy 40 ms, so OFF is a
+    // bit-for-bit restore of the pre-quantization law rather than a third behaviour.
+    out.rhythmMs = rhythmMode
+        ? (out.quantized ? kBlindReleaseRhythmFrames * out.frameMs : kBlindReleaseRhythmOffsetMs)
+        : 0.0;
+    const double raw = out.hRefMs + out.deltaMs + out.rhythmMs;
+    // FLOOR FIRST, THEN SNAP. The 450 ms floor is the pump-fake guard and it is a property of
+    // the CONSOLE's commit threshold, not of the grid — snapping first could hand the floor a
+    // number it then had to floor again, and flooring after the snap could leave the shipped
+    // hold off-grid. In this order the floor is itself on the grid (450 = 27 frames exactly at
+    // 1000/60), so neither step can undo the other.
+    out.floored = raw < kBlindReleaseMinHoldMs;
+    out.rawHoldMs = std::max(kBlindReleaseMinHoldMs, raw);
+    out.holdMs = out.quantized ? snappedConsoleFrameMs(out.rawHoldMs, out.frameMs)
+                               : out.rawHoldMs;
+    // Reported for both branches: with the snap off it is still the honest count of how many
+    // frames the console will hold for, which is the number that says whether the hold is on a
+    // boundary at all.
+    out.frames = consoleFrameCount(out.holdMs, out.frameMs);
+    return out;
+}
+
+// === [ORION_METER_BLIND_BACKSTOP 2026-09-14 owner] THE METER PATH'S BLIND BACKSTOP ==========
+//
+// THE LOSS. The owner treats "aborts on wide-open shots" as a ship blocker. One 2026-09-14 meter
+// session (lead 274) released 16 and lost 3, and none of the three was a press vision could ever
+// have scheduled:
+//
+//   (a) live_trajectory_timeout_abort — the reader logged `roi_not_found` for the WHOLE shot
+//       window and only found a meter at press_age 1055 ms. A genuine meter, never picked up
+//       during the shot.
+//   (b) ownership_proof_incomplete site=square_early_release — a Right Fade whose meter was first
+//       seen at 53.7 % and FALLING. A late-seen fade meter has ~150 ms of runway, less than the
+//       274 ms lead, so vision could not have armed it at any setting.
+//   (c) detector_authority_lost_abort after owned_fill_rollback_reacquire.
+//
+// …plus the older far-shot shape: 311 `press_unanswered_no_meter` lines in the recent logs, each
+// one a press that simply died at the player's release.
+//
+// THE ANSWER IS THE HYBRID ALREADY BUILT ON THE OTHER PATH. NO METER's blind hold is not a
+// competing timer; it is a DEADLINE that vision pre-empts whenever it can see the meter and that
+// a rising candidate can defer. Meter mode now runs the same machine, on the same arithmetic:
+//
+//     deadline = press + blindReleaseHold(type, mode)   // max(450, H_ref + Δ(type) + R(mode))
+//
+// PRECEDENCE, IN THE ORDER IT IS DECIDED — every step structural, none of it a flag comparison:
+//
+//   1. VISION WINS. The backstop is evaluated at exactly ONE site: the pre-ownership wait inside
+//      processIdle's Square branch. The instant the ownership proof promotes the press the engine
+//      leaves HoldState::Idle, processIdle stops being dispatched for it and the site is
+//      unreachable. A lock that lands even one tick before the deadline therefore takes the shot
+//      with no backstop line and no second release, by construction.
+//   2. NO CANDIDATE BY THE DEADLINE -> fire blind at the deadline, through the SAME output path
+//      the NO METER blind release uses (the Square release edge, or the Tempo up-flick pulse).
+//      That is case (a) and the far shot.
+//   3. A CANDIDATE IS VISIBLE AND RISING -> defer, bounded by kNoMeterVisionDeferMaxMs, through
+//      the SAME resolveBlindDeadline() NO METER runs. Releasing blind into a mid-fill meter is a
+//      guaranteed miss, and having no deferral at all is exactly why the OLD press-anchored
+//      fallback was unshippable and default-OFF. candidate_lost and cap_expired both fire.
+//   4. AN OWNED SHOT NEVER FALLS TO THE BACKSTOP, so [ORION_OWNED_METER_NEVER_ABORTS], the
+//      late-fire tolerance and [ORION_OWNERSHIP_PROOF_LENIENCY] keep absolute precedence over it.
+//      This rule needs no code either: it IS rule 1 read from the other end.
+//
+// WHAT THIS DELIBERATELY IS NOT. It does not take ownership, does not arm a ShotContext, does not
+// call triggerRelease() and does not start a post-release meter capture. That keeps the engine's
+// fail-closed release boundary untouched, and it is also the exclusion the learners need: every
+// learner site (recordPhaseConstantSample / PHASE SAMPLE, the PRESS-TIP OBSERVATION ->
+// recordPressToTipObservation prior, recordLandingLeadSample's latency label, and
+// recordNoMeterHoldObservation) hangs off evaluatePostReleaseMeter(), which only ever runs for a
+// capture started inside triggerRelease(). A backstop release therefore teaches nothing — the
+// same rule the blind NO METER release lives under, and the correct one: it carries no
+// measurement of its own.
+//
+// RETIRED WITH THIS: maybeFirePressAnchoredFallback() and pressAnchoredFallbackBlockReason(), the
+// v1 `prior - measured lead` law before them, and the ORION_PRESS_ANCHORED_FALLBACK env override.
+// `press_anchored_fallback_enabled` survives as a load-tolerated key only (AppConfigData).
+QString AutomationEngine::meterBlindBackstopBlockReason(double now) const
+{
+    if (!config_.meterBlindBackstop) {
+        return QStringLiteral("off");
+    }
+    // The backstop belongs to the strict live meter path. NO METER mode and pose timing have
+    // their own release clocks and must never grow a second one.
+    if (!autonomousLiveMeterTimingEnabled()) {
+        return QStringLiteral("not_live_meter");
+    }
+    // The type must be CLASSIFIED — it selects Δ — and Go-To is excluded for the reason
+    // blindReleaseTypeAllowed() gives (n=37 but hIQR 71-282 ms: no fixed hold can time it). A
+    // stick shot never reaches this Square site in the first place, so the exclusion is belt and
+    // braces rather than the only guard.
+    if (!blindReleaseTypeAllowed(pendingSquareShotType_)) {
+        return pendingSquareShotType_.isEmpty() ? QStringLiteral("unclassified")
+                                                : QStringLiteral("excluded_type");
+    }
+    // The lead check STAYS, as a diagnostic, not as an input: the blind hold contains no lead
+    // term, but processIdle returns at `waiting_for_latency_calibration` before this site is
+    // reachable without lead authority, so this can only ever CHANGE THE WORD on the abort line —
+    // it can never change a decision. Without it the abort line would report `user_released` for
+    // a press that in fact died in the pre-authority wait.
+    if (!measuredLeadAuthoritative(now)) {
+        return QStringLiteral("no_lead");
+    }
+    return QString();
+}
+
+// The meter-path twin of noMeterVisionCandidateRising(). It must read DIFFERENT evidence for a
+// structural reason: before ownership there is no ShotContext, so shot_.fillPct / peakFillPct do
+// not describe this press at all. The pending ownership EPISODE is this same engine's record of
+// the same frames one promotion earlier — opened only by a detected, fresh, confident,
+// structure-stamped, current-epoch sample — so the question and the evidence are the same.
+//
+// Every false-lock discriminator the episode enforces (the first-sight bound, the >8 pp cliff,
+// a descent below the episode anchor, geometry continuity, identity advance) is UPSTREAM of here
+// and untouched: a jersey, the scoreboard or the shot chart never opens an episode, and therefore
+// can never defer a deadline. A meter that has fallen away — case (b)'s 53.7 % and dropping —
+// breaks its episode on the descent, so it does not defer either; that press gets the blind
+// release it was previously losing outright.
+bool AutomationEngine::meterBackstopCandidateRising(double now) const noexcept
+{
+    if (pendingSquarePhysicalEpoch_ == 0 || !pendingMeterOwnership_.active
+        || pendingMeterOwnership_.physicalEpoch != pendingSquarePhysicalEpoch_) {
+        return false;
+    }
+    // Freshness, on the SAME bound the episode itself uses to decide that a sample gap broke it.
+    // A candidate that has gone quiet for longer than that is not on the screen in front of us.
+    if (pendingMeterOwnership_.lastMs < 0.0
+        || now - pendingMeterOwnership_.lastMs > kPendingMeterOwnershipMaxGapMs) {
+        return false;
+    }
+    const double fillPct = pendingMeterOwnership_.lastProofFillPct;
+    if (!std::isfinite(fillPct) || fillPct <= 0.0
+        || fillPct >= kNoMeterVisionDeferMaxFillPct) {
+        return false;   // nothing left to climb -> no vision release is still coming
+    }
+    // Still climbing. ONE frame is presence, not motion; two unique frames with a non-negative
+    // rise is the weakest honest claim that the meter in front of us is going up, and it is the
+    // same first->last proof fill the ownership proof's own rise test grades.
+    return pendingMeterOwnership_.sampleCount >= 2
+        && fillPct >= pendingMeterOwnership_.firstProofFillPct;
+}
+
+// [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16 owner] The latch recordPendingMeterOwnershipSample
+// sets, plus the live episode as a second, independent witness. The episode clause is
+// belt-and-braces (an episode can only be opened by a sample that already passed through the
+// latch above), stated rather than left to inspection because the cost of being wrong here is a
+// press released 100 ms early on a meter that WAS on the screen.
+bool AutomationEngine::meterBackstopCandidateEverSeen(quint64 physicalEpoch) const noexcept
+{
+    if (physicalEpoch == 0) {
+        return false;
+    }
+    if (pendingMeterFirstSeenEpoch_ == physicalEpoch) {
+        return true;
+    }
+    return pendingMeterOwnership_.active
+        && pendingMeterOwnership_.physicalEpoch == physicalEpoch;
+}
+
+// [ORION_METER_BACKSTOP_NEVER_SEEN_FADE 2026-09-16 owner] WHICH PROBE THIS TYPE IS JUDGED ON.
+// A fade spends its own, and it ships at 0 -- excluded. That is the OPPOSITE convention to
+// meterBackstopGraceMsForType() above, where a fade value of 0 falls back to the Standstill
+// number, and the difference is deliberate: there the fallback preserves a margin, here it would
+// install the very collapse that costs the measured slow fades (first sight 1000-1051 ms, after
+// their ~933-954 ms law) two banner-EXCELLENT vision shots. A fade collapses only when this key
+// is deliberately set above 0.
+double AutomationEngine::meterBackstopNeverSeenProbeMsForType(
+    const QString& shotType) const noexcept
+{
+    if (meterBackstopTypeIsFade(shotType)) {
+        return std::max(0.0, config_.meterBackstopNeverSeenProbeFadeMs);
+    }
+    return std::max(0.0, config_.meterBackstopNeverSeenProbeMs);
+}
+
+double AutomationEngine::meterBackstopGraceMsForType(const QString& shotType) const noexcept
+{
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15 owner] A fade spends its own grace; everything
+    // else spends the Standstill one. A fade grace of exactly 0 is the legacy request ("one
+    // grace for every type"), so it falls back rather than firing the fade at the bare law --
+    // which would be the opposite of what this knob is for.
+    if (meterBackstopTypeIsFade(shotType)) {
+        const double fadeGraceMs = std::max(0.0, config_.meterBackstopGraceFadeMs);
+        if (fadeGraceMs > 0.0) {
+            return fadeGraceMs;
+        }
+    }
+    return std::max(0.0, config_.meterBackstopGraceMs);
+}
+
+// === [ORION_VISION_HOLD_BAND 2026-09-15 owner] THE VISION RELEASE'S HOLD BAND ===============
+//
+// THE EVIDENCE, and the reason it is not a meter fix. Two live sessions plus one frame-dump
+// forensics pass, all on this rig: the game's LATE verdicts line up with the HOLD (press ->
+// release), not with anything visible in the meter.
+//
+//   session 23:51-23:54Z (42 presses, banner 22 EXCELLENT / 15 LATE / 3 EARLY, lead 274-299)
+//     Standstill EXCELLENT   622-700 ms   (median ~648)
+//     Standstill LATE        705, 719, 719, 726, 727, 733, 775, 1983  (+ coin flips at 649-661)
+//     Standstill EARLY       608, 632
+//   drill 20:36-20:39Z, fades
+//     EXCELLENT 945-987      LATE 1018-1099      (fade law 933-950)
+//
+// and the frame forensics say WHY: on a late shot the meter was DRAWN later after the press
+// (press -> meter-zero 552 ms vs 508 ms on the good ones) while the game's own green window did
+// not move with it. The console grades against the press and the animation. The drawn meter's
+// onset lags that by a variable 0-130 ms, and vision -- which tracks the drawn meter and nothing
+// else -- releases late by exactly that lag. No meter-side fix can see this, because in the
+// meter's own coordinates the late release is CORRECT.
+//
+// THE LAW IS ALREADY IN THIS FILE. blindReleaseHold(type, rhythm) is the press-anchored truth for
+// this rig, per type: Standstill 650 ms (the owner's own measured 647 ms snapped to 39 console
+// frames), fades ~933-950 through the learned/table delta. The owner's NO METER standstills were
+// "basically perfect" flying on precisely that number. So the band is not a new estimator and not
+// a second opinion about the tip -- it is a fence around a law we already trust.
+//
+// WHAT IS CLAMPED, AND WHAT IS NOT:
+//   * CLAMPED: the instant the release command is issued at, and only that.
+//   * NOT TOUCHED: decision.tipAbsMs, every predictor, every sigma, the reservation's own
+//     tip_eta, the banner/oracle trim and the lead. The learners keep seeing exactly what vision
+//     predicted, so the band cannot walk the aim by being on.
+//   * NOT AFFECTED: the METER BACKSTOP. That answers a press with NO candidate at all; it owns no
+//     ShotContext and never reaches this code.
+//
+// ORDER OF OPERATIONS, stated because two neighbouring features also move this instant:
+//   1. the banner/oracle trim moves the LEAD, so it has already moved the vision instant by the
+//      time the band sees it -- a trimmed shot can still be clamped, and that is correct: the
+//      trim is a few ms of aim, the band is a refusal of a 50-130 ms excursion.
+//   2. frame-native firing centres the TARGET on the console's frame grid. The band is applied to
+//      that frame-centred target, and the result is then re-snapped to the nearest frame centre
+//      when the grid is locked, so a clamped release still lands mid-frame. The re-snap can leave
+//      the instant up to half a console frame (8.3 ms) outside the band's edge; that is
+//      deliberate and bounded -- landing on a frame centre is worth more than the last 8 ms of a
+//      bound whose job is to refuse 50-130 ms excursions.
+//
+// KILL SWITCH: vision_hold_band_ms = 0 (or ORION_VISION_HOLD_BAND_MS=0) restores the 2026-09-15
+// firing instant byte-for-byte, on every path, with no line emitted and no learner fenced.
+AutomationEngine::VisionHoldBand AutomationEngine::visionHoldBandForShot() const
+{
+    VisionHoldBand out;
+    // The press is the band's zero, and it is NOT holdStartMs: on the meter path a shot is
+    // promoted when the ownership proof completes, 500-620 ms after the button, so holdStartMs is
+    // an ownership timestamp. physicalPressMs carries the Square edge itself (beginShot stamps it
+    // from the pending press's squareHoldStartMs_, the same monotonic clock every instant here
+    // lives on). A shot that is NOT press-dated has no anchor, so the band cannot bind on it --
+    // fail-open, because a band anchored on the wrong zero would displace every release.
+    if (shot_.physicalPressMs < 0.0 || !std::isfinite(shot_.physicalPressMs)) {
+        return out;
+    }
+    // A latency-calibration probe owns its own release policy and exists precisely to place the
+    // release somewhere the aim would not: clamping it would corrupt the measurement the whole
+    // lead authority is built from.
+    if (shot_.latencyCalibrationProbe) {
+        return out;
+    }
+    // THE BAND IS THE METER PATH'S. NO METER already flies this exact law as its aim (its blind
+    // deadline IS press + blindReleaseHold), and its vision assist is bounded by that deadline
+    // from the other side, so a band there would be a second copy of a fence that already exists
+    // -- and the one thing it could still do is move a NO METER release, which is the number the
+    // owner tunes directly.
+    if (shot_.inputTimedShot) {
+        return out;
+    }
+    // THE TYPE. Ordinarily the press edge's own classification, but the METER BACKSTOP may have
+    // already committed an upgrade-only re-type for this exact physical epoch inside the 200 ms
+    // type-grace window (a fade lean that lands a few frames after the button is typed Standstill
+    // at the edge). That decision is the engine's current best answer to "what animation is this",
+    // and judging a fade against the Standstill law would refuse every good fade release by
+    // ~285 ms. Upgrade-only, exactly as the backstop's own rule is: the backstop never downgrades.
+    // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] The rule itself now lives in
+    // shotTypeWithBackstopFadeRetype(), shared with the per-type lead offset so the band's law
+    // and the offset answer "what animation is this" identically. Byte-identical logic.
+    out.shotType = shotTypeWithBackstopFadeRetype();
+    // The Rhythm term belongs to the presses whose release edge IS a flick, which on an owned
+    // shot is exactly the two Tempo modes -- the same rule the backstop applies through
+    // rhythmFlickReleasePending(), stated here against the shot's own latched mode so a mid-hold
+    // settings write cannot re-price an already-flying press.
+    const bool rhythmMode = shot_.mode == ShotMode::TempoSquare
+        || shot_.mode == ShotMode::TempoStick;
+    // A fade's band is its own: its gather carries legitimate variance a standing shot does not.
+    // A fade band of exactly 0 means "no band for fades", NOT "fall back to the Standstill band"
+    // -- a narrower band on a wider-variance type would refuse good releases, which is the one
+    // failure this feature must not introduce.
+    const double bandMs = meterBackstopTypeIsFade(out.shotType)
+        ? std::max(0.0, config_.visionHoldBandFadeMs)
+        : std::max(0.0, config_.visionHoldBandMs);
+    if (!std::isfinite(bandMs) || bandMs <= 0.0) {
+        return out;   // the kill switch, per type
+    }
+    const BlindReleaseHold hold = blindReleaseHold(out.shotType, rhythmMode);
+    if (!std::isfinite(hold.holdMs) || hold.holdMs <= 0.0) {
+        return out;
+    }
+    out.armed = true;
+    out.pressMs = shot_.physicalPressMs;
+    out.lawMs = hold.holdMs;
+    out.bandMs = bandMs;
+    out.earliestMs = out.pressMs + out.lawMs - bandMs;
+    out.latestMs = out.pressMs + out.lawMs + bandMs;
+    return out;
+}
+
+double AutomationEngine::clampVisionFireToHoldBand(double fireAtMs, double leadMs)
+{
+    if (!std::isfinite(fireAtMs)) {
+        return fireAtMs;
+    }
+    // A confirmed observed window on the current owned meter makes the live tip
+    // deadline authoritative over the blind press-duration prior. The old clamp
+    // pulled a measured fade from 1136 ms to 1020 ms and flattened lead changes.
+    // All callers still require a valid tip prediction and normal release gates;
+    // this branch only stops replacing that deadline with a blind timing table.
+    if (config_.greenWindowPriority && autonomousLiveMeterTimingEnabled()
+        && !shot_.inputTimedShot && !shot_.latencyCalibrationProbe
+        && shot_.anchorValidMs >= 0.0 && shot_.meterDetected
+        && shot_.lastSampleGenuineAccept && meterReleaseAuthorityCurrent(nowMs())
+        && (greenTracker_.confirmed()
+            || (std::isfinite(shot_.fillPhaseAnchorMs) && shot_.fillPhaseAnchorMs >= 0.0))) {
+        // An observed phase crossing already dates this owned meter's tip. Do not
+        // commit a blind clamp while waiting for the green scan's third sample.
+        if (shot_.holdBandLoggedKind != QLatin1String("visible_tip")) {
+            shot_.holdBandLoggedKind = QStringLiteral("visible_tip");
+            emit engineDiagnostic(QStringLiteral(
+                "LIVE TIP PRIORITY: live_deadline_ms=%1 lead_ms=%2 "
+                "press_band_bypassed=1 epoch=%3 type=%4")
+                                      .arg(fireAtMs, 0, 'f', 2)
+                                      .arg(leadMs, 0, 'f', 2)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(shot_.shotType));
+        }
+        // Do not erase an earlier clamp's learner quarantine: a worker may have
+        // already committed it. New unclamped shots never receive that marker.
+        return fireAtMs;
+    }
+    const VisionHoldBand band = visionHoldBandForShot();
+    if (!band.armed) {
+        return fireAtMs;
+    }
+    QString kind;
+    double clampedMs = fireAtMs;
+    if (fireAtMs > band.latestMs) {
+        kind = QStringLiteral("late");
+        clampedMs = band.latestMs;
+    } else if (fireAtMs < band.earliestMs) {
+        kind = QStringLiteral("early");
+        clampedMs = band.earliestMs;
+    } else {
+        // INSIDE THE BAND: not one byte of state is written and not one line is emitted, so a
+        // shot the band never binds on is bit-for-bit the pre-band build.
+        return fireAtMs;
+    }
+    // === THE CORRECTION CEILING, and it is the band's fail-open half =====================
+    //
+    // The band is a REFUSAL built on a measured distribution: EXCELLENT tops out at law + 50 and
+    // law - 42, the LATE tail starts at law + 55, and the largest excursion the forensics ever
+    // dated was law + 125. A prediction HUNDREDS of ms from the law is not a mistimed shot in
+    // that distribution -- it is a different regime, and the most likely cause is that the LAW is
+    // wrong for this press rather than the prediction. blindReleaseHold() says so itself: an
+    // unlisted shot type (Post Fade, Post Hook, anything a future classifier adds) "resolves to 0,
+    // i.e. it is timed as a Standstill", which on a slow animation is wrong by ~300 ms BY
+    // CONSTRUCTION. Clamping a genuine vision release onto a law that is known-wrong for its type
+    // would be strictly worse than doing nothing, and it would do it silently.
+    //
+    // So the band abstains past kVisionHoldBandMaxCorrectionMs instead of making a correction it
+    // cannot justify -- fail-open, like every other refusal in this file -- and says so once, so
+    // "the band did nothing" is never indistinguishable from "the band is off".
+    if (std::abs(clampedMs - fireAtMs) > kVisionHoldBandMaxCorrectionMs) {
+        if (shot_.holdBandLoggedKind != QLatin1String("abstain")) {
+            shot_.holdBandLoggedKind = QStringLiteral("abstain");
+            emit engineDiagnostic(QStringLiteral(
+                "HOLD BAND: abstain_out_of_range vision_hold_ms=%1 law_ms=%2 band_ms=%3 "
+                "correction_ms=%4 max_correction_ms=%5 epoch=%6 type=%7")
+                                      .arg(fireAtMs - band.pressMs, 0, 'f', 1)
+                                      .arg(band.lawMs, 0, 'f', 1)
+                                      .arg(band.bandMs, 0, 'f', 1)
+                                      .arg(clampedMs - fireAtMs, 0, 'f', 1)
+                                      .arg(kVisionHoldBandMaxCorrectionMs, 0, 'f', 1)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(band.shotType));
+        }
+        // No ShotContext mark, so an abstained shot is NOT fenced out of the learners: nothing
+        // was displaced, so nothing it teaches is contaminated.
+        return fireAtMs;
+    }
+    // [ORION_TIP_FRAME_NATIVE] Re-snap. The band was applied to the frame-centred TARGET (the
+    // clamp moves target and fire instant by the same amount, since they differ by a fixed lead),
+    // so re-centre the clamped target on the console's frame grid and take the fire instant back
+    // off it. phaseAlignedFireTargetMs fails closed on its own -- flag off, grid unlocked, or a
+    // tip sitting on a boundary the grid cannot resolve all return the instant unchanged -- so
+    // this is inert on exactly the shots frame-native firing is inert on.
+    if (std::isfinite(leadMs)) {
+        QString resnapMode;
+        double resnapOffsetMs = 0.0;
+        const double resnappedTargetMs =
+            phaseAlignedFireTargetMs(clampedMs + leadMs, &resnapMode, &resnapOffsetMs);
+        if (std::isfinite(resnappedTargetMs)) {
+            clampedMs = resnappedTargetMs - leadMs;
+        }
+    }
+    // STICKY (see ShotContext::holdBandKind): the latest direction wins, but the shot can never
+    // go back to unclamped. This is the learner fence, and it must fail closed.
+    shot_.holdBandKind = kind;
+    if (shot_.holdBandLoggedKind != kind) {
+        shot_.holdBandLoggedKind = kind;
+        emit engineDiagnostic(QStringLiteral(
+            "HOLD BAND: clamped_%1 vision_hold_ms=%2 law_ms=%3 band_ms=%4 fire_hold_ms=%5 "
+            "epoch=%6 type=%7")
+                                  .arg(kind)
+                                  .arg(fireAtMs - band.pressMs, 0, 'f', 1)
+                                  .arg(band.lawMs, 0, 'f', 1)
+                                  .arg(band.bandMs, 0, 'f', 1)
+                                  .arg(clampedMs - band.pressMs, 0, 'f', 1)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(band.shotType));
+    }
+    return clampedMs;
+}
+
+bool AutomationEngine::maybeFireMeterBlindBackstop(ControllerState& output, double now,
+                                                   bool useTempo)
+{
+    // Guard 1 (identity): there must be a live pending press with a controller-origin epoch.
+    if (squareHoldStartMs_ < 0.0 || pendingSquarePhysicalEpoch_ == 0) {
+        return false;
+    }
+    // Guard 2 (single fire): this exact physical press epoch may be answered at most once. The
+    // fire path below ALSO retires the epoch, zeroes the pending state and latches Square, each
+    // of which independently closes this branch; the explicit fence exists so the invariant is
+    // stated rather than emergent.
+    if (meterBackstopFiredEpoch_ == pendingSquarePhysicalEpoch_) {
+        return false;
+    }
+    // Guard 3 (the player owns their own release): never fabricate an edge for a button the
+    // player has already let go of. The caller reaches this only while Square is held; this
+    // re-reads the same tick's physical packet so the invariant cannot drift with the caller.
+    if (!lastPhysical_.square()) {
+        return false;
+    }
+    if (!meterBlindBackstopBlockReason(now).isEmpty()) {
+        return false;
+    }
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] THE MODE BIT IS THE METER PATH'S OWN. Under a
+    // pending Square press rhythmFlickReleasePending() answers with pendingSquareTempoRemap_ —
+    // the value THIS physical edge latched from config_.tempoRemapEnabled, including the
+    // bridge-not-live demotion to a plain Button pass-through — and its pre-press fallback is the
+    // meter path's global (tempoEnabled || tempoRemapEnabled), the same expression the UI shows.
+    // It never reads inputTimedRhythmEnabled, so the 22:11Z leak (a blind flick fired under the
+    // NO METER rhythm flag) cannot recur, and the hold's Rhythm offset is charged to
+    // exactly the presses whose release edge IS a flick. It agrees with `useTempo` by
+    // construction, which is what keeps the hold and the edge describing the same release.
+    const bool rhythmMode = rhythmFlickReleasePending();
+    // [ORION_METER_BACKSTOP_GRACE 2026-09-15 owner] THE BACKSTOP ANSWERS A PRESS WHOSE METER IS
+    // NEVER PICKED UP; IT MUST NOT PRE-EMPT A PICKUP THAT IS MERELY LATE. Measured on the owner's
+    // court (2026-09-15 20:48-20:51Z, 37 presses): on the 26 vision-owned shots the engine's first
+    // sample arrived 509-586 ms after the press and the ownership proof completed 537-620 ms after
+    // it — 30-55 ms inside a 650 ms Standstill deadline — while nine presses fired
+    // `no_candidate_by_deadline` with the shared deferral opening ZERO times, because at the
+    // deadline those presses had no accepted sample for the deferral to see (it opens only for a
+    // candidate already rising within kBlindPreArmHorizonMs = 24 ms of the deadline). Those nine
+    // were not meterless presses; they were pickups a few frames slower than that margin, and a
+    // blind release at the law is a coin flip (that session's blind releases graded 3 EXCELLENT /
+    // 3 EARLY against vision's 15 EXCELLENT / 8 EARLY / 0 LATE). Paying `graceMs` of lateness on
+    // the truly-meterless press to hand every late pickup back to vision is the right trade.
+    //
+    // THE GRACE IS THE METER PATH'S ALONE. NO METER's noMeterBackstop_ never reads it: there the
+    // blind hold IS the aim, not a backstop, so adding a margin would simply mistime every shot.
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15 owner] ...and the FADE gets its own, larger
+    // one. Measured on the same court a day later (2026-09-15 20:36-20:39Z): a fade's meter is
+    // first SEEN 750-950 ms after the press (Right Fade 800/800/850/950/898, Left Fade 750/850)
+    // with the ownership proof another ~30-60 ms behind it, against a fade law of ~933-950 + the
+    // 100 ms Standstill grace = ~1033-1050. That is 30-100 ms of margin, and 2 of 11 fades in
+    // that drill fired the backstop. The grace is resolved PER TYPE from here on, through the one
+    // accessor both this arm and the re-type below read, so the two can never disagree.
+    const double graceMs = meterBackstopGraceMsForType(
+        meterBackstopArmedEpoch_ == pendingSquarePhysicalEpoch_ ? meterBackstop_.shotType
+                                                                : pendingSquareShotType_);
+    // Arm the deadline ONCE per physical press, anchored on the PRESS (never on `now`), so a tick
+    // the gates above refused — a lead that was not yet authoritative, say — costs nothing.
+    if (meterBackstopArmedEpoch_ != pendingSquarePhysicalEpoch_) {
+        meterBackstop_.clear();
+        meterBackstopArmedEpoch_ = pendingSquarePhysicalEpoch_;
+        meterBackstop_.shotType = pendingSquareShotType_;
+        meterBackstop_.deadlineMs = squareHoldStartMs_
+            + blindReleaseHold(meterBackstop_.shotType, rhythmMode).holdMs + graceMs;
+        // [ORION_NO_METER_TYPE_GRACE] The same 200 ms window NO METER gets, for the same reason:
+        // the type comes from the ONE poll that carried the Square edge, so a player whose fade
+        // lean lands a few frames after the button is typed Standstill and would be released
+        // ~300 ms short of their animation. Safe by arithmetic, not by tuning: the shortest hold
+        // this law can produce is 450 ms, so when the window closes the release is still >= 250 ms
+        // away and the deadline has never been handed to the precise-fire scheduler.
+        meterBackstop_.typeGraceEndMs = squareHoldStartMs_ + kNoMeterTypeGraceMs;
+        // Deliberately NOT logged. Arming happens on EVERY meter-path Square press, including
+        // the overwhelming majority that vision goes on to own, so a line here would be one
+        // extra row per shot for an event that had no consequence. Every term of the hold is on
+        // the `fired` line below, which is emitted only when the deadline actually decided
+        // something — and "no METER BACKSTOP line at all" then means exactly "vision owned it".
+    }
+    // [ORION_NO_METER_TYPE_GRACE] Upgrade-only re-type, through the SHARED law. It moves the
+    // BACKSTOP's own copy of the type and its own deadline and nothing else: pendingSquareShotType_
+    // — which the vision path's promotion, abort identity and Tempo gesture all read — is left
+    // exactly as the press edge latched it.
+    if (meterBackstop_.typeGraceEndMs >= 0.0) {
+        const QString upgraded = blindShotTypeUpgrade(now, meterBackstop_.shotType,
+                                                      meterBackstop_.typeGraceEndMs);
+        if (!upgraded.isEmpty()) {
+            const BlindReleaseHold before = blindReleaseHold(meterBackstop_.shotType, rhythmMode);
+            const BlindReleaseHold after = blindReleaseHold(upgraded, rhythmMode);
+            const double elapsedMs = now - squareHoldStartMs_;
+            meterBackstop_.shotType = upgraded;
+            // [ORION_METER_BACKSTOP_GRACE 2026-09-15] The re-type recomputes the SAME deadline
+            // expression, grace included, so the two arming sites can never disagree about what
+            // this press's deadline is. (An upgrade only ever moves it later, by a positive Δ.)
+            // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15] ...and the grace is re-resolved for the
+            // NEW type. A Standstill re-typed to a fade inside the grace window is a fade, and
+            // keeping the Standstill margin here would leave exactly the 30-100 ms exposure this
+            // knob exists to close -- on the shots most likely to need it, because a late lean is
+            // also a late meter.
+            const double upgradedGraceMs = meterBackstopGraceMsForType(upgraded);
+            meterBackstop_.deadlineMs = squareHoldStartMs_ + after.holdMs + upgradedGraceMs;
+            meterBackstop_.typeGraceEndMs = -1.0;
+            // [ORION_SHOT_GATE_TYPE 2026-09-15] Same epoch, new type, to the sidecar. NOTE this
+            // deliberately ships the BACKSTOP's own re-type even though pendingSquareShotType_ is
+            // left alone (see the note above): the question the reader is asking is "when is the
+            // meter due", and the answer the engine now believes is the fade's.
+            emit shotGateShotType(pendingSquarePhysicalEpoch_, upgraded, rhythmMode);
+            emit engineDiagnostic(QStringLiteral(
+                "METER BACKSTOP: reclassified Standstill -> %1 at +%2 ms, hold %3 -> %4")
+                                      .arg(upgraded)
+                                      .arg(elapsedMs, 0, 'f', 1)
+                                      .arg(before.holdMs, 0, 'f', 1)
+                                      .arg(after.holdMs, 0, 'f', 1));
+        } else if (now > meterBackstop_.typeGraceEndMs
+                   || meterBackstop_.shotType != QLatin1String("Standstill")) {
+            meterBackstop_.typeGraceEndMs = -1.0;   // window closed / nothing left to upgrade
+        }
+    }
+
+    // METER is vision-timed: an unowned press has no tip deadline. Keep the
+    // same-epoch type-grace updates above, but never turn the old blind table
+    // into an automatic release. The player's physical release remains theirs;
+    // the explicit NO METER mode retains its separate timed-release policy.
+    if (config_.greenWindowPriority) {
+        if (now >= meterBackstop_.deadlineMs && meterBackstop_.missLoggedDeadlineMs < 0.0) {
+            meterBackstop_.missLoggedDeadlineMs = meterBackstop_.deadlineMs;
+            emit engineDiagnostic(QStringLiteral(
+                "METER VISION WAIT: epoch=%1 type=%2 reason=no_owned_tip "
+                "blind_release_suppressed=1 output=physical_or_configured_gather")
+                                      .arg(pendingSquarePhysicalEpoch_)
+                                      .arg(meterBackstop_.shotType));
+        }
+        return false;
+    }
+
+    // === [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16 owner] THE NEVER-SEEN COLLAPSE ==========
+    //
+    // THE LOSS, in the owner's words: "next press does nothing, square button is stuck, you can't
+    // shoot, so I have to manually tempo with my stick to release the ball". Across ~300 presses,
+    // 7 real holds (400-980 ms, ordinary spacing, the Square-down edge accepted by the fork within
+    // 0.5 ms) produced NO meter candidate at all for the WHOLE hold — the reader never proposed
+    // anything (`PICKUP first_sight_fill=-1`) — and the owner let go by hand before the deadline
+    // the grace had built (Standstill 650 + 100 = 750; Right Fade ~950 + 220 = 1170).
+    //
+    // THE GRACE IS FOR A LATE PICKUP, AND ONLY FOR ONE. It was measured on presses whose meter is
+    // first SEEN 550-630 ms after the press and which must still reach vision. On a press where
+    // nothing has been seen AT ALL by law - probe, there is no pickup to hand back: the grace buys
+    // nothing and spends its whole length prolonging a hold the player already reads as a stuck
+    // button. So that press — and only that press — is answered at the bare law.
+    //
+    // THE QUESTION IS ASKED EVERY TICK, NOT ONCE. From the probe instant onward the deadline is
+    // recomputed from the same two terms the arm site used, so a candidate that surfaces between
+    // the probe and the law puts this press straight back on the full grace (and therefore back
+    // inside the deferral's reach) — the collapse undoes itself. That is precisely the 550-630 ms
+    // band the grace exists for. What the collapse costs is a pickup first seen AFTER the law.
+    //
+    // NOT WHILE DEFERRING: a deferral has already moved the deadline past the law, and by
+    // construction it can only ever have opened for a candidate that WAS seen. Probe 0 skips the
+    // block entirely, which is the 2026-09-15 deadline byte-for-byte.
+    // [ORION_METER_BACKSTOP_NEVER_SEEN_FADE 2026-09-16] The probe is resolved PER TYPE, from the
+    // backstop's own (re-typed) shot type, through the one accessor -- so a Standstill re-typed to
+    // a fade inside the type-grace window is judged on the FADE's probe, which by default means it
+    // is not judged at all. `neverSeen` is the OBSERVATION and is recorded whether or not the
+    // probe acts on it: `never_seen=1 grace_ms=220.0` is a press that really was meterless and was
+    // deliberately given the fade grace anyway, and that line is the one the next fade diagnosis
+    // greps for.
+    const bool neverSeen = !meterBackstopCandidateEverSeen(pendingSquarePhysicalEpoch_);
+    const double neverSeenProbeMs =
+        meterBackstopNeverSeenProbeMsForType(meterBackstop_.shotType);
+    bool neverSeenCollapsed = false;
+    if (neverSeenProbeMs > 0.0 && !meterBackstop_.deferring()) {
+        const double lawDeadlineMs = squareHoldStartMs_
+            + blindReleaseHold(meterBackstop_.shotType, rhythmMode).holdMs;
+        neverSeenCollapsed = neverSeen && now >= lawDeadlineMs - neverSeenProbeMs;
+        meterBackstop_.deadlineMs = neverSeenCollapsed
+            ? lawDeadlineMs
+            : lawDeadlineMs + meterBackstopGraceMsForType(meterBackstop_.shotType);
+    }
+
+    BlindBackstopLogContext ctx;
+    ctx.label = QStringLiteral("METER BACKSTOP");
+    ctx.identity = QStringLiteral("epoch=%1").arg(pendingSquarePhysicalEpoch_);
+    ctx.pressMs = squareHoldStartMs_;
+    // The episode's own last proof fill. It is also its PEAK: a descent below the anchor or an
+    // >8 pp cliff breaks the episode outright, so within one live episode last == max.
+    ctx.fillPct = pendingMeterOwnership_.active ? pendingMeterOwnership_.lastProofFillPct : -1.0;
+    ctx.peakFillPct = ctx.fillPct;
+    // Read BEFORE the resolve: a deferral that ends on this tick has already cleared its own
+    // bookkeeping by the time we fire, and the fired line must still be able to say which of the
+    // two outcomes it was. (Comparing the taken hold against the law's number would have been a
+    // lie in production, where a tick lands a few ms past the deadline on every ordinary press.)
+    const bool wasDeferring = meterBackstop_.deferring();
+    const double deadlineMs = resolveBlindDeadline(now, meterBackstop_, /*deferralAllowed=*/true,
+                                                   meterBackstopCandidateRising(now), ctx);
+    if (now < deadlineMs) {
+        return false;   // vision still has time to claim this press; it keeps priority
+    }
+    // [ORION_BLIND_WAITER 2026-09-15 owner] The meter path's backstop is tick-consumed BY
+    // CONSTRUCTION: it owns no ShotContext, no schedule token and no triggerRelease (see the
+    // "WHAT THIS DELIBERATELY IS NOT" note above), so there is nothing here for the precise-fire
+    // worker to hold and, unlike the NO METER path, a stalled tick costs this press LATENESS
+    // rather than the shot — there is no authority limit for it to expire against. What it did
+    // share with NO METER is that a stall was INVISIBLE in the log. It is not any more: the same
+    // shared line, from the same shared helper, on the same shared BlindBackstop state.
+    noteBlindDeadlineMissed(now, meterBackstop_, /*waiterArmed=*/false, ctx);
+
+    const QString shotType = meterBackstop_.shotType;
+    const BlindReleaseHold hold = blindReleaseHold(shotType, rhythmMode);
+    const double holdMs = now - squareHoldStartMs_;
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15] Resolved against the type that actually FIRED
+    // (the re-type above may have moved it), so `grace_ms` always describes the deadline this
+    // press was really judged against.
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16] A collapsed deadline spent NO grace, and the
+    // line says so with the number it actually used rather than the number the type would have
+    // been given: `grace_ms=0.0 never_seen=1` is the whole story of that release.
+    const double firedGraceMs = neverSeenCollapsed
+        ? 0.0 : meterBackstopGraceMsForType(shotType);
+    // `hold_ms` is the hold ACTUALLY taken (a deferral makes it longer than the law's number, and
+    // that is the point), `law_hold_ms` the law's own, `reason` which outcome ended the wait —
+    // the paired `deferral ended outcome=` line above names candidate_lost vs cap_expired. One
+    // grep answers "why did this press fire when it did".
+    const QString reason = wasDeferring ? QStringLiteral("deferral_ended")
+                                        : QStringLiteral("no_candidate_by_deadline");
+    emit engineDiagnostic(QStringLiteral(
+        // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14] The same grid fields the NO METER arm line
+        // carries, against `law_hold_ms` (the snapped number the law asked for) rather than
+        // `hold_ms` (what a deferral actually took): raw_ms is the pre-grid hold, frames the
+        // whole-frame count law_hold_ms lands on.
+        // [ORION_METER_BACKSTOP_GRACE 2026-09-15] APPEND-ONLY. `grace_ms` is the margin this
+        // press's deadline carried past `law_hold_ms`; `hold_ms - law_hold_ms - grace_ms` is then
+        // what a deferral (or a stalled tick) added on top of it. Appended at the END so every
+        // existing grep, field position and parser over this line keeps working.
+        "METER BACKSTOP: fired type=%1 hold_ms=%2 law_hold_ms=%3 h_ref=%4 delta=%5 delta_src=%6 "
+        "n=%7 table=%8 learned=%9 fade_trim=%10 rhythm_offset=%11 floored=%12 epoch=%13 "
+        "reason=%14 raw_ms=%15 frames=%16 frame_ms=%17 quantize=%18 rhythm_frames=%19 "
+        // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15] APPEND-ONLY. `grace_ms` is unchanged: it
+        // still carries whichever grace this press's type actually spent. `grace_kind` names
+        // WHICH of the two that was, so a returned log can separate "the fade grace is wrong"
+        // from "the fade never got the fade grace" -- the exact ambiguity a single number leaves.
+        // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16] APPEND-ONLY, and the field that makes the
+        // owner's complaint greppable: 1 = not one meter candidate was ever observed for this
+        // press. It reports the OBSERVATION, not the knob, so the pair says what was done about
+        // it: `never_seen=1 grace_ms=0.0` is a collapsed deadline (answered at the bare law),
+        // `never_seen=1` with a non-zero grace_ms is a meterless press whose type is excluded
+        // from the collapse (the shipped fade), and `never_seen=0` is an ordinary press that saw
+        // something and kept every normal grace/deferral rule.
+        "grace_ms=%20 grace_kind=%21 never_seen=%22")
+                              .arg(shotType)
+                              .arg(holdMs, 0, 'f', 1)
+                              .arg(hold.holdMs, 0, 'f', 1)
+                              .arg(hold.hRefMs, 0, 'f', 1)
+                              .arg(hold.deltaMs, 0, 'f', 1)
+                              .arg(hold.deltaLearned ? QStringLiteral("blend")
+                                                     : QStringLiteral("table"))
+                              .arg(hold.deltaLearnedN)
+                              .arg(hold.deltaTableMs, 0, 'f', 1)
+                              .arg(std::isfinite(hold.deltaLearnedMs)
+                                       ? QString::number(hold.deltaLearnedMs, 'f', 1)
+                                       : QStringLiteral("none"))
+                              .arg(hold.fadeTrimMs, 0, 'f', 1)
+                              .arg(hold.rhythmMs, 0, 'f', 1)
+                              .arg(hold.floored ? 1 : 0)
+                              .arg(pendingSquarePhysicalEpoch_)
+                              .arg(reason)
+                              .arg(hold.rawHoldMs, 0, 'f', 1)
+                              .arg(hold.frames)
+                              .arg(hold.frameMs, 0, 'f', 4)
+                              .arg(hold.quantized ? 1 : 0)
+                              .arg(hold.rhythmMs > 0.0 && hold.quantized
+                                       ? kBlindReleaseRhythmFrames : 0)
+                              .arg(firedGraceMs, 0, 'f', 1)
+                              .arg(meterBackstopTypeIsFade(shotType)
+                                       && config_.meterBackstopGraceFadeMs > 0.0
+                                   ? QStringLiteral("fade")
+                                   : QStringLiteral("standstill"))
+                              .arg(neverSeen ? 1 : 0));
+    // The press terminates HERE, so its SHOT NOT OWNED line belongs here too — with the reason
+    // that says what actually happened. Every press epoch still produces exactly one of these,
+    // so `grep "SHOT NOT OWNED"` remains a complete census of unclaimed presses.
+    emit engineDiagnostic(QStringLiteral(
+        "SHOT NOT OWNED: reason=press_answered_by_backstop physical_epoch=%1 hold_ms=%2 "
+        "shot_type=%3 unstamped=%4 stale_samples=%5 stamp_epoch_seen=%6 lead_ready=1 "
+        "sq_latch=0 output=meter_blind_backstop backstop=fired")
+                              .arg(pendingSquarePhysicalEpoch_)
+                              .arg(holdMs, 0, 'f', 1)
+                              .arg(shotType)
+                              .arg(pendingMeterOwnershipUnstampedSamples_)
+                              .arg(pendingMeterOwnershipStaleSamples_)
+                              .arg(pendingMeterOwnershipUnstampedStampEpoch_));
+
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] The backstop IS this press's release edge, so the
+    // sidecar's press window closes here. Emitted before the pending state is torn down below,
+    // while the epoch still exists. `epochNowMsF()` (not the engine's monotonic `now`) because
+    // the field is on the sidecar's fill-sample clock, the same contract release markers carry.
+    emitShotGateRelease(pendingSquarePhysicalEpoch_, epochNowMsF(), shotType);
+
+    meterBackstopFiredEpoch_ = pendingSquarePhysicalEpoch_;
+    meterBackstop_.clear();
+    meterBackstopArmedEpoch_ = 0;
+    const bool fadeGesture = tempoGestureIsFade(shotType, config_.tempoFadeMirrorGesture);
+    // Clear the pending state exactly as the abort path does: retire the epoch so a late meter
+    // frame cannot promote this press afterwards, drop the ownership episode/evidence, and end
+    // the hold clock.
+    squareHoldStartMs_ = -1.0;
+    retiredPhysicalShotEpoch_ = std::max(
+        retiredPhysicalShotEpoch_, pendingSquarePhysicalEpoch_);
+    pendingSquarePhysicalEpoch_ = 0;
+    pendingSquareArmGeneration_ = 0;
+    clearPendingMeterOwnershipEpisode();
+    clearPendingMeterOwnershipEvidence();
+    // The press is answered. The player is still physically holding Square, and that held button
+    // may neither re-arm nor leak back to the console as a second press: the existing overlap
+    // latch is the engine's own suppression for exactly this shape (processIdle strips X while it
+    // holds) and it clears itself on the debounced physical UP.
+    armSquareOverlapLatch();
+
+    if (useTempo) {
+        // TempoSquare's release edge is the up-flick, not a button release. Reuse the existing
+        // pass-through pulse so the flick is held for the same tempoFlickHoldMs/releasePulseMs
+        // window every other Tempo release uses — the only difference is that this one starts
+        // under a still-held Square, which is what tempoPassThroughPulseHeldPress_ records.
+        tempoPassThroughPulseActive_ = true;
+        tempoPassThroughPulseHeldPress_ = true;
+        tempoPassThroughPulseFadeGesture_ = fadeGesture;
+        tempoPassThroughPulseEndMs_ = now
+            + std::max(config_.tempoFlickHoldMs, config_.releasePulseMs);
+        applyShotReleaseEdge(output, ShotMode::TempoSquare, shotType, fadeGesture,
+                             tempoReleaseStyleFromString(config_.tempoReleaseStyle));
+        preserveFadeMovementVector(
+            output, shotType, pendingSquareLsArmX_, pendingSquareLsArmY_,
+            pendingSquareMovementValid_);
+        shot_.releasePlan = QStringLiteral("Idle / meter backstop tempo flick");
+    } else {
+        applyShotReleaseEdge(output, ShotMode::ButtonShot, shotType, false);
+        pendingSquareTempoRemap_ = false;
+        clearPendingSquareMovementContext();
+        shot_.releasePlan = QStringLiteral("Idle / meter backstop release");
+    }
+    shot_.releaseReason = QStringLiteral("press_answered_by_backstop");
+    return true;
+}
+
 void AutomationEngine::recordPressToTipObservation(const QString& shotType,
                                                    double pressToTipMs, double weight)
 {
@@ -13673,10 +21751,84 @@ void AutomationEngine::recordPressToTipObservation(const QString& shotType,
                                          config_.pressAnchoredTipN);
 }
 
+void AutomationEngine::recordNoMeterHoldObservation(const QString& shotType, double holdMs)
+{
+    // [ORION_NO_METER_V2 2026-09-14] "Learn the hold, not the tip" (design §3). The press->tip
+    // learner dates the meter STOP — which is our own release seen through the video, converted
+    // back to console time — so its samples swing with V's health (eps moved 6 -> 139 ms across
+    // one corpus with the hold unchanged). The hold is press->release on one clock: it needs no
+    // V, no stop and no delay correction, and it is exactly what the blind path commands.
+    if (shotType.isEmpty() || !std::isfinite(holdMs)) {
+        return;
+    }
+    // Plausibility band. The blind law reads this as a DIFFERENCE, so a single wild sample
+    // would land as a wild Δ; the window's median absorbs the rest.
+    if (holdMs < kPressAnchoredLearnMinMs || holdMs > kPressAnchoredLearnMaxMs) {
+        return;
+    }
+    auto& window = noMeterHoldWindow_[shotType];
+    window.append(holdMs);
+    while (window.size() > kPressAnchoredWindow) {
+        window.removeFirst();
+    }
+    QVector<double> sorted = window;
+    std::sort(sorted.begin(), sorted.end());
+    const int n = sorted.size();
+    const double sessionMedian = (n % 2) ? sorted[n / 2]
+                                         : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+    // Blend with what this session RESTORED from learning.json, with the restored influence
+    // fading exactly as the in-session window fills — the same shape the press->tip learner
+    // uses, so the two calibrations age identically.
+    const NoMeterHoldRecord prior = noMeterHoldPrior_.value(shotType);
+    const double priorN = std::min(static_cast<double>(std::max(0, prior.n)),
+                                   static_cast<double>(kPressAnchoredWindow));
+    const double blendN = std::clamp(static_cast<double>(kPressAnchoredWindow)
+                                         - static_cast<double>(n),
+                                     0.0, priorN);
+    const double denom = static_cast<double>(n) + blendN;
+    NoMeterHoldRecord published;
+    published.medianMs = denom > 0.0
+        ? (sessionMedian * static_cast<double>(n) + prior.medianMs * blendN) / denom
+        : sessionMedian;
+    published.n = static_cast<int>(std::min(static_cast<double>(kPressAnchoredWindow),
+                                            static_cast<double>(n) + priorN));
+    config_.noMeterHoldByType.insert(shotType, published);
+    emit noMeterHoldLearned(config_.noMeterHoldByType);
+}
+
 void AutomationEngine::emitPressTipObservation(int seq, const QString& shotType,
                                                bool graded, bool greenObserved,
                                                const QVector<MeterCalSample>& samples)
 {
+    // [ORION_NO_METER_V2 2026-09-14] FIRST, the hold — before anything that depends on dating
+    // the tip. The hold is press->release and needs no tip, no V and no stop: it is the one
+    // measurement on this path that cannot be degraded by the video pipeline. Graded landings
+    // only (an ungraded one may be an abort shape rather than a shot), and never a delayed or
+    // deliberately displaced shot, which are the same two exclusions the press->tip observation
+    // applies below and for the same reasons.
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] A BLIND release teaches neither number here. The
+    // hold it would contribute is the hold the engine itself commanded (perfectly circular: the
+    // learner would converge on whatever the slider was set to), and the press->tip observation
+    // below dates the same self-inflicted stop. A vision-timed NO METER release is an ordinary
+    // vision landing and is recorded exactly like a meter-mode one — which is how the hybrid
+    // keeps the blind path's own Δ honest while vision does the shooting.
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] Same exclusion for a knowingly-late release: both
+    // numbers below are dated from a stop the engine itself displaced.
+    // [ORION_VISION_HOLD_BAND 2026-09-15] ...and the same exclusion for a CLAMPED one, which
+    // matters most of all HERE. recordNoMeterHoldObservation below is the learner that produces
+    // no_meter_hold_by_type, i.e. the delta the band's own law is built from. A clamped release
+    // sits ON the band edge by construction, so feeding its hold back would walk the law toward
+    // whatever the clamp just imposed -- the law would chase its own clamp and the pair would
+    // converge on each other instead of on the animation. Losing those samples is the point.
+    if (meterCapBlindRelease_ || meterCapLateFireMs_ > 0.0
+        || !meterCapHoldBandKind_.isEmpty()) {
+        return;
+    }
+    if (graded && meterCapPressWallMs_ >= 0.0 && meterCapReleaseWallMs_ >= 0.0
+        && meterCapPhysicalEpoch_ != 0 && !devFireOffsetArmed_
+        && !(meterCapAppliedDelayMs_ > 0.0)) {
+        recordNoMeterHoldObservation(shotType, meterCapReleaseWallMs_ - meterCapPressWallMs_);
+    }
     // [ORION_PRESS_ANCHOR] Phase-A collector. One line per completed landing pairing the
     // delay-immune press wall time with the wall-time-equivalent real tip:
     //     real_tip_wall = observed stop (delayed video) - applied_delay - V
@@ -13786,15 +21938,41 @@ void AutomationEngine::maybeWarnTipTimingDivergence(double frozenPhysicalMs,
     const double aimOffsetMs = std::isfinite(config_.tipPhaseSeedPhysicalMs)
         ? config_.tipPhaseConstantMs - config_.tipPhaseSeedPhysicalMs
         : 0.0;
+    // [ORION_FREEZE_RIDES_RELEASE 2026-09-01] SAY WHAT THE NUMBER MEANS, WITH ITS SIGN. The
+    // measured value is anchor-to-freeze, and the freeze is where the game registered the
+    // release (see recordPhaseConstantSample), so it is a measurement of where the bot LANDED
+    // relative to the aim the manual value was calibrated for -- not of the animation. A
+    // negative d therefore means the release is registering |d| ms EARLY, and the correction is
+    // to fire later: Shot Lead + d (i.e. lower it), or Tip Timing - d (raise it). The previous
+    // advice ("Reset Tip Timing to use the measured animation") applied the measurement to the
+    // predicted tip, which fires |d| ms EARLIER on a shot that was already early -- the exact
+    // regression.  The 2026-09-01 logs repeatedly estimated an early shift, but there are no
+    // human banner labels for that 336-release corpus and its fill ruler is not a millisecond
+    // ground truth.  Treat d as an A/B candidate, not a self-grading correction. Prefix is
+    // load-bearing: tipTimingFreezeDivergenceWarnsAndPersistsMeasuredMedian counts lines by it.
+    const double dMs = measuredPhysicalMs - frozenPhysicalMs;
+    const QString direction = dMs < 0.0 ? QStringLiteral("EARLY") : QStringLiteral("LATE");
+    const QString leadAction = dMs < 0.0 ? QStringLiteral("decreasing")
+                                         : QStringLiteral("increasing");
+    const QString tipAction = dMs < 0.0 ? QStringLiteral("increasing")
+                                        : QStringLiteral("decreasing");
     emit engineDiagnostic(QStringLiteral(
-        "TIP TIMING DIVERGENCE: manual %1ms vs measured %2ms (d=%3ms). Shots stay timed to the "
-        "manual value; Reset Tip Timing to use the measured animation.")
+        "TIP TIMING DIVERGENCE: manual %1ms vs measured %2ms (d=%3ms). The measurement is "
+        "anchor-to-freeze and the freeze rides the release, so the instrument estimates releases "
+        "are landing ~%4ms %5 of the aim this manual value was calibrated for. Shots stay timed "
+        "to the manual value. For a controlled, banner-counted A/B, test %6 Shot Lead by %4ms "
+        "(or %7 Tip Timing by %4ms). Do NOT Reset Tip Timing: the learner would re-aim in the "
+        "wrong direction.")
                               .arg(frozenPhysicalMs + aimOffsetMs, 0, 'f', 0)
                               .arg(measuredPhysicalMs + aimOffsetMs, 0, 'f', 0)
-                              .arg(measuredPhysicalMs - frozenPhysicalMs, 0, 'f', 0));
+                              .arg(dMs, 0, 'f', 0)
+                              .arg(std::abs(dMs), 0, 'f', 0)
+                              .arg(direction)
+                              .arg(leadAction)
+                              .arg(tipAction));
 }
 
-void AutomationEngine::maybeAutoUnlockTipTiming(double measuredPhysicalMs, int n, int window)
+bool AutomationEngine::maybeAutoUnlockTipTiming(double measuredPhysicalMs, int n, int window)
 {
     // [ORION_AIM_AUTOUNLOCK 2026-08-13] A lock the rig's own instrument refutes is not holding a
     // known-good aim; it is holding a stale one, and it silences the learner while it does.
@@ -13821,18 +21999,18 @@ void AutomationEngine::maybeAutoUnlockTipTiming(double measuredPhysicalMs, int n
     // The learner then walks off the manual value as landings arrive (resetTipTiming keeps it as
     // the prior) rather than snapping to a number nobody has graded.
     if (!config_.tipTimingAutoUnlockEnabled || tipTimingAutoUnlockEmitted_) {
-        return;
+        return false;
     }
     if (n < window || !(frozenAimPhysicalMs_ > 0.0) || !(measuredPhysicalMs > 0.0)) {
-        return;
+        return false;
     }
     const double diffMs = measuredPhysicalMs - frozenAimPhysicalMs_;
     if (std::abs(diffMs) <= kTipTimingDivergenceWarnMs) {
         tipTimingDivergenceStreak_ = 0;
-        return;
+        return false;
     }
     if (++tipTimingDivergenceStreak_ < kTipTimingAutoUnlockConfirmations) {
-        return;
+        return false;
     }
     tipTimingAutoUnlockEmitted_ = true;
     tipTimingDivergenceStreak_ = 0;
@@ -13848,6 +22026,7 @@ void AutomationEngine::maybeAutoUnlockTipTiming(double measuredPhysicalMs, int n
                               .arg(diffMs, 0, 'f', 0)
                               .arg(kTipTimingAutoUnlockConfirmations));
     emit tipTimingAutoUnlockRequested(frozenAimPhysicalMs_, measuredPhysicalMs);
+    return true;
 }
 
 void AutomationEngine::maybeWarnLeadAuthorityDisagreement()
@@ -13910,8 +22089,16 @@ QString AutomationEngine::actuationLeadSourceLabel(double consumedLeadMs) const 
     // this term a delayed shot with a non-zero offset would be mislabelled "authority" — the
     // identical provenance lie the lead_kind/lead_source split was created to end. At offset 0
     // (always, at delay 0) this is byte-identical to the previous comparison.
-    const double keyedUserLeadMs =
-        config_.userActuationLeadMs + appliedMeterDelayLeadOffsetMs();
+    // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] ...and the per-type offset joins it for the identical
+    // reason: without this term every FADE on a tuned install would be mislabelled "authority"
+    // the moment the offset is non-zero, which is the same provenance lie. At offset 0 (always,
+    // on a Standstill at the shipped defaults) this is byte-identical to the previous comparison.
+    // Match the scheduling accessor's full user expression, just as the auto
+    // branch below does. An applied trim does not turn user tuning into measured authority.
+    const double keyedUserLeadMs = std::max(
+        0.0, config_.userActuationLeadMs + appliedMeterDelayLeadOffsetMs()
+                 + sessionLeadTrimMs_ + appliedBannerLeadTrimMs()
+                 + appliedLeadOffsetByTypeMs() - appliedRhythmFlickDelayMs());
     const bool inBandReplacement = !config_.leadOverrideFromEnv
         && std::isfinite(config_.userActuationLeadMs)
         && config_.userActuationLeadMs >= config_.actuationLeadMinMs
@@ -13920,6 +22107,21 @@ QString AutomationEngine::actuationLeadSourceLabel(double consumedLeadMs) const 
     if (inBandReplacement) {
         return config_.userActuationLeadSet ? QStringLiteral("user")
                                             : QStringLiteral("seed");
+    }
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] The untuned install's own label. Compared against the
+    // WHOLE expression measuredLeadForActuationMs() returns on that branch (seed + delay offset
+    // + session trim + banner trim - Rhythm delay) rather than the bare seed, so a shot that flew
+    // on a trimmed seed is still named honestly instead of degrading to "authority" -- the exact
+    // provenance lie the lead_kind/lead_source split was created to end.
+    const double autoSeedMs = appliedLeadAutoSeedMs();
+    if (autoSeedMs > 0.0) {
+        const double keyedAutoSeedMs = std::max(
+            0.0, autoSeedMs + appliedMeterDelayLeadOffsetMs() + sessionLeadTrimMs_
+                     + appliedBannerLeadTrimMs() + appliedLeadOffsetByTypeMs()
+                     - appliedRhythmFlickDelayMs());
+        if (std::abs(consumedLeadMs - keyedAutoSeedMs) <= 1e-9) {
+            return QStringLiteral("auto");
+        }
     }
     return QStringLiteral("authority");
 }
@@ -14050,14 +22252,33 @@ void AutomationEngine::recordPhaseConstantSample()
     if (!config_.tipPhaseEnabled) {
         return;
     }
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] A BLIND release never teaches the aim. The "stop"
+    // this learner dates is the meter halting because WE let go on a timer, not an animation
+    // landmark, so the observation is a measurement of our own output. A vision-timed NO METER
+    // release is an ordinary vision landing and passes through here untouched.
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] Nor does a release the engine knowingly issued late.
+    // The stop it dates is displaced by exactly that lateness, so feeding it here would teach the
+    // aim to be late by the amount the tolerance just rescued — the same reason a dev-offset
+    // sweep release is excluded from every learner.
+    // [ORION_VISION_HOLD_BAND 2026-09-15] Nor does a release the hold band displaced. Identical
+    // argument, identical direction: the stop this learner dates rides a release instant the
+    // engine moved by a known amount, so the phase constant would absorb the clamp as if it were
+    // evidence about the animation.
+    if (meterCapBlindRelease_ || meterCapLateFireMs_ > 0.0
+        || !meterCapHoldBandKind_.isEmpty()) {
+        return;
+    }
     if (meterCapPhaseAnchorMs_ < 0.0 || !meterCapPhaseStopConfirmed_
         || meterCapPhaseStopMs_ < 0.0) {
         return;   // no dated anchor, or the rise never demonstrably ended -> no evidence
     }
     // [ORION_STOP_SUBFRAME] Flag ON: measure against the refined sub-frame stop, re-centred so
     // the learned constant keeps the mean the seed/constant were calibrated against (flipping
-    // the flag removes dating noise; it must never move the aim). Refinement failure falls back
-    // to the snapped date, which the re-centring makes commensurable by construction.
+    // the flag removes dating noise; it must never move the aim). A refinement failure is still
+    // logged against the snapped date for diagnosis, but is not allowed to teach the learner:
+    // the 2026-09-01 deep-shot trace produced a 430.2ms accepted outlier on the only such failure,
+    // while 50/51 refinable samples remained healthy. A configured precision estimator must not
+    // silently mix its noisier fallback ruler into the adaptive aim.
     double stopForMeasurementMs = meterCapPhaseStopMs_;
     double stopSubframeRawMs = -1.0;
     if (config_.stopDatingSubframe) {
@@ -14083,7 +22304,12 @@ void AutomationEngine::recordPhaseConstantSample()
     // to contain -- which is exactly how the learner would otherwise fight the trim (fade-heavy
     // session drags the pooled median down, the trim then double-counts, the next standstill
     // fires early). 0 for every type with the flag off (default), keeping this line inert.
-    const double typeTrimMs = tipPhaseTypeTrimMs(meterCapShotType_);
+    // [ORION_PRESS_LATENCY_TRIM] the per-shot trim is subtracted exactly like the type trim:
+    // a shot fired trim ms earlier stops trim ms earlier, and the pooled learner must see the
+    // untrimmed physical phase or it would walk the base constant toward the session's latency.
+    const double typeTrimMs = (std::isfinite(meterCapPhaseTypeTrimMs_)
+        ? meterCapPhaseTypeTrimMs_ : tipPhaseTypeTrimMs(meterCapShotType_))
+        + meterCapPressLatencyTrimMs_;
     const double observedMs = std::isfinite(rawObservedMs)
         ? rawObservedMs - tipPhaseLevelAdjustmentMs(meterCapPhaseAnchorLevelPct_) - typeTrimMs
         : rawObservedMs;
@@ -14092,10 +22318,26 @@ void AutomationEngine::recordPhaseConstantSample()
     // commanded offset. While the sweep hook is armed NOTHING it produced may teach the aim:
     // the sample is still logged (the sweep analysis wants it) but never accepted.
     const bool devOffsetFenced = devFireOffsetArmed_;
+    const bool subframeUnavailable = config_.stopDatingSubframe
+        && stopSubframeRawMs < 0.0;
+    // [ORION_TIP_PHASE_FIRST_SIGHT] A first-sight-dated landing is LOGGED but never LEARNED
+    // FROM. The normalisation two lines above is the only thing standing between a raw
+    // observation and the pooled constant that aims every shot, and for a first-sight anchor
+    // it is tipPhaseLevelAdjustmentMs EXTRAPOLATED past the rung table's top knot (the very
+    // extrapolation phaseFirstSightSigmaMs charges the decision a wider sigma for). Feeding it
+    // here would inject that extrapolation error into the learned physical term, where it is
+    // no longer attributable to the shot that produced it and where it re-aims every OTHER
+    // shot type -- the exact defect the ladder's own normalisation comment was written to
+    // prevent. The existing code DOES handle anchor-fill-specific samples arithmetically; what
+    // it does not have is a way to say "this level is a guess", so this says it instead.
+    const bool firstSightAnchored = meterCapPhaseAnchorFirstSight_;
     const bool accepted = std::isfinite(observedMs)
         && observedMs >= config_.tipPhaseLearnMinMs
         && observedMs <= config_.tipPhaseLearnMaxMs
-        && !devOffsetFenced;
+        && !devOffsetFenced
+        && !subframeUnavailable
+        && !firstSightAnchored
+        && !meterCapFadePhaseCatchup_; // a corrected capture clock must not train the shared constant
     // [ORION_PHASE_PORTABILITY] ONE LINE PER LANDING, ALWAYS, ON EVERY INSTALL.
     //
     // WHY THIS EXISTS. The shipped animation constant (tipPhaseConstantMs) is a property of the
@@ -14125,10 +22367,23 @@ void AutomationEngine::recordPhaseConstantSample()
         extraFields += QStringLiteral("stop_subframe=%1 stop_snap_shift_ms=%2 ")
                            .arg(stopSubframeRawMs >= 0.0 ? 1 : 0)
                            .arg(meterCapPhaseStopMs_ - stopForMeasurementMs, 0, 'f', 2);
+        if (subframeUnavailable) {
+            extraFields += QStringLiteral("learn_reject=stop_subframe_unavailable ");
+        }
     }
     if (devOffsetFenced) {
         extraFields += QStringLiteral("dev_offset_fence=1 dev_offset_ms=%1 ")
                            .arg(lastReleaseDevOffsetMs_, 0, 'f', 2);
+    }
+    // [ORION_TIP_PHASE_FIRST_SIGHT] Present ONLY on a first-sight-dated landing, so every
+    // existing line -- and every existing parser (tools/timing RE_PHASE and kin) -- is
+    // byte-identical. The sample is still published: a demo log full of these is exactly how
+    // the level-extrapolation question gets answered off many machines instead of this one.
+    if (meterCapFadePhaseCatchup_) {
+        extraFields += QStringLiteral("learn_reject=fade_phase_catchup ");
+    }
+    if (firstSightAnchored) {
+        extraFields += QStringLiteral("anchor_first_sight=1 learn_reject=phase_first_sight ");
     }
     // [ORION_TYPE_TRIM] Only while the feature is live for THIS sample, keeping the flag-OFF
     // (and untrimmed-type) line byte-identical for every existing parser.
@@ -14158,6 +22413,47 @@ void AutomationEngine::recordPhaseConstantSample()
         phaseConstantSamplesMs_.removeFirst();
     }
     const int n = phaseConstantSamplesMs_.size();
+    // [ORION_SESSION_LEAD_PROBE] One bounded lead correction per session from the session's own
+    // anchor->freeze median (a latency, not a landing grade): see the header notes. Runs before
+    // the learner's own minimum so it cannot depend on aim-learning state.
+    if (config_.sessionLeadProbeEnabled && !sessionLeadTrimLatched_
+        && n >= std::max(1, config_.sessionLeadProbeMinSamples)) {
+        QVector<double> probe = phaseConstantSamplesMs_;
+        std::sort(probe.begin(), probe.end());
+        const double probeMedianMs = (n % 2 == 1)
+            ? probe[n / 2] : 0.5 * (probe[n / 2 - 1] + probe[n / 2]);
+        const double leadNowMs = config_.userActuationLeadMs;
+        sessionLeadTrimLatched_ = true;
+        if (!(leadReferencePhysicalMs_ > 0.0)
+            || std::abs(leadReferenceLeadMs_ - leadNowMs) > 0.5) {
+            // First full window under this lead: this session defines the reference.
+            leadReferencePhysicalMs_ = probeMedianMs;
+            leadReferenceLeadMs_ = leadNowMs;
+            sessionLeadTrimMs_ = 0.0;
+            emit engineDiagnostic(QStringLiteral(
+                "SESSION LEAD PROBE: disposition=reference_captured physical_median_ms=%1 "
+                "lead_ms=%2 n=%3 trim_ms=0.0")
+                                      .arg(probeMedianMs, 0, 'f', 1)
+                                      .arg(leadNowMs, 0, 'f', 1)
+                                      .arg(n));
+            emit leadReferenceCaptured(probeMedianMs, leadNowMs);
+        } else {
+            const double diffMs = probeMedianMs - leadReferencePhysicalMs_;
+            const double maxMs = std::max(0.0, config_.sessionLeadProbeMaxMs);
+            sessionLeadTrimMs_ = std::clamp(config_.sessionLeadProbeGain * diffMs, -maxMs, maxMs);
+            emit engineDiagnostic(QStringLiteral(
+                "SESSION LEAD PROBE: disposition=trim_latched physical_median_ms=%1 "
+                "reference_ms=%2 diff_ms=%3 gain=%4 trim_ms=%5 lead_ms=%6 effective_lead_ms=%7 n=%8")
+                                      .arg(probeMedianMs, 0, 'f', 1)
+                                      .arg(leadReferencePhysicalMs_, 0, 'f', 1)
+                                      .arg(diffMs, 0, 'f', 1)
+                                      .arg(config_.sessionLeadProbeGain, 0, 'f', 2)
+                                      .arg(sessionLeadTrimMs_, 0, 'f', 1)
+                                      .arg(leadNowMs, 0, 'f', 1)
+                                      .arg(leadNowMs + sessionLeadTrimMs_, 0, 'f', 1)
+                                      .arg(n));
+        }
+    }
     if (n < std::max(1, config_.tipPhaseLearnMinSamples)) {
         // Below this there is no claim worth making at all: one or two landings cannot
         // distinguish a different animation from ordinary shot-to-shot spread.
@@ -14172,9 +22468,35 @@ void AutomationEngine::recordPhaseConstantSample()
     // at n=10, against a 20 ms threshold). 2026-08-08 production: the manual value was 70 ms
     // below the live median all session and nothing said so -- the user tuned Shot Lead against
     // an aim the rig's own instrument refuted, which is what walked the pair unschedulable.
+    bool autoUnlockTriggered = false;
+    const double autoUnlockHandoverBaseMs = frozenAimPhysicalMs_;
     if (config_.tipPhaseAimFrozen && frozenAimPhysicalMs_ > 0.0 && n * 2 >= window) {
         maybeWarnTipTimingDivergence(frozenAimPhysicalMs_, medianMs);
-        maybeAutoUnlockTipTiming(medianMs, n, window);
+        autoUnlockTriggered = maybeAutoUnlockTipTiming(medianMs, n, window);
+    }
+    if (autoUnlockTriggered) {
+        // The signal above is a direct Qt connection in OrionAppController. Its resetTipTiming()
+        // saves settings and synchronously calls applyConfig(), flipping tipPhaseAimFrozen off
+        // before this stack frame resumes. Previously execution then fell through with n==window
+        // and assigned learnedPhasePhysicalMs_=medianMs below: the observed 421.3 -> 400.1 ms
+        // same-sample snap, despite the UI contract promising a smooth handover.
+        //
+        // The full window has already served its one purpose: independently establishing that
+        // the lock is stale. Do not spend the same evidence twice as an immediate aim update.
+        // Re-seed the existing shrinkage learner from the locked value and require fresh landings;
+        // at tipPhaseLearnMinSamples its first move is only minSamples/window of the disagreement,
+        // then it converges normally to a full fresh-window median.
+        phaseConstantSamplesMs_.clear();
+        learnedPhasePhysicalMs_ = autoUnlockHandoverBaseMs;
+        phaseShrinkBaseMs_ = autoUnlockHandoverBaseMs;
+        emit phaseMeasuredMedianUpdated(medianMs - phasePriorShiftMs());
+        emit engineDiagnostic(QStringLiteral(
+            "TIP TIMING HANDOVER: held_physical_ms=%1 measured_physical_ms=%2 "
+            "learner_window_reset=1 effective_const_ms=%3")
+                                  .arg(autoUnlockHandoverBaseMs, 0, 'f', 1)
+                                  .arg(medianMs, 0, 'f', 1)
+                                  .arg(effectiveTipPhaseConstantMs(), 0, 'f', 1));
+        return;
     }
     // [ORION_PHASE_COLD_START] SHRINK toward the observation instead of waiting for a full window.
     //
@@ -14293,7 +22615,12 @@ void AutomationEngine::recordLandingLeadSample(double peakFillPct, double fillAt
     // guess wearing a measurement's clothes, even in a diagnostic.
     // [ORION_DEV_FIRE_OFFSET] peak - fill_at_submit rides the (displaced) release; while the
     // sweep hook is armed this cannot be evidence about the lead.
-    if (devFireOffsetArmed_) {
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] A fired_late release is displaced by exactly the
+    // same kind of known quantity, so it is excluded by exactly the same rule.
+    // [ORION_VISION_HOLD_BAND 2026-09-15] And so is a band-clamped release, for the third time
+    // and the third instance of the same rule: travel_pp rides the displaced release.
+    if (devFireOffsetArmed_ || meterCapLateFireMs_ > 0.0
+        || !meterCapHoldBandKind_.isEmpty()) {
         return;
     }
     const double velocity = meterCapRiseVelocityPctPerMs_;
@@ -14353,6 +22680,11 @@ void AutomationEngine::evaluatePostReleaseMeter()
     const QString shotType = meterCapShotType_;
     const int seq = meterCapSeq_;
     const double peak = meterCapPeakFillPct_;
+    // [ORION_RAW_TOP] raw top and dwell; -1/0 when no raw sample was captured.
+    const double rawPeak = meterCapRawPeakFillPct_ > 0.0 ? meterCapRawPeakFillPct_ : -1.0;
+    const double topHoldMs = (meterCapTopFirstMs_ >= 0.0
+                              && meterCapTopLastMs_ >= meterCapTopFirstMs_)
+        ? meterCapTopLastMs_ - meterCapTopFirstMs_ : 0.0;
     const QVector<MeterCalSample> samples = meterCapSamples_;
     meterCapActive_ = false;                   // close up-front so any early return resets state
     meterCapSamples_.clear();
@@ -14550,7 +22882,11 @@ void AutomationEngine::evaluatePostReleaseMeter()
         //                                           floor (so a 16ms slider reading 50 is visible)
         // -1 on both = no tempo flick this shot (ButtonShot / GoToStick).
         "vel_at_rel=%13 frame_age_ms=%14 rtt_ms=%15 flick_ms=%16 flick_hold=%17 "
-        "meter_x=%18 meter_y=%19 meter_jump=%20 shot=%21")
+        // [ORION_RAW_TOP 2026-09-01] APPEND-ONLY, before shot=. raw_peak_fill is the highest
+        // max(coarse, subpixel) fill of the shot; top_hold_ms is how long raw >= 99 lasted
+        // inside the capture window. peak_fill (sub-pixel) saturates below a full bar, so a
+        // late release read 95-97 here and was graded EARLY; raw_peak_fill >= 99 is the top.
+        "meter_x=%18 meter_y=%19 meter_jump=%20 raw_peak_fill=%21 top_hold_ms=%22 shot=%23")
                               .arg(seq)
                               .arg(peak, 0, 'f', 2)
                               .arg(fill, 0, 'f', 2)
@@ -14571,6 +22907,8 @@ void AutomationEngine::evaluatePostReleaseMeter()
                               .arg(meterCapNormXAtRel_, 0, 'f', 4)
                               .arg(meterCapNormYAtRel_, 0, 'f', 4)
                               .arg(landingMeterJump, 0, 'f', 4)
+                              .arg(rawPeak, 0, 'f', 2)
+                              .arg(topHoldMs, 0, 'f', 0)
                               .arg(shotType));
 
     // [ORION_PRESS_ANCHOR] Graded landing -> H/M-confidence press->tip observation. H needs
@@ -14991,6 +23329,46 @@ void AutomationEngine::emitShotAbortIdentity(const char* site, qint64 physicalEp
                               .arg(lastMeterNormY_, 0, 'f', 4)
                               .arg(meterLockMaxJumpNorm_, 0, 'f', 4)
                               .arg(abortShotTypeToken(shotType)));
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] THE universal abort census is also the universal
+    // "this press produced no release edge" signal, so the sidecar's press window closes here
+    // rather than waiting out ORION_ANCHOR_ARM_S. -1 (structurally no epoch at this site) and
+    // an epoch that already released are both filtered by emitShotGateDisarm.
+    if (physicalEpoch > 0) {
+        emitShotGateDisarm(static_cast<quint64>(physicalEpoch), reason);
+    }
+}
+
+void AutomationEngine::emitShotGateRelease(quint64 physicalShotEpoch, double releaseWallMsEpoch,
+                                          const QString& shotType)
+{
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] One close per press, and a RELEASE always wins: the
+    // fence is set here so a later abort/cleanup on the same epoch cannot follow a real release
+    // edge with a disarm the sidecar would read as "the player cancelled".
+    if (physicalShotEpoch == 0 || physicalShotEpoch == shotGateReleasedEpoch_) {
+        return;
+    }
+    shotGateReleasedEpoch_ = physicalShotEpoch;
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] The banner reader's release feed is fed from THIS edge
+    // (remote_play_orchestrator.release_shot_gate -> BannerVerdictLive.note_release), so the ring
+    // a verdict is attributed against is filled from the same single funnel and with the same
+    // one-per-epoch fence. Anything else would let the engine and the sidecar disagree about
+    // which presses were shots.
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] liveShotOnsetMs() is read HERE, at the release edge:
+    // on the vision/NO METER path shot_ is still this shot, and on the METER BACKSTOP path there
+    // is no ShotContext and it correctly answers -1 (no tempo, reference class).
+    noteBannerTrimRelease(physicalShotEpoch, shotType, liveShotOnsetMs(), liveShotRange());
+    emit shotGateRelease(physicalShotEpoch, releaseWallMsEpoch);
+}
+
+void AutomationEngine::emitShotGateDisarm(quint64 physicalShotEpoch, const QString& reason)
+{
+    if (physicalShotEpoch == 0
+        || physicalShotEpoch == shotGateReleasedEpoch_
+        || physicalShotEpoch == shotGateDisarmedEpoch_) {
+        return;
+    }
+    shotGateDisarmedEpoch_ = physicalShotEpoch;
+    emit shotGateDisarm(physicalShotEpoch, reason);
 }
 
 QString AutomationEngine::abortShotTypeToken(const QString& shotType)
@@ -15022,6 +23400,7 @@ void AutomationEngine::abort(QString reason)
         (abortedMode == ShotMode::GoToStick || abortedMode == ShotMode::TempoStick)
         && shot_.state != HoldState::Idle;
     const QString abortedShotType = shot_.shotType;
+    const bool abortedTempoFadeGesture = shot_.tempoFadeGesture;
     const double abortedPhysicalPressMs = shot_.armTimestampMs;
     const double abortedLsArmX = shot_.lsArmX;
     const double abortedLsArmY = shot_.lsArmY;
@@ -15040,16 +23419,6 @@ void AutomationEngine::abort(QString reason)
         && squareLatchedUntilRelease_;
     const bool preserveSuppressedStickOverlap = (activeSquareAbort || activeStickAbort)
         && stickOverlapLatchedUntilNeutral_;
-    // Once a shot has been owned, no abort reason may reinterpret that physical
-    // gesture as a brand-new shot. Shot state is authoritative here: lastPhysical_
-    // is one raw poll and can contain a false release/neutral on the abort tick.
-    // Square requires three UP samples; stick modes require three neutral samples.
-    if (activeSquareAbort) {
-        squareRearmBlockedUntilRelease_ = true;
-    }
-    if (activeStickAbort) {
-        stickRearmBlockedUntilNeutral_ = true;
-    }
     // A copied token lives in OrionPreciseFireThread, not in these fields. Revoke it
     // synchronously before changing ownership/state. If the worker crossed the submit
     // boundary while the fence was entering, its confirmation wins: that physical edge
@@ -15086,6 +23455,20 @@ void AutomationEngine::abort(QString reason)
     const bool scheduleFenceFailed = invalidateUnconfirmedSchedule();
     if (consumeConfirmedSchedule()) {
         return;
+    }
+    // Only an actual abort needs this fence. A confirmed worker release above
+    // has won the race and must retain the normal successful-release lifecycle;
+    // otherwise the abort-only fence survives cooldown and swallows a certified
+    // rapid next press before the ordinary fresh-epoch latch canary can run.
+    // Once a shot has been owned, no abort reason may reinterpret that physical
+    // gesture as a brand-new shot. Shot state is authoritative here: lastPhysical_
+    // is one raw poll and can contain a false release/neutral on the abort tick.
+    // Square requires three UP samples; stick modes require three neutral samples.
+    if (activeSquareAbort) {
+        squareRearmBlockedUntilRelease_ = true;
+    }
+    if (activeStickAbort) {
+        stickRearmBlockedUntilNeutral_ = true;
     }
     clearScheduledFire();
     if (!latencyCalibrationProbe) {
@@ -15143,10 +23526,14 @@ void AutomationEngine::abort(QString reason)
             abortedMode, abortedShotType,
             abortedLsArmX, abortedLsArmY,
             abortedMode == ShotMode::TempoSquare
-                || abortedMode == ShotMode::TempoStick);
+                || abortedMode == ShotMode::TempoStick,
+            abortedPhysicalEpoch);
+        // abort() reset ShotContext above. Preserve the gesture chosen at arm,
+        // not that reset context's default or a newly interpreted classifier.
+        ownedOutputDrainTempoFadeGesture_ = abortedTempoFadeGesture;
     }
     if (preserveSuppressedSquareOverlap) {
-        squareLatchedUntilRelease_ = true;
+        armSquareOverlapLatch();
     }
     if (preserveSuppressedStickOverlap) {
         stickOverlapLatchedUntilNeutral_ = true;

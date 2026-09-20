@@ -1,21 +1,45 @@
-# ⚠️ VERIFY BEFORE DEPLOYING. As of 2026-08-04 no Worker named "orion-license-bot"
-# exists on account 991bf3f7aae56a88579b48475294ff2a. The two that DO exist are
-# "orion-discord-bot" (2026-07-03) and "license-redeem-proxy" (2026-06-23).
-# Deploying with this name publishes a THIRD Worker instead of updating the one
-# Discord's Interactions Endpoint URL actually points at — the commands would
-# silently keep hitting the old code. Set this to that Worker's real name first.
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  STOP — VERIFY THE WORKER NAME BEFORE `wrangler deploy`.                 ║
+# ║  As of 2026-08-04 NO Worker named "orion-license-bot" exists on account   ║
+# ║  991bf3f7aae56a88579b48475294ff2a. The two that DO exist are              ║
+# ║  "orion-discord-bot" (2026-07-03) and "license-redeem-proxy"             ║
+# ║  (2026-06-23), and the docs disagree about which one Discord's            ║
+# ║  Interactions Endpoint URL points at. Deploying under this name           ║
+# ║  publishes a THIRD Worker: the commands keep hitting the old code and     ║
+# ║  nothing looks broken. Read the URL off Dev Portal -> General Information ║
+# ║  -> Interactions Endpoint URL, match it to `wrangler deployments list`   ║
+# ║  / the dashboard, and set `name` to THAT Worker (README.md checklist).    ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 name = "orion-license-bot"
 main = "orion_worker.js"
 compatibility_date = "2025-01-15"   # must be recent enough for Ed25519 in Web Crypto
 
 # Non-secret config only. NEVER put the bot token / public key / bot secret here —
-# set those with:  wrangler secret put DISCORD_PUBLIC_KEY  (and DISCORD_APP_ID, ORION_BOT_SECRET)
+# set those with:
+#   wrangler secret put DISCORD_PUBLIC_KEY
+#   wrangler secret put DISCORD_APP_ID
+#   wrangler secret put ORION_BOT_SECRET     (== SSM /orion/bot_service_secret)
+#   wrangler secret put ORION_EDGE_AUTH      (== SSM /orion/edge_auth_secret)
 [vars]
 ORION_API_BASE = "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com"
-# Gumroad storefront base for /purchase buy buttons: "<base>/<product-slug>".
-# TODO: replace <seller> with the real Gumroad subdomain before deploying —
-# /purchase renders a "store links unavailable" warning while this is wrong.
+# The ONE destination /purchase sends people to (owner rule 2026-09-15: no tiers,
+# no prices in the bot — the website is the only place a price is written down).
+# TODO: set the real website URL before deploying — while it is unset /purchase
+# renders a "store link unavailable" warning (the Worker validates the URL and
+# drops the button rather than sending a message Discord would reject).
+STORE_URL = ""
+# LEGACY fallback used only when STORE_URL is empty, so a Worker deployed before
+# STORE_URL existed still shows a working button: "<base>/<product-slug>".
 GUMROAD_BASE = "https://<seller>.gumroad.com/l"
+# REMOVED 2026-09-15: GUMROAD_HWID_RESET_SLUG. Customers cannot buy a reset any
+# more (3 free, then 1 day off the subscription), so /hwid_reset renders no store
+# link at all. The webhook Lambda keeps GUMROAD_HWID_RESET_PRODUCT so an
+# in-flight sale still lands and staff can grant credits as goodwill.
+# Comma-separated Discord role ids allowed to /lookup OTHER users. Client-side
+# only — /api/bot/status has no server-side staff check yet. /deliver and
+# /keygen are gated by the SERVER (orion-staff), not by this list.
+STAFF_ROLE_IDS = ""
 
 # No KV namespace needed — the killswitch lives in the Lambda's DynamoDB so it
-# actually disables the launcher (gates /api/activate + the heartbeat).
+# actually disables the launcher (gates /api/activate + the heartbeat). The
+# Worker never writes it (/api/bot/killswitch is status-only per contract §5).

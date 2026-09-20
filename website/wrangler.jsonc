@@ -1,0 +1,59 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "venice-site",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "404-page"
+  },
+  "vars": {
+    "CHECKOUT_PROVIDER": "stripe",
+    "STRIPE_MODE": "test",
+    "DISCORD_CLIENT_ID": "1549481446782017668",
+    "DISCORD_INVITE_URL": "https://discord.gg/yTuekgdgEN",
+    "STRIPE_PUBLISHABLE_KEY": "pk_test_51UGADhGniZwGqtXLH9L5PjL2Mo379qEipie0FAeshc4tbSZs0UJM69Bxx3vGTAT8Cg9FBR3kmMz4MDbvaRd7C4qw00R1UsF9TM",
+    "STRIPE_PRICE_ID": "price_1UGAOmGniZwGqtXLa9iDiEtk",
+    "ORION_API_BASE": "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com"
+  },
+  "env": {
+    "production": {
+      "name": "venice-site-production",
+      "workers_dev": false,
+      "preview_urls": false,
+      "secrets": {
+        "required": [
+          "DISCORD_CLIENT_SECRET",
+          "ORION_BOT_SECRET",
+          "PAIR_ISSUER_SECRET",
+          "ORION_EDGE_AUTH",
+          "SESSION_SECRET",
+          "STRIPE_SECRET_KEY",
+          "STRIPE_WEBHOOK_SECRET"
+        ]
+      },
+      "routes": [
+        { "pattern": "zaeorion.com/*", "zone_id": "a08c0d7597c76df7e6d84a2c08bd106b" },
+        { "pattern": "www.zaeorion.com/*", "zone_id": "a08c0d7597c76df7e6d84a2c08bd106b" }
+      ],
+      "vars": {
+        "CHECKOUT_PROVIDER": "stripe",
+        "STRIPE_MODE": "live",
+        "DISCORD_CLIENT_ID": "1549481446782017668",
+        "DISCORD_INVITE_URL": "https://discord.gg/yTuekgdgEN",
+        "STRIPE_PUBLISHABLE_KEY": "pk_live_51UGADhGniZwGqtXLGqsTF6H7U9gtJ6TRlJkUPoYsmMmZDSucXIhLjquHkhK499uaN5eC3saUwL9oxotwPTqGYfeS00QL7TWHvq",
+        "STRIPE_PRICE_ID": "price_1UGaaRGniZwGqtXLwQV7OLRY",
+        "ORION_API_BASE": "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com"
+      }
+    }
+  }
+}

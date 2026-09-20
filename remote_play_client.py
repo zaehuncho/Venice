@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from decoder_pipe_identity import (
     canonical_executable_path,
@@ -69,6 +72,10 @@ class RemotePlayClientConfig:
     # before these probes existed, and auto-waking a console the user just
     # rested would fight an explicit user action.
     console_wake_allowed: bool = True
+    # Called with the port-wait budget (s) right after a rest-mode wakeup is sent, so the
+    # host can extend its own promote deadline. None = no extension possible (keep the
+    # deadline-sized budget).
+    on_console_waking: Optional[Callable[[float], None]] = None
 
 
 @dataclass
@@ -144,9 +151,14 @@ class _SessionReadinessTracker:
 
     def __init__(self, log_dir: str, baseline: Optional[Dict[str, int]] = None) -> None:
         self.log_dir = str(log_dir or "")
+        self._lock = threading.RLock()
         self.reset(baseline or {})
 
     def reset(self, baseline: Dict[str, int]) -> None:
+        with self._lock:
+            self._reset_locked(baseline)
+
+    def _reset_locked(self, baseline: Dict[str, int]) -> None:
         self.baseline = dict(baseline or {})
         self.path = ""
         self.offset = 0
@@ -184,6 +196,12 @@ class _SessionReadinessTracker:
         self.partial = joined[-_CHIAKI_SESSION_MARKER_OVERLAP:]
 
     def poll(self) -> Tuple[str, str]:
+        # Telemetry and launch/recovery may ask concurrently. The path,
+        # offset, partial marker and ready latch form one parser transaction.
+        with self._lock:
+            return self._poll_locked()
+
+    def _poll_locked(self) -> Tuple[str, str]:
         candidate = self._select_current_log()
         if not candidate:
             # No current launch-scoped bytes means there is no authority proof.
@@ -422,14 +440,178 @@ def find_chiaki_binary(explicit: str = "") -> str:
     return ""
 
 
-def terminate_chiaki_processes() -> None:
+_CHIAKI_IMAGE_NAMES = ("OrionStream.exe", "chiaki.exe", "chiaki-ng.exe", "chiaki4deck.exe")
+
+
+def _running_image_pids(targets: Tuple[str, ...]) -> Optional[List[Tuple[int, str]]]:
+    """(pid, lower-cased name) for each running ``targets`` process, via ONE
+    in-process toolhelp snapshot (~1ms).
+
+    Returns a (possibly empty) list, or None when the snapshot API is
+    unavailable/failed so callers can fall back to their conservative path.
+    """
     if os.name != "nt":
-        return
-    names = ("OrionStream.exe", "chiaki.exe", "chiaki-ng.exe", "chiaki4deck.exe")
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        ULONG_PTR = ctypes.c_size_t
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ULONG_PTR),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        # ctypes defaults BOTH the return value and every undeclared argument to
+        # a 32-bit C int. HANDLE is pointer-sized on the shipped x64 runtime, so
+        # an undeclared Process32FirstW/Process32NextW could truncate the
+        # snapshot handle and turn the probe into an exception (-> None -> the
+        # spawning fallback sweep). Measured on this rig the handles are small
+        # enough that it never fired, but the declaration is free and removes the
+        # failure mode from the only thing standing between a connect and 3s of
+        # taskkill.exe.
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            wanted = {name.lower() for name in targets}
+            found: List[Tuple[int, str]] = []
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                name = str(entry.szExeFile or "").lower()
+                if name in wanted:
+                    found.append((int(entry.th32ProcessID), name))
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+            return found
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception:
+        return None
+
+
+def _running_image_names(targets: Tuple[str, ...]) -> Optional[set]:
+    """Which of ``targets`` are running, via ONE in-process toolhelp snapshot (~1ms).
+
+    Returns a (possibly empty) lower-cased name set, or None when the snapshot
+    API is unavailable/failed so the caller can fall back to the spawning sweep
+    (the fixed-named-pipe-freeing guarantee must never rest on a failed probe).
+    """
+    pids = _running_image_pids(targets)
+    if pids is None:
+        return None
+    return {name for _pid, name in pids}
+
+
+def _terminate_pids_in_process(pids: List[Tuple[int, str]],
+                               wait_s: float = 1.5) -> Tuple[List[int], List[int]]:
+    """TerminateProcess every ``(pid, name)`` in-process. Returns (killed, failed).
+
+    [ORION_CONNECT_LATENCY 2026-09-14] The spawning sweep costs ~250ms per
+    taskkill.exe; OpenProcess + TerminateProcess + a bounded WaitForSingleObject
+    costs microseconds and, unlike `taskkill /IM`, can never touch a process the
+    caller did not name. NEVER kills this process or a system pid; the caller is
+    responsible for only ever handing it target-image pids.
+    """
+    killed: List[int] = []
+    failed: List[int] = []
+    if os.name != "nt" or not pids:
+        return killed, failed
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_TERMINATE = 0x0001
+        SYNCHRONIZE = 0x00100000
+        WAIT_OBJECT_0 = 0x00000000
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+    except Exception:
+        return killed, [int(pid) for pid, _name in pids]
+
+    self_pid = os.getpid()
+    budget_ms = max(0, int(float(wait_s) * 1000.0))
+    for pid, _name in pids:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 4 or pid == self_pid:
+            # pid 0/4 are System/Idle; our own pid is never a chiaki image.
+            continue
+        handle = 0
+        try:
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+            if not handle:
+                # Already gone (the common case) or access denied: the post-kill
+                # snapshot below is the authority, not this call.
+                failed.append(pid)
+                continue
+            if not kernel32.TerminateProcess(handle, 1):
+                failed.append(pid)
+                continue
+            if kernel32.WaitForSingleObject(handle, budget_ms) == WAIT_OBJECT_0:
+                killed.append(pid)
+            else:
+                failed.append(pid)
+        except Exception:
+            failed.append(pid)
+        finally:
+            if handle:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+    return killed, failed
+
+
+def _terminate_chiaki_processes_spawning(names: Tuple[str, ...],
+                                         running: Optional[set]) -> None:
+    """Legacy last-resort sweep: taskkill.exe /IM <name> /F /T per image, with
+    tasklist.exe verification when the toolhelp snapshot is unavailable.
+
+    Kept ONLY as the fallback for a failed snapshot or a pid-scoped kill that did
+    not clear the image, so the "fixed named pipes are free before launch"
+    guarantee never rests on an in-process path that just failed. ``/T`` is kept
+    here (and deliberately NOT reproduced in the pid path) because this branch
+    runs blind: with no snapshot we cannot enumerate a tree ourselves."""
     _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     deadline = time.time() + 6.0
     while True:
-        for name in names:
+        targets = (names if running is None
+                   else tuple(n for n in names if n.lower() in running)) or names
+        for name in targets:
             try:
                 subprocess.run(
                     ["taskkill.exe", "/IM", name, "/F", "/T"],
@@ -444,6 +626,13 @@ def terminate_chiaki_processes() -> None:
                 pass
         if time.time() >= deadline:
             return
+        running = _running_image_names(names)
+        if running is not None:
+            if not running:
+                return
+            time.sleep(0.15)
+            continue
+        # Snapshot unavailable: legacy tasklist verification.
         try:
             still_running = False
             for name in names:
@@ -463,6 +652,243 @@ def terminate_chiaki_processes() -> None:
         except Exception:
             return
         time.sleep(0.15)
+
+
+# Last sweep's factual report (pids/names found, what was killed, whether the
+# spawning fallback ran, wall cost). ensure_running() folds it into the stage
+# summary so the NEXT connect-latency diagnosis is read, not inferred.
+_LAST_SWEEP_REPORT: Dict[str, object] = {}
+
+
+def last_sweep_report() -> Dict[str, object]:
+    return dict(_LAST_SWEEP_REPORT)
+
+
+def terminate_chiaki_processes() -> Dict[str, object]:
+    """Free the fixed Orion named pipes: kill every chiaki-family process.
+
+    [ORION_CONNECT_LATENCY 2026-08-29] One toolhelp snapshot answers "is there
+    anything to kill?" in ~10ms, so a sweep with nothing running spawns NOTHING.
+    [ORION_CONNECT_LATENCY 2026-09-14] When something IS running the kill is now
+    in-process and PID-scoped (OpenProcess/TerminateProcess + a bounded wait)
+    instead of 4x `taskkill.exe /IM <name> /F /T` at ~250ms each. Only pids whose
+    image name is in ``_CHIAKI_IMAGE_NAMES`` are ever touched — never this
+    process, never an unrelated one. Child TREES are intentionally not walked:
+    the fixed pipes (orion_input / orion_frames under \\\\.\\pipe) are created by the
+    client process itself, and OrionStream spawns no children that hold them, so
+    a name-scoped kill is exactly the guarantee /T was standing in for. The
+    legacy spawning sweep remains the last-resort fallback for a failed snapshot
+    or a pid kill that did not clear the image.
+
+    Returns a factual report (also available via ``last_sweep_report()``).
+    """
+    global _LAST_SWEEP_REPORT
+    started = time.perf_counter()
+    report: Dict[str, object] = {"found": [], "killed": [], "failed": [],
+                                 "fallback": False, "ms": 0.0}
+    _LAST_SWEEP_REPORT = report
+    if os.name != "nt":
+        return report
+    names = _CHIAKI_IMAGE_NAMES
+    running = _running_image_pids(names)
+    if running is not None and not running:
+        report["ms"] = (time.perf_counter() - started) * 1000.0
+        return report
+    if running:
+        report["found"] = [f"{name}:{pid}" for pid, name in running]
+        # Two in-process rounds: the second catches a client that respawned or a
+        # handle that was still closing. Past that the image is not behaving like
+        # our own client and the blind sweep takes over.
+        for _round in range(2):
+            killed, failed = _terminate_pids_in_process(running)
+            report["killed"] = list(report["killed"]) + killed  # type: ignore[arg-type]
+            report["failed"] = failed
+            running = _running_image_pids(names)
+            if running is not None and not running:
+                report["ms"] = (time.perf_counter() - started) * 1000.0
+                return report
+            if running is None:
+                break
+            time.sleep(0.05)
+    # Snapshot unavailable, or the pid-scoped kill did not clear the image.
+    report["fallback"] = True
+    _terminate_chiaki_processes_spawning(names, {n for _p, n in running} if running else None)
+    report["ms"] = (time.perf_counter() - started) * 1000.0
+    return report
+
+
+# ---------------------------------------------------------------------------
+# CONSOLE ADDRESS DRIFT prewarm
+# ---------------------------------------------------------------------------
+# [ORION_CONNECT_LATENCY 2026-09-14] _resolve_console_host() costs ~2.4-3.4s
+# whenever the configured ip is silent (0.4s session-port probe + 0.8s discovery
+# probe + 1.2s subnet broadcast). On this rig the console moved .126 -> .81 and
+# settings still name .126, so EVERY first connect of an app run paid it inside
+# ensure_running() — it was the whole of the mis-labelled `stale_sweep=3020ms`.
+# The answer does not depend on the connect: resolve it in the BACKGROUND during
+# the warm preview (the standby prewarm pass calls prewarm_console_host()) and
+# the connect reads a cache. A cold cache falls back to today's synchronous
+# resolution unchanged — the prewarm is an accelerator, never an authority.
+_CONSOLE_HOST_PREWARM_TTL_S = 120.0
+# [ORION_CONNECT_LATENCY 2026-09-19] MEASURED RACE, and the whole reason a connect
+# is sometimes 3.5 s instead of 1.3 s.
+#
+# prewarm_console_host() used to short-circuit on "the entry is still fresh", so a
+# refresh could only ever START once the entry had ALREADY expired. The orchestrator
+# ticks it every 30 s (remote_play_orchestrator.py:3105) against a 120 s TTL, which
+# leaves the cache EMPTY from expiry until the next tick finishes its ~2.4 s lookup —
+# up to ~32 s of every 120 s, i.e. ~27 % of the wall clock. A Connect landing in that
+# hole pays _console_host_lookup() synchronously inside its own start_stream budget.
+#
+# Live proof (logs/orion_native.log):
+#   2026-09-19T02:33:23.578Z  CONSOLE ADDRESS DRIFT: ... console at 192.168.137.126   <- prewarm
+#   2026-09-19T02:35:34.181Z  Chiaki Remote Play settings saved.                      <- click, +130.6 s
+#   2026-09-19T02:35:37.550Z  start_stream timing: total=3103ms ... host_resolve=2440ms
+# and 2026-09-18T18:28:06.028Z -> 18:28:09.546Z, total=3266ms host_resolve=2422ms.
+# 2 of the 10 measured connects on this build; the other 8 had host_resolve=0 ms.
+#
+# The fix is to re-resolve while the answer is still VALID, so the cache never empties
+# between ticks. REFRESH_AFTER must sit above the 30 s tick (so a tick is not a
+# refresh every time) and far enough below the TTL that a ~2.4 s lookup always lands
+# before expiry: 45 s gives worst-case refresh-start at 75 s and fresh again by ~78 s
+# against a 120 s TTL. The SERVED answer is never older than the TTL — this only
+# changes when the refresh starts, never how stale a returned address may be.
+_CONSOLE_HOST_PREWARM_REFRESH_AFTER_S = 45.0
+_console_host_prewarm: Dict[str, Tuple[str, float]] = {}
+_console_host_prewarm_lock = threading.Lock()
+_console_host_prewarm_inflight: set = set()
+# configured host -> last adopted address we shouted about (log-level throttle).
+_console_host_last_logged: Dict[str, str] = {}
+
+
+def _console_host_prewarm_get(host: str) -> Optional[str]:
+    """The background-resolved address for ``host``, or None when there is no
+    fresh answer."""
+    host = str(host or "").strip()
+    if not host:
+        return None
+    with _console_host_prewarm_lock:
+        entry = _console_host_prewarm.get(host)
+    if not entry:
+        return None
+    resolved, stamped = entry
+    if (time.monotonic() - float(stamped)) >= _CONSOLE_HOST_PREWARM_TTL_S:
+        return None
+    return str(resolved or "") or None
+
+
+def _console_host_prewarm_age(host: str) -> Optional[float]:
+    """Seconds since ``host`` was last background-resolved, or None when there is
+    no entry at all. Deliberately ignores the TTL: this answers "how old", not
+    "is it still servable" (that stays _console_host_prewarm_get's job)."""
+    host = str(host or "").strip()
+    if not host:
+        return None
+    with _console_host_prewarm_lock:
+        entry = _console_host_prewarm.get(host)
+    if not entry:
+        return None
+    return max(0.0, time.monotonic() - float(entry[1]))
+
+
+def reset_console_host_prewarm() -> None:
+    """Drop every prewarmed answer (tests, and a settings host change)."""
+    with _console_host_prewarm_lock:
+        _console_host_prewarm.clear()
+        _console_host_last_logged.clear()
+
+
+def prewarm_console_host(host: str) -> str:
+    """Resolve CONSOLE ADDRESS DRIFT for ``host`` on a daemon thread so Connect
+    never pays for it. Returns a factual state token; never raises, never blocks.
+
+    Called from the standby prewarm pass (which the orchestrator already ticks
+    every 30s while the preview is warm). Idempotent and single-flight.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return "no-host"
+    if str(os.environ.get("ORION_PS5_DISCOVER_DRIFT", "1")).strip().lower() in {
+            "0", "false", "off"}:
+        return "disabled"
+    # [ORION_CONNECT_LATENCY 2026-09-19] Refresh BEFORE the entry expires (see the
+    # _CONSOLE_HOST_PREWARM_REFRESH_AFTER_S note): the old `is not None -> "fresh"`
+    # short-circuit meant a re-resolve could only start once the cache was already
+    # empty, so every TTL boundary opened a ~32 s window in which a Connect paid the
+    # full ~2.4 s lookup. An entry past REFRESH_AFTER is still SERVED normally while
+    # this background refresh runs — nothing is invalidated here.
+    age = _console_host_prewarm_age(host)
+    if age is not None and age < _CONSOLE_HOST_PREWARM_REFRESH_AFTER_S:
+        return "fresh"
+    refreshing = age is not None
+    with _console_host_prewarm_lock:
+        if host in _console_host_prewarm_inflight:
+            return "in-flight"
+        _console_host_prewarm_inflight.add(host)
+
+    def _worker() -> None:
+        try:
+            resolved = _console_host_lookup(host)
+            with _console_host_prewarm_lock:
+                _console_host_prewarm[host] = (resolved, time.monotonic())
+        except Exception as exc:  # fail-open: a cold cache is today's behaviour
+            logger.debug("Console host prewarm failed for %s: %s", host, exc)
+        finally:
+            with _console_host_prewarm_lock:
+                _console_host_prewarm_inflight.discard(host)
+
+    threading.Thread(target=_worker, name="console-host-prewarm",
+                     daemon=True).start()
+    # "refreshing" == an answer is still cached and servable while this runs;
+    # "started" == the cache was cold, so a Connect right now still pays the lookup.
+    return "refreshing" if refreshing else "started"
+
+
+def _console_host_lookup(host: str) -> str:
+    """The expensive part of CONSOLE ADDRESS DRIFT: returns the address to launch
+    against (the configured one unless discovery names exactly one alternative).
+
+    Shared by the connect path and the background prewarm. Never raises.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return host
+    try:
+        import ps5_wake
+        if not ps5_wake.is_ip_literal(host):
+            return host
+        if ps5_wake.session_port_open(host, timeout_s=0.4):
+            return host
+        if ps5_wake.probe_console_state(host, timeout_s=0.8).state != "no_answer":
+            return host
+        broadcast = ps5_wake.subnet_broadcast(host)
+        if not broadcast:
+            return host
+        found = [c for c in ps5_wake.discover_consoles(broadcast, timeout_s=1.2)
+                 if c.host != host]
+        if len(found) != 1:
+            if found:
+                logger.error(
+                    "CONSOLE ADDRESS DRIFT: configured %s is silent and %d consoles answer "
+                    "discovery (%s) - not guessing; set remote_play_console_ip",
+                    host, len(found), ", ".join(f"{c.host}:{c.state}" for c in found))
+            return host
+        adopted = found[0]
+        # ERROR the first time and on every change (the native relay never
+        # throttles ERROR, so the owner is told what to put in settings); INFO on
+        # the repeats, because the background prewarm re-resolves on a timer and
+        # an ERROR every two minutes would bury the line that matters.
+        level = (logger.error
+                 if _console_host_last_logged.get(host) != adopted.host
+                 else logger.info)
+        _console_host_last_logged[host] = adopted.host
+        level(
+            "CONSOLE ADDRESS DRIFT: configured %s is silent; discovery found the console at "
+            "%s (%s) - using it for this launch. Update settings remote_play_console_ip to %s.",
+            host, adopted.host, adopted.state, adopted.host)
+        return adopted.host
+    except Exception:
+        return host
 
 
 def chiaki_controller_env(disable_video: bool = False) -> dict:
@@ -517,30 +943,570 @@ def optimize_chiaki_process(pid: int) -> None:
         return
     try:
         import ctypes
+        from ctypes import wintypes
         PROCESS_SET_INFORMATION = 0x0200
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         HIGH_PRIORITY_CLASS = 0x00000080
-        handle = ctypes.windll.kernel32.OpenProcess(
+        # ctypes defaults an undeclared return value to a 32-bit C int.
+        # HANDLE is pointer-sized on the shipped x64 runtime; truncation here
+        # can silently break priority setup or prevent the handle from closing.
+        # Bind a private DLL instance rather than changing shared windll APIs.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+        kernel32.SetProcessPriorityBoost.argtypes = [wintypes.HANDLE, wintypes.BOOL]
+        kernel32.SetProcessPriorityBoost.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(
             PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
             False,
             int(pid),
         )
         if not handle:
+            logger.debug("Chiaki priority setup OpenProcess failed: %d", ctypes.get_last_error())
             return
         try:
-            ctypes.windll.kernel32.SetPriorityClass(handle, HIGH_PRIORITY_CLASS)
+            if not kernel32.SetPriorityClass(handle, HIGH_PRIORITY_CLASS):
+                logger.debug("Chiaki SetPriorityClass failed: %d", ctypes.get_last_error())
             # Disable dynamic priority boost changes for steadier frame cadence.
-            ctypes.windll.kernel32.SetProcessPriorityBoost(handle, True)
+            if not kernel32.SetProcessPriorityBoost(handle, True):
+                logger.debug("Chiaki SetProcessPriorityBoost failed: %d", ctypes.get_last_error())
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
     except Exception as exc:
         logger.debug("Chiaki process optimization failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Standby client pool — "pre-booted client, deferred session"
+# ---------------------------------------------------------------------------
+# [ORION_CONNECT_LATENCY 2026-08-30] The measured warm-Connect breakdown left the
+# Chiaki client's OWN boot (process spawn -> Qt/QML/decoder init, ~1.0-1.3s idle,
+# ~3.2s under detector/capture CPU contention) as the dominant cost. The pool
+# spawns that client EARLY — while the warm capture preview runs, long before
+# Connect — in the fork's `--standby` mode, which pays the whole boot but opens
+# NO console session (the fork refuses every session-creation path until the
+# control pipe's explicit `open` command). On Connect the manager promotes the
+# already-booted client, paying only the ~0.6s PS5 handshake plus ~1ms of IPC.
+#
+# SAFETY BY CONSTRUCTION: a standby client has no chiaki session (guarded at the
+# fork's single `new StreamSession` site), so no input can reach the console and
+# the PS5 is never held while the UI says disconnected. Readiness stays PROVEN:
+# promotion still requires the launch-scoped streaminfo marker in a fresh
+# session log, exactly like a cold spawn.
+#
+# OLD-CLIENT FAIL-CLOSED (corrected 2026-08-30, measured on the real pre-standby
+# binary): a pre-standby OrionStream.exe does NOT exit on the unknown `--standby`
+# option. QCommandLineParser.process() on a Windows GUI app raises a MODAL native
+# error dialog (class #32770, title "Chiaki") and the process lingers un-exited
+# behind it, VISIBLE on the user's desktop. It never touches the console — the
+# parse error precedes all session work (verified: no session log, no pipes) —
+# but a dialog per preview is unacceptable, so the pool never spawns `--standby`
+# at a binary that cannot parse it: it first sniffs the executable for the
+# CHIAKI_ORION_STANDBY_PIPE literal (load-bearing in every standby-capable
+# build, absent from every earlier one; measured 3 hits vs 0). A binary that
+# passes the sniff but never creates its control pipe is killed and latched
+# unsupported at the boot deadline; one that exits young with an error latches
+# via the early-exit verdict. `ORION_STANDBY_CLIENT=0` disables the pool.
+
+_STANDBY_READY_REPLY = "ok standby"
+_STANDBY_OPEN_OK_REPLY = "ok opening"
+# A standby child that dies this quickly never served a promote; treat its exit
+# code as a verdict on `--standby` support for this exact binary.
+_STANDBY_EARLY_EXIT_S = 15.0
+# How long an "unsupported binary" verdict stands before re-probing (a doomed
+# probe spawn costs ~100ms once per TTL — cheap insurance against a false latch).
+_STANDBY_UNSUPPORTED_TTL_S = 600.0
+# The env-var literal main.cpp reads to name the control pipe. Present in every
+# standby-capable OrionStream.exe by construction, absent from every earlier
+# build — the spawn-free capability test that keeps a stale install from ever
+# showing the parser-error dialog (see OLD-CLIENT FAIL-CLOSED above).
+_STANDBY_CAPABILITY_MARKER = b"CHIAKI_ORION_STANDBY_PIPE"
+# A standby that has not produced its control pipe by now never will (measured
+# boot-to-pipe: ~0.9s idle, ~3.2s under live detector/capture contention —
+# this is >10x the worst case, so a breach is a wedge, not load). The claim
+# path has its own 2s budget; this deadline is the PREWARM-side containment
+# that kills the wedge and latches the binary so it is not respawned.
+_STANDBY_BOOT_DEADLINE_S = 45.0
+
+
+def standby_client_enabled() -> bool:
+    return str(os.environ.get("ORION_STANDBY_CLIENT", "1")).strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _standby_pipe_path(pipe_name: str) -> str:
+    return "\\\\.\\pipe\\" + str(pipe_name)
+
+
+def _standby_pipe_exists(pipe_path: str) -> bool:
+    """True once the standby control pipe exists — the fork creates it only AFTER
+    its full boot completed, so existence IS the boot-complete proof."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.WaitNamedPipeW(str(pipe_path), 1))
+    except Exception:
+        return False
+
+
+def _standby_pipe_transact(pipe_path: str, command: str, timeout_s: float = 2.0,
+                           *, cancel_event=None, write_lock=None) -> str:
+    """One line out, one line back on the standby control pipe. Returns the reply
+    (stripped) or "" on any failure/timeout. Runs in a worker thread so a wedged
+    pipe can never hang the caller past its budget."""
+    result: List[str] = []
+    expired = threading.Event()
+
+    def _worker() -> None:
+        try:
+            handle = open(pipe_path, "r+b", buffering=0)
+        except OSError:
+            return
+        try:
+            # A timed-out daemon can finish opening the pipe MUCH later. It must
+            # not issue an old "open" after shutdown/a subsequent connection.
+            # Serialize only the small command write with manager.stop(), never
+            # the potentially blocking pipe open or reply read.
+            with write_lock if write_lock is not None else nullcontext():
+                if expired.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                    return
+                handle.write(command.encode("ascii", "replace") + b"\n")
+            reply = b""
+            while not reply.endswith(b"\n") and len(reply) < 256:
+                chunk = handle.read(1)
+                if not chunk:
+                    break
+                reply += chunk
+            result.append(reply.strip().decode("ascii", "replace"))
+        except OSError:
+            pass
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=_worker, name="standby-pipe", daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.1, float(timeout_s)))
+    expired.set()
+    return result[0] if result else ""
+
+
+@dataclass
+class StandbyClient:
+    process: subprocess.Popen
+    pipe_name: str
+    pipe_path: str
+    executable_path: str
+    nickname: str
+    host: str
+    disable_video: bool
+    identity_sha256: str
+    identity_size: int
+    spawned_at: float
+    # Set the first time the control pipe is observed: a child that WAS ready and
+    # later died was a working standby build (crash/sweep), not an unsupported one.
+    ready_seen: bool = False
+
+
+class StandbyClientPool:
+    """Owns at most ONE standby client. Spawned during the warm preview by the
+    orchestrator's prewarm loop; claimed (removed) by the manager's promote path
+    on Connect. Every validation failure kills the candidate and reports None so
+    the caller falls back to today's cold-spawn path — the pool can defer work,
+    never block a connect."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._client: Optional[StandbyClient] = None
+        self._unsupported: Dict[tuple, str] = {}
+        # fingerprint -> bool: does the binary embed the standby marker? A
+        # fingerprint pins path+size+mtime, so a verdict cannot outlive the
+        # bytes it was measured on; sniff FAILURES are never cached.
+        self._capability: Dict[tuple, bool] = {}
+        self._spawn_counter = 0
+        self._atexit_registered = False
+
+    # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _binary_fingerprint(path: str) -> Optional[tuple]:
+        try:
+            st = os.stat(path)
+            return (os.path.normcase(os.path.abspath(path)),
+                    int(st.st_size), int(st.st_mtime_ns))
+        except OSError:
+            return None
+
+    def _binary_supports_standby(self, path: str, fingerprint: tuple) -> bool:
+        """Spawn-free capability test: scan the executable for the standby
+        control-pipe env-var literal. Measured 2026-08-30 on the real binaries:
+        3 hits in a standby build, 0 in the pre-standby one — and the old
+        client, if spawned with `--standby`, would raise a visible modal error
+        dialog and linger instead of exiting (see OLD-CLIENT FAIL-CLOSED).
+        Fails CLOSED on read errors: only the shortcut is lost, the cold spawn
+        path is untouched."""
+        cached = self._capability.get(fingerprint)
+        if cached is not None:
+            return cached
+        marker = _STANDBY_CAPABILITY_MARKER
+        supported = False
+        try:
+            with open(path, "rb") as fh:
+                tail = b""
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    if marker in tail + chunk:
+                        supported = True
+                        break
+                    tail = chunk[-(len(marker) - 1):]
+        except OSError as exc:
+            logger.warning("Standby capability sniff failed for %s: %s", path, exc)
+            return False
+        if len(self._capability) >= 8:
+            self._capability.clear()
+        self._capability[fingerprint] = supported
+        if not supported:
+            logger.info(
+                "Standby mode unavailable: %s predates --standby support "
+                "(no control-pipe marker); Connect keeps today's cold-spawn path",
+                path)
+        return supported
+
+    def _enforce_boot_deadline_locked(self) -> None:
+        """Kill and latch a standby whose control pipe never appeared. The old
+        pre-standby client wedges on a modal parser-error dialog instead of
+        exiting; the capability sniff should keep it from ever being spawned,
+        and this deadline contains anything else that boots but never serves."""
+        client = self._client
+        if client is None or client.ready_seen:
+            return
+        if _standby_pipe_exists(client.pipe_path):
+            client.ready_seen = True
+            return
+        if time.monotonic() - client.spawned_at < _STANDBY_BOOT_DEADLINE_S:
+            return
+        self._client = None
+        fingerprint = self._binary_fingerprint(client.executable_path)
+        if fingerprint is not None:
+            self._unsupported[fingerprint] = (
+                time.monotonic(),
+                f"control pipe never appeared within {_STANDBY_BOOT_DEADLINE_S:.0f}s")
+            logger.warning(
+                "Standby mode marked unsupported for %s (%s) - Connect keeps "
+                "today's cold-spawn path (re-probed after %.0fs or a binary change)",
+                client.executable_path, self._unsupported[fingerprint][1],
+                _STANDBY_UNSUPPORTED_TTL_S)
+        self._kill_locked(client, "control pipe never appeared within the boot deadline")
+
+    def _kill_locked(self, client: StandbyClient, reason: str) -> None:
+        logger.info("Standby client discarded (%s): pid=%s",
+                    reason, getattr(client.process, "pid", 0))
+        try:
+            if client.process.poll() is None:
+                client.process.terminate()
+                try:
+                    client.process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    client.process.kill()
+                    try:
+                        client.process.wait(timeout=1.0)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.debug("Standby discard cleanup failed: %s", exc)
+
+    def _prune_dead_locked(self) -> None:
+        client = self._client
+        if client is None:
+            return
+        rc = None
+        try:
+            rc = client.process.poll()
+        except Exception:
+            rc = -1
+        if rc is None:
+            return
+        self._client = None
+        age_s = time.monotonic() - client.spawned_at
+        if (age_s < _STANDBY_EARLY_EXIT_S and int(rc or 0) != 0
+                and not client.ready_seen):
+            # Never became ready and died immediately with an error: this binary
+            # (most likely a pre-standby client rejecting the unknown option)
+            # does not support standby. The latch EXPIRES so a false positive —
+            # e.g. a young standby caught by a broad taskkill sweep, whose
+            # victims also exit 1 — self-heals instead of disabling standby for
+            # the life of the binary.
+            fingerprint = self._binary_fingerprint(client.executable_path)
+            if fingerprint is not None:
+                self._unsupported[fingerprint] = (
+                    time.monotonic(),
+                    f"standby child exited rc={rc} after {age_s:.1f}s")
+                logger.warning(
+                    "Standby mode marked unsupported for %s (%s) - Connect keeps "
+                    "today's cold-spawn path (re-probed after %.0fs or a binary change)",
+                    client.executable_path, self._unsupported[fingerprint][1],
+                    _STANDBY_UNSUPPORTED_TTL_S)
+        else:
+            logger.info("Standby client exited (rc=%s after %.1fs); will respawn on "
+                        "the next prewarm pass", rc, age_s)
+
+    # -- public API --------------------------------------------------------
+
+    def state(self) -> str:
+        with self._lock:
+            self._prune_dead_locked()
+            self._enforce_boot_deadline_locked()
+            client = self._client
+            if client is None:
+                return "absent"
+            if client.ready_seen or _standby_pipe_exists(client.pipe_path):
+                client.ready_seen = True
+                return "ready"
+            return "booting"
+
+    def ensure_spawned(self, *, chiaki_path: str = "", console_ip: str = "",
+                       disable_video: bool = False, identity_sha256: str = "",
+                       identity_size: int = -1) -> str:
+        """Spawn the standby client if none exists. Returns a factual state token;
+        never raises. Refuses to spawn beside ANY other chiaki-family process."""
+        if not standby_client_enabled():
+            return "disabled"
+        if os.name != "nt":
+            return "unsupported-os"
+        # [ORION_CONNECT_LATENCY 2026-09-14] Pay CONSOLE ADDRESS DRIFT resolution
+        # here, on the prewarm thread, for the same reason the client boot is paid
+        # here: it is ~2.4s of socket timeouts that does not depend on the connect.
+        # Non-blocking and single-flight; a cold cache just means today's
+        # synchronous resolution inside ensure_running().
+        try:
+            prewarm_console_host(console_ip)
+        except Exception as exc:
+            logger.debug("Console host prewarm kick failed: %s", exc)
+        with self._lock:
+            self._prune_dead_locked()
+            self._enforce_boot_deadline_locked()
+            if self._client is not None:
+                return "present"
+            chiaki = find_chiaki_binary(chiaki_path)
+            if not chiaki:
+                return "no-binary"
+            fingerprint = self._binary_fingerprint(chiaki)
+            if fingerprint is not None:
+                verdict = self._unsupported.get(fingerprint)
+                if verdict is not None:
+                    if time.monotonic() - verdict[0] < _STANDBY_UNSUPPORTED_TTL_S:
+                        return "unsupported"
+                    del self._unsupported[fingerprint]
+            host = str(console_ip or "").strip()
+            if not host:
+                return "no-host"
+            running = _running_image_pids(_CHIAKI_IMAGE_NAMES)
+            if running is None or running:
+                # A live session, a stale client, or an unanswerable snapshot:
+                # the connect path's sweep owns those cases; a standby spawned
+                # beside them would only be swept as one more stale process.
+                return "busy"
+            if fingerprint is not None and not self._binary_supports_standby(
+                    chiaki, fingerprint):
+                # A pre-standby client would show a modal parser-error dialog
+                # and linger (verified 2026-08-30); never spawn `--standby` at
+                # one. Sits after the cheap refusals so the 7MB scan (cached by
+                # fingerprint) only ever runs when a spawn was otherwise due.
+                return "no-standby-support"
+            probe = _probe_chiaki_client_cached(chiaki)
+            if not probe.client_ran or not probe.nickname:
+                return "no-nickname"
+
+            expected_sha = str(identity_sha256 or "").strip().lower()
+            try:
+                expected_size = int(identity_size)
+            except (TypeError, ValueError, OverflowError):
+                expected_size = -1
+            identity_requested = bool(expected_sha or expected_size >= 0)
+
+            self._spawn_counter += 1
+            pipe_name = f"orion_standby_{os.getpid()}_{self._spawn_counter}"
+            env = chiaki_controller_env(disable_video=bool(disable_video))
+            env["CHIAKI_ORION_STANDBY_PIPE"] = pipe_name
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+
+            def _spawn() -> subprocess.Popen:
+                # Options must precede the positionals (QCommandLineParser runs in
+                # ParseAsPositionalArguments mode; see the cold-launch comment).
+                return subprocess.Popen(
+                    [chiaki, "--standby", "stream", probe.nickname, host],
+                    cwd=os.path.dirname(chiaki) if os.path.isfile(chiaki) else None,
+                    env=env,
+                    startupinfo=startupinfo,
+                )
+
+            try:
+                if identity_requested:
+                    if (expected_size < 0 or len(expected_sha) != 64
+                            or any(ch not in "0123456789abcdef" for ch in expected_sha)):
+                        return "identity-malformed"
+                    with locked_executable_snapshot(chiaki) as snapshot:
+                        if (not snapshot.valid or snapshot.size != expected_size
+                                or snapshot.sha256 != expected_sha):
+                            return "identity-mismatch"
+                        process = _spawn()
+                else:
+                    process = _spawn()
+            except Exception as exc:
+                logger.warning("Standby client spawn failed: %s", exc)
+                return "spawn-failed"
+
+            self._client = StandbyClient(
+                process=process,
+                pipe_name=pipe_name,
+                pipe_path=_standby_pipe_path(pipe_name),
+                executable_path=chiaki,
+                nickname=probe.nickname,
+                host=host,
+                disable_video=bool(disable_video),
+                identity_sha256=expected_sha if identity_requested else "",
+                identity_size=expected_size if identity_requested else -1,
+                spawned_at=time.monotonic(),
+            )
+            if not self._atexit_registered:
+                self._atexit_registered = True
+                atexit.register(self.shutdown)
+            logger.info(
+                "Standby Remote Play client spawned (pid=%s, nickname=%s) - boot "
+                "is being paid now instead of on Connect",
+                getattr(process, "pid", 0), probe.nickname)
+            # Isolation proof, mirroring the cold-spawn line: env= is authoritative
+            # for the child, so a routing-leak investigation can confirm the
+            # no-cloak path for a PROMOTED standby too.
+            logger.info(
+                "Standby isolation env (pid=%s): IGNORE_DEVICES=%s HIDAPI_PS5=%s HIDAPI_PS4=%s",
+                getattr(process, "pid", 0),
+                env.get("SDL_GAMECONTROLLER_IGNORE_DEVICES"),
+                env.get("SDL_JOYSTICK_HIDAPI_PS5"),
+                env.get("SDL_JOYSTICK_HIDAPI_PS4"),
+            )
+            return "spawned"
+
+    def claim(self, *, nickname: str, disable_video: bool, executable_path: str,
+              identity_sha256: str = "", identity_size: int = -1,
+              wait_ready_s: float = 2.0) -> Optional[StandbyClient]:
+        """Hand the standby to a connect attempt, removing it from the pool.
+
+        Every mismatch against the CURRENT connect parameters kills the standby
+        and returns None: a standby is a shortcut, never an authority — the
+        caller's cold path remains the source of truth."""
+        if not standby_client_enabled():
+            return None
+        with self._lock:
+            self._prune_dead_locked()
+            client = self._client
+            if client is None:
+                return None
+            self._client = None
+
+            expected_sha = str(identity_sha256 or "").strip().lower()
+            try:
+                expected_size = int(identity_size)
+            except (TypeError, ValueError, OverflowError):
+                expected_size = -1
+            identity_requested = bool(expected_sha or expected_size >= 0)
+
+            if str(nickname or "") != client.nickname:
+                self._kill_locked(client, "nickname changed since spawn")
+                return None
+            if bool(disable_video) != client.disable_video:
+                self._kill_locked(client, "video-disable route changed since spawn")
+                return None
+            if (os.path.normcase(os.path.abspath(str(executable_path or "")))
+                    != os.path.normcase(os.path.abspath(client.executable_path))):
+                self._kill_locked(client, "client binary path changed since spawn")
+                return None
+            if identity_requested and (client.identity_sha256 != expected_sha
+                                       or client.identity_size != expected_size):
+                self._kill_locked(client, "executable identity changed since spawn")
+                return None
+
+            deadline = time.monotonic() + max(0.0, float(wait_ready_s))
+            while not _standby_pipe_exists(client.pipe_path):
+                if client.process.poll() is not None:
+                    self._kill_locked(client, "died before becoming ready")
+                    return None
+                if time.monotonic() >= deadline:
+                    self._kill_locked(client, "not ready within the claim budget")
+                    return None
+                time.sleep(0.02)
+            client.ready_seen = True
+
+            reply = _standby_pipe_transact(client.pipe_path, "ping", timeout_s=1.0)
+            if reply != _STANDBY_READY_REPLY:
+                self._kill_locked(client, f"unexpected ping reply {reply!r}")
+                return None
+            return client
+
+    def discard(self, reason: str = "") -> None:
+        with self._lock:
+            client = self._client
+            self._client = None
+            if client is not None:
+                self._kill_locked(client, reason or "discarded")
+
+    def shutdown(self) -> None:
+        """Best-effort clean exit for an unclaimed standby (atexit + orchestrator
+        stop). The broad image-name sweeps and the native job object remain the
+        containment backstops."""
+        with self._lock:
+            client = self._client
+            self._client = None
+        if client is None:
+            return
+        try:
+            if client.process.poll() is None:
+                _standby_pipe_transact(client.pipe_path, "quit", timeout_s=0.5)
+                try:
+                    client.process.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if client.process.poll() is None:
+                client.process.kill()
+                try:
+                    client.process.wait(timeout=1.0)
+                except Exception:
+                    pass
+            logger.info("Standby client shut down (pid=%s)",
+                        getattr(client.process, "pid", 0))
+        except Exception as exc:
+            logger.debug("Standby shutdown cleanup failed: %s", exc)
+
+
+_STANDBY_POOL: Optional[StandbyClientPool] = None
+_STANDBY_POOL_LOCK = threading.Lock()
+
+
+def get_standby_pool() -> StandbyClientPool:
+    global _STANDBY_POOL
+    with _STANDBY_POOL_LOCK:
+        if _STANDBY_POOL is None:
+            _STANDBY_POOL = StandbyClientPool()
+        return _STANDBY_POOL
 
 
 class RemotePlayClientManager:
     def __init__(self, config: Optional[RemotePlayClientConfig] = None) -> None:
         self._config = config or RemotePlayClientConfig()
         self._process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.RLock()
+        self._stop_requested = threading.Event()
         # Monotonic within this manager.  The decoder-pipe reader joins the pipe
         # server PID to this exact owned launch generation; a numeric PID alone is
         # not sufficient because Windows eventually recycles PIDs.
@@ -554,6 +1520,8 @@ class RemotePlayClientManager:
         self._session_tracker = _SessionReadinessTracker(self._session_log_dir)
         self._failed_start_reaped = False
         self._stale_client_cleanup_done = False
+        # Per-stage wall-clock (ms) of the most recent ensure_running() run.
+        self.last_stage_timings: Dict[str, float] = {}
 
     @property
     def status(self) -> RemotePlayClientStatus:
@@ -608,19 +1576,56 @@ class RemotePlayClientManager:
 
     def is_session_ready(self) -> bool:
         """Current console-session authority, independent of local pipe/process liveness."""
-        if not self.is_running() or not self._status.ok:
+        if self._stop_requested.is_set() or not self.is_running():
+            self._status.session_ready = False
+            self._readiness_reason = ('process_exited' if self._process is not None
+                                      else 'not_running')
+            return False
+        if not self._status.ok:
+            self._status.session_ready = False
+            self._readiness_reason = 'launch_not_ready'
             return False
         if not self._config.require_session_ready:
-            return True
+            with self._process_lock:
+                if self._stop_requested.is_set():
+                    self._readiness_reason = 'stopped'
+                    return False
+                self._readiness_reason = 'readiness_not_required'
+                return True
         state, path = self._session_tracker.poll()
-        if state != "ready":
-            self._status.session_ready = False
+        with self._process_lock:
+            if self._stop_requested.is_set():
+                self._status.session_ready = False
+                self._readiness_reason = 'stopped'
+                return False
+            self._readiness_reason = 'session_' + state
+            self._status.session_ready = state == 'ready'
             if path:
                 self._status.session_log_path = path
-            return False
-        if path:
-            self._status.session_log_path = path
-        return True
+            return self._status.session_ready
+
+    def readiness_diagnostic(self) -> Dict[str, object]:
+        """Snapshot only: no launch, I/O, credentials, command line, or authority grant."""
+        process = self._process
+        return {
+            'reason': getattr(self, '_readiness_reason', 'not_checked'),
+            'pid': int(getattr(process, 'pid', 0) or 0),
+            'exit_code': getattr(process, 'returncode', None),
+            'session_log': os.path.basename(self._status.session_log_path or '')[:128],
+        }
+
+    def _cancelled_status(self):
+        return RemotePlayClientStatus(ok=False, session_ready=False,
+                                      message="Remote Play launch cancelled by shutdown")
+
+    def _publish_ready_status(self, status):
+        # Window scans and priority bookkeeping above this boundary can block or
+        # yield. A result that completed after stop is not current authority.
+        with self._process_lock:
+            if self._stop_requested.is_set():
+                return self._cancelled_status()
+            self._status = status
+            return status
 
     def ensure_running(self) -> RemotePlayClientStatus:
         # The native side hands us wait_timeout_s sized against ITS OWN hard
@@ -630,39 +1635,79 @@ class RemotePlayClientManager:
         # whole run here so prep time (including a rest-mode wake) comes out of
         # the readiness poll instead of extending the total past the native
         # deadline, where our carefully-built error text is never surfaced.
+        if self._stop_requested.is_set():
+            return self._cancelled_status()
         self._prep_started = time.time()
+        # [ORION_CONNECT_LATENCY 2026-08-29] Per-stage wall-clock instrumentation.
+        # The 5.3s warm promote was diagnosed from a single fallback-timer log line
+        # once already; every stage now stamps its own cost so the next breakdown
+        # is read, not inferred. Exposed via last_stage_timings / stage_summary().
+        stages: Dict[str, float] = {}
+        self.last_stage_timings = stages
+        _mark = time.perf_counter()
         self._failed_start_reaped = False
         self._stale_client_cleanup_done = False
-        # The Orion input/frame hooks use fixed named pipes. A stale OrionStream
-        # process can keep those server pipes open after a watchdog restart; if we
-        # "adopt" that window, the fresh stream process cannot create its bridges
-        # (ERROR_PIPE_BUSY) and both detection and input hook silently degrade.
-        if self._config.close_on_stop and (os.environ.get("ORION_INPUT_HOOK") or os.environ.get("ORION_FRAME_PIPE")):
-            terminate_chiaki_processes()
-            self._stale_client_cleanup_done = True
+        # [ORION_STANDBY 2026-08-30] Promote a pre-booted standby client when one is
+        # available and matches this exact connect: pays ~1ms of IPC instead of the
+        # client's whole boot. Every mismatch or hiccup returns None and the cold
+        # path below runs unchanged — the standby is an accelerator, never an
+        # authority. A terminal (ok=False) result is a console wake refusal, which
+        # is the same verdict the cold path would produce.
+        launch: Optional[RemotePlayClientStatus] = None
+        if self._config.require_session_ready and standby_client_enabled():
+            # [ORION_CONNECT_LATENCY 2026-09-14] Timed SEPARATELY. Until today the
+            # _mark above ran straight through to the stale_sweep_ms stamp, so the
+            # whole standby attempt — including _resolve_console_host()'s 2.4s of
+            # socket timeouts — was reported as `stale_sweep=3020ms` and three
+            # weeks of diagnosis chased a taskkill sweep that cost ~12ms.
+            launch = self._promote_standby(stages)
+            stages["standby_attempt_ms"] = (time.perf_counter() - _mark) * 1000.0
+            if launch is not None and not launch.ok:
+                self._status = launch
+                self._log_stage_summary("wake_refused")
+                return launch
+        if self._stop_requested.is_set():
+            return self._cancelled_status()
+        if launch is None:
+            _mark = time.perf_counter()
+            # The Orion input/frame hooks use fixed named pipes. A stale OrionStream
+            # process can keep those server pipes open after a watchdog restart; if we
+            # "adopt" that window, the fresh stream process cannot create its bridges
+            # (ERROR_PIPE_BUSY) and both detection and input hook silently degrade.
+            if self._config.close_on_stop and (os.environ.get("ORION_INPUT_HOOK") or os.environ.get("ORION_FRAME_PIPE")):
+                terminate_chiaki_processes()
+                self._stale_client_cleanup_done = True
+                stages["stale_sweep_ms"] = (time.perf_counter() - _mark) * 1000.0
+                self._note_sweep(stages)
+                _mark = time.perf_counter()
 
-        # Snapshot AFTER stale-child cleanup.  Any old success marker, including
-        # final shutdown bytes written during cleanup, is outside this launch's
-        # authority window.
-        self._session_log_baseline = _snapshot_session_logs(self._session_log_dir)
-        self._session_tracker.reset(self._session_log_baseline)
+            # Snapshot AFTER stale-child cleanup.  Any old success marker, including
+            # final shutdown bytes written during cleanup, is outside this launch's
+            # authority window.
+            self._session_log_baseline = _snapshot_session_logs(self._session_log_dir)
+            self._session_tracker.reset(self._session_log_baseline)
 
-        hwnd, title = find_remote_play_window(self._config.window_title)
-        if hwnd and not self._config.require_session_ready:
-            self._status = RemotePlayClientStatus(
-                ok=True,
-                mode="existing",
-                hwnd=hwnd,
-                window_title=title,
-                message="Remote Play window already running",
-                session_ready=True,
-            )
-            return self._status
+            hwnd, title = find_remote_play_window(self._config.window_title)
+            stages["prelaunch_scan_ms"] = (time.perf_counter() - _mark) * 1000.0
+            if hwnd and not self._config.require_session_ready:
+                return self._publish_ready_status(RemotePlayClientStatus(
+                    ok=True,
+                    mode="existing",
+                    hwnd=hwnd,
+                    window_title=title,
+                    message="Remote Play window already running",
+                    session_ready=True,
+                ))
 
-        mode = self._normalize_mode(self._config.client_mode, self._config.platform)
-        launch = self._launch(mode)
+            mode = self._normalize_mode(self._config.client_mode, self._config.platform)
+            _mark = time.perf_counter()
+            launch = self._launch(mode)
+            stages["launch_total_ms"] = (time.perf_counter() - _mark) * 1000.0
+        if self._stop_requested.is_set():
+            return self._cancelled_status()
         if not launch.ok:
             self._status = launch
+            self._log_stage_summary("launch_failed")
             return launch
 
         deadline = self._readiness_deadline(time.time())
@@ -670,20 +1715,56 @@ class RemotePlayClientManager:
         ready_title = ""
         last_session_state = "waiting"
         last_session_log = ""
+        wait_started = time.perf_counter()
+        last_window_scan = 0.0
         while time.time() < deadline:
-            hwnd, title = find_remote_play_window(self._config.window_title)
-            if hwnd:
-                ready_hwnd, ready_title = hwnd, title
+            if self._stop_requested.is_set():
+                return self._cancelled_status()
+            # [ORION_CONNECT_LATENCY 2026-08-29] On the session-ready path the
+            # window is bookkeeping (embed/graceful-close), never the readiness
+            # authority — the log marker is. Scanning every 25ms iteration ran
+            # EnumWindows+EnumChildWindows+OpenProcess ~40x/s for nothing; under
+            # live capture/detector load each scan is tens of ms and steals poll
+            # cadence from the marker. Throttle it to 10Hz there; the window-only
+            # (non-session) path keeps its every-iteration scan, where the window
+            # IS the readiness signal.
+            _now = time.perf_counter()
+            if (not self._config.require_session_ready
+                    or _now - last_window_scan >= 0.1):
+                last_window_scan = _now
+                hwnd, title = find_remote_play_window(self._config.window_title)
+                if hwnd:
+                    ready_hwnd, ready_title = hwnd, title
             if self._config.require_session_ready:
                 last_session_state, last_session_log = self._session_tracker.poll()
+                if self._stop_requested.is_set():
+                    return self._cancelled_status()
+                if last_session_log and "client_boot_ms" not in stages:
+                    # First launch-scoped bytes from the child: everything before
+                    # this is client start-up, everything after is the console
+                    # handshake (chiaki's first write lands with its session
+                    # request — measured 2026-08-29, they are <10ms apart).
+                    stages["client_boot_ms"] = (time.perf_counter() - wait_started) * 1000.0
                 if last_session_state == "ready":
+                    ready_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                    stages["ready_wait_ms"] = ready_wait_ms
+                    stages["handshake_ms"] = max(
+                        0.0, ready_wait_ms - stages.get("client_boot_ms", 0.0))
+                    # The window may not have been scanned since it appeared
+                    # (10Hz throttle above); one final scan keeps status.hwnd
+                    # fresh for embed/graceful-close without ever having gated
+                    # readiness on it.
+                    if not ready_hwnd:
+                        hwnd, title = find_remote_play_window(self._config.window_title)
+                        if hwnd:
+                            ready_hwnd, ready_title = hwnd, title
                     # The controller route is not authorized before this fresh
                     # marker.  Keep the new child at Windows' normal priority
                     # during process/decoder startup so it cannot pre-empt the
                     # already-live capture-card/QML preview, then apply Orion's
                     # streaming priority policy exactly when input becomes live.
                     optimize_chiaki_process(int(getattr(self._process, "pid", 0) or 0))
-                    self._status = RemotePlayClientStatus(
+                    status = self._publish_ready_status(RemotePlayClientStatus(
                         ok=True,
                         mode=launch.mode,
                         path=launch.path,
@@ -693,8 +1774,9 @@ class RemotePlayClientManager:
                         message="Remote Play console input session ready",
                         session_ready=True,
                         session_log_path=last_session_log,
-                    )
-                    return self._status
+                    ))
+                    self._log_stage_summary("ready" if status.ok else "cancelled")
+                    return status
                 if last_session_state == "ended":
                     # A launch-scoped disconnect/quit before streaminfo is a
                     # definitive console-session failure, not a reason to keep
@@ -704,7 +1786,7 @@ class RemotePlayClientManager:
                     # authorized to hold the controller route open.
                     break
             elif ready_hwnd:
-                self._status = RemotePlayClientStatus(
+                return self._publish_ready_status(RemotePlayClientStatus(
                     ok=True,
                     mode=launch.mode,
                     path=launch.path,
@@ -713,8 +1795,7 @@ class RemotePlayClientManager:
                     window_title=ready_title,
                     message="Remote Play client window ready",
                     session_ready=True,
-                )
-                return self._status
+                ))
             if self._process and self._process.poll() is not None:
                 break
             # [ORION_CONNECT_LATENCY 2026-08-12] #89. The readiness MARKER is the console's to
@@ -731,7 +1812,14 @@ class RemotePlayClientManager:
             # This does NOT make connect near-instant. The architectural fix is pre-launching
             # Chiaki during live preview so the handshake is already done when Connect is pressed;
             # that is a real design change and is not attempted here.
-            time.sleep(0.025)
+            #
+            # [ORION_STANDBY 2026-08-30] On a standby PROMOTE the client boot is already
+            # paid, so the whole wait is ~0.7s and the 25ms quantum is a visible slice of
+            # it (mean +12.5ms sitting on a marker that has already landed). The poll body
+            # measures 0.315ms, so 100Hz costs ~3% of one core for well under a second —
+            # cheap next to the live capture threads it briefly shares a box with. The
+            # cold path keeps the measured 25ms choice above unchanged.
+            time.sleep(0.010 if "standby" in stages else 0.025)
 
         if self._config.require_session_ready:
             detail = ("the current Chiaki session ended before becoming ready"
@@ -771,7 +1859,59 @@ class RemotePlayClientManager:
                 " The failed OrionStream input client did not confirm exit; "
                 "disconnect Orion before retrying."
             )
+        self.last_stage_timings["ready_wait_ms"] = (
+            time.perf_counter() - wait_started) * 1000.0
+        self._log_stage_summary("not_ready")
         return self._status
+
+    def stage_summary(self) -> str:
+        """One-line factual stage breakdown of the last ensure_running() run."""
+        stages = dict(getattr(self, "last_stage_timings", {}) or {})
+        if not stages:
+            return ""
+        # NOTE: only *_ms keys belong here (the formatter strips the suffix); the
+        # bare "standby" marker is emitted by the sorted leftover loop below.
+        order = ("standby_attempt_ms", "host_resolve_ms", "stale_sweep_ms",
+                 "prelaunch_scan_ms", "binary_resolve_ms",
+                 "probe_ms", "standby_claim_ms", "wake_check_ms", "identity_ms",
+                 "spawn_ms", "standby_promote_ms", "launch_total_ms",
+                 "client_boot_ms", "handshake_ms", "ready_wait_ms")
+        parts = []
+        for key in order:
+            if key in stages:
+                parts.append(f"{key[:-3]}={stages.pop(key):.0f}ms")
+        for key in sorted(stages):
+            value = stages[key]
+            parts.append(f"{key}={value:.0f}ms" if isinstance(value, float)
+                         else f"{key}={value}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _note_sweep(stages: Dict[str, object]) -> None:
+        """Fold the last sweep's factual report into the stage summary so the next
+        diagnosis reads WHAT was killed instead of inferring it from a total."""
+        try:
+            report = last_sweep_report()
+        except Exception:
+            return
+        found = list(report.get("found") or [])
+        killed = list(report.get("killed") or [])
+        stages["sweep_found"] = ",".join(str(f) for f in found) if found else "none"
+        if killed:
+            stages["sweep_killed"] = ",".join(str(p) for p in killed)
+        if report.get("failed"):
+            stages["sweep_failed"] = ",".join(str(p) for p in report["failed"])  # type: ignore[index]
+        if report.get("fallback"):
+            stages["sweep_fallback"] = "taskkill"
+        if found:
+            logger.info("Stale-client sweep: found=%s killed=%s failed=%s fallback=%s (%.0fms)",
+                        found, killed, report.get("failed"), report.get("fallback"),
+                        float(report.get("ms") or 0.0))
+
+    def _log_stage_summary(self, outcome: str) -> None:
+        summary = self.stage_summary()
+        if summary:
+            logger.info("ensure_running stage timing (%s): %s", outcome, summary)
 
     def _reap_failed_start(self) -> bool:
         """Promptly stop an owned client after readiness failed.
@@ -903,10 +2043,15 @@ class RemotePlayClientManager:
         return False
 
     def stop(self) -> None:
-        if not self._config.close_on_stop:
-            return
-        proc = self._process
-        self._process = None
+        with self._process_lock:
+            if self._stop_requested.is_set():
+                return
+            self._stop_requested.set()
+            self._status.session_ready = False
+            if not self._config.close_on_stop:
+                return
+            proc = self._process
+            self._process = None
         # The stream window HWND tracked by ensure_running() (both the launched and the adopted
         # path set it). No HWND / not Windows => every branch below no-ops and behaviour is
         # exactly the legacy terminate + taskkill + terminate_chiaki_processes().
@@ -1008,6 +2153,77 @@ class RemotePlayClientManager:
             pass
         return ""
 
+    def _resolve_console_host(self, host: str) -> str:
+        """CONSOLE ADDRESS DRIFT (2026-09-02): if the configured ip is silent but exactly one
+        console answers a subnet discovery broadcast, use THAT address for this launch.
+
+        The PS5 lives on the PC's ICS network and its DHCP lease has moved three times in
+        two days (.100 -> .138 -> .126); every move ended the same way -- the input session
+        to the stale ip died before it became ready while the console answered discovery
+        one address over. Bounded to ~1.6s and paid ONLY when the configured host answers
+        neither its session port nor discovery (a launch that would fail anyway). Two or
+        more answering consoles, or none, keep the configured host: this never guesses.
+        The adopted address is logged at ERROR level (the native relay never throttles that
+        level) so the drift is named the moment it happens; settings.json is NOT rewritten
+        here (it is signed) -- the log line tells the owner what to update.
+        Fail-open: any exception means the configured host, unchanged.
+
+        [ORION_CONNECT_LATENCY 2026-09-14] This method WAS the first-connect stall.
+        A silent configured host costs 0.4s + 0.8s + 1.2s of real socket timeouts,
+        and ensure_running() charged the whole thing to `stale_sweep`. It is now
+        (a) separately timed as host_resolve_ms and (b) normally served from the
+        background prewarm the warm preview already paid for."""
+        stages = getattr(self, "last_stage_timings", None)
+        _mark = time.perf_counter()
+
+        def _stamp(value: str) -> str:
+            if isinstance(stages, dict):
+                stages["host_resolve_ms"] = (
+                    float(stages.get("host_resolve_ms", 0.0))
+                    + (time.perf_counter() - _mark) * 1000.0)
+            return value
+
+        host = str(host or "").strip()
+        if not host:
+            self._console_host_adopted = ""
+            return host
+        # One adoption serves the whole connect (standby check + cold spawn) and the next
+        # ~180s of retries, so the probe is not paid twice per Connect.
+        cached = getattr(self, "_console_host_adoption", None)
+        if (cached and cached[0] == host
+                and (time.monotonic() - float(cached[2])) < 180.0):
+            self._console_host_adopted = cached[1] if cached[1] != host else ""
+            return _stamp(cached[1])
+        self._console_host_adopted = ""
+        if str(os.environ.get("ORION_PS5_DISCOVER_DRIFT", "1")).strip().lower() in {"0", "false", "off"}:
+            return _stamp(host)
+        # The warm preview's prewarm pass already resolved this host in the
+        # background: a connect must never pay 2.4s of socket timeouts for an
+        # answer that is sitting in memory.
+        prewarmed = _console_host_prewarm_get(host)
+        if prewarmed:
+            if prewarmed != host:
+                self._console_host_adoption = (host, prewarmed, time.monotonic())
+                self._console_host_adopted = prewarmed
+                logger.info("CONSOLE ADDRESS DRIFT: using the prewarmed address %s "
+                            "for configured %s (resolved during the warm preview)",
+                            prewarmed, host)
+            return _stamp(prewarmed)
+        resolved = _console_host_lookup(host)
+        if resolved != host:
+            # Only an ADOPTION is cached (unchanged from 2026-09-02): a host that
+            # answers costs ~1ms to re-verify, and caching "the configured host is
+            # fine" would hide a drift that happens mid-session.
+            self._console_host_adoption = (host, resolved, time.monotonic())
+            self._console_host_adopted = resolved
+        # Refresh an EXISTING prewarm entry only (never create one here): the
+        # prewarm cache is process-wide and a connect must not seed it for a host
+        # the preview never warmed.
+        with _console_host_prewarm_lock:
+            if host in _console_host_prewarm:
+                _console_host_prewarm[host] = (resolved, time.monotonic())
+        return _stamp(resolved)
+
     def _ensure_console_awake(self, nickname: str, host: str,
                               chiaki_path: str) -> Optional["RemotePlayClientStatus"]:
         """Wake a resting PS5 before the input client is spawned.
@@ -1036,16 +2252,44 @@ class RemotePlayClientManager:
                 # probe send, unbounded by the probe budget. Production always
                 # configures an IP literal (native discovery yields IPs).
                 return None
-            probe = ps5_wake.probe_console_state(host, timeout_s=2.5)
-            self._last_console_probe = probe.state
-            if probe.state != "standby":
-                # ready -> normal launch; no_answer -> can't distinguish a
-                # firewall eating UDP replies from a powered-off console, so
-                # keep today's behavior and let the failure path add evidence.
-                return None
-            logger.info(
-                "PS5 at %s is in rest mode - sending Remote Play wakeup", host)
+            # FAST PATH: if the Remote Play session port already answers, the console is
+            # awake and reachable -- no wake needed. A quick TCP check (~0.4s worst case,
+            # instant on the common case) skips the 2.5s UDP discovery probe that is paid
+            # on EVERY connect otherwise (and burns the full 2.5s when a firewall eats the
+            # UDP replies). This is the dominant fixed cost of "Connect" on an awake console.
+            try:
+                if ps5_wake.session_port_open(host, timeout_s=0.4):
+                    self._last_console_probe = "ready"
+                    return None
+            except Exception:
+                pass
+            # WAKE FIRST, ASK QUESTIONS SECOND (2026-08-29). The session port is closed, so
+            # the console is resting, off, or unreachable. Previously we spent up to 2.5s on a
+            # UDP discovery probe BEFORE sending the wakeup, so the console's own ~10-20s boot
+            # only started ~3s after Connect. A wakeup is a no-op to an awake console and
+            # inert to an off one, so send it immediately and let a SHORT probe (1.0s, in
+            # parallel with the boot it just started) decide only the messaging/budget.
             regist_key, is_ps5 = ps5_wake.read_chiaki_regist_key(nickname)
+            wake_sent = False
+            if regist_key:
+                try:
+                    wake_sent = bool(ps5_wake.send_wakeup(host, regist_key, ps5=is_ps5))
+                except Exception:
+                    wake_sent = False
+            probe = ps5_wake.probe_console_state(host, timeout_s=1.0)
+            self._last_console_probe = probe.state
+            if probe.state == "ready":
+                return None          # awake after all (transient TCP miss) -> normal launch
+            if probe.state != "standby":
+                # no_answer: can't distinguish a firewall eating UDP replies from a powered-off
+                # console -> keep today's control flow (launch; the failure path adds evidence).
+                # The wakeup already went out above, so a resting console behind such a
+                # firewall is booting by the time the user presses Connect again.
+                return None
+            if probe.state == "standby":
+                logger.info(
+                    "PS5 at %s is in rest mode - Remote Play wakeup %s", host,
+                    "sent" if wake_sent else "NOT sent (no stored key)")
             if not regist_key:
                 return RemotePlayClientStatus(
                     ok=False,
@@ -1058,7 +2302,7 @@ class RemotePlayClientManager:
                         "PS button), then press Connect again."
                     ),
                 )
-            if not ps5_wake.send_wakeup(host, regist_key, ps5=is_ps5):
+            if not wake_sent:
                 return RemotePlayClientStatus(
                     ok=False,
                     mode="chiaki",
@@ -1070,7 +2314,34 @@ class RemotePlayClientManager:
                     ),
                 )
             wake_started = time.time()
-            if ps5_wake.wait_for_session_port(host, budget_s=9.0):
+            # Budget sized against the native promote deadline that wait_timeout_s mirrors
+            # (kStreamPromoteDeadlineMs=20s -> wait_timeout_s 18s): leave ~5s for the TCP
+            # check + probe already spent and the Chiaki spawn + handshake still to come.
+            # Was a fixed 9s, which FAILED on any console needing longer (most do: 10-20s)
+            # and cost the user a manual "press Connect again" round-trip. A no_answer probe
+            # (firewall or powered off) gets a shorter wait so a dead console fails fast.
+            try:
+                _wt = float(getattr(self._config, "wait_timeout_s", 18.0) or 18.0)
+            except Exception:
+                _wt = 18.0
+            port_budget = max(6.0, min(15.0, _wt - 5.0))
+            _cb = getattr(self._config, "on_console_waking", None)
+            if callable(_cb):
+                # The host will extend its promote deadline by our budget, so cover the full
+                # documented rest-mode boot (15-25s) instead of the awake-sized window.
+                port_budget = 25.0
+            try:
+                _ov = os.environ.get("ORION_PS5_WAKE_PORT_BUDGET_S", "").strip()
+                if _ov:
+                    port_budget = max(3.0, min(40.0, float(_ov)))
+            except Exception:
+                pass
+            if callable(_cb):
+                try:
+                    _cb(float(port_budget))
+                except Exception:
+                    pass
+            if ps5_wake.wait_for_session_port(host, budget_s=port_budget):
                 logger.info(
                     "PS5 woke and is accepting Remote Play sessions (%.1fs)",
                     time.time() - wake_started)
@@ -1082,16 +2353,172 @@ class RemotePlayClientManager:
                 path=chiaki_path,
                 message=(
                     "The PS5 was in rest mode - a Remote Play wakeup was sent "
-                    "and the console is waking now (this takes ~15-25 "
-                    "seconds). Press Connect again in a moment."
+                    "and the console is still waking (waited %.0fs). Press Connect "
+                    "again in a moment - it connects immediately once the console "
+                    "is up." % (time.time() - wake_started)
                 ),
             )
         except Exception as exc:  # fail-open: wake plumbing must never block a launch
             logger.warning("Console wake check failed (proceeding to launch): %s", exc)
             return None
 
-    def _launch(self, mode: str) -> RemotePlayClientStatus:
+    @staticmethod
+    def _discard_claimed_standby(client: "StandbyClient", reason: str) -> None:
+        """Kill a standby ALREADY REMOVED from the pool that failed post-claim
+        validation/promotion. Bounded and PID-scoped; the cold path's broad sweep
+        (which runs next) remains the backstop."""
+        logger.info("Claimed standby discarded (%s): pid=%s",
+                    reason, getattr(client.process, "pid", 0))
+        try:
+            if client.process.poll() is None:
+                client.process.terminate()
+                try:
+                    client.process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    client.process.kill()
+                    try:
+                        client.process.wait(timeout=1.0)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.debug("Claimed-standby cleanup failed: %s", exc)
+
+    def _promote_standby(self, stages: Dict[str, float]) -> Optional[RemotePlayClientStatus]:
+        """[ORION_STANDBY 2026-08-30] Promote the pre-booted standby client instead
+        of spawning one. Returns:
+          - ok=True status: promotion command accepted; the caller runs the SAME
+            launch-scoped session-log readiness poll a cold spawn gets (readiness
+            stays proven, never assumed from the promote ack);
+          - ok=False status: terminal console wake refusal (identical verdict to
+            the cold path's);
+          - None: no usable standby — fall back to today's spawn path.
+        """
+        pool = get_standby_pool()
+        if pool.state() == "absent":
+            return None
+        _mark = time.perf_counter()
         chiaki = find_chiaki_binary(self._config.chiaki_path)
+        stages["binary_resolve_ms"] = (time.perf_counter() - _mark) * 1000.0
+        if not chiaki:
+            return None
+        _mark = time.perf_counter()
+        probe = _probe_chiaki_client_cached(chiaki)
+        stages["probe_ms"] = (time.perf_counter() - _mark) * 1000.0
+        if not probe.client_ran or not probe.nickname:
+            return None
+        host = str(self._config.console_ip or "").strip()
+        if not host:
+            return None
+        # CONSOLE ADDRESS DRIFT: the standby was pre-spawned against the CONFIGURED host,
+        # but the spawn-time host is NOT binding — the fork's standby control protocol
+        # takes the address on the promote command and it wins:
+        #   "open [<host>] -> clears the hold, opens the session to <host> (default: the
+        #    spawn-time host)"  (chiaki-ng-src/gui/src/main.cpp RunStreamStandby)
+        # So a drifted console is promoted against the ADOPTED address instead of being
+        # thrown away. [ORION_CONNECT_LATENCY 2026-09-14] The old bail cost every first
+        # connect since 09-13 its whole standby saving (~3s of cold client boot) on this
+        # rig, where settings still name .126 and the console moved to .81.
+        resolved_host = self._resolve_console_host(host)
+        if resolved_host and resolved_host != host:
+            logger.info("Standby promote retargeted to the adopted console address %s "
+                        "(configured %s is silent)", resolved_host, host)
+            host = resolved_host
+
+        _mark = time.perf_counter()
+        client = pool.claim(
+            nickname=probe.nickname,
+            disable_video=bool(self._config.disable_video),
+            executable_path=chiaki,
+            identity_sha256=self._config.chiaki_identity_sha256,
+            identity_size=self._config.chiaki_identity_size,
+            # User connected before the standby finished booting: waiting a beat
+            # is cheaper than a cold spawn, but never hang — past this budget the
+            # standby is killed and the cold path runs.
+            wait_ready_s=2.0,
+        )
+        stages["standby_claim_ms"] = (time.perf_counter() - _mark) * 1000.0
+        if client is None:
+            return None
+
+        # Scoped stale check stands in for the broad taskkill sweep: a standby
+        # holds NO fixed Orion pipes (the input/frame bridges are created only
+        # inside a StreamSession, which a standby by construction does not have),
+        # so the sweep's only remaining job is OTHER chiaki-family processes —
+        # and any of those sends us to the sweeping cold path.
+        running = _running_image_pids(_CHIAKI_IMAGE_NAMES)
+        standby_pid = int(getattr(client.process, "pid", 0) or 0)
+        if running is None or {pid for pid, _name in running} - {standby_pid}:
+            self._discard_claimed_standby(
+                client, "stale-check inconclusive or other chiaki processes present")
+            return None
+
+        # Launch-scoped readiness baseline: the standby has written NO session log
+        # (no session ever existed), so everything on disk predates this launch.
+        self._session_log_baseline = _snapshot_session_logs(self._session_log_dir)
+        self._session_tracker.reset(self._session_log_baseline)
+
+        _mark = time.perf_counter()
+        wake_refusal = self._ensure_console_awake(probe.nickname, host, chiaki)
+        stages["wake_check_ms"] = (time.perf_counter() - _mark) * 1000.0
+        if wake_refusal is not None:
+            # Terminal for THIS connect. The orchestrator's failure path sweeps
+            # every chiaki-family image right after this returns, so returning the
+            # unpromoted standby to the pool would only leave the pool holding a
+            # soon-dead handle — discard it cleanly instead; the prewarm loop
+            # re-arms a fresh standby for the retry.
+            self._discard_claimed_standby(client, "console wake refused")
+            return wake_refusal
+
+        launched_path = canonical_executable_path(chiaki)
+        if not launched_path:
+            self._discard_claimed_standby(client, "executable identity unavailable")
+            return None
+
+        with self._process_lock:
+            if self._stop_requested.is_set():
+                self._discard_claimed_standby(client, "shutdown before promotion")
+                return self._cancelled_status()
+            self._process = client.process
+        _mark = time.perf_counter()
+        reply = _standby_pipe_transact(
+            client.pipe_path, f"open {host}", timeout_s=2.5,
+            cancel_event=self._stop_requested, write_lock=self._process_lock)
+        stages["standby_promote_ms"] = (time.perf_counter() - _mark) * 1000.0
+        with self._process_lock:
+            if self._stop_requested.is_set():
+                return self._cancelled_status()  # stop owns the detached child
+            if reply != _STANDBY_OPEN_OK_REPLY:
+                self._process = None
+        if reply != _STANDBY_OPEN_OK_REPLY:
+            self._discard_claimed_standby(client, f"open not accepted (reply={reply!r})")
+            return None
+        stages["standby"] = 1
+        self._launch_generation_counter += 1
+        self._owned_launch_generation = self._launch_generation_counter
+        self._owned_launch_path = launched_path
+        self._owned_creation_time_100ns = windows_process_creation_time_100ns(
+            getattr(client.process, "_handle", None))
+        if self._owned_creation_time_100ns <= 0:
+            logger.warning(
+                "Standby client creation identity unavailable; reusable decoder timing disabled")
+        logger.info(
+            "Standby client promoted: open %s sent to pre-booted pid=%s "
+            "(client boot was paid during the warm preview)", host, standby_pid)
+        return RemotePlayClientStatus(
+            ok=True,
+            mode="chiaki",
+            path=chiaki,
+            pid=standby_pid,
+            message="Promoted pre-booted standby Remote Play client",
+        )
+
+    def _launch(self, mode: str) -> RemotePlayClientStatus:
+        stages = getattr(self, "last_stage_timings", None)
+        if stages is None:
+            stages = self.last_stage_timings = {}
+        _mark = time.perf_counter()
+        chiaki = find_chiaki_binary(self._config.chiaki_path)
+        stages["binary_resolve_ms"] = (time.perf_counter() - _mark) * 1000.0
         if not chiaki:
             return RemotePlayClientStatus(
                 ok=False,
@@ -1108,14 +2535,25 @@ class RemotePlayClientManager:
         # slow Windows host that duplicate consumed a material share of the
         # bounded console-readiness deadline.
         if not self._stale_client_cleanup_done:
+            _mark = time.perf_counter()
             terminate_chiaki_processes()
+            stages["stale_sweep_ms"] = (
+                stages.get("stale_sweep_ms", 0.0)
+                + (time.perf_counter() - _mark) * 1000.0)
+            self._note_sweep(stages)
             self._stale_client_cleanup_done = True
 
         # Auto-discover registered console nickname via `chiaki list` so we can
         # invoke direct stream mode and bypass the Chiaki lobby/discovery UI.
-        probe = _probe_chiaki_client(chiaki)
+        # Fingerprint-cached: a warm reconnect reuses the last successful answer
+        # instead of spawning the client again (see _probe_chiaki_client_cached).
+        _mark = time.perf_counter()
+        probe = _probe_chiaki_client_cached(chiaki)
+        stages["probe_ms"] = (time.perf_counter() - _mark) * 1000.0
         nickname = probe.nickname
         host = str(self._config.console_ip or "").strip()
+        if host:
+            host = self._resolve_console_host(host)   # CONSOLE ADDRESS DRIFT, see the method
 
         # [ORION_CLIENT_LAUNCHABILITY 2026-08-13] Fail HERE, loudly, when the client
         # itself will not run. Falling through to the lobby in this state cannot work
@@ -1144,7 +2582,9 @@ class RemotePlayClientManager:
             # sends WAKEUP). Detect standby here and wake it BEFORE spawning the
             # client, or every Connect against a resting PS5 dies ~5s in with
             # "Session request connect failed: Timeout".
+            _mark = time.perf_counter()
             wake_refusal = self._ensure_console_awake(nickname, host, chiaki)
+            stages["wake_check_ms"] = (time.perf_counter() - _mark) * 1000.0
             if wake_refusal is not None:
                 return wake_refusal
             # IMPORTANT: chiaki-ng uses QCommandLineParser::ParseAsPositionalArguments mode,
@@ -1187,12 +2627,15 @@ class RemotePlayClientManager:
                 startupinfo.wShowWindow = 0  # SW_HIDE
 
             def _spawn():
-                return subprocess.Popen(
-                    cmd,
-                    cwd=os.path.dirname(path) if os.path.isfile(path) else None,
-                    env=launch_env,
-                    startupinfo=startupinfo,
-                )
+                with self._process_lock:
+                    if self._stop_requested.is_set():
+                        raise RuntimeError("client launch cancelled by shutdown")
+                    self._process = subprocess.Popen(
+                        cmd,
+                        cwd=os.path.dirname(path) if os.path.isfile(path) else None,
+                        env=launch_env,
+                        startupinfo=startupinfo,
+                    )
 
             expected_sha = str(
                 self._config.chiaki_identity_sha256 or "").strip().lower()
@@ -1200,6 +2643,10 @@ class RemotePlayClientManager:
                 expected_size = int(self._config.chiaki_identity_size)
             except (TypeError, ValueError, OverflowError):
                 expected_size = -1
+            stages = getattr(self, "last_stage_timings", None)
+            if stages is None:
+                stages = self.last_stage_timings = {}
+            _mark = time.perf_counter()
             identity_requested = bool(expected_sha or expected_size >= 0)
             if identity_requested:
                 if (expected_size < 0 or len(expected_sha) != 64
@@ -1213,15 +2660,18 @@ class RemotePlayClientManager:
                         return RemotePlayClientStatus(
                             ok=False, mode=mode, path=path,
                             message=f"Failed to start {mode}: executable identity mismatch")
+                    stages["identity_ms"] = (time.perf_counter() - _mark) * 1000.0
+                    _mark = time.perf_counter()
                     # Identity (size + SHA-256) is verified above and re-checked
                     # against the running producer at pipe-bind time; the former
                     # deny-write file lock across this Popen was removed as it was
                     # fragile in practice (AV/concurrent readers tripped it).
-                    self._process = _spawn()
+                    _spawn()
             else:
                 # Developer/test compatibility is cold-only: absence of a native
                 # expectation prevents decoder cache scope elsewhere.
-                self._process = _spawn()
+                _spawn()
+            stages["spawn_ms"] = (time.perf_counter() - _mark) * 1000.0
             launched_path = canonical_executable_path(path)
             if not launched_path:
                 # The child may already exist, but an unnameable executable can
@@ -1364,6 +2814,105 @@ def _probe_chiaki_client(chiaki_path: str) -> ChiakiClientProbe:
 
     # Exited normally with no Host: line — genuinely no registered console.
     return ChiakiClientProbe("", True, "")
+
+
+def _registered_hosts_stamp() -> int:
+    """Change stamp for chiaki's registered-hosts store (HKCU registry).
+
+    Max LastWriteTime (100ns FILETIME) across the registered_hosts key and its
+    per-host subkeys, so registering/re-registering ANY console invalidates a
+    cached nickname probe. -1 when unreadable (still a stable cache key: the
+    probe cache only compares stamps for equality).
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        import winreg
+
+        base = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Chiaki\Chiaki\registered_hosts")
+        try:
+            sub_count, _values, stamp = winreg.QueryInfoKey(base)
+            stamp = int(stamp)
+            for index in range(int(sub_count)):
+                try:
+                    sub = winreg.OpenKey(base, winreg.EnumKey(base, index))
+                except OSError:
+                    continue
+                try:
+                    stamp = max(stamp, int(winreg.QueryInfoKey(sub)[2]))
+                finally:
+                    winreg.CloseKey(sub)
+            return stamp
+        finally:
+            winreg.CloseKey(base)
+    except OSError:
+        return -1
+    except Exception:
+        return -1
+
+
+def _client_probe_fingerprint(chiaki_path: str) -> Optional[tuple]:
+    """Cache key binding a probe result to the exact client install + registration state.
+
+    Covers the exe (path/size/mtime), the DLL set beside it (count/total size/max
+    mtime — the 2026-08-13 loader-failure incident was a stale DLL beside a fresh
+    exe), and the registered-hosts registry stamp (a new/changed registration must
+    re-probe so the nickname stays chiaki's own answer). None disables caching.
+    """
+    try:
+        st = os.stat(chiaki_path)
+        dll_count = 0
+        dll_size = 0
+        dll_mtime = 0
+        with os.scandir(os.path.dirname(os.path.abspath(chiaki_path))) as entries:
+            for entry in entries:
+                if entry.name.lower().endswith(".dll") and entry.is_file():
+                    es = entry.stat()
+                    dll_count += 1
+                    dll_size += int(es.st_size)
+                    dll_mtime = max(dll_mtime, int(es.st_mtime_ns))
+        return (
+            os.path.normcase(os.path.abspath(chiaki_path)),
+            int(st.st_size),
+            int(st.st_mtime_ns),
+            dll_count,
+            dll_size,
+            dll_mtime,
+            _registered_hosts_stamp(),
+        )
+    except OSError:
+        return None
+
+
+_PROBE_CACHE: Dict[tuple, ChiakiClientProbe] = {}
+_PROBE_CACHE_MAX = 8
+
+
+def _probe_chiaki_client_cached(chiaki_path: str) -> ChiakiClientProbe:
+    """`chiaki list` probe with a fingerprint-keyed success cache.
+
+    [ORION_CONNECT_LATENCY 2026-08-29] The probe spawns the full client once per
+    connect (~75ms idle, more under live capture/detector load) to answer two
+    stable questions: the registered nickname and whether the client can run at
+    all. Both answers are functions of the client install + registration state,
+    so a SUCCESSFUL probe (client ran AND a nickname was found) is reused while
+    the fingerprint matches. Failures and empty nicknames are never cached —
+    those drive fail-fast messaging / the lobby fallback, where re-probing is
+    the point. Monkeypatched tests keep working: the real probe is looked up on
+    the module at call time and unknown paths never fingerprint.
+    """
+    fingerprint = _client_probe_fingerprint(chiaki_path)
+    if fingerprint is not None:
+        cached = _PROBE_CACHE.get(fingerprint)
+        if cached is not None and cached.client_ran and cached.nickname:
+            return cached
+    probe = _probe_chiaki_client(chiaki_path)
+    if fingerprint is not None and probe.client_ran and probe.nickname:
+        if len(_PROBE_CACHE) >= _PROBE_CACHE_MAX:
+            _PROBE_CACHE.clear()
+        _PROBE_CACHE[fingerprint] = probe
+    return probe
 
 
 def _detect_chiaki_nickname(chiaki_path: str) -> str:

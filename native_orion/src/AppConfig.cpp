@@ -1,4 +1,5 @@
 #include "AppConfig.h"
+#include "BannerLeadTrim.h"
 #include "OrionPaths.h"
 #include "RemotePlayExecutablePolicy.h"
 
@@ -14,8 +15,64 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace orion {
+
+namespace {
+// [ORION_NO_METER_SHELVED 2026-09-15 owner] "Shelve the no meter path, we'll beef that up for a
+// later update." This is the fence that makes that true of an INSTALL rather than only of the UI:
+// load() and save() both force input_timed_enabled false while it is false, so a hand-edited
+// settings.json, a file restored from a backup, or a settings.json written by yesterday's build
+// with the mode selected all come up on the meter path. The UI half (RemotePlayPage's mode switch
+// and the two NO METER cards) is unmounted, and the controller's setter refuses -- three
+// independent doors, because a half-shelved mode that only the UI hides is exactly the state that
+// ships a blind release to a customer who never chose one.
+//
+// NOTHING IS COMPILED OUT. The whole blind engine -- NO METER v2's hold law, the vision-assist
+// hybrid, the console-frame quantiser, the per-type hold learner -- is still built, still tested,
+// and still USED: the meter path's own blind backstop answers an unclaimed press through the same
+// code. setInputTimedAllowedForTesting() lifts the fence so those tests drive the real path.
+bool g_inputTimedAllowed = false;   // see AppConfig::inputTimedAllowed()
+
+// [ORION_SPRINT_RELEASE_FENCED 2026-09-17 owner] The SECOND fence, built for the same reason and
+// on the same shape. sprint_release_on_square shipped ON for one evening, was refuted live on
+// 2026-09-16 23:04 (every press carrying R2 went dead, 100 %), and its compiled default was
+// flipped to false the same night -- but a default is only the answer for a file that does not
+// already have one. The owner's settings.json still carried the `true` the earlier session had
+// persisted, the file won over the default, and 2026-09-17's acceptance session lost EVERY fade
+// (9 firings, 0 fades answered) to a behaviour that had already been proven harmful.
+//
+// So the default is no longer the mechanism: load() and save() both force the key false while
+// this is false, which means a persisted true, a restored backup and a hand edit all come up on
+// the pad's own R2. The key itself keeps round-tripping (it is still read, still written, still
+// in `introducedKeys`) so an existing settings.json stays valid and the day the mechanism is
+// re-run it finds its own key where it left it.
+//
+// NOTHING IS COMPILED OUT. The shaping, its state machine and all six of its tests are still
+// built and still tested; ORION_SPRINT_RELEASE_ON_SQUARE=1 (exact "1") is the ONLY door, and it
+// is a dev A/B door -- the engine's own env override already honours it, so setting it lifts the
+// fence on BOTH halves at once and the A and the B stay the same build.
+bool g_sprintReleaseAllowed = false;   // see AppConfig::sprintReleaseAllowed()
+}
+
+bool AppConfig::inputTimedAllowed() noexcept { return g_inputTimedAllowed; }
+void AppConfig::setInputTimedAllowedForTesting(bool allowed) noexcept { g_inputTimedAllowed = allowed; }
+
+bool AppConfig::sprintReleaseAllowed()
+{
+    if (g_sprintReleaseAllowed) {
+        return true;
+    }
+    // Ignore-don't-guess, exactly like the engine's own override: an EXACT "1" (trimmed) lifts the
+    // fence and every other value -- "true", "yes", "0", a typo, an empty string -- leaves it up.
+    return qEnvironmentVariable("ORION_SPRINT_RELEASE_ON_SQUARE").trimmed() == QLatin1String("1");
+}
+
+void AppConfig::setSprintReleaseAllowedForTesting(bool allowed) noexcept
+{
+    g_sprintReleaseAllowed = allowed;
+}
 
 namespace {
 
@@ -38,6 +95,7 @@ double perLevelNudge(const QJsonObject& perLevel, const QString& key)
 QString defaultChiakiPath(const QString& rootDir)
 {
 #ifdef ORION_PRODUCTION_BUILD
+    Q_UNUSED(rootDir);
     // Persist the intended install-relative location even when the package is
     // incomplete. Runtime resolution separately requires the file to exist and
     // fails closed; an old external absolute path must never survive as a
@@ -124,7 +182,7 @@ AppConfig::AppConfig(QString rootDir, QObject* parent)
     : QObject(parent),
       rootDir_(std::move(rootDir))
 {
-    // Production is meter-authority-only: repair both legacy
+    // Repair the legacy pose-only mode flags independently of inputTimedEnabled:
     // `no_meter_enabled=true` and contradictory dual-true files at the trusted load
     // boundary. Pose-only timing remains compile-time-gated lab code in the engine;
     // it is never loadable from a shipped settings file.
@@ -190,8 +248,7 @@ const QList<AppConfig::SettingsMigration>& AppConfig::settingsMigrations()
     // shipped entry (idempotency across installs depends on the history being
     // append-only).
     //
-    // CURRENTLY EMPTY, ON PURPOSE. v1 exists to install the settings_version
-    // stamp itself; the infrastructure is the deliverable. The one candidate
+    // v1 exists to install the settings_version stamp itself; its one candidate
     // rule was drafted, evidenced, and then PULLED the same day -- history:
     //
     // [PULLED 2026-08-08] v1 phase_veto_directional OFF -> ON.
@@ -240,7 +297,22 @@ const QList<AppConfig::SettingsMigration>& AppConfig::settingsMigrations()
     //     choice, and 16 is slower convergence, not a correctness bug.
     // Any of these can be flipped by a FUTURE registry entry (new version) once
     // its counted batch lands; the mechanism existing is the point.
-    static const QList<SettingsMigration> registry = {};
+    // [ORION_FREEZE_RIDES_RELEASE 2026-09-01] v2 is a fail-closed correction,
+    // not a timing retune.  Older builds saved the then-default true value into
+    // settings.json even when the user never selected it.  The instrument is now
+    // proven to measure the release landing rather than the animation tip, so an
+    // automatic unlock can move an already-early aim farther in the wrong
+    // direction.  There was no *_user_set companion in the old schema; false is
+    // therefore the safe upgrade value.  A user may explicitly opt back in after
+    // the v2 stamp, and current-version files are never migrated again.
+    static const QList<SettingsMigration> registry = {
+        {2,
+         QStringLiteral("tip_timing_auto_unlock"),
+         QJsonValue(true),
+         QJsonValue(false),
+         QString{},
+         QStringLiteral("anchor-to-freeze measures the release landing; legacy auto-unlock can move the aim in the wrong direction")},
+    };
     return registry;
 }
 
@@ -358,9 +430,158 @@ bool AppConfig::load()
 bool AppConfig::save(const AppConfigData& requested, QString* error)
 {
     AppConfigData data = requested;
+    // [ORION_NO_METER_V2 2026-09-14] Retired from the timing math; still normalised and written
+    // so an existing file round-trips unchanged (see AppConfigData).
+    data.inputTimedDelayMs = std::isfinite(data.inputTimedDelayMs)
+        ? std::clamp(data.inputTimedDelayMs, 100.0, 2500.0) : 500.0;
+    data.inputTimedLeadMs = std::isfinite(data.inputTimedLeadMs)
+        ? std::clamp(data.inputTimedLeadMs, 150.0, 400.0) : 272.0;
+    // [ORION_NO_METER_V2 2026-09-14 owner] THE blind hold. Clamped to the slider's own band on
+    // the way out too, so no write path can persist a hold the UI could not have produced — the
+    // 500 ms floor is the pump-fake guard's first line.
+    data.noMeterHoldMs = std::isfinite(data.noMeterHoldMs)
+        ? std::clamp(data.noMeterHoldMs, AppConfigData::kNoMeterHoldMinMs,
+                     AppConfigData::kNoMeterHoldMaxMs)
+        : 650.0;
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14 owner] Same policy as the hold: clamp on the way out
+    // so no write path persists a trim the slider could not have produced.
+    data.noMeterFadeTrimMs = std::isfinite(data.noMeterFadeTrimMs)
+        ? std::clamp(data.noMeterFadeTrimMs, AppConfigData::kNoMeterFadeTrimMinMs,
+                     AppConfigData::kNoMeterFadeTrimMaxMs)
+        : 0.0;
+    // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] Same policy as the hold: the grid is
+    // clamped on the way out too, so no write path can persist a frame period the engine would
+    // then have to re-clamp (a zero or a NaN here would divide the whole blind law by nothing).
+    data.consoleFrameMs = clampedConsoleFrameMs(data.consoleFrameMs);
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] Same policy: no write path may persist a tolerance
+    // outside the band, because the ceiling is what keeps a "late" release a shot.
+    data.lateFireToleranceMs = std::isfinite(data.lateFireToleranceMs)
+        ? std::clamp(data.lateFireToleranceMs, AppConfigData::kLateFireToleranceMinMs,
+                     AppConfigData::kLateFireToleranceMaxMs)
+        : 24.0;
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] Same policy: no write path may persist a step or a
+    // clamp outside the band, because the clamp is what keeps the banner loop a trim rather than
+    // a second, unaccountable lead control.
+    data.bannerTrimStepMs = std::isfinite(data.bannerTrimStepMs)
+        ? std::clamp(data.bannerTrimStepMs, AppConfigData::kBannerTrimStepMinMs,
+                     AppConfigData::kBannerTrimStepMaxMs)
+        : 3.0;
+    data.bannerTrimMaxMs = std::isfinite(data.bannerTrimMaxMs)
+        ? std::clamp(data.bannerTrimMaxMs, AppConfigData::kBannerTrimMaxMinMs,
+                     AppConfigData::kBannerTrimMaxMaxMs)
+        : 15.0;
+    // [ORION_BANNER_TRIM_HOLD 2026-09-16] Same policy again: no write path may persist a hold
+    // outside the band, because a hold under four would let one good run retire a trim the
+    // verdicts had just earned -- which is the behaviour this setting exists to end.
+    data.bannerTrimHoldShots = std::clamp(data.bannerTrimHoldShots,
+                                          AppConfigData::kBannerTrimHoldShotsMin,
+                                          AppConfigData::kBannerTrimHoldShotsMax);
+    // [ORION_BANNER_TRIM_BIAS 2026-09-19] Same policy again, for the same reason: the two limits
+    // are what keep the integrator a bounded second opinion rather than a per-verdict stepper,
+    // so no write path may persist a window or a vote margin outside its band.
+    data.bannerTrimBiasWindow = std::clamp(data.bannerTrimBiasWindow,
+                                           AppConfigData::kBannerTrimBiasWindowMin,
+                                           AppConfigData::kBannerTrimBiasWindowMax);
+    data.bannerTrimBiasVotes = std::clamp(data.bannerTrimBiasVotes,
+                                          AppConfigData::kBannerTrimBiasVotesMin,
+                                          AppConfigData::kBannerTrimBiasVotesMax);
+    // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] Same policy, and for the same reason the banner
+    // trim's clamp exists: no write path may persist a per-type offset outside the band, because
+    // the band is what keeps this a per-type correction rather than a second Shot Lead.
+    data.leadOffsetLeftFadeMs = clampedLeadOffsetMs(data.leadOffsetLeftFadeMs, 8.0);
+    data.leadOffsetRightFadeMs = clampedLeadOffsetMs(data.leadOffsetRightFadeMs, 8.0);
+    data.leadOffsetStandstillMs = clampedLeadOffsetMs(data.leadOffsetStandstillMs, 0.0);
+    data.leadOffsetOtherMs = clampedLeadOffsetMs(data.leadOffsetOtherMs, 0.0);
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17] Same policy, same band as the other four.
+    data.leadOffsetFadeMidMs = clampedLeadOffsetMs(data.leadOffsetFadeMidMs, 6.0);
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] Same policy: no write path may persist an aim margin or a
+    // placeholder outside its band. The margin's ceiling is what keeps it a margin rather than a
+    // second Shot Lead, and the placeholder's band is the slider's own, so the auto seed is
+    // always a value the control could have produced.
+    data.aimMarginMs = std::isfinite(data.aimMarginMs)
+        ? std::clamp(data.aimMarginMs, AppConfigData::kAimMarginMinMs,
+                     AppConfigData::kAimMarginMaxMs)
+        : 69.0;
+    data.leadFactoryPlaceholderMs = std::isfinite(data.leadFactoryPlaceholderMs)
+        ? std::clamp(data.leadFactoryPlaceholderMs,
+                     AppConfigData::kLeadFactoryPlaceholderMinMs,
+                     AppConfigData::kLeadFactoryPlaceholderMaxMs)
+        : 269.0;
+    // [ORION_METER_BACKSTOP_GRACE 2026-09-15] Same policy: no write path may persist a grace
+    // outside the band, because the ceiling is what keeps the backstop inside the shot it answers.
+    data.meterBackstopGraceMs = std::isfinite(data.meterBackstopGraceMs)
+        ? std::clamp(data.meterBackstopGraceMs, AppConfigData::kMeterBackstopGraceMinMs,
+                     AppConfigData::kMeterBackstopGraceMaxMs)
+        : 100.0;
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15] Same policy, its own band.
+    data.meterBackstopGraceFadeMs = std::isfinite(data.meterBackstopGraceFadeMs)
+        ? std::clamp(data.meterBackstopGraceFadeMs, AppConfigData::kMeterBackstopGraceFadeMinMs,
+                     AppConfigData::kMeterBackstopGraceFadeMaxMs)
+        : 220.0;
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16] Same policy, its own band: no write path may
+    // persist a probe outside it, because the ceiling is what keeps the question ("has ANYTHING
+    // been seen yet?") from being asked before a normal meter could have been drawn.
+    data.meterBackstopNeverSeenProbeMs = std::isfinite(data.meterBackstopNeverSeenProbeMs)
+        ? std::clamp(data.meterBackstopNeverSeenProbeMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeMinMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeMaxMs)
+        : 0.0;   // [2026-09-17] the compiled default, which is now the collapse OFF
+    // [ORION_METER_BACKSTOP_NEVER_SEEN_FADE 2026-09-16] Same policy, its own band.
+    data.meterBackstopNeverSeenProbeFadeMs =
+        std::isfinite(data.meterBackstopNeverSeenProbeFadeMs)
+        ? std::clamp(data.meterBackstopNeverSeenProbeFadeMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeFadeMinMs,
+                     AppConfigData::kMeterBackstopNeverSeenProbeFadeMaxMs)
+        : 0.0;
+    // [ORION_VISION_HOLD_BAND 2026-09-15] Same policy again, per band: no write path may persist
+    // a band outside it, because the ceiling is what keeps the band from binding on a real hold
+    // and the floor IS the kill switch.
+    data.visionHoldBandMs = std::isfinite(data.visionHoldBandMs)
+        ? std::clamp(data.visionHoldBandMs, AppConfigData::kVisionHoldBandMinMs,
+                     AppConfigData::kVisionHoldBandMaxMs)
+        : 40.0;
+    data.visionHoldBandFadeMs = std::isfinite(data.visionHoldBandFadeMs)
+        ? std::clamp(data.visionHoldBandFadeMs, AppConfigData::kVisionHoldBandFadeMinMs,
+                     AppConfigData::kVisionHoldBandFadeMaxMs)
+        : 60.0;
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] An unrecognised style is replaced by the shipped
+    // one on the way out, so a hand-edited file can never persist a value the engine would have
+    // to guess at. "flick" and "letgo" are the whole vocabulary.
+    if (data.tempoReleaseStyle != QLatin1String("flick")
+        && data.tempoReleaseStyle != QLatin1String("letgo")) {
+        data.tempoReleaseStyle = QStringLiteral("flick");
+    }
+    // [ORION_SPRINT_RELEASE_FENCED 2026-09-17 owner] The write half of the fence. No route may
+    // persist a true while the feature is fenced, so the file on disk agrees with the install
+    // rather than carrying a selection nothing will honour -- and, crucially, so the ONE write
+    // the app makes on any other setting also scrubs the true the refuted session left behind.
+    // The key keeps being written (false), so the file round-trips and stays valid.
+    if (!sprintReleaseAllowed()) {
+        data.sprintReleaseOnSquare = false;
+    }
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16] Same clamp-on-every-route policy the timing
+    // knobs use: no write path may persist a sprint cut outside the band, because the floor is
+    // what keeps an ordinary walk from being reshaped and the ceiling is the saturated trigger
+    // the owner's dead presses actually reported.
+    data.sprintReleaseR2Threshold = std::clamp(data.sprintReleaseR2Threshold,
+                                               AppConfigData::kSprintReleaseR2ThresholdMin,
+                                               AppConfigData::kSprintReleaseR2ThresholdMax);
+    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16] Same policy: no write path may persist a hold
+    // outside the band, because 0 IS the kill switch and the ceiling is what keeps the latch from
+    // outliving the frame it exists to protect. A non-finite value falls back to the shipped 50.
+    data.squarePressR2HoldMs = std::isfinite(data.squarePressR2HoldMs)
+        ? std::clamp(data.squarePressR2HoldMs, AppConfigData::kSquarePressR2HoldMinMs,
+                     AppConfigData::kSquarePressR2HoldMaxMs)
+        : 50.0;
     data.meterEnabled = true;
     data.noMeterEnabled = false;
     normalizeRemotePlayBackend(data, rootDir_);
+    // [ORION_LEAD_BY_SOURCE 2026-09-14] THE chokepoint for the per-route stash invariant: every
+    // path that writes the live Shot Lead (setActuationLeadMs, nudge, lead-calibration steps,
+    // the measured seed, reset, a Venice profile import) ends up here, so mirroring once here
+    // means no write path can forget. The individual setters mirror explicitly as well; this is
+    // the guarantee that survives someone adding a seventh write path.
+    mirrorActuationLeadIntoSourceStash(data);
     QJsonObject obj;
     // [ORION_SETTINGS_VERSION] Always stamp the CURRENT schema generation: this file is
     // being written by this build, so its defaults ARE this build's defaults. load()
@@ -380,13 +601,22 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("profiles"), profiles_);
     obj.insert(QStringLiteral("meter_color"), data.meterColor);
     obj.insert(QStringLiteral("meter_style"), data.meterStyle);
+    obj.insert(QStringLiteral("meter_proposer"), normalizedMeterProposer(data.meterProposer));
+    // [ORION_PILL_YOLO_ROUTE 2026-09-17] Written on every save so the key exists in
+    // an installed settings.json and an owner can take the route down by hand.
+    obj.insert(QStringLiteral("pill_yolo_route"), data.pillYoloRoute);
     obj.insert(QStringLiteral("remote_play_client_mode"), QStringLiteral("chiaki"));
     obj.insert(QStringLiteral("remote_play_console"), data.remotePlayConsole);
+    if (!data.xboxRemotePlayWindowTitle.isEmpty())
+        obj.insert(QStringLiteral("xbox_remote_play_window_title"), data.xboxRemotePlayWindowTitle);
     obj.insert(QStringLiteral("stream_setup_complete"), data.streamSetupComplete);
     obj.insert(QStringLiteral("preflight_complete"), data.preflightComplete);
     obj.insert(QStringLiteral("legal_accepted_version"), data.legalAcceptedVersion);
     obj.insert(QStringLiteral("video_source"), data.videoSource);
     obj.insert(QStringLiteral("capture_card_index"), data.captureCardIndex);
+    // [ORION_CAPTURE_FPS 2026-09-14] Persisted already-snapped, so the file never carries a rate
+    // the card was not actually asked for.
+    obj.insert(QStringLiteral("capture_card_fps"), snappedCaptureCardFps(data.captureCardFps));
     obj.insert(QStringLiteral("hardware_decode"), data.hardwareDecode);
     obj.insert(QStringLiteral("controller_type"), data.controllerType);
     obj.insert(QStringLiteral("auto_reconnect"), data.autoReconnect);
@@ -420,6 +650,8 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("anchor_rise_min_pct"), data.anchorRiseMinPct);
     obj.insert(QStringLiteral("ownership_proof_two_frame"), data.ownershipProofTwoFrame);
     obj.insert(QStringLiteral("tip_phase_anchor_base20"), data.tipPhaseAnchorBase20);
+    obj.insert(QStringLiteral("tip_phase_anchor_consensus"), data.tipPhaseAnchorConsensus);
+    obj.insert(QStringLiteral("tip_phase_first_sight_anchor"), data.tipPhaseFirstSightAnchor);
     obj.insert(QStringLiteral("tip_phase_type_trim_enabled"), data.tipPhaseTypeTrimEnabled);
     {
         QJsonObject trim;
@@ -432,8 +664,11 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("stop_reopen_corroborate"), data.stopReopenCorroborate);
     obj.insert(QStringLiteral("stop_dating_subframe"), data.stopDatingSubframe);
     obj.insert(QStringLiteral("phase_veto_directional"), data.phaseVetoDirectional);
+    // [ORION_TIP_FRAME_NATIVE 2026-09-15] fire on the console frame grid (default true).
+    obj.insert(QStringLiteral("tip_frame_native"), data.tipFrameNative);
     obj.insert(QStringLiteral("tip_phase_aim_frozen"), data.tipPhaseAimFrozen);
     obj.insert(QStringLiteral("tip_timing_auto_unlock"), data.tipTimingAutoUnlockEnabled);
+    obj.insert(QStringLiteral("session_lead_probe"), data.sessionLeadProbeEnabled);
     obj.insert(QStringLiteral("tip_source_steal_guard"), data.tipSourceStealGuardEnabled);
     obj.insert(QStringLiteral("tip_phase_rung_imminent_hold"), data.tipPhaseRungImminentHold);
     obj.insert(QStringLiteral("tempo_tip_parity"), data.tempoTipParity);
@@ -479,11 +714,35 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("square_passthrough_enabled"), data.squarePassthroughEnabled);
     obj.insert(QStringLiteral("meter_settle_allow_smooth_motion"), data.meterSettleAllowSmoothMotion);
     obj.insert(QStringLiteral("square_passthrough_button"), data.squarePassthroughButton);
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] see AppConfigData::sprintReleaseOnSquare.
+    // [ORION_SPRINT_RELEASE_FENCED 2026-09-17] `data` was already forced false above while the
+    // feature is fenced, so this writes false without knowing why.
+    obj.insert(QStringLiteral("sprint_release_on_square"), data.sprintReleaseOnSquare);
+    obj.insert(QStringLiteral("sprint_release_r2_threshold"), data.sprintReleaseR2Threshold);
+    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] see AppConfigData::squarePressR2HoldMs
+    obj.insert(QStringLiteral("square_press_r2_hold_ms"), data.squarePressR2HoldMs);
     obj.insert(QStringLiteral("no_dip_enabled"), data.noDipEnabled);
     obj.insert(QStringLiteral("no_dip_lead_ms"), data.noDipLeadMs);
     // [ORION_USER_LEAD] the user-facing Shot Lead + whether the USER (not the measurement) set it.
     obj.insert(QStringLiteral("actuation_lead_ms"), data.actuationLeadMs);
     obj.insert(QStringLiteral("actuation_lead_user_set"), data.actuationLeadUserSet);
+    // [ORION_LEAD_BY_SOURCE 2026-09-14] ONE key holds both routes' leads:
+    //   "actuation_lead_by_source": {"capture_card": {"lead_ms": 274, "user_set": true}, ...}
+    // An absent route = never configured there (see AppConfigData::actuationLeadBySourceMs).
+    // actuation_lead_ms / actuation_lead_user_set remain the canonical LIVE pair the engine and
+    // the Venice profile read; this object is only the memory for the route not in use.
+    {
+        QJsonObject leadBySource;
+        for (auto it = data.actuationLeadBySourceMs.constBegin();
+             it != data.actuationLeadBySourceMs.constEnd(); ++it) {
+            QJsonObject entry;
+            entry.insert(QStringLiteral("lead_ms"), it.value());
+            entry.insert(QStringLiteral("user_set"),
+                         data.actuationLeadUserSetBySource.value(it.key(), false));
+            leadBySource.insert(it.key(), entry);
+        }
+        obj.insert(QStringLiteral("actuation_lead_by_source"), leadBySource);
+    }
     // [ORION_METER_DELAY_LEAD_KEYING] see AppConfigData::meterDelayLeadOffsetMs.
     obj.insert(QStringLiteral("meter_delay_lead_offset_ms"), data.meterDelayLeadOffsetMs);
     // [ORION_USER_TIP] whether the USER explicitly chose the tip-timing value. The value
@@ -527,6 +786,105 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     // [ORION_GREEN_CENTER] 0 = aim at the green window's late edge (previous behaviour).
     obj.insert(QStringLiteral("autonomous_green_center_frac"), data.autonomousGreenCenterFrac);
     obj.insert(QStringLiteral("autonomous_green_center_max_ms"), data.autonomousGreenCenterMaxMs);
+    // [ORION_NO_METER_SHELVED 2026-09-15] Written false while the mode is shelved, so the file on
+    // disk agrees with the install rather than carrying a selection nothing will honour. The key
+    // itself keeps being written: an existing file must still round-trip, and the day the mode
+    // comes back it must find its own key where it left it.
+    obj.insert(QStringLiteral("input_timed_enabled"),
+               data.inputTimedEnabled && inputTimedAllowed());
+    obj.insert(QStringLiteral("input_timed_delay_ms"), data.inputTimedDelayMs);
+    obj.insert(QStringLiteral("input_timed_lead_ms"), data.inputTimedLeadMs);
+    obj.insert(QStringLiteral("input_timed_rhythm_enabled"), data.inputTimedRhythmEnabled);
+    // [ORION_NO_METER_V2 2026-09-14] the blind-release reference hold (ms).
+    obj.insert(QStringLiteral("no_meter_hold_ms"), data.noMeterHoldMs);
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14] the fade-only trim (ms), added to both fade deltas.
+    obj.insert(QStringLiteral("no_meter_fade_trim_ms"), data.noMeterFadeTrimMs);
+    // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14] the console's input-sampling period (ms) and the
+    // switch that snaps every blind hold onto it. Persisted already-clamped.
+    obj.insert(QStringLiteral("console_frame_ms"), clampedConsoleFrameMs(data.consoleFrameMs));
+    obj.insert(QStringLiteral("no_meter_frame_quantize"), data.noMeterFrameQuantize);
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] let VISION own a NO METER shot whenever it can
+    // see the meter; the blind hold stays as the deadline.
+    obj.insert(QStringLiteral("no_meter_vision_assist"), data.noMeterVisionAssist);
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] how late the vision path may still fire (ms).
+    obj.insert(QStringLiteral("late_fire_tolerance_ms"), data.lateFireToleranceMs);
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] the closed loop from the game's own TIMING banner back
+    // onto the Shot Lead: the switch, the per-verdict step and the clamp. The trim itself lives
+    // in learning.json (banner_lead_trim_by_type) -- it is evidence, not a setting.
+    obj.insert(QStringLiteral("banner_lead_trim"), data.bannerLeadTrim);
+    obj.insert(QStringLiteral("banner_trim_step_ms"), data.bannerTrimStepMs);
+    obj.insert(QStringLiteral("banner_trim_max_ms"), data.bannerTrimMaxMs);
+    // [ORION_BANNER_TRIM_HOLD 2026-09-16] How many consecutive EXCELLENT/GREEN verdicts hold the
+    // trim before it idles back toward the slider. Persisted already-clamped.
+    obj.insert(QStringLiteral("banner_trim_hold_shots"),
+               std::clamp(data.bannerTrimHoldShots, AppConfigData::kBannerTrimHoldShotsMin,
+                          AppConfigData::kBannerTrimHoldShotsMax));
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16] Whether the trim is keyed by (shot type, tempo) or by
+    // shot type alone. A plain switch, like banner_lead_trim itself.
+    obj.insert(QStringLiteral("banner_trim_tempo_buckets"), data.bannerTrimTempoBuckets);
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17] Whether FADES also key on the shot's range.
+    obj.insert(QStringLiteral("banner_trim_range_buckets"), data.bannerTrimRangeBuckets);
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19] Whether a panel with NO coverage cell (the 2-cell
+    // TIMING | DISTANCE layout: no defender context) calibrates the trim as an open shot does.
+    obj.insert(QStringLiteral("banner_trim_absent_coverage_open"),
+               data.bannerTrimAbsentCoverageOpen);
+    // [ORION_BANNER_TRIM_BIAS 2026-09-19] The net-vote integrator's window and margin. Persisted
+    // already-clamped, exactly like banner_trim_hold_shots.
+    obj.insert(QStringLiteral("banner_trim_bias_window"),
+               std::clamp(data.bannerTrimBiasWindow, AppConfigData::kBannerTrimBiasWindowMin,
+                          AppConfigData::kBannerTrimBiasWindowMax));
+    obj.insert(QStringLiteral("banner_trim_bias_votes"),
+               std::clamp(data.bannerTrimBiasVotes, AppConfigData::kBannerTrimBiasVotesMin,
+                          AppConfigData::kBannerTrimBiasVotesMax));
+    // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] The fixed per-shot-type addition to the Shot Lead,
+    // in ms. Persisted already-clamped, exactly like console_frame_ms: the band is what keeps a
+    // per-type correction from becoming a second lead control.
+    obj.insert(QStringLiteral("lead_offset_left_fade_ms"),
+               clampedLeadOffsetMs(data.leadOffsetLeftFadeMs, 8.0));
+    obj.insert(QStringLiteral("lead_offset_right_fade_ms"),
+               clampedLeadOffsetMs(data.leadOffsetRightFadeMs, 8.0));
+    obj.insert(QStringLiteral("lead_offset_standstill_ms"),
+               clampedLeadOffsetMs(data.leadOffsetStandstillMs, 0.0));
+    obj.insert(QStringLiteral("lead_offset_other_ms"),
+               clampedLeadOffsetMs(data.leadOffsetOtherMs, 0.0));
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17] The mid-range fade's own offset.
+    obj.insert(QStringLiteral("lead_offset_fade_mid_ms"),
+               clampedLeadOffsetMs(data.leadOffsetFadeMidMs, 6.0));
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] the plug-and-play Shot Lead: the switch, the game-side
+    // aim margin added to this rig's measured latency, and the placeholder used until that
+    // latency is authoritative. actuation_lead_ms is NEVER written by any of them.
+    obj.insert(QStringLiteral("lead_auto_seed"), data.leadAutoSeed);
+    obj.insert(QStringLiteral("aim_margin_ms"), data.aimMarginMs);
+    obj.insert(QStringLiteral("lead_factory_placeholder_ms"), data.leadFactoryPlaceholderMs);
+    // [ORION_OWNED_METER_NEVER_ABORTS 2026-09-14] an owned, lead-validated shot fires at ANY
+    // lateness rather than aborting; the tolerance above becomes the beyond_tolerance label.
+    obj.insert(QStringLiteral("owned_meter_never_aborts"), data.ownedMeterNeverAborts);
+    // [ORION_OWNERSHIP_PROOF_LENIENCY 2026-09-14] near the deadline, accept a same-candidate
+    // ownership episode whose proof a geometry break restarted.
+    obj.insert(QStringLiteral("ownership_proof_leniency"), data.ownershipProofLeniency);
+    // [ORION_METER_BLIND_BACKSTOP 2026-09-14] the meter path's blind backstop deadline.
+    obj.insert(QStringLiteral("meter_blind_backstop"), data.meterBlindBackstop);
+    // [ORION_METER_BACKSTOP_GRACE 2026-09-15] how long that deadline waits past the law (ms).
+    obj.insert(QStringLiteral("meter_backstop_grace_ms"), data.meterBackstopGraceMs);
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15] the fade's own, larger grace.
+    obj.insert(QStringLiteral("meter_backstop_grace_fade_ms"), data.meterBackstopGraceFadeMs);
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16] how long before the law the backstop asks
+    // whether ANY candidate has been seen for this press (0 = off).
+    obj.insert(QStringLiteral("meter_backstop_never_seen_probe_ms"),
+               data.meterBackstopNeverSeenProbeMs);
+    // [ORION_METER_BACKSTOP_NEVER_SEEN_FADE 2026-09-16] the fade's own probe (0 = fades excluded).
+    obj.insert(QStringLiteral("meter_backstop_never_seen_probe_fade_ms"),
+               data.meterBackstopNeverSeenProbeFadeMs);
+    // [ORION_VISION_HOLD_BAND 2026-09-15] how far a VISION release may sit from the press-anchored
+    // hold law before it is clamped back onto the band (ms; 0 = off), and the fade's own band.
+    obj.insert(QStringLiteral("vision_hold_band_ms"), data.visionHoldBandMs);
+    obj.insert(QStringLiteral("vision_hold_band_fade_ms"), data.visionHoldBandFadeMs);
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] "flick" (opposing full-scale flick) or "letgo"
+    // (drive the stick to neutral at the same instant).
+    obj.insert(QStringLiteral("tempo_release_style"), data.tempoReleaseStyle);
+    // [ORION_PRESS_ANCHORED_FALLBACK 2026-09-14 — RETIRED] written only so an existing file
+    // round-trips; nothing reads it.
+    obj.insert(QStringLiteral("press_anchored_fallback_enabled"), data.pressAnchoredFallbackEnabled);
     obj.insert(QStringLiteral("no_meter_enabled"), data.noMeterEnabled);
     obj.insert(QStringLiteral("no_meter_release_point"), data.noMeterReleasePoint);
     obj.insert(QStringLiteral("no_meter_base_offset_ms"), data.noMeterBaseOffsetMs);
@@ -576,6 +934,9 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("fixed_hold_time_ms"), data.fixedHoldMs);
     obj.insert(QStringLiteral("early_late_offset_ms"), data.earlyLateOffsetMs);
     obj.insert(QStringLiteral("tempo_wait_ms"), data.tempoWaitMs);
+    // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] Written in BOTH layouts the other tempo keys use
+    // (flat + the nested "tempo" object) so a file written by either generation round-trips.
+    obj.insert(QStringLiteral("rhythm_flick_delay_ms"), data.rhythmFlickDelayMs);
     obj.insert(QStringLiteral("tempo_flick_hold_ms"), data.tempoFlickHoldMs);
     obj.insert(QStringLiteral("tempo_min_stick_hold_ms"), data.tempoMinStickHoldMs);
     obj.insert(QStringLiteral("tempo_fallback_timeout_ms"), data.tempoFallbackTimeoutMs);
@@ -608,6 +969,7 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     tempo.insert(QStringLiteral("input_source"), data.remotePlayInputSource);
     tempo.insert(QStringLiteral("input_mode"), data.remotePlayInputSource);
     tempo.insert(QStringLiteral("wait_ms"), data.tempoWaitMs);
+    tempo.insert(QStringLiteral("rhythm_flick_delay_ms"), data.rhythmFlickDelayMs);
     tempo.insert(QStringLiteral("flick_hold_ms"), data.tempoFlickHoldMs);
     tempo.insert(QStringLiteral("min_stick_hold_ms"), data.tempoMinStickHoldMs);
     tempo.insert(QStringLiteral("fallback_timeout_ms"), data.tempoFallbackTimeoutMs);
@@ -729,6 +1091,11 @@ bool AppConfig::saveLearning(const LearningData& data, QString* error)
     if (data.measuredPhasePhysicalMs > 0.0) {
         obj.insert(QStringLiteral("measured_phase_physical_ms"), data.measuredPhasePhysicalMs);
     }
+    // [ORION_SESSION_LEAD_PROBE] engine units (no base shift), plus the lead it belongs to.
+    if (data.leadReferencePhysicalMs > 0.0 && data.leadReferenceLeadMs > 0.0) {
+        obj.insert(QStringLiteral("lead_reference_physical_ms"), data.leadReferencePhysicalMs);
+        obj.insert(QStringLiteral("lead_reference_lead_ms"), data.leadReferenceLeadMs);
+    }
     {
         QJsonObject rb;
         for (auto it = data.shotTypeRttBaselineMs.constBegin(); it != data.shotTypeRttBaselineMs.constEnd(); ++it) {
@@ -756,6 +1123,38 @@ bool AppConfig::saveLearning(const LearningData& data, QString* error)
             tl.insert(it.key(), it.value());
         }
         obj.insert(QStringLiteral("shot_type_latency_ms"), tl);
+    }
+    // [ORION_NO_METER_V2 2026-09-14] Per-shot-type press->release hold measured on the vision
+    // path. {median_ms, n} per type: the blind law needs the count as much as the value, because
+    // it only prefers a learned Δ once BOTH the type and Standstill carry real evidence.
+    {
+        QJsonObject nh;
+        for (auto it = data.noMeterHoldByType.constBegin();
+             it != data.noMeterHoldByType.constEnd(); ++it) {
+            QJsonObject rec;
+            rec.insert(QStringLiteral("median_ms"), it.value().medianMs);
+            rec.insert(QStringLiteral("n"), it.value().n);
+            nh.insert(it.key(), rec);
+        }
+        obj.insert(QStringLiteral("no_meter_hold_by_type"), nh);
+    }
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] The banner loop's per-shot-type additive trim, in ms.
+    // A plain number per bucket: unlike the hold there is no count to weigh, because the trim IS
+    // the accumulated evidence and it decays 50 % at the next start regardless of how it got
+    // there. Out-of-band entries are dropped on the way OUT as well as on the way in, so no
+    // write path can persist a trim the loader would then have to refuse.
+    {
+        QJsonObject bt;
+        for (auto it = data.bannerLeadTrimByType.constBegin();
+             it != data.bannerLeadTrimByType.constEnd(); ++it) {
+            const double value = it.value();
+            if (!std::isfinite(value)
+                || std::abs(value) > BannerLeadTrim::kPersistCeilingMs) {
+                continue;
+            }
+            bt.insert(it.key(), value);
+        }
+        obj.insert(QStringLiteral("banner_lead_trim_by_type"), bt);
     }
     QSaveFile file(learningPath());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -854,8 +1253,8 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     data_.meterColor = cleanText(obj, "meter_color", data_.meterColor, 48);
     data_.meterStyle = cleanText(obj, "meter_style", data_.meterStyle, 48);
     {
-        // Unknown style/colour -> the SHIPPED defaults (2026-07-25 reconciliation: Arrow/Purple ->
-        // Arrow2/Red, tracking AppConfigData). A valid explicit value in settings.json still wins.
+        // Unknown style/colour -> the current certified shipped defaults. A
+        // valid explicit value in settings.json still wins.
         const QString style = data_.meterStyle.trimmed().toLower();
         if (style != QLatin1String("arrow")
             && style != QLatin1String("arrow2")
@@ -870,13 +1269,23 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
             && color != QLatin1String("white")
             && color != QLatin1String("yellow")
             && color != QLatin1String("red")) {
-            data_.meterColor = QStringLiteral("Red");
+            data_.meterColor = QStringLiteral("White");
         }
     }
+    // Unknown/absent proposer -> "cv" (the certified default); "yolo" is the only
+    // other accepted value. Normalised here so settings.json can never hand the
+    // sidecar an ORION_METER_PROPOSER value get_locator() does not understand.
+    data_.meterProposer = normalizedMeterProposer(
+        cleanText(obj, "meter_proposer", data_.meterProposer, 16));
+    // [ORION_PILL_YOLO_ROUTE 2026-09-17] Missing key -> the compiled default (true),
+    // which is what makes a Pill install that predates this build launch on the only
+    // proposer that can see its meter. See AppConfigData::pillYoloRoute.
+    data_.pillYoloRoute = cleanBool(obj, "pill_yolo_route", data_.pillYoloRoute);
     data_.remotePlayClientMode = cleanText(obj, "remote_play_client_mode", data_.remotePlayClientMode, 48);
     {
         const QString console = cleanText(obj, "remote_play_console", data_.remotePlayConsole, 16).trimmed().toLower();
         data_.remotePlayConsole = (console == QLatin1String("xbox")) ? QStringLiteral("Xbox") : QStringLiteral("PS5");
+        data_.xboxRemotePlayWindowTitle = cleanText(obj, "xbox_remote_play_window_title", QString(), 512).trimmed();
     }
     data_.streamSetupComplete = cleanBool(obj, "stream_setup_complete", data_.streamSetupComplete);
     data_.preflightComplete = cleanBool(obj, "preflight_complete", data_.preflightComplete);
@@ -894,6 +1303,13 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
                                 ? QStringLiteral("capture_card") : QStringLiteral("decoder");
     }
     data_.captureCardIndex = cleanInt(obj, "capture_card_index", data_.captureCardIndex, 0, 16);
+    // [ORION_CAPTURE_FPS 2026-09-14] A missing or non-numeric key keeps the compiled default
+    // (60 — exactly what every build before this one hard-coded, so an existing install is
+    // unchanged); any number present is SNAPPED to {30, 60, 120}. cleanInt's band is deliberately
+    // far wider than the allowed set — it only rejects absurd values before the snap, because a
+    // clamp to a band EDGE is a different (and wrong) answer than "the nearest supported mode".
+    data_.captureCardFps = snappedCaptureCardFps(
+        cleanInt(obj, "capture_card_fps", data_.captureCardFps, 0, 1000));
     data_.hardwareDecode = cleanBool(obj, "hardware_decode", data_.hardwareDecode);
     // Controller type is pinned to X360 (the only supported virtual pad — DS4 emulation
     // was buggy and is no longer selectable). Any legacy "DS4" in settings normalises to X360.
@@ -983,6 +1399,13 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         // supersedes the narrower legacy-violet migration that used to live in
         // this block. Style survives as the one remaining knob: it is shape,
         // not colour.
+        //
+        // History (the pin is what makes a restyle a one-constant change —
+        // every persisted value converges on the compiled default next launch):
+        //   pre-2026-08-06  #CC44FF  reference violet
+        //   2026-08-06      #FF2BD6  magenta
+        //   2026-09-14      magenta -> blue #1E90FF, owner: blue, visible on
+        //                   light and dark.
         data_.meterOverlayColor =
             QString::fromLatin1(AppConfigData::kMeterOverlayDefaultColor);
         data_.meterOverlayRgb = false;
@@ -991,6 +1414,7 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         const QString lowerStyle = rawStyle.toLower();
         if (lowerStyle == QLatin1String("brackets")) data_.meterOverlayStyle = QStringLiteral("Brackets");
         else if (lowerStyle == QLatin1String("hairline")) data_.meterOverlayStyle = QStringLiteral("Hairline");
+        else if (lowerStyle == QLatin1String("clean")) data_.meterOverlayStyle = QStringLiteral("Clean");
         else data_.meterOverlayStyle = QStringLiteral("Solid");
     }
 
@@ -1029,12 +1453,23 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     data_.ownershipProofTwoFrame = cleanBool(obj, "ownership_proof_two_frame", data_.ownershipProofTwoFrame);
     // Candidate-B decision-budget flag: base anchor 30 -> 20 constellation (default OFF).
     data_.tipPhaseAnchorBase20 = cleanBool(obj, "tip_phase_anchor_base20", data_.tipPhaseAnchorBase20);
+    data_.tipPhaseAnchorConsensus = cleanBool(
+        obj, "tip_phase_anchor_consensus", data_.tipPhaseAnchorConsensus);
+    // [ORION_TIP_PHASE_FIRST_SIGHT] anchor the phase model on the first accepted sample when
+    // every witnessable ladder rung is already history (default ON).
+    data_.tipPhaseFirstSightAnchor = cleanBool(
+        obj, "tip_phase_first_sight_anchor", data_.tipPhaseFirstSightAnchor);
     // [ORION_TYPE_TRIM] per-shot-type tip-phase trim (default OFF). Values clamped to
     // single-digit ms so a stale settings entry can never move an aim by more than one
     // green-window sliver; keys are exact classifyShotType labels.
     data_.tipPhaseTypeTrimEnabled = cleanBool(obj, "tip_phase_type_trim_enabled", data_.tipPhaseTypeTrimEnabled);
-    {
+    // A settings file that carries the map is AUTHORITATIVE for it: the built-in defaults are
+    // replaced, not merged. Merging let a default (Right Fade -6) ride silently under a file
+    // that only named Left Fade -- live on 2026-09-01 for a whole batch nobody had configured.
+    if (obj.contains(QStringLiteral("tip_phase_type_trim"))
+        && obj.value(QStringLiteral("tip_phase_type_trim")).isObject()) {
         const auto trim = obj.value(QStringLiteral("tip_phase_type_trim")).toObject();
+        data_.tipPhaseTypeTrimMs.clear();
         for (auto it = trim.constBegin(); it != trim.constEnd(); ++it) {
             data_.tipPhaseTypeTrimMs.insert(it.key(), qBound(-9.0, it.value().toDouble(), 9.0));
         }
@@ -1047,11 +1482,14 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     // both the default flip and the v1 migration were withdrawn 2026-08-08 -- see
     // settingsMigrations() for the history and the re-enable condition).
     data_.phaseVetoDirectional = cleanBool(obj, "phase_veto_directional", data_.phaseVetoDirectional);
+    data_.tipFrameNative = cleanBool(obj, "tip_frame_native", data_.tipFrameNative);
     // [ORION_AIM_FREEZE] hold the learned aim still for the session (default OFF).
     data_.tipPhaseAimFrozen = cleanBool(obj, "tip_phase_aim_frozen", data_.tipPhaseAimFrozen);
-    // [ORION_AIM_AUTOUNLOCK] Hand a refuted lock back to the learner (default ON).
+    // [ORION_AIM_AUTOUNLOCK] Hand a refuted lock back to the learner (opt-in; default OFF).
     data_.tipTimingAutoUnlockEnabled = cleanBool(obj, "tip_timing_auto_unlock",
                                                  data_.tipTimingAutoUnlockEnabled);
+    data_.sessionLeadProbeEnabled = cleanBool(obj, "session_lead_probe",
+                                              data_.sessionLeadProbeEnabled);
     // [ORION_SOURCE_STEAL_GUARD] worse-sigma decisions may not evict an armed token (default ON).
     data_.tipSourceStealGuardEnabled = cleanBool(obj, "tip_source_steal_guard",
                                                  data_.tipSourceStealGuardEnabled);
@@ -1123,6 +1561,37 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         cleanBool(obj, "meter_settle_allow_smooth_motion", data_.meterSettleAllowSmoothMotion);
     data_.squarePassthroughButton =
         cleanText(obj, "square_passthrough_button", data_.squarePassthroughButton, 8);
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] A plain boolean read the same
+    // fail-to-the-setting way square_passthrough_enabled is: a non-boolean value leaves the
+    // compiled default standing rather than silently changing the press. The threshold is
+    // CLAMPED into its band rather than rejected -- an out-of-band value is a typo, not a
+    // request to reshape every walk (64) or to disarm the feature (a value above 255 is
+    // unreachable by a trigger).
+    // [ORION_SPRINT_RELEASE_FENCED 2026-09-17 owner] The read half of the fence, and the half
+    // that actually cost the owner a session: the compiled default lost to a persisted true, so
+    // the persisted value is now READ (it still has to round-trip) and then ANDed away. Logged
+    // once per load when it actually fenced something, because "my fades stopped answering" must
+    // be one grep away from its cause and not a silent disagreement between file and build.
+    const bool persistedSprintRelease =
+        cleanBool(obj, "sprint_release_on_square", data_.sprintReleaseOnSquare);
+    const bool sprintReleaseIsAllowed = sprintReleaseAllowed();
+    data_.sprintReleaseOnSquare = persistedSprintRelease && sprintReleaseIsAllowed;
+    if (persistedSprintRelease && !sprintReleaseIsAllowed) {
+        qWarning().noquote()
+            << QStringLiteral("SPRINT RELEASE: persisted true ignored (feature fenced 2026-09-17;"
+                              " env ORION_SPRINT_RELEASE_ON_SQUARE=1 to re-enable for testing)");
+    }
+    data_.sprintReleaseR2Threshold =
+        cleanInt(obj, "sprint_release_r2_threshold", 200,
+                 AppConfigData::kSprintReleaseR2ThresholdMin,
+                 AppConfigData::kSprintReleaseR2ThresholdMax);
+    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] Non-numeric leaves the compiled default
+    // standing (cleanDouble's fallback), numeric is CLAMPED into the band rather than rejected --
+    // an out-of-band value is a typo, not a request to hold the trigger for a quarter of a second.
+    data_.squarePressR2HoldMs =
+        cleanDouble(obj, "square_press_r2_hold_ms", data_.squarePressR2HoldMs,
+                    AppConfigData::kSquarePressR2HoldMinMs,
+                    AppConfigData::kSquarePressR2HoldMaxMs);
     data_.noDipEnabled = cleanBool(obj, "no_dip_enabled", data_.noDipEnabled);
     data_.noDipLeadMs = cleanDouble(obj, "no_dip_lead_ms", data_.noDipLeadMs, -150.0, 150.0);
     // [ORION_USER_LEAD] accepted set is {0} u [150, 800]: 0 means "not configured yet" (the
@@ -1135,6 +1604,42 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         data_.actuationLeadMs = AppConfigData::kActuationLeadMinMs;
     }
     data_.actuationLeadUserSet = cleanBool(obj, "actuation_lead_user_set", data_.actuationLeadUserSet);
+    // [ORION_LEAD_BY_SOURCE 2026-09-14] The per-route stash. Same band/clean rules as
+    // actuation_lead_ms above (cleanActuationLeadMs IS that rule, factored out). Only the two
+    // canonical route keys are accepted verbatim; anything else in the object is ignored rather
+    // than folded onto a route, so a hand-edited file cannot make two keys fight over "decoder".
+    // An entry that resolves to not-configured is dropped, keeping "absent == not configured".
+    //
+    // MIGRATION + INVARIANT in one call: mirroring the live pair afterwards seeds the CURRENT
+    // route from actuation_lead_ms when the file predates this key (an existing install keeps
+    // firing at exactly the lead it had), and re-asserts the invariant when a hand-edited stash
+    // disagrees with the live pair — the live pair is the authority, because that is the number
+    // the engine and every earlier build actually consume. Live values are never changed here.
+    {
+        data_.actuationLeadBySourceMs.clear();
+        data_.actuationLeadUserSetBySource.clear();
+        const QJsonObject leadBySource =
+            obj.value(QStringLiteral("actuation_lead_by_source")).toObject();
+        for (auto it = leadBySource.constBegin(); it != leadBySource.constEnd(); ++it) {
+            if (actuationLeadSourceKey(it.key()) != it.key() && it.key() != QLatin1String("xbox_wgc")) {
+                continue;   // not one of the two canonical route keys
+            }
+            const QJsonObject entry = it.value().toObject();
+            const QJsonValue leadValue = entry.value(QStringLiteral("lead_ms"));
+            if (!leadValue.isDouble()) {
+                continue;
+            }
+            const double lead = cleanActuationLeadMs(leadValue.toDouble(0.0));
+            const QJsonValue userValue = entry.value(QStringLiteral("user_set"));
+            const bool userSet = userValue.isBool() && userValue.toBool(false);
+            if (!actuationLeadIsConfigured(lead, userSet)) {
+                continue;
+            }
+            data_.actuationLeadBySourceMs.insert(it.key(), lead);
+            data_.actuationLeadUserSetBySource.insert(it.key(), userSet);
+        }
+        mirrorActuationLeadIntoSourceStash(data_);
+    }
     // [ORION_METER_DELAY_LEAD_KEYING] Signed Shot Lead offset for the delayed condition. Clamped
     // into its own band by cleanDouble; 0 (the default) leaves the engine byte-identical.
     data_.meterDelayLeadOffsetMs =
@@ -1189,6 +1694,211 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
                                                   data_.autonomousGreenCenterFrac, 0.0, 1.0);
     data_.autonomousGreenCenterMaxMs = cleanDouble(obj, "autonomous_green_center_max_ms",
                                                    data_.autonomousGreenCenterMaxMs, 0.0, 80.0);
+    // [ORION_NO_METER_SHELVED 2026-09-15] Same fence on the way in: a true on disk (from an older
+    // build, a restored backup, or a hand edit) loads as false while the mode is shelved.
+    data_.inputTimedEnabled =
+        inputTimedAllowed() && cleanBool(obj, "input_timed_enabled", false);
+    // [ORION_NO_METER_V2 2026-09-14] Tolerated, not consumed: an existing file keeps its values
+    // and loads without complaint, but no timing math reads either one any more.
+    data_.inputTimedDelayMs = cleanDouble(obj, "input_timed_delay_ms", 500.0, 100.0, 2500.0);
+    data_.inputTimedLeadMs = cleanDouble(obj, "input_timed_lead_ms", 272.0, 150.0, 400.0);
+    data_.inputTimedRhythmEnabled = cleanBool(obj, "input_timed_rhythm_enabled", false);
+    // [ORION_NO_METER_V2 2026-09-14] The blind hold. Out-of-band / hand-edited values are clamped
+    // INTO the slider's band rather than rejected: the floor is a safety property, so the answer
+    // to "someone wrote 200" is 500, never 200.
+    data_.noMeterHoldMs = cleanDouble(obj, "no_meter_hold_ms", 650.0,
+                                      AppConfigData::kNoMeterHoldMinMs,
+                                      AppConfigData::kNoMeterHoldMaxMs);
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14] The fade-only trim. Clamped into the slider's band
+    // for the same reason as the hold.
+    data_.noMeterFadeTrimMs = cleanDouble(obj, "no_meter_fade_trim_ms", 0.0,
+                                          AppConfigData::kNoMeterFadeTrimMinMs,
+                                          AppConfigData::kNoMeterFadeTrimMaxMs);
+    // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] The console's frame period. A missing or
+    // non-numeric key keeps the compiled default (the exact 1000/60), and a hand-edited value is
+    // clamped into 8..40 ms rather than rejected — the band is a guard against a broken number,
+    // not a menu of modes, and dividing the blind law by a zero or a NaN is the failure it
+    // exists to make impossible.
+    data_.consoleFrameMs = clampedConsoleFrameMs(
+        cleanDouble(obj, "console_frame_ms", kConsoleFrameMsDefault,
+                    AppConfigData::kConsoleFrameMinMs, AppConfigData::kConsoleFrameMaxMs));
+    // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] Default TRUE. An existing settings.json
+    // without the key adopts the snap, which IS the behaviour change the owner asked for
+    // ("641 felt inconsistent, 650 is basically perfect"); false restores the unquantized law.
+    data_.noMeterFrameQuantize = cleanBool(obj, "no_meter_frame_quantize",
+                                           data_.noMeterFrameQuantize);
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] Default TRUE. An existing settings.json
+    // without the key adopts the hybrid, which is the behaviour change the owner asked for; the
+    // key exists so pure-blind stays one toggle away for the A/B.
+    data_.noMeterVisionAssist = cleanBool(obj, "no_meter_vision_assist",
+                                          data_.noMeterVisionAssist);
+    // [ORION_LATE_FIRE_TOLERANCE 2026-09-14 owner] Clamped into the band rather than rejected:
+    // 0 restores the abort-on-any-miss behaviour exactly, and the ceiling is a safety property
+    // (past ~40 ms a "late" release is not a shot any more, it is a giveaway).
+    data_.lateFireToleranceMs = cleanDouble(obj, "late_fire_tolerance_ms", 24.0,
+                                            AppConfigData::kLateFireToleranceMinMs,
+                                            AppConfigData::kLateFireToleranceMaxMs);
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] Default TRUE. An existing settings.json without
+    // the key adopts the loop, which is the behaviour change the owner asked for; the key exists
+    // so a pure open-loop Shot Lead stays one toggle away. Step and clamp are CLAMPED into their
+    // bands rather than rejected, exactly like late_fire_tolerance_ms: a 0 step is a valid
+    // request ("record the verdicts, move nothing") and the ceilings are safety properties.
+    data_.bannerLeadTrim = cleanBool(obj, "banner_lead_trim", data_.bannerLeadTrim);
+    data_.bannerTrimStepMs = cleanDouble(obj, "banner_trim_step_ms", 3.0,
+                                         AppConfigData::kBannerTrimStepMinMs,
+                                         AppConfigData::kBannerTrimStepMaxMs);
+    data_.bannerTrimMaxMs = cleanDouble(obj, "banner_trim_max_ms", 15.0,
+                                        AppConfigData::kBannerTrimMaxMinMs,
+                                        AppConfigData::kBannerTrimMaxMaxMs);
+    // [ORION_BANNER_TRIM_HOLD 2026-09-16 owner] The EXCELLENT/GREEN hold, CLAMPED into its band
+    // like its two neighbours: an out-of-band value is a typo, not a request to disarm the hold.
+    data_.bannerTrimHoldShots = cleanInt(obj, "banner_trim_hold_shots", 12,
+                                         AppConfigData::kBannerTrimHoldShotsMin,
+                                         AppConfigData::kBannerTrimHoldShotsMax);
+    // [ORION_BANNER_TRIM_TEMPO 2026-09-16 owner] The tempo sub-buckets. A plain boolean, read the
+    // same fail-to-the-setting way banner_lead_trim is: a non-boolean value leaves the compiled
+    // default (TRUE) standing rather than silently disarming the split.
+    data_.bannerTrimTempoBuckets = cleanBool(obj, "banner_trim_tempo_buckets",
+                                             data_.bannerTrimTempoBuckets);
+    // [ORION_BANNER_TRIM_RANGE 2026-09-17 owner] The fade range sub-buckets. A plain boolean,
+    // read the same way: an existing settings.json without the key adopts TRUE, which changes
+    // nothing on its own -- a fade only gains a third key segment once the sidecar can actually
+    // read the range, and an unknown range keys exactly as the 2026-09-16 build did.
+    data_.bannerTrimRangeBuckets = cleanBool(obj, "banner_trim_range_buckets",
+                                             data_.bannerTrimRangeBuckets);
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19 owner] A panel with no coverage CELL calibrates.
+    // A plain boolean, read the fail-to-the-setting way its neighbours are: an existing
+    // settings.json without the key adopts TRUE, which is the behaviour change the owner asked
+    // for -- the 2-cell drill panel was 98 of 281 graded releases on 2026-09-18 and every one of
+    // them was excluded from the loop as "coverage unknown".
+    data_.bannerTrimAbsentCoverageOpen = cleanBool(obj, "banner_trim_absent_coverage_open",
+                                                   data_.bannerTrimAbsentCoverageOpen);
+    // [ORION_BANNER_TRIM_BIAS 2026-09-19 owner] The integrator's window and vote margin, CLAMPED
+    // into their bands like banner_trim_hold_shots: an out-of-band value is a typo, not a request
+    // to disarm the bound. 0 votes IS a legal request (the documented kill switch) and is inside
+    // the band, so it survives the clamp.
+    data_.bannerTrimBiasWindow = cleanInt(obj, "banner_trim_bias_window", 12,
+                                          AppConfigData::kBannerTrimBiasWindowMin,
+                                          AppConfigData::kBannerTrimBiasWindowMax);
+    data_.bannerTrimBiasVotes = cleanInt(obj, "banner_trim_bias_votes", 0,
+                                         AppConfigData::kBannerTrimBiasVotesMin,
+                                         AppConfigData::kBannerTrimBiasVotesMax);
+    // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16 owner] The fixed per-shot-type addition to the Shot
+    // Lead. CLAMPED into the band rather than rejected, exactly like banner_trim_step_ms: 0 is a
+    // valid request on every bucket (and zeroing all four restores the 2026-09-16 baseline lead
+    // byte-for-byte) while the +-40 ceiling is a safety property. An existing settings.json
+    // without the keys adopts the 8/8/0/0 defaults, which IS the behaviour change the owner asked
+    // for -- fades fire 8 ms earlier, standstills are untouched.
+    data_.leadOffsetLeftFadeMs = cleanDouble(obj, "lead_offset_left_fade_ms", 8.0,
+                                             AppConfigData::kLeadOffsetByTypeMinMs,
+                                             AppConfigData::kLeadOffsetByTypeMaxMs);
+    data_.leadOffsetRightFadeMs = cleanDouble(obj, "lead_offset_right_fade_ms", 8.0,
+                                              AppConfigData::kLeadOffsetByTypeMinMs,
+                                              AppConfigData::kLeadOffsetByTypeMaxMs);
+    data_.leadOffsetStandstillMs = cleanDouble(obj, "lead_offset_standstill_ms", 0.0,
+                                               AppConfigData::kLeadOffsetByTypeMinMs,
+                                               AppConfigData::kLeadOffsetByTypeMaxMs);
+    data_.leadOffsetOtherMs = cleanDouble(obj, "lead_offset_other_ms", 0.0,
+                                          AppConfigData::kLeadOffsetByTypeMinMs,
+                                          AppConfigData::kLeadOffsetByTypeMaxMs);
+    // [ORION_LEAD_OFFSET_FADE_MID 2026-09-17 owner] Used INSTEAD of the two fade offsets when
+    // the live press's range reads `mid`. An existing file without the key adopts 6.0, which is
+    // only reachable once a range actually arrives.
+    data_.leadOffsetFadeMidMs = cleanDouble(obj, "lead_offset_fade_mid_ms", 6.0,
+                                            AppConfigData::kLeadOffsetByTypeMinMs,
+                                            AppConfigData::kLeadOffsetByTypeMaxMs);
+    // [ORION_LEAD_AUTO_SEED 2026-09-15 owner] Default TRUE. An existing settings.json without the
+    // key adopts the seed, which is the behaviour change the owner asked for -- and which can
+    // only reach an install whose Shot Lead is still "never configured", because a configured
+    // lead (user-set OR already seeded into actuation_lead_ms) out-ranks it everywhere. The
+    // margin and the placeholder are CLAMPED into their bands rather than rejected, exactly like
+    // banner_trim_step_ms: 0 margin restores today's pure authority lead and the ceilings are
+    // safety properties.
+    data_.leadAutoSeed = cleanBool(obj, "lead_auto_seed", data_.leadAutoSeed);
+    data_.aimMarginMs = cleanDouble(obj, "aim_margin_ms", 69.0,
+                                    AppConfigData::kAimMarginMinMs,
+                                    AppConfigData::kAimMarginMaxMs);
+    data_.leadFactoryPlaceholderMs =
+        cleanDouble(obj, "lead_factory_placeholder_ms", 269.0,
+                    AppConfigData::kLeadFactoryPlaceholderMinMs,
+                    AppConfigData::kLeadFactoryPlaceholderMaxMs);
+    // [ORION_OWNED_METER_NEVER_ABORTS 2026-09-14 owner] default TRUE; false restores the bounded
+    // tolerance above exactly as it shipped.
+    data_.ownedMeterNeverAborts = cleanBool(obj, "owned_meter_never_aborts",
+                                            data_.ownedMeterNeverAborts);
+    // [ORION_OWNERSHIP_PROOF_LENIENCY 2026-09-14 owner] default TRUE; false restores today's
+    // ownership_proof_incomplete refusal exactly.
+    data_.ownershipProofLeniency = cleanBool(obj, "ownership_proof_leniency",
+                                             data_.ownershipProofLeniency);
+    // [ORION_METER_BLIND_BACKSTOP 2026-09-14 owner] default TRUE. An existing settings.json
+    // without the key adopts the backstop, which is the behaviour change the owner asked for
+    // ("aborts on wide-open shots" is a ship blocker); false restores today's
+    // press_unanswered_no_meter abort exactly.
+    data_.meterBlindBackstop = cleanBool(obj, "meter_blind_backstop", data_.meterBlindBackstop);
+    // [ORION_METER_BACKSTOP_GRACE 2026-09-15 owner] Clamped into the band rather than rejected,
+    // exactly like the late-fire tolerance: 0 restores the 2026-09-14 deadline (press + the law)
+    // byte-for-byte, and the ceiling is a safety property (a grace past ~400 ms would outlive the
+    // shot animation the backstop exists to answer). An existing settings.json without the key
+    // adopts the 100 ms default, which IS the behaviour change the owner asked for.
+    // [ORION_METER_BACKSTOP_GRACE_FADE 2026-09-15 owner] Clamped into its band rather than
+    // rejected, exactly like the Standstill grace: 0 restores the single-grace behaviour (a fade
+    // then uses meter_backstop_grace_ms) and the ceiling is a safety property.
+    data_.meterBackstopGraceFadeMs = cleanDouble(obj, "meter_backstop_grace_fade_ms", 220.0,
+                                                 AppConfigData::kMeterBackstopGraceFadeMinMs,
+                                                 AppConfigData::kMeterBackstopGraceFadeMaxMs);
+    data_.meterBackstopGraceMs = cleanDouble(obj, "meter_backstop_grace_ms", 100.0,
+                                             AppConfigData::kMeterBackstopGraceMinMs,
+                                             AppConfigData::kMeterBackstopGraceMaxMs);
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-16 owner] Clamped into its band rather than
+    // rejected, exactly like the two graces: 0 restores the 2026-09-15 deadline byte-for-byte and
+    // the ceiling is a safety property.
+    // [ORION_METER_BACKSTOP_NEVER_SEEN 2026-09-17 owner] The default is now 0 -- THE COLLAPSE IS
+    // OFF. The 2026-09-17 press-window dump showed it firing blind 19-39 ms before a LATE
+    // GATHER's own meter existed (track drawn at press+614/+617, collapsed deadline +653), and a
+    // blind fire on a shot that was about to have a meter costs more than the ~100 ms of feel it
+    // saves on a press that was never going to get one. See AppConfigData for the full trade; an
+    // existing settings.json that carries the key keeps whatever the owner set.
+    data_.meterBackstopNeverSeenProbeMs = cleanDouble(
+        obj, "meter_backstop_never_seen_probe_ms", 0.0,
+        AppConfigData::kMeterBackstopNeverSeenProbeMinMs,
+        AppConfigData::kMeterBackstopNeverSeenProbeMaxMs);
+    // [ORION_METER_BACKSTOP_NEVER_SEEN_FADE 2026-09-16 owner] Clamped into its own band, and its
+    // default is 0: an existing settings.json without the key EXCLUDES fades from the collapse,
+    // which is the measured behaviour (a slow fade's meter is first seen 1000-1051 ms into the
+    // press, after its own law). 0 here means excluded, NOT "fall back to the Standstill probe".
+    data_.meterBackstopNeverSeenProbeFadeMs = cleanDouble(
+        obj, "meter_backstop_never_seen_probe_fade_ms", 0.0,
+        AppConfigData::kMeterBackstopNeverSeenProbeFadeMinMs,
+        AppConfigData::kMeterBackstopNeverSeenProbeFadeMaxMs);
+    // [ORION_VISION_HOLD_BAND 2026-09-15 owner] Clamped into the band rather than rejected,
+    // exactly like the two backstop graces: 0 is the kill switch (vision fires wherever it
+    // predicted, byte-for-byte the 2026-09-15 build) and the ceiling is a safety property (a band
+    // past ~200 ms cannot bind on a real hold, so it would be an OFF switch wearing an ON label).
+    // [SHIP CONFIG 2026-09-17] The compiled default is now 0 (band OFF) -- see AppConfigData::
+    // visionHoldBandMs for the 09-16 21:00 refutation. An existing settings.json without the key
+    // therefore adopts 0/0 and fires exactly where vision predicted, and a file that DOES carry
+    // the key keeps whatever the owner last set. The two fallbacks below must stay in lockstep
+    // with the header's defaults or a fresh install and a key-less file would disagree.
+    data_.visionHoldBandMs = cleanDouble(obj, "vision_hold_band_ms", 0.0,
+                                         AppConfigData::kVisionHoldBandMinMs,
+                                         AppConfigData::kVisionHoldBandMaxMs);
+    data_.visionHoldBandFadeMs = cleanDouble(obj, "vision_hold_band_fade_ms", 0.0,
+                                             AppConfigData::kVisionHoldBandFadeMinMs,
+                                             AppConfigData::kVisionHoldBandFadeMaxMs);
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15 owner] Ignore-unknown, never guess: a value that is
+    // neither "flick" nor "letgo" leaves the shipped flick in force. cleanText gives us the raw
+    // string; the vocabulary check is here so file, setting and env all share one rule.
+    {
+        const QString style = cleanText(obj, "tempo_release_style", data_.tempoReleaseStyle, 16)
+                                  .trimmed().toLower();
+        if (style == QLatin1String("flick") || style == QLatin1String("letgo")) {
+            data_.tempoReleaseStyle = style;
+        }
+    }
+    // [ORION_PRESS_ANCHORED_FALLBACK 2026-09-14 — RETIRED] Tolerated on load so an existing file
+    // is neither rejected nor silently rewritten; no code path reads the value.
+    data_.pressAnchoredFallbackEnabled = cleanBool(
+        obj, "press_anchored_fallback_enabled", data_.pressAnchoredFallbackEnabled);
     data_.noMeterEnabled = cleanBool(obj, "no_meter_enabled", data_.noMeterEnabled);
     data_.noMeterReleasePoint = cleanText(obj, "no_meter_release_point", data_.noMeterReleasePoint, 32);
     // Range widened 2026-08-08 from [-40, 40] to [-200, 200]: the header default is 83.0
@@ -1236,6 +1946,13 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     data_.fixedHoldMs = cleanDouble(obj, "fixed_hold_time_ms", data_.fixedHoldMs, 100.0, 2000.0);
     data_.earlyLateOffsetMs = cleanDouble(obj, "early_late_offset_ms", data_.earlyLateOffsetMs, -100.0, 100.0);
     data_.tempoWaitMs = cleanDouble(obj, "tempo_wait_ms", data_.tempoWaitMs, 0.0, 250.0);
+    // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] Signed trim, so the band is symmetric about 0 and 0
+    // is the inert default. Clamped rather than ignored: unlike the Shot Lead (where an
+    // out-of-band value must degrade to "not configured" so it cannot become an invented lead),
+    // this can only ever shrink an EXISTING lead, so clamping is the safe, predictable behaviour.
+    data_.rhythmFlickDelayMs = cleanDouble(obj, "rhythm_flick_delay_ms", data_.rhythmFlickDelayMs,
+                                           AppConfigData::kRhythmFlickDelayMinMs,
+                                           AppConfigData::kRhythmFlickDelayMaxMs);
     // [ORION_FLICK_FLOOR 2026-08-13] Lower bound is 50, not 10, because AutomationEngine applies
     // `std::max(flickHold, releasePulseMs)` and releasePulseMs is a fixed 50.0 (engine-only, never
     // configurable). Everything under 50 therefore ran as 50: this owner's stored 16 had been
@@ -1271,6 +1988,10 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
                 data_.remotePlayInputSource);
         }
         data_.tempoWaitMs = cleanDouble(tempo, "wait_ms", data_.tempoWaitMs, 0.0, 250.0);
+        data_.rhythmFlickDelayMs = cleanDouble(tempo, "rhythm_flick_delay_ms",
+                                               data_.rhythmFlickDelayMs,
+                                               AppConfigData::kRhythmFlickDelayMinMs,
+                                               AppConfigData::kRhythmFlickDelayMaxMs);
         // Same 50 ms engine floor as the flat tempo_flick_hold_ms key above.
         data_.tempoFlickHoldMs = cleanDouble(tempo, "flick_hold_ms", data_.tempoFlickHoldMs, 50.0, 500.0);
         data_.tempoMinStickHoldMs = cleanDouble(tempo, "min_stick_hold_ms", data_.tempoMinStickHoldMs, 0.0, 500.0);
@@ -1362,6 +2083,15 @@ void AppConfig::loadLearningObject(const QJsonObject& obj)
         const double v = obj.value(QStringLiteral("measured_phase_physical_ms")).toDouble(-1.0);
         learning_.measuredPhasePhysicalMs = (v >= 200.0 && v <= 500.0) ? v : -1.0;
     }
+    // [ORION_SESSION_LEAD_PROBE] same plausibility band; an out-of-band pair reads as never
+    // captured and the engine recaptures.
+    {
+        const double v = obj.value(QStringLiteral("lead_reference_physical_ms")).toDouble(-1.0);
+        const double l = obj.value(QStringLiteral("lead_reference_lead_ms")).toDouble(-1.0);
+        const bool ok = v >= 200.0 && v <= 500.0 && l > 0.0 && l <= 1000.0;
+        learning_.leadReferencePhysicalMs = ok ? v : -1.0;
+        learning_.leadReferenceLeadMs = ok ? l : -1.0;
+    }
     const auto typeCalPhase = obj.value(QStringLiteral("shot_type_cal_phase")).toObject();
     for (auto it = typeCalPhase.constBegin(); it != typeCalPhase.constEnd(); ++it) {
         learning_.shotTypeCalPhase.insert(it.key(), it.value().toInt());
@@ -1386,6 +2116,32 @@ void AppConfig::loadLearningObject(const QJsonObject& obj)
     const auto typeLatency = obj.value(QStringLiteral("shot_type_latency_ms")).toObject();
     for (auto it = typeLatency.constBegin(); it != typeLatency.constEnd(); ++it) {
         learning_.shotTypeLatencyMs.insert(it.key(), it.value().toDouble());
+    }
+    // [ORION_NO_METER_V2 2026-09-14] Per-type vision-path hold. A record whose median is outside
+    // the plausible hold envelope, or whose count is non-positive, is dropped rather than
+    // installed: it feeds a BLIND release, so a corrupt entry must degrade to the shipped table,
+    // never to an arbitrary hold.
+    const auto noMeterHold = obj.value(QStringLiteral("no_meter_hold_by_type")).toObject();
+    for (auto it = noMeterHold.constBegin(); it != noMeterHold.constEnd(); ++it) {
+        const QJsonObject rec = it.value().toObject();
+        NoMeterHoldRecord parsed;
+        parsed.medianMs = rec.value(QStringLiteral("median_ms")).toDouble(-1.0);
+        parsed.n = rec.value(QStringLiteral("n")).toInt(0);
+        if (parsed.n > 0 && parsed.medianMs >= 200.0 && parsed.medianMs <= 4000.0) {
+            learning_.noMeterHoldByType.insert(it.key(), parsed);
+        }
+    }
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] Same schema guard, same reason: this value is ADDED to
+    // the owner's Shot Lead, so a corrupt entry must degrade to "no trim" rather than to an
+    // offset no setting could have produced. The 50 % start decay and the clamp to the LIVE
+    // banner_trim_max_ms both happen in the engine (BannerLeadTrim::restoreDecayed) -- the file
+    // layer only refuses what is not a number in the persistable band.
+    const auto bannerTrim = obj.value(QStringLiteral("banner_lead_trim_by_type")).toObject();
+    for (auto it = bannerTrim.constBegin(); it != bannerTrim.constEnd(); ++it) {
+        const double value = it.value().toDouble(std::numeric_limits<double>::quiet_NaN());
+        if (std::isfinite(value) && std::abs(value) <= BannerLeadTrim::kPersistCeilingMs) {
+            learning_.bannerLeadTrimByType.insert(it.key(), value);
+        }
     }
 }
 

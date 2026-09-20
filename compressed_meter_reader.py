@@ -164,6 +164,17 @@ class CompressedMeterReader(SimpleMeterReader):
             self._tip_persist = 0
             self._native_y = None
 
+    def reset_tracking(self):
+        """Retire pixel-coordinate acquisition evidence on source/profile changes.
+
+        Ordinary lock/shot resets deliberately keep the same scene's hint and
+        rejected rail registry; a new source or profile must not inherit them.
+        """
+        super().reset_tracking()
+        self._acq_hint = None
+        self._decor_registry = []
+        self._registry_frame = 0
+
     # ------------------------------------------------------------------ #
     #  quality layer: q_session -> discrete tunables + the luma gate
     # ------------------------------------------------------------------ #
@@ -488,10 +499,11 @@ class CompressedMeterReader(SimpleMeterReader):
     def read(self, frame, ts: Optional[float] = None) -> dict:
         if ts is None:
             ts = _time.perf_counter()
+        # Direct read() callers must retire old geometry BEFORE the stale fast
+        # return. detect() already prepares it; this same-size call is idempotent.
+        # Reset precedes _cur_ts because _reset_state clears the de-lag timestamp.
+        self._prepare_frame_geometry(frame)
         self._cur_ts = ts                      # de-lag dt inside _read_fill (state only)
-        if not self.W or not self.H:
-            self.H, self.W = int(frame.shape[0]), int(frame.shape[1])
-            self._recompute_scale()
         locked = self.conf >= self.CONF_MIN and self.box is not None
         stale_now = locked and self._check_stale(frame, ts)
         if stale_now and self._stale_run < self.STALE_RUN_MAX:

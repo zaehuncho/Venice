@@ -3,7 +3,11 @@
 from pathlib import Path
 import re
 
-from tools.release_filter_policy import is_crown_jewel_python, is_forbidden_file_name
+from tools.release_filter_policy import (
+    is_crown_jewel_python,
+    is_forbidden_file_name,
+    is_unapproved_model_path,
+)
 
 
 def test_transient_test_transcripts_are_forbidden_but_license_text_is_allowed():
@@ -28,6 +32,13 @@ def test_packet_delay_lab_artifacts_are_never_release_files():
 
     assert is_forbidden_file_name("delay_test.py")
     assert is_forbidden_file_name("ADAPTIVE_DELAY_PLAN.md")
+
+
+def test_only_source_bound_production_detector_model_is_release_approved():
+    assert not is_unapproved_model_path(Path("models/orion_meter_detector.onnx"))
+    assert is_unapproved_model_path(Path("models/experimental_meter.onnx"))
+    assert is_crown_jewel_python(Path("meter_detector_yolo.py"))
+    assert is_crown_jewel_python(Path("autogreen_sidecar.py"))
 
 
 def test_decoder_pipe_identity_is_compiled_tested_and_never_shipped_as_source():
@@ -75,7 +86,9 @@ def test_verifier_builds_every_registered_native_test_executable():
     root = Path(__file__).resolve().parents[1]
     script = (root / "scripts" / "verify_orion.ps1").read_text(encoding="utf-8")
     cmake = (root / "native_orion" / "CMakeLists.txt").read_text(encoding="utf-8")
-    registered = set(re.findall(r"add_test\(NAME\s+(\w+)", cmake))
+    # Qt tests are registered through orion_add_qtest(target), whose add_test
+    # call uses ${target}; a literal-name regex misses every registered test.
+    registered = set(re.findall(r"orion_add_qtest\((Orion\w+Tests)\)", cmake))
     assert registered
 
     build_lines = {

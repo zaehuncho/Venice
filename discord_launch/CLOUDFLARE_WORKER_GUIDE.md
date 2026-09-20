@@ -17,31 +17,51 @@ Create Customer/Lifetime/Trial/Verified/Muted (per `SERVER_BLUEPRINT.md`); copy 
 Deploy `backend/lambda_function.py` (has `/api/bot/*`, the SellHub webhook, `register-commands`). Sanity: `GET https://v348t5hg3i.execute-api.us-east-1.amazonaws.com/api/version`.
 
 ## 5. Deploy the Worker
+
+**STOP — confirm the Worker name first (do not skip).** `wrangler.toml` says `name = "orion-license-bot"`, and as of 2026-08-04 **no Worker by that name exists** on the account. The two that do are `orion-discord-bot` and `license-redeem-proxy`, and the docs disagree about which one Discord actually calls. Deploying as-is publishes a *third* Worker: nothing errors, and the commands keep running the old code.
+
+1. Dev Portal → your app → **General Information → Interactions Endpoint URL**. Read the hostname.
+2. Match it to a Worker: `wrangler deployments list` / the Cloudflare dashboard (Workers & Pages).
+3. Set `name` in `wrangler.toml` to **that** Worker. Only then deploy.
+
 ```
 npm i -g wrangler && wrangler login
 # in a folder with orion_worker.js + wrangler.toml:
 wrangler secret put DISCORD_PUBLIC_KEY     # paste the app Public Key (hex)
 wrangler secret put DISCORD_APP_ID         # the Application ID
 wrangler secret put ORION_BOT_SECRET       # the SAME value as SSM /orion/bot_service_secret
+wrangler secret put ORION_EDGE_AUTH        # the SAME value as SSM /orion/edge_auth_secret
 wrangler deploy
 ```
-Note the URL (`https://orion-license-bot.<account>.workers.dev`, or add a custom route on `zaeorion.com`). Secrets stay in Worker secrets — never in `wrangler.toml`.
+`ORION_EDGE_AUTH` is **not optional**: the HIGH-3/HIGH-4 hardening made `require_edge_auth()` unconditional for every route, `/api/bot/*` included — without it every command 403s before it reaches the bot-secret gate.
+
+`[vars]` in `wrangler.toml` (non-secret): `ORION_API_BASE`, **`STORE_URL`** (the website `/purchase` links to — set it or `/purchase` drops the button and says so), `STAFF_ROLE_IDS` (comma-separated; client-side gate for `/lookup` of other users only).
+
+`GUMROAD_BASE` survives only as a fallback for `STORE_URL` so a Worker deployed before this change keeps a working button. `GUMROAD_HWID_RESET_SLUG` is **gone**: under the owner's 2026-09-15 rule a customer gets 3 free HWID resets and then pays 1 day off the subscription, so `/hwid_reset` links no store at all.
+
+Note the URL, or add a custom route on `zaeorion.com`. Secrets stay in Worker secrets — never in `wrangler.toml`.
 
 ## 6. Discord Interactions URL
 Dev Portal → General Information → **Interactions Endpoint URL** = the Worker URL → Save. Discord sends a signed PING; with the real Ed25519 verify it saves with a green check. *(Fails = wrong DISCORD_PUBLIC_KEY secret, or an old `compatibility_date`.)*
 
-## 7. Register the 3 commands (owner, once)
+## 7. Register the commands (owner, re-run on every command change)
+The old `/api/discord/register-commands` Lambda route **does not exist** on the deployed bundle (`LAMBDA_RECONCILIATION.md`). Commands are pushed straight to Discord from `discord_commands.json`:
 ```
-curl -X POST "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com/api/discord/register-commands" \
-     -H "X-Orion-Admin-Secret: <ADMIN_SECRET>"
+export DISCORD_BOT_TOKEN=...   DISCORD_APP_ID=...   ORION_GUILD_ID=...
+python register_commands.py --dry-run     # prints what would be sent
+python register_commands.py               # bulk PUT, guild-scoped = instant
 ```
-→ registers `claim_trial`, `hwid_reset`, `deliver` (guild = instant). The launcher killswitch is NOT a Discord command — see `OrionOwner.exe` / `orion-admin killswitch`.
+→ `purchase`, `claim_trial`, `hwid_reset`, `deliver`, `keygen`, `lookup`. Bulk-overwrite: anything not in the JSON is removed from the guild. Do **not** run this while the gateway bot (`orion_bot.py`) is the deployed front-end — it syncs its own tree on boot and the two fight.
+
+**Then grant the staff role access**: `/deliver` and `/keygen` ship with `default_member_permissions: "0"`, which hides them from everyone but Discord administrators. Server Settings → Integrations → *(the app)* → **Command Permissions** → allow the Staff role. That is *visibility only* — authorization is the license server's `orion-staff` check on `actor_discord_id` (contract §1/§4).
+
+The launcher killswitch is NOT a Discord command, and `/api/bot/killswitch` is status-only (contract §5) — flip global kill from `OrionOwner.exe` / `orion-admin`.
 
 ## 8. SellHub webhook
 Dash → Webhooks → `https://v348t5hg3i.execute-api.us-east-1.amazonaws.com/api/sellhub/webhook`; events **paid/completed + refunded/chargeback**; signing secret → SSM `/orion/sellhub_webhook_secret`; product delivery = the "check your DMs" static message.
 
 ## 9. Test
-- `/claim_trial` → DMs a key + Trial role; re-run → "already claimed"; a 2nd trial on the SAME PC (alt) → "device already used a trial".
+- `/claim_trial` → DMs the Discord connection link + Trial role; re-run → "already claimed"; a 2nd trial on the SAME PC (alt) → "device already used a trial".
 - `/hwid_reset` → unbinds; immediate re-run → "try again in 24h".
 - `/deliver user:@x plan:month` → DMs a month key + Customer role.
 - Buy with a 100%-off coupon → webhook → DM key + Customer role + `#sales-log`.

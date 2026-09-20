@@ -1,0 +1,16 @@
+{
+  "name": "venice-site",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test:worker": "node --test tests/worker.test.mjs",
+    "check": "python tests/verify_site.py public/index.html && node --test tests/worker.test.mjs",
+    "deploy:preview": "wrangler deploy",
+    "deploy:production": "wrangler deploy --env production"
+  },
+  "devDependencies": {
+    "wrangler": "^4.118.0"
+  }
+}

@@ -24,7 +24,7 @@ C:\Python314\python.exe tools\admin\check_backend_contract.py --base-url https:/
 
 ## Packing command
 
-Use `tools\security\pack_orion_release.py` to apply the packer and then verify
+Use `tools\security\pack_lethe_release.py` to apply the packer and then verify
 the packed package. The script copies `release\orion-package` to
 `release\orion-package-packed`, runs the packer per target, regenerates
 `release_manifest.json`, runs the package audit, launches Owner/Staff startup
@@ -34,7 +34,7 @@ The packer command template must contain `{input}` and `{output}`. Do not quote
 the placeholders; the wrapper inserts quoted paths.
 
 ```powershell
-C:\Python314\python.exe tools\security\pack_orion_release.py `
+C:\Python314\python.exe tools\security\pack_lethe_release.py `
   --packer-command "C:\Path\To\PackerConsole.exe {input} {output} -profile C:\Path\To\orion-owner-staff-profile.cfg" `
   --require-live-backend
 ```
@@ -42,7 +42,7 @@ C:\Python314\python.exe tools\security\pack_orion_release.py `
 For a verification dry run without a packer installed:
 
 ```powershell
-C:\Python314\python.exe tools\security\pack_orion_release.py --verify-only
+C:\Python314\python.exe tools\security\pack_lethe_release.py --verify-only
 ```
 
 ## Default pack targets and DLL safety boundary
@@ -55,7 +55,7 @@ The production wrapper packs first-party executable binaries only:
 - `OrionUpdater.exe`
 
 All DLL release targets are currently blocked, including Orion's first-party
-core DLLs. The internal OrionPack DLL round-trip harness remains valid lab
+core DLLs. The internal Lethe DLL round-trip harness remains valid lab
 coverage, but it does not authorize packed DLLs for production: protected DLL
 imports are still resolved during `DllMain`, under the Windows loader lock.
 Keep every DLL unpacked until loader-safe deferred initialization is implemented

@@ -179,6 +179,40 @@ public:
         return std::nullopt;
     }
 
+    // A provisional prior-frame bridge can already be visible when its exact
+    // detector observation arrives. Refine ONLY the currently acknowledged
+    // texture, never another pending/older serial or a newer-on-older join.
+    // An existing visible lock is mandatory: this cannot resurrect a cleared
+    // outline or turn late metadata into new detection/timing authority.
+    [[nodiscard]] bool backfillPresentedExact(
+        int lastAcknowledgedSerial, const QSize& captureSize,
+        int sourceFrameNumber, const QRect& captureBox, quint64 shotToken)
+    {
+        if (lastAcknowledgedSerial < 0 || sourceFrameNumber < 0
+            || !captureSize.isValid() || !captureBox.isValid()) {
+            return false;
+        }
+        for (auto& snapshot : snapshots_) {
+            if (snapshot.serial != lastAcknowledgedSerial) {
+                continue;
+            }
+            if (!snapshot.meterConfirmed
+                || (!snapshot.meterBox.isValid() && !snapshot.joinedCaptureBox.isValid())
+                || snapshot.captureSize != captureSize
+                || snapshot.sourceFrameNumber != sourceFrameNumber
+                || snapshot.shotToken != shotToken
+                || snapshot.joinedDetectionFrameNumber >= sourceFrameNumber) {
+                return false;
+            }
+            snapshot.meterBox = {};
+            snapshot.rejectedBox = {};
+            snapshot.joinedCaptureBox = captureBox;
+            snapshot.joinedDetectionFrameNumber = sourceFrameNumber;
+            return true;
+        }
+        return false;
+    }
+
     // A preview can beat its detector result through the independent decode and
     // telemetry paths. Patch only snapshots which QML has not acknowledged,
     // and let the caller resolve a box using the same exact-or-prior frame join

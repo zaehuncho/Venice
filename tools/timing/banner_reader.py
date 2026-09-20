@@ -50,8 +50,8 @@ WHERE THE BANNER LIVES (measured 2026-08-06 on the 2026-08-04 framedumps)
    * The release->verdict-onset delay is NOT constant: measured 0.5-0.9 s on
      park courts, ~1.9-2.2 s on the persistent-panel court. The join uses a
      [0.2, 3.5] s window with FIFO assignment, after per-session clock
-     calibration (framedump PNG mtimes lag capture by a writer-queue delay that
-     differs per session; calibrated against reservation_created log lines).
+    calibration. New framedumps carry producer-side capture time in frames.csv;
+    legacy dumps fall back to PNG mtimes and reservation_created calibration.
 
 USAGE
   # 1) scan recorded frames -> banner events CSV (+ crops for hand-labelling)
@@ -289,16 +289,41 @@ def extract_value_mask(frame, lx, ly):
     # squashes the glyphs at canonicalisation (measured: 19-row bbox for 9-row text)
     rowsum = gm.sum(axis=1)
     if rowsum.max() > 0:
-        thr_r = 0.25 * rowsum.max()
-        peak = int(np.argmax(rowsum))
+        # A made shot can draw a bright green outline around the TIMING cell.
+        # Its horizontal bottom edge is denser than every glyph row and used to
+        # win argmax below, trimming the actual EXCELLENT word away and making
+        # the offline grader systematically blind to greens.  Exclude only
+        # near-solid horizontal rules when choosing the text band; keep them in
+        # `gm` until the ordinary band trim has selected the glyph rows.
+        group_width = int(grp[-1] - grp[0] + 1)
+        peak_rows = rowsum.copy()
+        peak_rows[peak_rows >= 0.80 * group_width] = 0
+        if peak_rows.max() <= 0:
+            peak_rows = rowsum
+        thr_r = 0.25 * peak_rows.max()
+        peak = int(np.argmax(peak_rows))
         r0 = peak
-        while r0 > 0 and rowsum[r0 - 1] >= thr_r:
+        while r0 > 0 and peak_rows[r0 - 1] >= thr_r:
             r0 -= 1
         r1 = peak
-        while r1 < len(rowsum) - 1 and rowsum[r1 + 1] >= thr_r:
+        while r1 < len(rowsum) - 1 and peak_rows[r1 + 1] >= thr_r:
             r1 += 1
         gm[:r0, :] = 0
         gm[r1 + 1:, :] = 0
+        # The same selected-cell outline has near-solid vertical sides.  They
+        # survive the row trim as two remote bars and stretch the canonical
+        # word mask from ~100 px to the entire cell, destroying word NCC.  Only
+        # remove dense columns at the outer edges of the active span; dense
+        # interior columns are legitimate glyph strokes (E/L/T, etc.).
+        colsum_after = gm.sum(axis=0)
+        active_cols = np.flatnonzero(colsum_after > 0)
+        if active_cols.size:
+            left, right = int(active_cols[0]), int(active_cols[-1])
+            edge_width = max(3, int(round(0.08 * (right - left + 1))))
+            dense = colsum_after >= 0.80 * max(1, r1 - r0 + 1)
+            edge = ((np.arange(gm.shape[1]) <= left + edge_width) |
+                    (np.arange(gm.shape[1]) >= right - edge_width))
+            gm[:, dense & edge] = 0
     ys, xs = np.nonzero(gm)
     if ys.size < MIN_MASK_PX or (ys.max() - ys.min()) < 7 or (xs.max() - xs.min()) < 18:
         return None
@@ -340,37 +365,78 @@ def classify_word(tight_mask, word_tmpls):
 
 
 # ---------------------------------------------------------------- frame sources
-def iter_session(session_dir):
-    """Yield (frame_idx, wall_dt_local, path) for a framedump session, mtime-ordered
-    coherently: sessions can be two spliced runs (index wrap overwrote the head --
-    seen in session_20260804_201020 at idx 141). We order by mtime, which restores
-    each run's internal order; the caller sees a monotone timeline."""
-    rows = []
-    for p in glob.glob(os.path.join(session_dir, "f*_raw.png")):
+def _session_capture_times(session_dir, paths):
+    """Return path -> producer epoch seconds for capture-clock framedumps.
+
+    ``write_wall`` is the schema marker. Older frames.csv files stamped t_wall
+    inside the async writer, so treating their t_wall as capture time would
+    silently preserve the exact queue-delay bug this index is meant to remove.
+    A sidecar restart can reuse/overwrite f00000..., leaving duplicate CSV keys;
+    select the row whose write_wall is nearest the surviving PNG mtime.
+    """
+    csv_path = os.path.join(session_dir, "frames.csv")
+    if not os.path.isfile(csv_path):
+        return {}
+    try:
+        with open(csv_path, newline="", encoding="utf-8", errors="replace") as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames or "write_wall" not in reader.fieldnames:
+                return {}
+            candidates = {}
+            for row in reader:
+                try:
+                    key = (int(row["idx"]), int(row["detected"]))
+                    capture_wall = float(row["t_wall"])
+                    write_wall = float(row["write_wall"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (np.isfinite(capture_wall) and np.isfinite(write_wall)):
+                    continue
+                candidates.setdefault(key, []).append((write_wall, capture_wall))
+    except OSError:
+        return {}
+
+    capture_times = {}
+    for p in paths:
         m = re.search(r"f(\d+)_([01])_raw\.png$", os.path.basename(p))
         if not m:
             continue
-        rows.append((os.path.getmtime(p), int(m.group(1)), p))
+        choices = candidates.get((int(m.group(1)), int(m.group(2))))
+        if not choices:
+            continue
+        png_mtime = os.path.getmtime(p)
+        capture_times[p] = min(choices, key=lambda pair: abs(pair[0] - png_mtime))[1]
+    return capture_times
+
+
+def iter_session(session_dir):
+    """Yield (frame_idx, wall_dt_local, path) in capture chronology.
+
+    Capture-clock framedumps use producer-side frames.csv time. Legacy sessions
+    remain mtime-ordered because their t_wall was recorded only after async PNG
+    encoding. Ordering by either clock also restores each run's internal order
+    when an index wrap overwrote the head (session_20260804_201020 at idx 141).
+    """
+    paths = glob.glob(os.path.join(session_dir, "f*_raw.png"))
+    capture_times = _session_capture_times(session_dir, paths)
+    rows = []
+    for p in paths:
+        m = re.search(r"f(\d+)_([01])_raw\.png$", os.path.basename(p))
+        if not m:
+            continue
+        rows.append((capture_times.get(p, os.path.getmtime(p)), int(m.group(1)), p))
     rows.sort()
     for mt, idx, p in rows:
         yield idx, datetime.datetime.fromtimestamp(mt), p
 
 
-def calibrate_video_scale(path, label_tmpl, tempo_tmpl, samples=50):
-    """For windowed captures (game inside an app preview): find the prescale
-    factor and label search window that bring the banner to template scale.
-    Samples frames across the video, tries a scale ladder with a full-frame
-    label search, and returns (prescale, strip) from the modal high-scoring
-    hit -- or None if the plain fixed-scale path already works / no banner."""
+def _calibrate_scale_frames(frames, label_tmpl, tempo_tmpl):
+    """Find the prescale/search window shared by an iterable of BGR frames."""
     SCALES = (1.0, 1.15, 1.3, 1.5, 1.7, 1.9, 2.1, 2.3)
-    cap = cv2.VideoCapture(path)
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     hits = []
     fixed_hits = 0
-    for fi in range(0, n, max(1, n // samples)):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-        ok, frame = cap.read()
-        if not ok:
+    for frame in frames:
+        if frame is None:
             continue
         base = normalise(frame)
         best = None
@@ -393,7 +459,6 @@ def calibrate_video_scale(path, label_tmpl, tempo_tmpl, samples=50):
             hits.append(best)
             if best[1] == 1.0 and best[0] >= LABEL_THR:
                 fixed_hits += 1
-    cap.release()
     if len(hits) < 5:
         return None
     if fixed_hits >= max(2, len(hits) // 2):
@@ -406,6 +471,40 @@ def calibrate_video_scale(path, label_tmpl, tempo_tmpl, samples=50):
     x, y = xs[len(xs) // 2], ys[len(ys) // 2]
     strip = (x - 160, x + 160 + LABEL_W, y - 40, y + 40 + 16)
     return s_star, strip
+
+
+def calibrate_video_scale(path, label_tmpl, tempo_tmpl, samples=50):
+    """For windowed videos, find the scale that restores template geometry."""
+    cap = cv2.VideoCapture(path)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def sampled_frames():
+        for fi in range(0, n, max(1, n // samples)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, frame = cap.read()
+            if ok:
+                yield frame
+
+    try:
+        return _calibrate_scale_frames(sampled_frames(), label_tmpl, tempo_tmpl)
+    finally:
+        cap.release()
+
+
+def calibrate_session_scale(session_dir, label_tmpl, tempo_tmpl, samples=80):
+    """Find template scale for raw framedumps too.
+
+    NBA 2K can render the same two-column feedback panel at a smaller glyph
+    scale than the older template corpus even though the capture itself is
+    still native 720p.  Session scans previously had no scale calibration at
+    all, so clear TIMING banners yielded zero events.
+    """
+    records = list(iter_session(session_dir))
+    if not records:
+        return None
+    step = max(1, len(records) // samples)
+    frames = (cv2.imread(records[i][2]) for i in range(0, len(records), step))
+    return _calibrate_scale_frames(frames, label_tmpl, tempo_tmpl)
 
 
 def iter_video(path, stride):
@@ -561,6 +660,14 @@ def cmd_scan(args):
     prescale, strip = 1.0, None
     if args.session:
         source = os.path.basename(os.path.normpath(args.session))
+        if getattr(args, "auto_scale", False):
+            cal = calibrate_session_scale(args.session, label_tmpl, tempo_tmpl)
+            if cal:
+                prescale, strip = cal
+                print(f"auto-scale: banner found at {prescale:.2f}x, "
+                      f"search window {strip} (session capture)")
+            else:
+                print("auto-scale: fixed-scale path is fine (or no banner found)")
         it = ((idx, t, cv2.imread(p)) for idx, t, p in iter_session(args.session))
     else:
         source = os.path.splitext(os.path.basename(args.video))[0]
@@ -968,16 +1075,20 @@ def cmd_analyze(args):
     print(f"                 miss   green")
     print(f"  narrow      {a:6d}  {b:6d}")
     print(f"  wide        {c:6d}  {d:6d}")
-    from scipy.stats import fisher_exact, chi2_contingency
     tbl = [[a, b], [c, d]]
     if min(a + b, c + d) > 0:
-        odds, p = fisher_exact(tbl)
-        print(f"  Fisher exact: odds={odds:.3f} p={p:.4f}")
-        if all(x >= 5 for x in (a, b, c, d)):
-            chi2, pc, _, _ = chi2_contingency(tbl)
-            print(f"  chi-square:   chi2={chi2:.3f} p={pc:.4f}")
+        try:
+            from scipy.stats import fisher_exact, chi2_contingency
+        except ImportError:
+            print("  significance tests omitted (optional scipy is not installed)")
         else:
-            print("  chi-square omitted (expected cell < 5); Fisher is the valid test")
+            odds, p = fisher_exact(tbl)
+            print(f"  Fisher exact: odds={odds:.3f} p={p:.4f}")
+            if all(x >= 5 for x in (a, b, c, d)):
+                chi2, pc, _, _ = chi2_contingency(tbl)
+                print(f"  chi-square:   chi2={chi2:.3f} p={pc:.4f}")
+            else:
+                print("  chi-square omitted (expected cell < 5); Fisher is the valid test")
     clamped = [r for r in graded if r["green_floor_clamped"] == "1"]
     print(f"\ngreen_start pinned at 98.00 floor on {len(clamped)}/{len(graded)} rows "
           f"({100.0 * len(clamped) / len(graded):.0f}%) -- clamp-artifact context for the widths")
@@ -1217,8 +1328,8 @@ def main():
     s.add_argument("--min-frames", type=int, default=2,
                    help="drop events seen on fewer frames (default 2; use 1 for sparse dumps)")
     s.add_argument("--auto-scale", action="store_true",
-                   help="video only: calibrate for windowed captures (game inside an "
-                        "app preview at non-native scale); no-op when fixed scale works")
+                   help="calibrate banner/template scale for framedumps or windowed "
+                        "video; no-op when fixed scale already works")
     s.set_defaults(fn=cmd_scan)
 
     s = sub.add_parser("labelsheet", help="numbered crop sheets for blind hand-labelling")

@@ -34,6 +34,23 @@ struct ShotIntentEdges {
     }
 };
 
+// [ORION_RHYTHM_STICK_PULL 2026-09-15] THE ONE spelling of the intent label, shared by the
+// "Physical shot epoch: ... intent=" forensic line and by the `shot_gate_arm send: source=`
+// field the sidecar receives as `src=`. It used to be an inline ternary in the middle of
+// OrionAppController's controller tick, which is exactly where a fourth gesture (or a rename)
+// would have produced two spellings of the same edge and made a session log unjoinable.
+//
+// The values are WIRE VALUES: the sidecar logs them and post-mortem tooling greps them, so they
+// are append-only. `square` wins a simultaneous read because a Square edge is a committed shot
+// press while a stick deflection is still a gesture.
+[[nodiscard]] inline const char* shotIntentSourceLabel(const ShotIntentEdges& edges) noexcept
+{
+    if (edges.square) {
+        return "square_edge";
+    }
+    return edges.stickUp ? "stick_up_edge" : "stick_down_edge";
+}
+
 // Canonical right-stick shot predicate shared by the first-edge reader wake
 // and AutomationEngine's later hold-to-own debounce.  Keeping the vertical
 // threshold and lateral-dominance rule here prevents a diagonal dribble from
@@ -108,6 +125,12 @@ inline ShotIntentEdges shotIntentEdges(const ControllerState& current,
 class ShotIntentEdgeTracker final {
 public:
     static constexpr int kReleaseSamples = 3;
+    // Once an OWNED Square release has been positively delivered, the console is
+    // already observing Square-up.  A rapid human release/re-press can therefore
+    // use two selected-device UP reports as its physical-end proof without
+    // weakening the ordinary three-report debounce.  Two is deliberate: one
+    // dropped RawInput/HID report remains incapable of minting a new shot epoch.
+    static constexpr int kDeliveredSquareReleaseSamples = 2;
 
     [[nodiscard]] ShotIntentEdges update(
         const ControllerState& current,
@@ -115,6 +138,8 @@ public:
         double stickDownThreshold,
         double lateralMaxRatio = 0.70) noexcept
     {
+        squareEdgeEmittedThisUpdate_ = false;
+        lastSquareEdgeUsedDeliveredRelease_ = false;
         const bool rawCurrentUp = verticalStickShotIntent(
             current, true, stickUpThreshold, lateralMaxRatio);
         const bool currentDown = verticalStickShotIntent(
@@ -145,8 +170,7 @@ public:
         }
 
         ShotIntentEdges edges;
-        edges.square = updateGesture(
-            current.square(), squareLatched_, squareInactiveSamples_);
+        edges.square = updateSquareGesture(current.square());
         edges.stickUp = updateGesture(
             currentUp, stickUpLatched_, stickUpInactiveSamples_);
         edges.stickDown = updateGesture(
@@ -174,6 +198,46 @@ public:
         return edges;
     }
 
+    // Called only after the locally-authoritative controller route accepted a
+    // generated Square-up release packet.  This grants no shot/fire authority;
+    // it merely lets a subsequent REAL physical release/re-press form a fresh
+    // input epoch after two UP reports.  The normal path remains three reports.
+    //
+    // Delivery confirmation is resolved later in the controller tick than the
+    // raw-input update.  Preserve a just-observed two-UP -> DOWN rebound so the
+    // confirmation can qualify it retroactively; the next still-DOWN poll emits
+    // the edge.  A rebound from only one UP report remains latched.
+    void noteOwnedSquareReleaseDelivered() noexcept
+    {
+        if (transportRecoveryAwaitingNeutral_ || squareEdgeEmittedThisUpdate_
+            || !squareLatched_) {
+            return;
+        }
+        deliveredSquareReleasePending_ = true;
+        if (squareInactiveSamples_ >= kDeliveredSquareReleaseSamples
+            || squareReboundInactiveSamples_ >= kDeliveredSquareReleaseSamples) {
+            squareLatched_ = false;
+            deliveredSquareReleaseQualified_ = true;
+        }
+    }
+
+    // A queued completion from an older shot cannot grant the current gesture
+    // the two-UP shortcut. Local delivery proves only the packet's own epoch;
+    // the normal three-UP rearm remains available when identity is absent.
+    void noteOwnedSquareReleaseDeliveredForEpoch(
+        quint64 releasedPhysicalEpoch, quint64 currentPhysicalEpoch) noexcept
+    {
+        if (releasedPhysicalEpoch == 0 || releasedPhysicalEpoch != currentPhysicalEpoch) {
+            return;
+        }
+        noteOwnedSquareReleaseDelivered();
+    }
+
+    [[nodiscard]] bool lastSquareEdgeUsedDeliveredRelease() const noexcept
+    {
+        return lastSquareEdgeUsedDeliveredRelease_;
+    }
+
     // Entered only after a previously-live selected controller becomes
     // unavailable. Preserve every gesture latch: only update() calls carrying
     // real selected-device reports may prove the required physical neutral.
@@ -181,6 +245,9 @@ public:
     {
         transportRecoveryAwaitingNeutral_ = true;
         transportRecoveryNeutralSamples_ = 0;
+        deliveredSquareReleasePending_ = false;
+        deliveredSquareReleaseQualified_ = false;
+        squareReboundInactiveSamples_ = 0;
     }
 
     [[nodiscard]] bool transportRecoveryActive() const noexcept
@@ -199,9 +266,53 @@ public:
         stickDownInactiveSamples_ = kReleaseSamples;
         transportRecoveryAwaitingNeutral_ = false;
         transportRecoveryNeutralSamples_ = 0;
+        deliveredSquareReleasePending_ = false;
+        deliveredSquareReleaseQualified_ = false;
+        squareReboundInactiveSamples_ = 0;
+        squareEdgeEmittedThisUpdate_ = false;
+        lastSquareEdgeUsedDeliveredRelease_ = false;
     }
 
 private:
+    [[nodiscard]] bool updateSquareGesture(bool active) noexcept
+    {
+        if (active) {
+            // Retain only the immediately preceding inactive run.  This lets a
+            // delivery acknowledgement later in THIS controller tick recover a
+            // two-report rapid release, while an old mid-hold dropout cannot be
+            // spent at some unrelated future release.
+            squareReboundInactiveSamples_ = squareInactiveSamples_;
+            squareInactiveSamples_ = 0;
+            if (!squareLatched_) {
+                squareLatched_ = true;
+                squareEdgeEmittedThisUpdate_ = true;
+                lastSquareEdgeUsedDeliveredRelease_ =
+                    deliveredSquareReleaseQualified_;
+                deliveredSquareReleasePending_ = false;
+                deliveredSquareReleaseQualified_ = false;
+                squareReboundInactiveSamples_ = 0;
+                return true;
+            }
+            return false;
+        }
+
+        squareReboundInactiveSamples_ = 0;
+        squareInactiveSamples_ = std::min(
+            kReleaseSamples, squareInactiveSamples_ + 1);
+        if (squareInactiveSamples_ >= kReleaseSamples) {
+            // The ordinary fully-debounced boundary wins and carries no special
+            // post-release attribution.
+            squareLatched_ = false;
+            deliveredSquareReleasePending_ = false;
+            deliveredSquareReleaseQualified_ = false;
+        } else if (deliveredSquareReleasePending_
+                   && squareInactiveSamples_ >= kDeliveredSquareReleaseSamples) {
+            squareLatched_ = false;
+            deliveredSquareReleaseQualified_ = true;
+        }
+        return false;
+    }
+
     [[nodiscard]] static bool updateGesture(
         bool active, bool& latched, int& inactiveSamples) noexcept
     {
@@ -236,6 +347,11 @@ private:
     int stickDownInactiveSamples_ = kReleaseSamples;
     bool transportRecoveryAwaitingNeutral_ = false;
     int transportRecoveryNeutralSamples_ = 0;
+    bool deliveredSquareReleasePending_ = false;
+    bool deliveredSquareReleaseQualified_ = false;
+    int squareReboundInactiveSamples_ = 0;
+    bool squareEdgeEmittedThisUpdate_ = false;
+    bool lastSquareEdgeUsedDeliveredRelease_ = false;
 };
 
 // [DPAD-UP BYPASS HOTKEY 2026-08-08] Rising-edge latch for the physical D-pad Up

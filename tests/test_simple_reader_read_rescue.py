@@ -18,6 +18,18 @@ import pytest
 import simple_meter_reader as smr
 from simple_meter_reader import SimpleMeterReader
 
+
+# [ORION_READER_IDLE_PUBLISH_GATE 2026-09-15] The fixtures below feed a meter with NO press
+# armed and (mostly) a constant fill -- byte for byte the shape the reader's idle publication
+# gate now withholds from the engine and the overlay (see SimpleMeterReader._idle_publish_ok).
+# The gate is a PUBLICATION policy with its own suite (tests/test_idle_publish_gate.py); these
+# tests are about what the reader MEASURES, so the gate is switched off here and they keep
+# measuring it.
+@pytest.fixture(autouse=True)
+def _idle_publish_gate_off(monkeypatch):
+    monkeypatch.setenv("ORION_READER_IDLE_PUBLISH_GATE", "0")
+
+
 BH, BW = 107, 24
 METER_X, METER_Y = 600, 300
 FILL_EDGE = 40          # rows from box top -> fill ~62%
@@ -146,9 +158,9 @@ def test_honest_zero_when_meter_truly_gone(monkeypatch):
     res = r.detect(blank, ts=1.04)
     assert fake.priority_calls == 1
     assert fake.now_calls == 0
-    assert res.detected                      # held box still serves (coast semantics)
+    assert not res.detected                  # retained box is not a white-edge measurement
     assert res.fill_pct == 0.0
-    assert tuple(res.bbox) == TRUE_BOX
+    assert tuple(r._det_active_box) == TRUE_BOX
     assert r._det_diag["rescue_seat"] == 0
 
 
@@ -178,7 +190,7 @@ def test_teleport_rescue_refused(monkeypatch):
     assert fake.priority_calls == 1
     assert fake.now_calls == 0
     assert res.fill_pct == 0.0
-    assert tuple(res.bbox) == TRUE_BOX       # lock did not teleport
+    assert tuple(r._det_active_box) == TRUE_BOX       # lock did not teleport
     assert r._det_diag["rescue_seat"] == 0
 
 

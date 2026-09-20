@@ -1,9 +1,15 @@
+#include <atomic>
+#include <memory>
+#include <utility>
 #include "RemotePlaySession.h"
+#include "InputSessionRetryPolicy.h"  // [ORION_INPUT_DEAD_UX] failure-class wire values
 #include "RemotePlayDecodePolicy.h"
 #include "ReleaseMarkerProtocol.h"
 #include "RemotePlayExecutablePolicy.h"
 #include "SidecarLaunchPolicy.h"
 #include "SidecarLogRelayPolicy.h"
+#include "ShotGateProtocol.h"
+#include "SidecarReaderProfile.h"
 #include "SidecarWatchdog.h"  // Track W: restart pacing + bounded video-device enumeration
 
 #include <QtCore/QByteArray>
@@ -39,7 +45,9 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace orion {
@@ -51,6 +59,27 @@ constexpr bool kProductionBuild = true;
 #else
 constexpr bool kProductionBuild = false;
 #endif
+
+// [ORION_ACTIVITY_FEED 2026-09-14 owner "overall polish"] Steady-state health
+// samples log once a MINUTE, not every ~5 s. A census of one hour of
+// logs/orion_native.log found these three templates alone contributing 1322
+// lines (Telemetry stage split 439, preview_pipeline 438+438, SHM preview frame
+// read 445). They are periodic gauges: at a minute they still describe the
+// session, and every one of them falls back to its original fast cadence while a
+// value is across a health threshold, so a real fault keeps its resolution.
+constexpr qint64 kCustomerTelemetryLogIntervalMs = 60'000;
+// emit -> receipt transit that means the sidecar/stdout path is genuinely
+// struggling rather than merely being measured.
+constexpr double kEmitTransitUnhealthyMs = 120.0;
+// A presentation gap this large is a visible hitch, not jitter.
+constexpr qint64 kPreviewPresentGapUnhealthyNs = 100'000'000;   // 100 ms
+// One SHM read line per this many frames while healthy (~60 s at 60 FPS); the
+// original 300 (~5 s) cadence returns while a source->dispatch age is unhealthy.
+constexpr quint64 kShmPreviewLogFrameStride = 3600;
+constexpr quint64 kShmPreviewLogFrameStrideUnhealthy = 300;
+constexpr double kShmDispatchAgeUnhealthyMs = 80.0;
+// Bound on the per-window transit sample buffer now that the window is a minute.
+constexpr std::size_t kTelemetryWindowSampleCap = 8192;
 
 remote_play_executable_policy::Selection resolveChiakiExecutable(
     const AppConfigData& config, const QString& rootDir)
@@ -656,6 +685,10 @@ RemotePlaySession::RemotePlaySession(QObject* parent)
 RemotePlaySession::~RemotePlaySession()
 {
     sidecarRestartPending_ = false;
+    sidecarStartAfterStop_ = false;
+    ++sessionIntentGeneration_;
+    if (retiringSidecar_) retiringSidecar_->cancelCompletion();
+    waitForStopped();
     resetPreviewPresentation(false);
     retireShmSourceEpoch();
     // GRACEFUL CHIAKI DISCONNECT: the job object closed below carries KILL_ON_JOB_CLOSE, so
@@ -696,47 +729,45 @@ RemotePlaySession::~RemotePlaySession()
 }
 
 #ifdef Q_OS_WIN
-void RemotePlaySession::assignSidecarToJob(QProcess* process)
+namespace {
+QString assignProcessToOwnedJob(QProcess* process, void*& ownedJob)
 {
-    if (!process || process != sidecarProcess_ || process->processId() == 0) {
-        return;
-    }
-
-    if (!sidecarJob_) {
+    if (!process || process->processId() == 0) return {};
+    if (!ownedJob) {
         HANDLE job = CreateJobObjectW(nullptr, nullptr);
-        if (!job) {
-            emit setupMessage(QStringLiteral("Sidecar job object unavailable (winerr=%1); startup reaping remains active.")
-                                  .arg(GetLastError()));
-            return;
-        }
+        if (!job) return QStringLiteral("Sidecar job object unavailable (winerr=%1).")
+            .arg(GetLastError());
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
             const DWORD error = GetLastError();
             CloseHandle(job);
-            emit setupMessage(QStringLiteral("Sidecar job object setup failed (winerr=%1); startup reaping remains active.")
-                                  .arg(error));
-            return;
+            return QStringLiteral("Sidecar job object setup failed (winerr=%1).").arg(error);
         }
-        sidecarJob_ = job;
+        ownedJob = job;
     }
-
-    HANDLE child = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE,
-                               static_cast<DWORD>(process->processId()));
-    if (!child) {
-        emit setupMessage(QStringLiteral("Sidecar job assignment skipped (OpenProcess winerr=%1).")
-                              .arg(GetLastError()));
-        return;
+    HANDLE child = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                               FALSE, static_cast<DWORD>(process->processId()));
+    if (!child) return QStringLiteral("Sidecar job assignment skipped (OpenProcess winerr=%1).")
+        .arg(GetLastError());
+    BOOL alreadyOwned = FALSE;
+    if (IsProcessInJob(child, static_cast<HANDLE>(ownedJob), &alreadyOwned) && alreadyOwned) {
+        CloseHandle(child);
+        return {};
     }
-    const bool assigned = AssignProcessToJobObject(static_cast<HANDLE>(sidecarJob_), child);
+    const bool assigned = AssignProcessToJobObject(static_cast<HANDLE>(ownedJob), child);
     const DWORD error = assigned ? ERROR_SUCCESS : GetLastError();
     CloseHandle(child);
-    if (assigned) {
-        emit setupMessage(QStringLiteral("Sidecar job assigned: orphan cleanup armed."));
-    } else {
-        emit setupMessage(QStringLiteral("Sidecar job assignment failed (winerr=%1); startup reaping remains active.")
-                              .arg(error));
-    }
+    return assigned ? QStringLiteral("Sidecar job assigned: orphan cleanup armed.")
+                    : QStringLiteral("Sidecar job assignment failed (winerr=%1).").arg(error);
+}
+} // namespace
+
+void RemotePlaySession::assignSidecarToJob(QProcess* process)
+{
+    if (process != sidecarProcess_) return;
+    const auto message = assignProcessToOwnedJob(process, sidecarJob_);
+    if (!message.isEmpty()) emit setupMessage(message);
 }
 #endif
 
@@ -854,6 +885,10 @@ void RemotePlaySession::cancelAudioApply()
 
 void RemotePlaySession::scheduleAudioApply(bool muted)
 {
+    if (isXboxRemotePlay(config_)) {
+        audioRetryTimer_.stop();
+        return; // Microsoft's client owns its audio/quality configuration.
+    }
     pendingAudioMuted_ = muted;
     audioRetryAttempts_ = 0;
     if (state_ == RemotePlayState::Disconnected || state_ == RemotePlayState::Error) {
@@ -898,18 +933,40 @@ bool RemotePlaySession::reportRemotePlayExecutableIdentity(
     return true;
 }
 
+void RemotePlaySession::beginConnectStopwatch()
+{
+    connectStopwatch_.start();
+    connectStopwatchArmed_ = true;
+}
+
 void RemotePlaySession::start()
 {
     if (state_ == RemotePlayState::Running || state_ == RemotePlayState::Connecting) {
         return;
     }
+    // [ORION_CONNECT_LATENCY 2026-09-19] First measured boundary: how long the
+    // native side spent between the click and asking anything of the console.
+    // Measured 09-18/09-19 (n=10): 264 ms median, of which 152 ms was the Win32
+    // window containment that now runs AFTER this call. A Connect that reaches
+    // start() without a stopwatch (retry machinery, watchdog) simply arms one here
+    // so the later stamps stay meaningful.
+    if (connectStopwatchArmed_) {
+        emit setupMessage(QStringLiteral("Connect stage: native_prep=%1ms (click -> session start)")
+                              .arg(connectStopwatch_.elapsed()));
+    } else {
+        beginConnectStopwatch();
+    }
 
-    if (config_.remotePlayConsoleIp.trimmed().isEmpty()) {
+    if (isXboxRemotePlay(config_) && config_.xboxRemotePlayWindowTitle.trimmed().isEmpty()) {
+        setState(RemotePlayState::Error, QStringLiteral("Select the Xbox Remote Play window in Setup first."));
+        return;
+    }
+    if (!isXboxRemotePlay(config_) && config_.remotePlayConsoleIp.trimmed().isEmpty()) {
         setState(RemotePlayState::Error, QStringLiteral("Console IP is required before starting Chiaki"));
         return;
     }
 
-    if (resolveChiakiPath(config_, rootDir_).isEmpty()) {
+    if (!isXboxRemotePlay(config_) && resolveChiakiPath(config_, rootDir_).isEmpty()) {
 #ifdef ORION_PRODUCTION_BUILD
         setState(RemotePlayState::Error,
                  QStringLiteral("Production package is incomplete: bundled "
@@ -925,6 +982,7 @@ void RemotePlaySession::start()
     // A fresh connect supersedes any watchdog respawn still waiting out its release beat — this
     // path brings its own sidecar up, so letting the stale timer through would double-spawn.
     sidecarRestartPending_ = false;
+    ++sessionIntentGeneration_;   // [F7] retires any deferred handoff from an earlier intent
     ++inputRecoveryGeneration_;
     inputRecoveryPending_ = false;
     rejectLateInputRecoveryReady_ = true;
@@ -983,31 +1041,9 @@ void RemotePlaySession::start()
     }
 
     pruneChiakiSessionLogs();
-#ifdef Q_OS_WIN
-    // P4: reap any orphaned stream client from a previous crash / hard-kill BEFORE launching so
-    // the orchestrator never spawns a duplicate. Safe here: start() returned above if a session is
-    // already Connecting/Running, so this only ever clears genuine orphans. SKIP it on a warm
-    // preview handoff — stopSidecar() just above already ran cleanupRemotePlayClientsBlocking(), a
-    // 2-pass SUPERSET of this single sweep over the identical process names, so re-running it here
-    // only added blocking taskkill spawns (GUI-thread stall) to every warm Connect for zero extra
-    // cleanup. (Preview never launches chiaki/OrionStream, so on that path there is nothing to reap
-    // beyond what the teardown already swept.)
-    if (!handOffPreview) {
-        reapOrphanStreamClientsBlocking();
-    }
-#endif
-    setState(RemotePlayState::Connecting, QStringLiteral("Starting Chiaki autogreen sidecar"));
-    if (handOffPreview) {
-        // Deferred start once the preview sidecar has released the Elgato handle (same beat the
-        // watchdog uses for a capture-card restart). Guard against a disconnect during the wait.
-        QTimer::singleShot(sidecarRestartDelayMs(isCaptureCardSource(config_)), this, [this]() {
-            if (state_ == RemotePlayState::Connecting) {
-                startSidecar();
-            }
-        });
-    } else {
-        startSidecar();
-    }
+    setState(RemotePlayState::Connecting, isXboxRemotePlay(config_)
+        ? QStringLiteral("Attaching Xbox Remote Play window") : QStringLiteral("Starting Chiaki autogreen sidecar"));
+    scheduleSidecarStart(handOffPreview ? sidecarRestartDelayMs(isCaptureCardSource(config_)) : 0);
     scheduleAudioApply(!config_.streamAudioEnabled);
 }
 
@@ -1026,6 +1062,19 @@ void RemotePlaySession::startCapturePreview()
     if (state_ == RemotePlayState::Running || state_ == RemotePlayState::Connecting) {
         return;
     }
+    // [ORION_DISCONNECT_AUDIT 2026-09-19] F6: a watchdog respawn armed just before
+    // this preview would fire into a sidecar THIS call is about to start, hit
+    // startSidecar()'s "already running" guard and log "Sidecar start skipped" -- so
+    // the recovery the watchdog asked for is silently downgraded to a preview and
+    // never happens. start() and stop() both retire the pending respawn for exactly
+    // this reason (it is the cancellation token, there is no other); a preview that
+    // takes ownership of the sidecar slot owes the same. Announce it: a silently
+    // cancelled restart is how a "random disconnect" becomes unexplainable.
+    if (sidecarRestartPending_) {
+        sidecarRestartPending_ = false;
+        emit setupMessage(QStringLiteral(
+            "Pending sidecar restart cancelled: a capture preview took the sidecar slot."));
+    }
     previewMode_ = true;
     // Stay logically Disconnected so Connect remains enabled; the status text signals preview.
     setState(RemotePlayState::Disconnected, QStringLiteral("Live capture preview"));
@@ -1035,6 +1084,13 @@ void RemotePlaySession::startCapturePreview()
 
 void RemotePlaySession::stop()
 {
+    // Record intent before asynchronous child teardown and before clearing recovery
+    // state. Otherwise a requested stop during recovery looks like a spontaneous exit.
+    emit setupMessage(QStringLiteral("Remote Play stop requested: state=%1 "
+                                     "input_recovery_pending=%2 restart_pending=%3")
+                          .arg(static_cast<int>(state_))
+                          .arg(inputRecoveryPending_ ? 1 : 0)
+                          .arg(sidecarRestartPending_ ? 1 : 0));
     // User-initiated disconnect: flag the teardown as INTENTIONAL before killing the
     // sidecar so its QProcess::finished emits sidecarExited(false), not a phantom
     // mid-stream crash. Without this the crash handler in OrionAppController treats the
@@ -1048,11 +1104,16 @@ void RemotePlaySession::stop()
     // restart armed just before the user clicked Disconnect relaunches the sidecar (and chiaki,
     // and therefore the PS5 session) seconds after the teardown finished.
     sidecarRestartPending_ = false;
+    sidecarStartAfterStop_ = false;
+    captureInventoryStartRequested_ = false;
+    captureInventoryPrepared_ = false;
+    ++sessionIntentGeneration_;   // [F7] a stop retires any deferred handoff outright
     // FIX 1: cancel any in-flight promotion bookkeeping so its deferred fallback/deadline timers
     // stand down instead of firing an "Autogreen running" / "did not confirm" over a teardown.
     ++streamPromoteGeneration_;
     streamPromotePending_ = false;
     streamPromoteAcked_ = false;
+    streamPromoteDeadlineExtendMs_ = 0;
     streamPromoteFromWarmPreview_ = false;
     ++inputRecoveryGeneration_;
     inputRecoveryPending_ = false;
@@ -1234,7 +1295,7 @@ void RemotePlaySession::openChiakiClient()
     }
 
     // Lobby/config mode ONLY — never auto-start a stream. This is the one-time
-    // console-registration entry point; the in-app Enable Bot + Controller button owns the
+    // console-registration entry point; the in-app Connect button owns the
     // actual streaming + embed. (Passing `stream nickname host` would launch a
     // stream straight away, which is exactly what we don't want here.)
     bool started = false;
@@ -1249,11 +1310,15 @@ void RemotePlaySession::openChiakiClient()
         emit setupMessage(QStringLiteral("Failed to open the bundled Remote Play client."));
         return;
     }
-    emit setupMessage(QStringLiteral("Remote Play client opened. Register or select your console, then return to Venice and press Enable Bot + Controller."));
+    // [2026-09-14 UI REVAMP] "Enable Bot + Controller" no longer exists as a label:
+    // the revamped shell has one action, Connect. Point the user at what they can see.
+    emit setupMessage(QStringLiteral("Remote Play client opened. Register or select your console, then return to Venice and press Connect."));
 }
 
 void RemotePlaySession::applyBandwidthMode(BandwidthMode mode)
 {
+    if (isXboxRemotePlay(config_))
+        return;
     // Translate the preset into chiaki-ng's QSettings keys. Chiaki stores per-target
     // overrides under settings/<key>_local_<console_type>, plus a global default the
     // engine reads when no local override exists. We write both so the value sticks
@@ -1439,9 +1504,11 @@ void RemotePlaySession::discoverPs5()
         seenIps.insert(c.ip);
     }
 
-    // Collect responses for ~2 seconds, then score and pick the best.
+    // Collect responses for up to ~2 seconds (ceiling for the no-answer case), then score and
+    // pick the best. Early-exit as soon as a REGISTERED console answers (see foundRegistered).
     QElapsedTimer timer;
     timer.start();
+    bool foundRegistered = false;
     while (timer.elapsed() < 2000) {
         if (!socket.waitForReadyRead(200)) continue;
         while (socket.hasPendingDatagrams()) {
@@ -1480,6 +1547,8 @@ void RemotePlaySession::discoverPs5()
             // then state=Ready, then PS5 type, then the existence of a host-id field.
             if (!c.hostId.isEmpty() && registeredIds.contains(c.hostId)) {
                 c.score += 1000;
+                foundRegistered = true;   // definitive identity match -> stop early (dedup already
+                                          // guards against a duplicate outscoring this one)
                 for (const auto& h : registered) {
                     if (h.hostIdHex == c.hostId) {
                         c.matchedNick = h.nickname;
@@ -1509,6 +1578,11 @@ void RemotePlaySession::discoverPs5()
             }
 
             candidates.append(c);
+        }
+        // A registered console answered: its host-id is a definitive identity match that will win
+        // the scoring, so stop collecting now instead of waiting out the full 2s ceiling.
+        if (foundRegistered) {
+            break;
         }
     }
 
@@ -1603,6 +1677,24 @@ void RemotePlaySession::testSession(const QString& user)
 
 void RemotePlaySession::setState(RemotePlayState state, QString status)
 {
+    // [ORION_CONNECT_LATENCY 2026-09-19] Close the stage clock on the first terminal
+    // transition after a click. "Running" is the number the owner actually feels
+    // ("instant connect"); Error/Disconnected are stamped too so a failed connect is
+    // measurable instead of silent. Emitted BEFORE stateChanged so the line lands
+    // above whatever the state handler logs. Diagnostic only.
+    const bool terminal = state == RemotePlayState::Running
+        || state == RemotePlayState::Error
+        || state == RemotePlayState::Disconnected;
+    if (connectStopwatchArmed_ && terminal && state_ == RemotePlayState::Connecting) {
+        connectStopwatchArmed_ = false;
+        emit setupMessage(QStringLiteral("Connect stage: total=%1ms click -> %2")
+                              .arg(connectStopwatch_.elapsed())
+                              .arg(state == RemotePlayState::Running
+                                       ? QStringLiteral("Running")
+                                       : (state == RemotePlayState::Error
+                                              ? QStringLiteral("Error")
+                                              : QStringLiteral("Disconnected"))));
+    }
     state_ = state;
     statusText_ = std::move(status);
     emit stateChanged(state_, statusText_);
@@ -1722,6 +1814,11 @@ void RemotePlaySession::runHelper(const QString& operation, const QStringList& a
 
 QString RemotePlaySession::pythonExecutable() const
 {
+    // Memoized: the cv2-import probe below spawns a python process (waitForFinished up to 8s)
+    // per candidate on the GUI thread. It used to run on EVERY sidecar (re)start; resolve once.
+    if (!cachedPythonExe_.isEmpty()) {
+        return cachedPythonExe_;
+    }
     const QString env = QString::fromLocal8Bit(qgetenv("ORION_PYREMOTEPLAY_PYTHON")).trimmed();
     const QString root = rootDir_.isEmpty()
                              ? QDir::toNativeSeparators(QDir::homePath() + QStringLiteral("/Desktop/NexusVision"))
@@ -1774,11 +1871,16 @@ QString RemotePlaySession::pythonExecutable() const
         // The explicit ORION_PYREMOTEPLAY_PYTHON override is trusted as-is; every auto-
         // discovered candidate must prove it can import cv2 before we commit to it.
         if (candidate == env || canImportCv2(candidate)) {
+            cachedPythonExe_ = candidate;
             return candidate;
         }
     }
     // Nothing could import cv2 — fall back to the first interpreter that at least exists (no
     // worse than the legacy behaviour; the launch will then surface the real import error).
+    // Only cache a non-empty fallback so a transient empty result doesn't get pinned forever.
+    if (!firstExisting.isEmpty()) {
+        cachedPythonExe_ = firstExisting;
+    }
     return firstExisting;
 }
 
@@ -1819,8 +1921,10 @@ QByteArray RemotePlaySession::buildSidecarConfig() const
     // Size is transported as a canonical decimal string so the JSON boundary can
     // never round a future 64-bit value.  Missing identity leaves decoder timing
     // cold/unscoped; it is never substituted with path metadata alone.
-    QString windowTitle = config_.remotePlayWindowTitle.trimmed();
-    if (windowTitle.isEmpty() || windowTitle.compare(QStringLiteral("Chiaki"), Qt::CaseInsensitive) == 0) {
+    const bool xbox = isXboxRemotePlay(config_);
+    QString windowTitle = xbox ? config_.xboxRemotePlayWindowTitle.trimmed()
+                               : config_.remotePlayWindowTitle.trimmed();
+    if (!xbox && (windowTitle.isEmpty() || windowTitle.compare(QStringLiteral("Chiaki"), Qt::CaseInsensitive) == 0)) {
         // The Orion fork's stream window is titled by applicationDisplayName.
         if (chiakiPath.contains(QStringLiteral("OrionStream"), Qt::CaseInsensitive)) {
             windowTitle = QStringLiteral("Orion Stream");
@@ -1832,21 +1936,21 @@ QByteArray RemotePlaySession::buildSidecarConfig() const
     }
 
     QJsonObject obj;
-    obj.insert(QStringLiteral("console_ip"), config_.remotePlayConsoleIp.trimmed());
+    obj.insert(QStringLiteral("console_ip"), xbox ? QString() : config_.remotePlayConsoleIp.trimmed());
     obj.insert(QStringLiteral("console_identity"),
-               registeredConsoleRouteIdentity(config_.remotePlayConsoleIp));
-    obj.insert(QStringLiteral("platform"), QStringLiteral("ps5"));
-    obj.insert(QStringLiteral("client_mode"), QStringLiteral("chiaki"));
+               xbox ? QString() : registeredConsoleRouteIdentity(config_.remotePlayConsoleIp));
+    obj.insert(QStringLiteral("platform"), xbox ? QStringLiteral("xbox") : QStringLiteral("ps5"));
+    obj.insert(QStringLiteral("client_mode"), xbox ? QStringLiteral("external") : QStringLiteral("chiaki"));
     // Preview mode opens the capture card only (no Chiaki / Remote Play / input hook) so the panel
     // shows the HDMI feed before Connect; the full session launches Chiaki. See AppConfig.h. The
     // orchestrator already honours auto_launch_client=false and, in capture-card mode, brings the
     // Elgato up independently of any Chiaki window.
-    obj.insert(QStringLiteral("auto_launch_client"), sidecarShouldAutoLaunchClient(previewMode_));
-    obj.insert(QStringLiteral("close_client_on_disconnect"), true);
-    obj.insert(QStringLiteral("chiaki_path"), chiakiPath);
+    obj.insert(QStringLiteral("auto_launch_client"), !xbox && sidecarShouldAutoLaunchClient(previewMode_));
+    obj.insert(QStringLiteral("close_client_on_disconnect"), !xbox);
+    obj.insert(QStringLiteral("chiaki_path"), xbox ? QString() : chiakiPath);
     const bool decoderProducerIdentityReady =
-        remote_play_executable_policy::insertDecoderPipeProducerExpectation(obj, chiakiPath);
-    if (!decoderProducerIdentityReady) {
+        !xbox && remote_play_executable_policy::insertDecoderPipeProducerExpectation(obj, chiakiPath);
+    if (!xbox && !decoderProducerIdentityReady) {
         // Do not expose a path/hash here. Python receives explicit empty fields
         // and permanently keeps decoder timing cold/unscoped for this process.
         qWarning("Remote Play decoder producer identity unavailable; reusable timing disabled");
@@ -1867,7 +1971,7 @@ QByteArray RemotePlaySession::buildSidecarConfig() const
     // capture-card and no-card decoder sessions cold-start calibration on every
     // launch even though their fixed pipelines were identifiable.  AppConfig
     // already normalizes this value to exactly capture_card or decoder.
-    obj.insert(QStringLiteral("frame_source"), config_.videoSource);
+    obj.insert(QStringLiteral("frame_source"), xbox ? QStringLiteral("wgc") : config_.videoSource);
     obj.insert(QStringLiteral("preview_fps"), preset.previewFps);
     obj.insert(QStringLiteral("preview_width"), preset.previewWidth);
     obj.insert(QStringLiteral("show_video"), true);
@@ -1875,14 +1979,12 @@ QByteArray RemotePlaySession::buildSidecarConfig() const
     obj.insert(QStringLiteral("virtual_controller"), false);
     obj.insert(QStringLiteral("hidhide"), false);
     obj.insert(QStringLiteral("goto_shot"), true);
-    // Send the user's CONFIGURED meter colour to the detector. The old `autoMeterColor ? "Purple"`
-    // override was a 2026-06 workaround for a stint when the meter was purple but meter_color was a
-    // stale "Red"; it is now THE bug — the user's meter is RED, and a forced "Purple" mask (hue
-    // 138-162) matches ZERO red pixels (red wraps 0/179), so the detector cannot see the meter at
-    // all (the live "locks onto nothing / waiting for meter"). Honour the explicit colour; fall back
-    // to Red (the live meter), not Purple. TODO: true colour auto-detect (sample the meter region).
+    // Send the user's configured meter colour to the detector. The clean-install
+    // fallback must match AppConfigData and the certified detector profile; a
+    // split Red/White default lets YOLO locate the box while the fill mask reads
+    // the wrong pixels.
     const QString sidecarMeterColor =
-        config_.meterColor.isEmpty() ? QStringLiteral("Red") : config_.meterColor;
+        config_.meterColor.isEmpty() ? QStringLiteral("White") : config_.meterColor;
     obj.insert(QStringLiteral("meter_color"), sidecarMeterColor);
     obj.insert(QStringLiteral("meter_style"), config_.meterStyle);
     obj.insert(QStringLiteral("confidence_gate"), config_.detectionConfidencePercent / 100.0);
@@ -1932,6 +2034,8 @@ void RemotePlaySession::promoteWarmPreviewToStream()
         setState(RemotePlayState::Error,
                  QStringLiteral("Stream promotion blocked: trusted Remote Play client image unavailable"));
         restoreWarmPreviewAfterPromotionFailure();
+        emit inputSessionFailure(
+            static_cast<int>(InputSessionFailureClass::IdentityBlocked), false);
         return;
     }
 
@@ -1945,6 +2049,7 @@ void RemotePlaySession::promoteWarmPreviewToStream()
     const quint64 generation = ++streamPromoteGeneration_;
     streamPromotePending_ = true;
     streamPromoteAcked_ = false;
+    streamPromoteDeadlineExtendMs_ = 0;
     rejectLateSidecarStarted_ = false;
 
     QJsonObject cmd;
@@ -1962,6 +2067,8 @@ void RemotePlaySession::promoteWarmPreviewToStream()
         setState(RemotePlayState::Error,
                  QStringLiteral("Stream start failed: detection sidecar is not running"));
         restoreWarmPreviewAfterPromotionFailure();
+        emit inputSessionFailure(
+            static_cast<int>(InputSessionFailureClass::CommandUndeliverable), false);
         return;
     }
     // Push current tuning so the promoted stream carries the live meter/remap config (the same
@@ -2004,21 +2111,36 @@ void RemotePlaySession::promoteWarmPreviewToStream()
     // the client launch, stdout stalled). Reporting the truth beats leaving the user on a
     // "Connecting" that will never resolve — and, critically, beats the old fake "running".
     QTimer::singleShot(kStreamPromoteDeadlineMs, this, [this, generation]() {
-        if (generation != streamPromoteGeneration_ || !streamPromotePending_) {
-            return;
+        if (streamPromoteDeadlineExtendMs_ > 0) {
+            return;   // a rest-mode wake is in progress; the extended timer owns the verdict
         }
-        if (state_ != RemotePlayState::Connecting) {
-            return;
-        }
-        streamPromotePending_ = false;
-        rejectLateSidecarStarted_ = true;
-        emit setupMessage(QStringLiteral("Stream promotion timed out after %1 ms with no "
-                                         "started/error from the sidecar.").arg(kStreamPromoteDeadlineMs));
-        setState(RemotePlayState::Error,
-                 QStringLiteral("Stream start did not confirm - no input link to the console. "
-                                "Disconnect and try again."));
-        restoreWarmPreviewAfterPromotionFailure();
+        fireStreamPromoteDeadline(generation, kStreamPromoteDeadlineMs);
     });
+}
+
+void RemotePlaySession::fireStreamPromoteDeadline(quint64 generation, int deadlineMs)
+{
+    if (generation != streamPromoteGeneration_ || !streamPromotePending_) {
+        return;
+    }
+    if (state_ != RemotePlayState::Connecting) {
+        return;
+    }
+    streamPromotePending_ = false;
+    rejectLateSidecarStarted_ = true;
+    // Read BEFORE any reset: >0 records that a rest-mode wake extended this
+    // attempt, so the retry planner waits out the console boot.
+    const bool wakeObserved = streamPromoteDeadlineExtendMs_ > 0;
+    emit setupMessage(QStringLiteral("Stream promotion timed out after %1 ms with no "
+                                     "started/error from the sidecar.").arg(deadlineMs));
+    setState(RemotePlayState::Error,
+             QStringLiteral("Stream start did not confirm - no input link to the console. "
+                            "Disconnect and try again."));
+    restoreWarmPreviewAfterPromotionFailure();
+    // No verdict arrived: the sidecar may be wedged inside the promotion, so the
+    // controller's retry MUST be cold (see InputSessionRetryPolicy.h).
+    emit inputSessionFailure(
+        static_cast<int>(InputSessionFailureClass::DeadlineTimeout), wakeObserved);
 }
 
 void RemotePlaySession::restoreWarmPreviewAfterPromotionFailure()
@@ -2043,6 +2165,10 @@ void RemotePlaySession::restoreWarmPreviewAfterPromotionFailure()
 
 void RemotePlaySession::startSidecar()
 {
+    if (stopping()) {
+        scheduleSidecarStart(sidecarRestartDelayMs(isCaptureCardSource(config_)));
+        return;
+    }
     if (sidecarProcess_ && sidecarProcess_->state() != QProcess::NotRunning) {
         // Never silent: callers (start(), the deferred handoff/watchdog timers) set Connecting
         // FIRST and then call this, so a swallowed no-op here leaves the UI stuck on "Connecting"
@@ -2052,10 +2178,16 @@ void RemotePlaySession::startSidecar()
         return;
     }
 
+    if (isCaptureCardSource(config_) && !isXboxRemotePlay(config_) && !captureInventoryPrepared_) {
+        prepareSidecarCaptureInventory();
+        return;
+    }
+    captureInventoryPrepared_ = false;
+
     // A full sidecar launch will immediately spawn the Remote Play client. Pin
     // and identify that image before any cleanup/process mutation. Capture-card
     // warm preview deliberately skips this because it does not launch Chiaki.
-    if (sidecarShouldAutoLaunchClient(previewMode_)) {
+    if (!isXboxRemotePlay(config_) && sidecarShouldAutoLaunchClient(previewMode_)) {
         const QString remotePlayExecutable = resolveChiakiPath(config_, rootDir_);
         if (remotePlayExecutable.isEmpty()) {
             setState(RemotePlayState::Error,
@@ -2072,23 +2204,9 @@ void RemotePlaySession::startSidecar()
         }
     }
 
-#ifdef Q_OS_WIN
-    // Reap an orphaned sidecar from a PREVIOUS OrionNative that was force-killed (taskkill /F,
-    // crash). Such a zombie python.exe still holds the capture card open via OpenCV VideoCapture
-    // and the new sidecar then cannot open the device. Filter on the "ActiveMovie Window" title:
-    // DirectShow/Media Foundation creates it exactly when a video device is opened, so this
-    // targets a python process holding a CAPTURE DEVICE and nothing else.
-    //
-    // Deliberately NOT matched here: "OleMainThreadWndName" (that hidden window exists in ANY
-    // COM-initialising Python process, so filtering on it would kill unrelated user python
-    // processes) and a wmic command-line sweep (wmic.exe is removed in current Windows 11 builds,
-    // so it is a no-op that only blocks the GUI thread). Orphans created from NOW on are handled
-    // structurally by the KILL_ON_JOB_CLOSE job object in assignSidecarToJob().
-    QProcess::execute(QStringLiteral("taskkill.exe"),
-                      {QStringLiteral("/FI"), QStringLiteral("WINDOWTITLE eq ActiveMovie Window"),
-                       QStringLiteral("/IM"), QStringLiteral("python.exe"),
-                       QStringLiteral("/F"), QStringLiteral("/T")});
-#endif
+    // No global process sweep here. Each native-launched sidecar generation is
+    // owned by its job; stale client recovery belongs to the sidecar worker.
+
 
     // Production packages deliberately omit the crown-jewel Python modules, so a production
     // build MUST launch the compiled sidecar regardless of attacker/user-controlled environment.
@@ -2123,6 +2241,24 @@ void RemotePlaySession::startSidecar()
         return;
     }
 
+    // The learned detector is a source-bound sidecar model. Production always
+    // resolves it beside OrionNative.exe; it must never fall through to the
+    // developer-tree default compiled into meter_detector_yolo.py.
+    const QString meterModelRoot = productionBuild
+        ? QCoreApplication::applicationDirPath()
+        : (rootDir_.isEmpty()
+               ? QDir::toNativeSeparators(QDir::homePath() + QStringLiteral("/Desktop/NexusVision"))
+               : QDir::toNativeSeparators(rootDir_));
+    const QString shippedMeterModel = QDir::toNativeSeparators(
+        QDir(meterModelRoot).filePath(QStringLiteral("models/orion_meter_detector.onnx")));
+    if constexpr (productionBuild) {
+        if (!QFileInfo::exists(shippedMeterModel)) {
+            setState(RemotePlayState::Error,
+                     QStringLiteral("Production package is incomplete: required meter detector model not found"));
+            return;
+        }
+    }
+
     auto* proc = new QProcess(this);
     sidecarProcess_ = proc;
     // A fresh sidecar starts a fresh decoder-frame namespace. No image from the
@@ -2146,6 +2282,7 @@ void RemotePlaySession::startSidecar()
     ++streamPromoteGeneration_;
     streamPromotePending_ = false;
     streamPromoteAcked_ = false;
+    streamPromoteDeadlineExtendMs_ = 0;
     streamPromoteFromWarmPreview_ = false;
     rejectLateSidecarStarted_ = false;
     ++inputRecoveryGeneration_;
@@ -2195,8 +2332,35 @@ void RemotePlaySession::startSidecar()
         cpargs->flags |= 0x08000000;  // CREATE_NO_WINDOW
     });
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    // Apply the exact profile used to certify timing. Production ignores inherited
+    // overrides; development keeps explicit values for controlled A/B work.
+    const QString shippedReaderProfile = applyShippedReaderProfile(env, !productionBuild);
+    if constexpr (productionBuild) {
+        env.insert(QStringLiteral("ORION_METER_MODEL"), shippedMeterModel);
+    } else if (!env.contains(QStringLiteral("ORION_METER_MODEL"))) {
+        env.insert(QStringLiteral("ORION_METER_MODEL"), shippedMeterModel);
+    }
+    // Meter box proposer from the user's Meter Detection setting ("cv" | "yolo").
+    // Read once by meter_detector_yolo.get_locator() when this sidecar builds its
+    // locator singleton, so this launch is the moment the setting takes effect.
+    const QString meterProposerResolved =
+        applyMeterProposerSetting(env, config_.meterProposer, !productionBuild);
+    // [ORION_PILL_YOLO_ROUTE 2026-09-17] The STYLE gets the last word on the proposer,
+    // but only for Pill: the CV contour locator proposes a box on 0 of 642 measured
+    // Pill frames (its 3 px fill core against an 8 px width floor) while the packaged
+    // ONNX net -- which is the 08-30 Pill-trained one -- reads 661/661 at IoU 0.93. A
+    // Pill launch therefore exports ORION_METER_PROPOSER=yolo plus ORION_METER_STYLE=
+    // pill; every other style leaves this call with the environment untouched. One log
+    // line per launch names the route (or, with the route killed, the blind mismatch).
+    const MeterStyleRouteResult meterStyleRoute =
+        applyPillYoloRoute(env, config_.meterStyle, config_.pillYoloRoute);
+    emit setupMessage(QStringLiteral("Sidecar shipped timing profile: %1 %2 model=orion_meter_detector.onnx")
+                          .arg(shippedReaderProfile, meterProposerResolved));
+    if (!meterStyleRoute.log.isEmpty()) {
+        emit setupMessage(meterStyleRoute.log);
+    }
     const bool captureCardSource = isCaptureCardSource(config_);
-    const bool requireRemotePlayFramePipe = shouldRequireRemotePlayFramePipe(
+    const bool requireRemotePlayFramePipe = !isXboxRemotePlay(config_) && shouldRequireRemotePlayFramePipe(
         productionBuild, captureCardSource);
     const auto envFlagEnabled = [&env](const QString &name) {
         const QString value = env.value(name).trimmed().toLower();
@@ -2209,7 +2373,7 @@ void RemotePlaySession::startSidecar()
     const bool developmentFramePipeRequested =
         envFlagEnabled(QStringLiteral("ORION_FRAME_PIPE"))
         || envFlagEnabled(QStringLiteral("CHIAKI_ORION_FRAME_PIPE"));
-    const bool frameExportEnabled = shouldEnableRemotePlayFrameExport(
+    const bool frameExportEnabled = !isXboxRemotePlay(config_) && shouldEnableRemotePlayFrameExport(
         captureCardSource, requireRemotePlayFramePipe, developmentFramePipeRequested);
     const auto removeFrameExportEnvironment = [&env]() {
         env.remove(QStringLiteral("ORION_FRAME_PIPE"));
@@ -2245,6 +2409,15 @@ void RemotePlaySession::startSidecar()
     if (qEnvironmentVariableIsSet("ORION_INPUT_HOOK")) {
         env.insert(QStringLiteral("ORION_INPUT_HOOK"), qEnvironmentVariable("ORION_INPUT_HOOK"));
     }
+    if (isXboxRemotePlay(config_)) {
+        removeFrameExportEnvironment();
+        env.insert(QStringLiteral("ORION_INPUT_HOOK"), QStringLiteral("0"));
+        env.insert(QStringLiteral("ORION_WGC"), QStringLiteral("1"));
+        env.remove(QStringLiteral("ORION_WGC_MONITOR"));
+        env.remove(QStringLiteral("ORION_CAPTURE_CARD"));
+        env.remove(QStringLiteral("ORION_CAPTURE_CARD_INDEX"));
+        env.remove(QStringLiteral("ORION_CAPTURE_FPS"));
+    }
     if (requireRemotePlayFramePipe) {
         // Compile-time production policy: the decoder pipe is the bot's only
         // authoritative no-card eye. Ignore inherited dev overrides and pin both
@@ -2256,6 +2429,10 @@ void RemotePlaySession::startSidecar()
                    QStringLiteral(R"(\\.\pipe\orion_frames)"));
         env.remove(QStringLiteral("ORION_CAPTURE_CARD"));
         env.remove(QStringLiteral("ORION_CAPTURE_CARD_INDEX"));
+        // [ORION_CAPTURE_FPS 2026-09-14] The decoder pipe has no card to ask for a rate; strip an
+        // inherited value so the orchestrator cannot construct a CaptureCardBackend cadence from
+        // a setting that describes hardware this launch is not using.
+        env.remove(QStringLiteral("ORION_CAPTURE_FPS"));
         env.remove(QStringLiteral("ORION_VIDEO_DEVICE_NAMES"));
         env.remove(QStringLiteral("ORION_VIDEO_DEVICE_IDS"));
         env.remove(QStringLiteral("ORION_WGC"));
@@ -2308,28 +2485,21 @@ void RemotePlaySession::startSidecar()
         removeFrameExportEnvironment();
         env.insert(QStringLiteral("ORION_CAPTURE_CARD"), QStringLiteral("1"));
         env.insert(QStringLiteral("ORION_CAPTURE_CARD_INDEX"), QString::number(config_.captureCardIndex));
+        // [ORION_CAPTURE_FPS 2026-09-14] The rate the card is ASKED for. Snapped on the way out as
+        // well as on the way in, so a settings file hand-edited between load and launch still
+        // hands the sidecar one of {30, 60, 120}.
+        const int captureFps = snappedCaptureCardFps(config_.captureCardFps);
+        env.insert(QStringLiteral("ORION_CAPTURE_FPS"), QString::number(captureFps));
+        emit setupMessage(QStringLiteral("Frame source: capture card index=%1 fps=%2 (requested)")
+                              .arg(config_.captureCardIndex)
+                              .arg(captureFps));
         // Never let a caller-inherited identity survive a failed/empty native
         // enumeration. Only this launch's atomic inventory may authorize reuse.
         env.remove(QStringLiteral("ORION_VIDEO_DEVICE_NAMES"));
         env.remove(QStringLiteral("ORION_VIDEO_DEVICE_IDS"));
-        // Webcam protection: hand the sidecar the index-ordered device NAME list so its card
-        // auto-detect probes only capture-card-looking devices. A fresh enumeration also exports
-        // an opaque, same-index stable ID list for route-scoped latency-cache validation.
-        //
-        // Track W: bound this enumeration so a contended Elgato (right after a watchdog restart)
-        // can NEVER wedge the GUI thread into SAFE MODE. The DirectShow ICreateDevEnum call can
-        // block 10-15s on a device the just-killed sidecar has not released; runBoundedEnumeration
-        // runs it on a detached worker and, past kVideoEnumTimeoutMs, reuses the last-good cached
-        // names instead of blocking. Cached IDs are stripped on that fallback because a same-model
-        // card could have been swapped at the same index; only a fresh result exports identity.
-        const VideoInputDeviceInventory videoDevices = runBoundedEnumeration(
-            kVideoEnumTimeoutMs, cachedVideoDeviceInventory_.namesOnlyFallback(),
-            []() { return enumerateVideoInputDevices(); });
-        if (insertVideoInputDeviceEnvironment(env, videoDevices)) {
-            // Store exactly what this attempt trusted. On timeout that is a
-            // name-only snapshot, so stale identity is erased from memory too.
-            cachedVideoDeviceInventory_ = videoDevices;
-        }
+        // Preparation ran on a worker. Only a fresh index-aligned inventory may
+        // carry stable IDs; the bounded timeout path strips cached identities.
+        (void)insertVideoInputDeviceEnvironment(env, cachedVideoDeviceInventory_);
     }
     // Deterministic ground truth of which ORION_* variables the child sidecar receives.
     // Never log their values: launch environments can contain license material, API
@@ -2355,10 +2525,25 @@ void RemotePlaySession::startSidecar()
     connect(proc, &QProcess::readyReadStandardOutput, this, &RemotePlaySession::onSidecarStdout);
     connect(proc, &QProcess::readyReadStandardError, this, &RemotePlaySession::onSidecarStderr);
     connect(proc, &QProcess::finished, this, [this, proc](int exitCode, QProcess::ExitStatus status) {
+        // Only the current generation can classify an unexpected exit. Deliberate
+        // retirement detaches these handlers and completes through AsyncProcessRetirer.
+        if (sidecarProcess_ != proc) {
+            emit setupMessage(QStringLiteral(
+                "Retired sidecar (pid %1) exited after a newer one was already running "
+                "(code %2) - ignored.")
+                    .arg(proc->processId()).arg(exitCode));
+            proc->deleteLater();
+            return;
+        }
         // T5 observability: drain the FINAL stderr flush FIRST (it usually carries the
         // Python traceback), then unconditionally log the exit + the rolling stderr tail.
         // This deliberately bypasses the WARNING throttle — a sidecar death must never be
         // silent in orion_native.log again.
+#ifdef Q_OS_WIN
+        // The crashed generation may still own a client. Retire only its job,
+        // before any replacement can be assigned to a fresh job.
+        if (const auto job = static_cast<HANDLE>(std::exchange(sidecarJob_, nullptr))) CloseHandle(job);
+#endif
         const QByteArray finalStderr = proc->readAllStandardError();
         const auto finalLines = finalStderr.split('\n');
         for (const QByteArray& line : finalLines) {
@@ -2394,6 +2579,7 @@ void RemotePlaySession::startSidecar()
         ++streamPromoteGeneration_;
         streamPromotePending_ = false;
         streamPromoteAcked_ = false;
+        streamPromoteDeadlineExtendMs_ = 0;
         streamPromoteFromWarmPreview_ = false;
         rejectLateSidecarStarted_ = true;
         ++inputRecoveryGeneration_;
@@ -2475,6 +2661,7 @@ void RemotePlaySession::startSidecar()
     });
 
     connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError err) {
+        if (sidecarProcess_ != proc) return;
         // Launch failure only; a mid-stream crash arrives via QProcess::finished. We never
         // block the GUI thread on waitForStarted() — that up-to-5 s wait was the connect stall.
         if (err == QProcess::FailedToStart) {
@@ -2516,115 +2703,136 @@ void RemotePlaySession::startSidecar()
     proc->start();
 }
 
-void RemotePlaySession::restartSidecar()
+void RemotePlaySession::prepareSidecarCaptureInventory()
 {
-    // Only flag the restart as intentional when a live process is actually being
-    // torn down here — its QProcess::finished will fire and consume the flag. If the
-    // sidecar already exited on its own (real crash, sidecarProcess_ nulled), there
-    // is no finished event to consume it, so leaving it set would wrongly suppress a
-    // genuine repeat crash on the NEXT process and defeat the safe-mode escalation.
-    intentionalSidecarRestart_ = (sidecarProcess_ != nullptr
-                                  && sidecarProcess_->state() != QProcess::NotRunning);
-    stopSidecar();
-    // Give the old process a beat to release the frame pipe / capture handles before we
-    // respawn. Track W: in capture-card mode wait longer (kSidecarRestartDelayMsCaptureCard)
-    // so the Elgato's DirectShow handle releases first — respawning too soon makes the new
-    // sidecar hit "no live device (index 0)" and leaves the device contended, which then stalls
-    // the GUI-thread video-device enumeration into SAFE MODE. Decoder-pipe mode has no
-    // DirectShow device to release, so it keeps the historical fast beat.
-    const bool captureCard = isCaptureCardSource(config_);
-    const int delayMs = sidecarRestartDelayMs(captureCard);
-    emit setupMessage(QStringLiteral("Sidecar restart scheduled: delayMs=%1 captureCard=%2")
-                          .arg(delayMs)
-                          .arg(captureCard ? 1 : 0));
-    // CANCELLATION GUARD (the warm-preview handoff timer in start() has the equivalent): this
-    // deferred relaunch was unguarded, so a watchdog restart armed moments before the user hits
-    // Disconnect fired ~0.6-3s LATER — after the teardown — and resurrected the whole session: a
-    // fresh sidecar, which relaunches chiaki, which makes the PS5 reconnect unbidden, while also
-    // racing startCapturePreview() for the single-open Elgato handle.
-    //
-    // The guard is a pending-intent flag, NOT `state_ == Running || Connecting`. stopSidecar()
-    // above makes QProcess::finished fire, and that handler sets state_ to Disconnected whenever
-    // it was Running/Connecting (see startSidecar's finished lambda) — while startSidecar() itself
-    // never sets Connecting; Running only returns when telemetry arrives. So by the time this beat
-    // elapses state_ is ALWAYS Disconnected and a state check would block every watchdog restart.
-    // stop() clears the flag, which is exactly the disconnect case we need to cancel.
-    sidecarRestartPending_ = true;
-    QTimer::singleShot(delayMs, this, [this]() {
-        if (!sidecarRestartPending_) {
-            return;   // a disconnect (or a fresh connect) superseded this restart during the beat
-        }
+    captureInventoryStartRequested_ = true;
+    captureInventoryStartGeneration_ = sessionIntentGeneration_;
+    if (captureInventoryPending_) return;
+    captureInventoryPending_ = true;
+    struct InventoryResult {
+        VideoInputDeviceInventory inventory;
+        std::atomic<bool> ready{false};
+    };
+    auto result = std::make_shared<InventoryResult>();
+    const auto fallback = cachedVideoDeviceInventory_.namesOnlyFallback();
+    std::thread([result, fallback]() {
+        try {
+            result->inventory = runBoundedEnumeration(kVideoEnumTimeoutMs, fallback,
+                []() { return enumerateVideoInputDevices(); });
+        } catch (...) { result->inventory = fallback; }
+        result->ready.store(true, std::memory_order_release);
+    }).detach();
+    auto* poll = new QTimer(this);
+    poll->setInterval(10);
+    connect(poll, &QTimer::timeout, this, [this, result, poll]() {
+        if (!result->ready.load(std::memory_order_acquire)) return;
+        poll->stop();
+        poll->deleteLater();
+        captureInventoryPending_ = false;
+        cachedVideoDeviceInventory_ = result->inventory;
+        if (!std::exchange(captureInventoryStartRequested_, false)
+                || captureInventoryStartGeneration_ != sessionIntentGeneration_) return;
+        captureInventoryPrepared_ = true;
+        startSidecar();
+    });
+    poll->start();
+}
+
+void RemotePlaySession::scheduleSidecarStart(int delayMs)
+{
+    const quint64 generation = sessionIntentGeneration_;
+    if (stopping()) {
+        sidecarStartAfterStop_ = true;
+        sidecarStartAfterStopGeneration_ = generation;
+        sidecarStartAfterStopDelayMs_ = delayMs;
+        return;
+    }
+    QTimer::singleShot(delayMs, this, [this, generation]() {
+        if (generation != sessionIntentGeneration_) return;
+        if (!previewMode_ && state_ != RemotePlayState::Connecting
+                && state_ != RemotePlayState::Running && !sidecarRestartPending_) return;
         sidecarRestartPending_ = false;
         startSidecar();
     });
 }
 
+void RemotePlaySession::restartSidecar()
+{
+    // No retired process means no exit callback to consume this flag. Leaving
+    // it set in that case would suppress the next generation's genuine crash.
+    intentionalSidecarRestart_ = retiringSidecar_
+        || (sidecarProcess_ && sidecarProcess_->state() != QProcess::NotRunning);
+    ++sessionIntentGeneration_;
+    stopSidecar();
+    const int delayMs = sidecarRestartDelayMs(isCaptureCardSource(config_));
+    emit setupMessage(QStringLiteral("Sidecar restart scheduled after cleanup: delayMs=%1").arg(delayMs));
+    sidecarRestartPending_ = true;
+    if (!previewMode_ && (state_ == RemotePlayState::Running || state_ == RemotePlayState::Connecting))
+        setState(RemotePlayState::Connecting, QStringLiteral("Restarting detection sidecar"));
+    scheduleSidecarStart(delayMs);
+}
+
+void RemotePlaySession::waitForStopped()
+{
+    if (retiringSidecar_) retiringSidecar_->waitForExit(kSidecarGracefulShutdownMs);
+}
+
 void RemotePlaySession::stopSidecar()
 {
+    // No readiness timer or ACK from the retiring generation may authorize
+    // input while its asynchronous shutdown drains, or affect its replacement.
+    ++streamPromoteGeneration_;
+    streamPromotePending_ = false;
+    streamPromoteAcked_ = false;
+    streamPromoteDeadlineExtendMs_ = 0;
+    streamPromoteFromWarmPreview_ = false;
+    rejectLateSidecarStarted_ = true;
+    ++inputRecoveryGeneration_;
+    inputRecoveryPending_ = false;
+    rejectLateInputRecoveryReady_ = true;
     cancelAudioApply();
     resetPreviewPresentation(false);
     retireShmSourceEpoch();
-    shmOpenFailures_ = 0;
-    shmReadFailures_ = 0;
-    shmFramesRead_ = 0;
-    lastShmFramesReadCount_ = 0;
+    shmOpenFailures_ = shmReadFailures_ = 0;
+    shmFramesRead_ = lastShmFramesReadCount_ = 0;
     shmFallbackRequested_ = false;
     jpegFallbackFirstFrameNumber_ = 0;
-    auto* proc = sidecarProcess_;
-    sidecarProcess_ = nullptr;
     sidecarBuffer_.clear();
     previewChunks_.reset();
-    const qint64 sidecarPid = proc ? proc->processId() : 0;
-    // GRACEFUL CHIAKI DISCONNECT: true only when the sidecar refused to exit within the grace
-    // window and we had to force it. Gates the /F /T sweep below — see the comment there.
-    bool forcedTermination = false;
-    if (proc && proc->state() != QProcess::NotRunning) {
-        const QByteArray line = QJsonDocument(QJsonObject{{QStringLiteral("cmd"), QStringLiteral("shutdown")}})
-                                    .toJson(QJsonDocument::Compact) + '\n';
-        proc->write(line);
-        proc->closeWriteChannel();
-        proc->terminate();
-        // Give Python enough time to run orch.stop(), which closes the
-        // RemotePlayClientManager and calls terminate_chiaki_processes() (loops
-        // up to 6s doing taskkill+verify). 900ms was too short — the hard
-        // taskkill /F /T fired before graceful shutdown, abruptly dropping the
-        // PS5 TCP connection and triggering "LAN cable disconnected" on the PS5.
-        if (!proc->waitForFinished(kSidecarGracefulShutdownMs)) {
-            forcedTermination = true;
+    if (retiringSidecar_) return;
+    auto* proc = std::exchange(sidecarProcess_, nullptr);
+    if (!proc) return;
+    emit setupMessage(QStringLiteral("Sidecar shutdown requested asynchronously: pid=%1 "
+                                     "intentional=%2 input_recovery_pending=%3")
+                          .arg(proc->processId()).arg(intentionalSidecarRestart_ ? 1 : 0)
+                          .arg(inputRecoveryPending_ ? 1 : 0));
+    std::function<void()> releaseChildren;
+    std::function<void(QProcess*)> claimProcess;
 #ifdef Q_OS_WIN
-            if (sidecarPid > 0) {
-                runTaskkillBlocking({QStringLiteral("/PID"), QString::number(sidecarPid), QStringLiteral("/F"), QStringLiteral("/T")});
-            }
+    // Never reuse the old job for a replacement generation, nor kill by image/title.
+    auto job = std::make_shared<void*>(std::exchange(sidecarJob_, nullptr));
+    releaseChildren = [job]() {
+        if (auto handle = static_cast<HANDLE>(std::exchange(*job, nullptr))) CloseHandle(handle);
+    };
+    claimProcess = [job](QProcess* process) {
+        // Own no session/controller pointer: safe even during parent destruction.
+        const auto message = assignProcessToOwnedJob(process, *job);
+        if (!message.isEmpty()) qInfo().noquote() << message;
+    };
 #endif
-            if (proc->state() != QProcess::NotRunning) {
-                proc->kill();
-                proc->waitForFinished(500);
-            }
-        }
-    }
-
-#ifdef Q_OS_WIN
-    // Deterministic cleanup beats a detached best-effort taskkill here. The
-    // custom OrionStream fallback can briefly spawn a child while the parent
-    // still owns \\.\pipe\orion_input / \\.\pipe\orion_frames; a restart that
-    // races that state leaves the new stream without hooks.
-    //
-    // GRACEFUL CHIAKI DISCONNECT: but this must NOT run on the clean-exit path. When the sidecar
-    // exits normally it has already closed the Chiaki session properly (chiaki_session_stop ->
-    // Takion/ctrl disconnect) and reaped its own client; running a blanket TerminateProcess sweep
-    // anyway was what made EVERY teardown — including a mid-game watchdog restartSidecar() — look
-    // to the PS5 like the transport had simply vanished ("LAN cable disconnected"). It also costs
-    // 8 blocking taskkill spawns + 300ms of msleep on the GUI thread for nothing. Keep it strictly
-    // as the recovery path for a sidecar that had to be force-killed, where an orphaned stream
-    // client holding \\.\pipe\orion_input really can survive.
-    if (forcedTermination) {
-        cleanupRemotePlayClientsBlocking();
-    }
-#endif
-
-    if (proc) {
-        proc->deleteLater();
-    }
+    retiringSidecar_ = new AsyncProcessRetirer(proc, this, std::move(releaseChildren),
+        [this](bool forced) {
+            retiringSidecar_ = nullptr;
+            intentionalSidecarRestart_ = false;
+            emit setupMessage(forced ? QStringLiteral("Sidecar shutdown completed (deadline fallback).")
+                                     : QStringLiteral("Sidecar shutdown completed gracefully."));
+            emit sidecarExited(false);
+            emit sidecarStopFinished();
+            if (std::exchange(sidecarStartAfterStop_, false)
+                    && sidecarStartAfterStopGeneration_ == sessionIntentGeneration_)
+                scheduleSidecarStart(sidecarStartAfterStopDelayMs_);
+        }, std::move(claimProcess));
+    retiringSidecar_->start(kSidecarGracefulShutdownMs);
 }
 
 bool RemotePlaySession::sendSidecarCommand(const QJsonObject& cmd)
@@ -3347,8 +3555,17 @@ void RemotePlaySession::handleShmPumpBatch(const SharedMemoryFramePumpBatch& bat
     }
     const int frameNumber = batch.mappedFrameNumber > 0
         ? batch.mappedFrameNumber : batch.eventFrameNumber;
+    // [ORION_ACTIVITY_FEED 2026-09-14] Was every 300 frames (~5 s, 445 lines/hour in
+    // the census). One line a minute while the presentation path is healthy; the
+    // original 5 s stride returns the moment source->dispatch age is unhealthy, so a
+    // stalling preview is still sampled at the resolution the fault needs.
+    const quint64 shmLogStride =
+        (std::isfinite(shmSourceToDispatchAgeMs_)
+         && shmSourceToDispatchAgeMs_ >= kShmDispatchAgeUnhealthyMs)
+            ? kShmPreviewLogFrameStrideUnhealthy
+            : kShmPreviewLogFrameStride;
     if (priorFramesRead == 0
-        || (shmFramesRead_ / 300) > (priorFramesRead / 300)) {
+        || (shmFramesRead_ / shmLogStride) > (priorFramesRead / shmLogStride)) {
         emit setupMessage(QStringLiteral(
                               "SHM preview frame read: count=%1 frame=%2 %3x%4 "
                               "source_to_read_ms=%5 read_to_dispatch_ms=%6 "
@@ -3362,10 +3579,18 @@ void RemotePlaySession::handleShmPumpBatch(const SharedMemoryFramePumpBatch& bat
                               .arg(shmSourceToDispatchAgeMs_, 0, 'f', 1)
                               .arg(shmPresentationTimestampRejects_));
     }
+    // Drain a bounded display burst in source order during this one GUI wake.
+    // The existing four-frame presenter still drops oldest on overflow; this
+    // does not change its prime depth, render clock, or detector/shot timing.
+    for (const auto& preceding : batch.precedingFrames) {
+        queuePreviewFrame(preceding.image, preceding.mappedFrameNumber > 0
+            ? preceding.mappedFrameNumber : preceding.eventFrameNumber);
+    }
     queuePreviewFrame(batch.image, frameNumber);
 }
 
-void RemotePlaySession::armMeterGate(const QString& source, quint64 physicalShotEpoch)
+void RemotePlaySession::armMeterGate(const QString& source, quint64 physicalShotEpoch,
+                                     const QString& shotType, bool rhythm)
 {
     const QString encodedEpoch = encodePoseArmToken(physicalShotEpoch);
     if (encodedEpoch.isEmpty()) {
@@ -3375,23 +3600,74 @@ void RemotePlaySession::armMeterGate(const QString& source, quint64 physicalShot
     const QString normalized = source.trimmed().left(24);
     const QString effectiveSource =
         normalized.isEmpty() ? QStringLiteral("hw") : normalized;
-    const bool sent = sendSidecarCommand({{"cmd", "shot_gate_arm"},
-                                          {"source", effectiveSource},
-                                          {"shot_epoch", encodedEpoch}});
+    const bool sent = sendSidecarCommand(
+        makeShotGateArmCommand(effectiveSource, physicalShotEpoch, shotType, rhythm));
     // PERMANENT t=0 ARM FORENSICS (one bounded line per physical shot edge). This command is
     // the reader's early wake-up (Path A) and used to be completely silent, which made "was
     // the reader armed during acquisition?" unanswerable from a session log (the visible
     // "POSE ARM" line belongs to the LATER pose_arm command at shot-begin). Pairs with the
     // orchestrator's "SHOT-GATE ARM RECEIPT" line: a send without a receipt = pipe loss; a
     // "Physical shot epoch" line without this send = the controller-guard blocked the arm.
-    emit setupMessage(QStringLiteral("shot_gate_arm send: epoch=%1 source=%2 sent=%3")
+    // [ORION_SHOT_GATE_TYPE 2026-09-15] shot_type/rhythm are APPENDED, so every existing reader
+    // of this line is unaffected. `unclassified` is EMITTED, never omitted, when the edge
+    // carried no classification (a probe edge, an old engine) -- a reader must be able to
+    // separate "this press was never typed" from "this build predates the field".
+    emit setupMessage(QStringLiteral(
+                          "shot_gate_arm send: epoch=%1 source=%2 sent=%3 shot_type=%4 rhythm=%5")
                           .arg(physicalShotEpoch)
                           .arg(effectiveSource)
+                          .arg(sent ? 1 : 0)
+                          .arg(shotGateShotTypeField(shotType))
+                          .arg(rhythm ? 1 : 0));
+}
+
+void RemotePlaySession::sendShotGateRelease(quint64 physicalShotEpoch, double releaseWallMsEpoch)
+{
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] The closing half of the arm. Without it the sidecar's
+    // press window can only expire on a timer (ORION_ANCHOR_ARM_S, 2.5 s), which keeps the
+    // nameplate anchor running for ~1 s after every shot has already left the hand and leaves a
+    // retired press able to accept a sub-floor candidate from the NEXT screen. One line per
+    // release, paired with the orchestrator's "SHOT-GATE RELEASE RECEIPT".
+    const QString encodedEpoch = encodePoseArmToken(physicalShotEpoch);
+    if (encodedEpoch.isEmpty()) {
+        emit setupMessage(
+            QStringLiteral("Refused shot_gate_release with invalid physical-shot epoch"));
+        return;
+    }
+    const bool sent = sendSidecarCommand(
+        makeShotGateReleaseCommand(physicalShotEpoch, releaseWallMsEpoch));
+    emit setupMessage(QStringLiteral("shot_gate_release send: epoch=%1 release_ms=%2 sent=%3")
+                          .arg(physicalShotEpoch)
+                          .arg(releaseWallMsEpoch, 0, 'f', 1)
+                          .arg(sent ? 1 : 0));
+}
+
+void RemotePlaySession::sendShotGateDisarm(quint64 physicalShotEpoch, const QString& reason)
+{
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] A press that ended with NO bot release -- the player
+    // let go (tap / pump fake) or the engine aborted. The reader must close the window on this
+    // exactly as it does on a release; a manual cancel is otherwise indistinguishable from a
+    // shot still in flight.
+    const QString encodedEpoch = encodePoseArmToken(physicalShotEpoch);
+    if (encodedEpoch.isEmpty()) {
+        emit setupMessage(
+            QStringLiteral("Refused shot_gate_disarm with invalid physical-shot epoch"));
+        return;
+    }
+    const QString encodedReason = encodeShotGateReason(reason);
+    const bool sent = sendSidecarCommand(
+        makeShotGateDisarmCommand(physicalShotEpoch, encodedReason));
+    emit setupMessage(QStringLiteral("shot_gate_disarm send: epoch=%1 reason=%2 sent=%3")
+                          .arg(physicalShotEpoch)
+                          .arg(encodedReason.isEmpty() ? QStringLiteral("unspecified")
+                                                       : encodedReason)
                           .arg(sent ? 1 : 0));
 }
 
 bool RemotePlaySession::recoverInputLink()
 {
+    if (isXboxRemotePlay(config_))
+        return false; // External app sessions have no replaceable Chiaki input process.
     if (state_ != RemotePlayState::Running || inputRecoveryPending_) {
         return false;
     }
@@ -3403,28 +3679,35 @@ bool RemotePlaySession::recoverInputLink()
         rejectLateInputRecoveryReady_ = true;
         setState(RemotePlayState::Error,
                  QStringLiteral("Chiaki input recovery blocked: trusted client image unavailable"));
+        emit inputSessionFailure(
+            static_cast<int>(InputSessionFailureClass::IdentityBlocked), false);
         return false;
     }
 
     const quint64 generation = ++inputRecoveryGeneration_;
     inputRecoveryPending_ = true;
     rejectLateInputRecoveryReady_ = false;
+    // Close/drain the old controller route before the sidecar can create the
+    // replacement pipe. Running remains the capture state, not input authority.
+    emit inputRecoveryStarted();
     if (!sendSidecarCommand({{"cmd", "recover_input"}})) {
         inputRecoveryPending_ = false;
         rejectLateInputRecoveryReady_ = true;
         setState(RemotePlayState::Error,
                  QStringLiteral("Chiaki input recovery command could not reach the sidecar."));
+        emit inputSessionFailure(
+            static_cast<int>(InputSessionFailureClass::CommandUndeliverable), false);
         return false;
     }
 
-    // Revoke route authority synchronously with the recovery request. Waiting for the sidecar's
-    // asynchronous `begin` event would leave a small Running window after the pipe was known lost.
-    setState(RemotePlayState::Connecting,
-             QStringLiteral("Recovering console input session"));
+    // This is an input-child repair, not a new stream generation: retain Running
+    // so capture epoch, detector history and learned timing remain intact.
+    setState(RemotePlayState::Running,
+             QStringLiteral("Recovering console input session; live capture retained"));
     QTimer::singleShot(kInputSessionRecoveryDeadlineMs, this, [this, generation]() {
         if (!inputRecoveryDeadlineApplies(
                 generation, inputRecoveryGeneration_, inputRecoveryPending_,
-                state_ == RemotePlayState::Connecting)) {
+                state_ == RemotePlayState::Running)) {
             return;
         }
         inputRecoveryPending_ = false;
@@ -3435,6 +3718,10 @@ bool RemotePlaySession::recoverInputLink()
         setState(RemotePlayState::Error,
                  QStringLiteral("Chiaki input recovery did not prove a current console session; "
                                 "automation remains disabled."));
+        // No verdict from the sidecar: the recovery worker may be wedged. Cold
+        // retry only (see InputSessionRetryPolicy.h).
+        emit inputSessionFailure(
+            static_cast<int>(InputSessionFailureClass::DeadlineTimeout), false);
     });
     return true;
 }
@@ -3644,6 +3931,10 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
                          QStringLiteral("Remote Play input session was not proven ready; "
                                         "automation remains disabled."));
                 restoreWarmPreviewAfterPromotionFailure();
+                // The sidecar's command loop provably returned (it emitted this
+                // verdict), so a warm in-place re-promotion is safe.
+                emit inputSessionFailure(
+                    static_cast<int>(InputSessionFailureClass::SidecarVerdict), false);
                 return;
             }
             rejectLateSidecarStarted_ = false;
@@ -3654,25 +3945,55 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
         // The sidecar acknowledged the warm-preview -> stream promotion and will report a
         // real verdict (started/error). A missing ack is rejected after the short protocol grace;
         // neither branch can promote from process liveness alone.
-        if (msg.value(QStringLiteral("state")).toString() == QLatin1String("begin")
-                && streamPromotePending_) {
+        const QString promoteState = msg.value(QStringLiteral("state")).toString();
+        if (promoteState == QLatin1String("begin") && streamPromotePending_) {
             streamPromoteAcked_ = true;
+            // [ORION_CONNECT_LATENCY 2026-09-19] The handoff boundary: everything
+            // before it is ours, everything after it is the sidecar's own
+            // `start_stream timing:` line. Stamping the click-relative elapsed here
+            // makes the two halves addable without guessing.
             emit setupMessage(QStringLiteral("Stream promotion started - waiting for the sidecar's "
-                                             "Chiaki/input result."));
+                                             "Chiaki/input result.%1")
+                                  .arg(connectStopwatchArmed_
+                                           ? QStringLiteral(" (handoff=%1ms)")
+                                                 .arg(connectStopwatch_.elapsed())
+                                           : QString()));
+        } else if (promoteState == QLatin1String("waking") && streamPromotePending_
+                   && streamPromoteDeadlineExtendMs_ == 0) {
+            // The sidecar found the console in rest mode, sent the Remote Play wakeup and is
+            // waiting up to budget_ms for the session port. A PS5 takes ~10-25s to boot, longer
+            // than the 20s deadline above (sized for an AWAKE console), so extend ONCE by the
+            // sidecar's own budget plus spawn/handshake headroom. Still a hard deadline; still
+            // fail-closed on no verdict.
+            const int budgetMs = msg.value(QStringLiteral("budget_ms")).toInt();
+            if (budgetMs > 0) {
+                streamPromoteAcked_ = true;
+                streamPromoteDeadlineExtendMs_ = budgetMs + 8000;
+                const quint64 generation = streamPromoteGeneration_;
+                const int extendMs = streamPromoteDeadlineExtendMs_;
+                emit setupMessage(QStringLiteral("Console is in rest mode - woke it, waiting up to "
+                                                 "%1 s for it to boot...").arg((budgetMs + 500) / 1000));
+                setState(RemotePlayState::Connecting,
+                         QStringLiteral("Waking the console from rest mode..."));
+                QTimer::singleShot(extendMs, this, [this, generation, extendMs]() {
+                    fireStreamPromoteDeadline(generation, extendMs);
+                });
+            }
         }
     } else if (event == QLatin1String("input_recovery")) {
         const QString recoveryState = msg.value(QStringLiteral("state")).toString();
         if (recoveryState == QLatin1String("begin")) {
             if (!inputRecoveryPending_ || rejectLateInputRecoveryReady_
-                    || state_ != RemotePlayState::Connecting) {
+                    || state_ != RemotePlayState::Running) {
                 emit setupMessage(QStringLiteral("Ignored input-recovery begin without a current "
                                                  "pending recovery attempt."));
                 return;
             }
-            // recoverInputLink() already moved to Connecting synchronously; refresh only the
-            // explanatory status once the sidecar confirms it received the command.
-            setState(RemotePlayState::Connecting,
-                      QStringLiteral("Recovering console input session"));
+            // Refresh only the explanatory status once the retained sidecar confirms it received
+            // the command. The state deliberately stays Running: route authority is held by the
+            // separate input-recovery gate until a fresh direct-pipe write succeeds.
+            setState(RemotePlayState::Running,
+                      QStringLiteral("Recovering console input session; live capture retained"));
             emit setupMessage(QStringLiteral("Recovering Chiaki input link in place; live capture "
                                               "and meter detection remain active."));
         } else if (recoveryState == QLatin1String("ready")) {
@@ -3680,9 +4001,9 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
             const bool inputReady = msg.value(QStringLiteral("input_ready")).toBool(false);
             if (!shouldAcceptInputRecoveryReady(
                     inputRecoveryPending_, rejectLateInputRecoveryReady_,
-                    state_ == RemotePlayState::Connecting, hasInputReady, inputReady)) {
+                    state_ == RemotePlayState::Running, hasInputReady, inputReady)) {
                 if (!inputRecoveryPending_ || rejectLateInputRecoveryReady_
-                        || state_ != RemotePlayState::Connecting) {
+                        || state_ != RemotePlayState::Running) {
                     emit setupMessage(QStringLiteral("Ignored late/out-of-scope input-recovery ready "
                                                      "verdict."));
                     return;
@@ -3691,6 +4012,8 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
                 rejectLateInputRecoveryReady_ = true;
                 setState(RemotePlayState::Error,
                           QStringLiteral("Recovered input child did not prove a fresh console session."));
+                emit inputSessionFailure(
+                    static_cast<int>(InputSessionFailureClass::SidecarVerdict), false);
                 return;
             }
             inputRecoveryPending_ = false;
@@ -3701,7 +4024,7 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
                                               "controller pipe to reconnect."));
         } else if (recoveryState == QLatin1String("error")) {
             if (!inputRecoveryPending_ || rejectLateInputRecoveryReady_
-                    || state_ != RemotePlayState::Connecting) {
+                    || state_ != RemotePlayState::Running) {
                 emit setupMessage(QStringLiteral("Ignored late/out-of-scope input-recovery error "
                                                  "verdict."));
                 return;
@@ -3714,6 +4037,8 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
             emit setupMessage(QStringLiteral("Chiaki input recovery failed: %1")
                                   .arg(msg.value(QStringLiteral("msg")).toString(
                                       QStringLiteral("unknown input-link error"))));
+            emit inputSessionFailure(
+                static_cast<int>(InputSessionFailureClass::SidecarVerdict), false);
         }
     } else if (event == QLatin1String("capabilities")) {
         // FIX 2: what this install can actually do. Only `no_meter_available` today. Keys that are
@@ -3746,6 +4071,26 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
         // flag stops the deadline timer from double-reporting; setState(Error) already prevents the
         // protocol-grace timer (it only acts while Connecting).
         const bool failedPromotion = streamPromotePending_;
+        // [ORION_INPUT_DEAD_UX] A non-promotion error that ends a RUNNING session
+        // is the same player trap (live HDMI, dead input) and gets the same
+        // classified failure below. Snapshot before setState overwrites it.
+        const bool endedRunningSession = state_ == RemotePlayState::Running;
+        // [ORION_DISCONNECT_AUDIT 2026-09-19] F5: the input_recovery/error branch
+        // above clears the recovery pair; this GENERIC error branch never did. The
+        // session leaves Running with inputRecoveryPending_ still true, and because
+        // inputRecoveryDeadlineApplies() requires a Running session the 20 s deadline
+        // then no-ops -- so nothing clears it until the next start()/stop()/exit.
+        // While stuck: recoverInputLink() refuses at its own guard, AND
+        // inputLinkRecoveryAction()'s inputOnlyRecoveryPending short-circuit
+        // suppresses the controller's whole escalation ladder. Invariant restored
+        // here: "recovery pending" implies a live session, always.
+        if (inputRecoveryPending_) {
+            ++inputRecoveryGeneration_;
+            inputRecoveryPending_ = false;
+            rejectLateInputRecoveryReady_ = true;
+            emit setupMessage(QStringLiteral(
+                "Input recovery abandoned: the session ended with an error while it was pending."));
+        }
         if (failedPromotion) {
             streamPromotePending_ = false;
             rejectLateSidecarStarted_ = true;
@@ -3755,6 +4100,10 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
         setState(RemotePlayState::Error, errMsg.isEmpty() ? QStringLiteral("Autogreen error") : errMsg);
         if (failedPromotion) {
             restoreWarmPreviewAfterPromotionFailure();
+        }
+        if (failedPromotion || endedRunningSession) {
+            emit inputSessionFailure(
+                static_cast<int>(InputSessionFailureClass::SidecarVerdict), false);
         }
     } else if (event == QLatin1String("stopped")) {
         setState(RemotePlayState::Disconnected, QStringLiteral("Autogreen stopped"));
@@ -3831,8 +4180,8 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
         // and is intentionally allowed to report false. Once Running, missing
         // evidence or an ended Chiaki session revokes authority immediately,
         // then gets one bounded input-only repair. recoverInputLink()
-        // synchronously enters Connecting (which disarms automation), latches a
-        // generation-scoped pending attempt, and preserves the capture sidecar.
+        // synchronously revokes route authority without leaving Running, latches
+        // a generation-scoped pending attempt, and preserves the capture sidecar.
         const bool hasInputReady = msg.contains(QStringLiteral("input_ready"));
         const bool inputReady = msg.value(QStringLiteral("input_ready")).toBool(false);
         if (shouldAutoRecoverInputFromTelemetry(
@@ -3870,12 +4219,27 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
                 // multi-second value means the two clocks disagree, not that transit was fast.
                 if (transit >= 0.0 && transit < 5000.0) {
                     sidecarEmitTransitMs_ = transit;
-                    emitTransitSamples_.push_back(transit);
+                    // [ORION_ACTIVITY_FEED 2026-09-14] The window is a minute now, so bound
+                    // the sample buffer instead of letting a 60 Hz feed grow it unchecked.
+                    if (emitTransitSamples_.size() < kTelemetryWindowSampleCap) {
+                        emitTransitSamples_.push_back(transit);
+                    }
                 }
             }
+            // [ORION_ACTIVITY_FEED 2026-09-14 owner "overall polish"] This fired every 5 s —
+            // 439 lines in one hour of the census. It is a steady-state health sample, not an
+            // event, so the healthy cadence is once a MINUTE; a transit that crosses the
+            // unhealthy threshold falls back to the original 5 s cadence so a real stall is
+            // still visible at the resolution it needs.
+            const bool transitUnhealthy =
+                std::isfinite(sidecarEmitTransitMs_)
+                && sidecarEmitTransitMs_ >= kEmitTransitUnhealthyMs;
+            const qint64 emitTransitDueMs = transitUnhealthy
+                ? kEmitTransitLogIntervalMs
+                : kCustomerTelemetryLogIntervalMs;
             if (lastEmitTransitLogMs_ == 0) {
                 lastEmitTransitLogMs_ = nowEpochMs;
-            } else if (nowEpochMs - lastEmitTransitLogMs_ >= kEmitTransitLogIntervalMs
+            } else if (nowEpochMs - lastEmitTransitLogMs_ >= emitTransitDueMs
                        && emitTransitSamples_.size() >= 8) {
                 lastEmitTransitLogMs_ = nowEpochMs;
                 std::vector<double> s = emitTransitSamples_;
@@ -3971,7 +4335,23 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
                 shmReadToDispatchWindowMaxMs_ = 0.0;
                 shmSourceToDispatchWindowMaxMs_ = 0.0;
             } else if (nowPipelineMs - lastPreviewPipelineStatsMs_
-                       >= kPreviewPipelineStatsIntervalMs) {
+                       >= ([this]() -> qint64 {
+                              // [ORION_ACTIVITY_FEED 2026-09-14 owner] 876 of the
+                              // census hour's lines were these two templates at a
+                              // 5 s beat. Steady state is a minute; a window that
+                              // recorded a dropped/underflowed present, or a
+                              // present gap over the hitch threshold, keeps the
+                              // original 5 s cadence so the fault stays legible.
+                              const bool unhealthy =
+                                  previewPresentationUnderflows_
+                                          != lastPreviewDisplayUnderflowCount_
+                                  || previewPresentationDroppedFrames_
+                                          != lastPreviewDisplayDroppedCount_
+                                  || previewPresentationWindowMaxGapNs_
+                                          >= kPreviewPresentGapUnhealthyNs;
+                              return unhealthy ? kPreviewPipelineStatsIntervalMs
+                                               : kCustomerTelemetryLogIntervalMs;
+                          })()) {
                 const FrameDecoderStats stats = frameDecoder_->stats();
                 const double seconds = std::max(
                     0.001, static_cast<double>(nowPipelineMs - lastPreviewPipelineStatsMs_) / 1000.0);
@@ -4181,6 +4561,15 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
         const double fusionFill = fusion.value(QStringLiteral("fill_pct")).toDouble(-1.0);
         const double trackingFill = tracking.value(QStringLiteral("fill_pct")).toDouble(-1.0);
         const double sidecarFill = fusionFill >= 0.0 ? fusionFill : (trackingFill >= 0.0 ? trackingFill : fill);
+        // Estimator provenance must come from the SAME object that supplied
+        // sidecarFill.  A future fusion payload which omits the identity must
+        // not inherit tracking's identity and falsely bless a different ruler.
+        const QJsonObject fillPayload = fusionFill >= 0.0
+            ? fusion : (trackingFill >= 0.0 ? tracking : QJsonObject{});
+        const MeterFillEstimatorIdentity fillEstimator =
+            decodeMeterFillEstimatorIdentity(fillPayload);
+        const double coarseFill = fillPayload.value(
+            QStringLiteral("coarse_fill_pct")).toDouble(-1.0);
         const double sidecarConfidence = fusion.value(QStringLiteral("confidence")).toDouble(
             tracking.value(QStringLiteral("confidence")).toDouble(conf));
         const double sidecarVelocity = fusion.value(QStringLiteral("velocity_pct_s")).toDouble(
@@ -4221,9 +4610,19 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
         // release authority independently requires measurementCaptureTsMs.
         const double frameAgeEpochMs = coherentMeasurementClock
             ? measurementCaptureTsMs : captureTsMs;
+        // Record the EARLIEST steady bound of this epoch-age evaluation.
+        // Parsing and Qt delivery occur later. A scheduling pause between the
+        // two reads must over-age the frame conservatively, never disappear
+        // into a midpoint and make old pixels look fresh. Preserve the full
+        // bracket width too: AutomationEngine rejects timing evidence whose
+        // clock-pair uncertainty exceeds the shared 1 ms precision budget,
+        // instead of turning a long scheduling pause into an early anchor.
+        const auto ageSteadyBefore = std::chrono::steady_clock::now();
+        const double ageReceiptEpochMs = std::chrono::duration<double, std::milli>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto ageSteadyAfter = std::chrono::steady_clock::now();
         const double effectiveFrameAgeMs = effectiveSidecarFrameAgeMs(
-            frameAgeMs_, frameAgeEpochMs,
-            static_cast<double>(QDateTime::currentMSecsSinceEpoch()));
+            frameAgeMs_, frameAgeEpochMs, ageReceiptEpochMs);
         const bool sidecarFresh = std::isfinite(effectiveFrameAgeMs)
             && effectiveFrameAgeMs <= 350.0 && pixelAgeMs_ <= 200.0 && feedHealthy;
         // P1b: every frame now carries a top-level meter_present bool. On meter loss the sidecar emits
@@ -4273,12 +4672,25 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
             // On meter loss, clear fill/confidence (and the derived tracking) so the overlay + engine see a
             // genuine no-meter sample, not a lingering last-known value that keeps the HOLD clock alive.
             sidecarResult.fillPct = meterPresent ? sidecarFill : 0.0;
+            sidecarResult.coarseFillPct = meterPresent && std::isfinite(coarseFill)
+                    && coarseFill >= 0.0 && coarseFill <= 100.0
+                ? coarseFill : -1.0;
+            sidecarResult.fillEstimatorMode = meterPresent && fillEstimator.isValid()
+                ? fillEstimator.mode : QString{};
+            sidecarResult.fillEstimatorGeneration = meterPresent && fillEstimator.isValid()
+                ? fillEstimator.generation : 0;
             sidecarResult.confidence = meterPresent ? std::clamp(sidecarConfidence, 0.0, 1.0) : 0.0;
             sidecarResult.velocityPctS = meterPresent ? sidecarVelocity : 0.0;
             sidecarResult.accelerationPctS2 = meterPresent ? sidecarAccel : 0.0;
             sidecarResult.etaToGreenMs = meterPresent ? sidecarEta : -1.0;
             sidecarResult.targetPct = sidecarTarget;
             sidecarResult.frameAgeMs = effectiveFrameAgeMs;
+            sidecarResult.nativeFrameAgeSampleSteadyNs =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    ageSteadyBefore.time_since_epoch()).count();
+            sidecarResult.nativeFrameAgeSampleBracketNs =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    ageSteadyAfter - ageSteadyBefore).count();
             sidecarResult.consecutiveFrames = sidecarResult.detected ? 3 : 0;
             sidecarResult.releaseReady = fusion.value(QStringLiteral("release_ready")).toBool(false);
             // === Tip-timing IPC contract (Python sidecar per-frame payload fields) ===
@@ -4467,6 +4879,21 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
                 sidecarResult.width = bbox.at(2).toInt();
                 sidecarResult.height = bbox.at(3).toInt();
             }
+            // [ORION_PROOF_DETECTOR_BOX 2026-09-19] The same frame's DETECTOR rectangle, before
+            // the reader's display hug. Optional: an older sidecar omits it and every consumer
+            // falls back to the drawn bbox above, which is exactly today's behaviour. See
+            // DetectionResult::detX.
+            const auto detBbox = msg.value(QStringLiteral("det_bbox")).toArray();
+            if (detBbox.size() == 4) {
+                const int detWidth = detBbox.at(2).toInt();
+                const int detHeight = detBbox.at(3).toInt();
+                if (detWidth > 0 && detHeight > 0) {
+                    sidecarResult.detX = detBbox.at(0).toInt();
+                    sidecarResult.detY = detBbox.at(1).toInt();
+                    sidecarResult.detWidth = detWidth;
+                    sidecarResult.detHeight = detHeight;
+                }
+            }
             const auto bboxWh = msg.value(QStringLiteral("bbox_wh")).toArray();
             if (bboxWh.size() == 2) {
                 const int bboxFrameWidth = bboxWh.at(0).toInt();
@@ -4566,6 +4993,157 @@ void RemotePlaySession::handleSidecarMessage(const QJsonObject& msg)
             msg.value(QStringLiteral("state")).toString(),
             msg.value(QStringLiteral("learned_date")).toString(),
             msg.value(QStringLiteral("calibrating")).toBool(false));
+    } else if (event == QLatin1String("detector_health")) {
+        // Reader detector health (provider / inference ms / lifecycle counters), ~2 s cadence,
+        // for the Meter Detection card. PRESENTATION ONLY: handed to the controller verbatim
+        // and never to the engine, the telemetry snapshot, or any timing path.
+        emit detectorHealthReady(msg);
+    } else if (event == QLatin1String("banner_verdict")) {
+        // [ORION_BANNER_VERDICT_LIVE 2026-09-14] One graded shot read off the GAME'S OWN
+        // shot-feedback panel by the sidecar (banner_verdict_live.py - the live twin of the
+        // validated offline grader tools/timing/panel_grade.py). Exactly one event per banner
+        // APPEARANCE, ~0.5-1.5 s after the release. PRESENTATION ONLY: it feeds the owner's
+        // tuning tally and is never handed to the engine, the telemetry snapshot, or any
+        // timing path. timing/coverage are the grader's own template words - never invented.
+        const QString timing = msg.value(QStringLiteral("timing")).toString();
+        if (timing.isEmpty()) return;   // the sidecar never emits a blank/UNKNOWN verdict
+        const QString timingColor = msg.value(QStringLiteral("timing_color")).toString();
+        const QString coverage = msg.value(QStringLiteral("coverage")).toString();
+        // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19 owner] The panel's LAYOUT, which `coverage`
+        // alone cannot carry: an empty word is BOTH "this 2-cell TIMING | DISTANCE panel has no
+        // coverage cell" (a drill, or any no-defender context -- 98 of the 281 graded releases
+        // across the 2026-09-18 sessions) and "it has one and it was unreadable". Those two take
+        // OPPOSITE paths in the engine's trim, so the reader emits the layout separately
+        // (banner_verdict_live.py `has_coverage`).
+        //
+        // DEFAULT TRUE, deliberately: an older sidecar that does not send the field, or a field
+        // that is not a bool, reads back as "this panel had a coverage cell", which is the
+        // 2026-09-18 strict gate byte-for-byte. The new behaviour can only ever be unlocked by a
+        // sidecar that positively says the cell was absent.
+        const bool hasCoverage = msg.value(QStringLiteral("has_coverage")).toBool(true);
+        const double ncc = msg.value(QStringLiteral("ncc")).toDouble();
+        const qint64 frameEpochMs =
+            static_cast<qint64>(msg.value(QStringLiteral("frame_epoch_ms")).toDouble());
+        const int seq = msg.value(QStringLiteral("seq")).toInt();
+        // [ORION_BANNER_LEAD_TRIM 2026-09-15] The attribution the sidecar already computed. It
+        // forwards nothing unattributed while ORION_BANNER_REQUIRE_RELEASE holds, but the field
+        // is read (and defaulted to 0) here rather than assumed, so the closed loop is
+        // fail-closed against a sidecar that forwards one anyway. `release_seq` is the SHOT-GATE
+        // EPOCH, which is what note_release() is keyed on.
+        const int attributed = msg.value(QStringLiteral("attributed")).toInt(0);
+        const qint64 releaseSeq =
+            static_cast<qint64>(msg.value(QStringLiteral("release_seq")).toDouble(-1.0));
+        const double releaseDelayMs =
+            msg.value(QStringLiteral("release_delay_ms")).toDouble(-1.0);
+        // Same relay the sidecar's own log lines take, so every verdict is in the native log
+        // for banner_join-style post-mortems as well as on the live signal below. The
+        // sidecar's matching stderr INFO line is not relayed (plain INFO is filtered), so
+        // this is the verdict's only route into the log.
+        // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19] `has_cov` is printed right after `coverage`,
+        // matching the sidecar's own line, because `coverage=-` alone is ambiguous and the two
+        // cases it covers take opposite paths in the trim.
+        emit setupMessage(
+            QStringLiteral("Sidecar: BANNER VERDICT: timing=%1 coverage=%2 has_cov=%3 ncc=%4")
+                .arg(timing,
+                     coverage.isEmpty() ? QStringLiteral("-") : coverage,
+                     hasCoverage ? QStringLiteral("1") : QStringLiteral("0"),
+                     QString::number(ncc, 'f', 3)));
+        emit bannerVerdict(timing, timingColor, coverage, ncc, frameEpochMs, seq,
+                           attributed, releaseSeq, releaseDelayMs, hasCoverage);
+    } else if (event == QLatin1String("release_oracle")
+               || (event.isEmpty()
+                   && msg.value(QStringLiteral("type")).toString()
+                          == QLatin1String("release_oracle"))) {
+        // BOTH SPELLINGS, deliberately. Every message on this channel is keyed on "event", but
+        // the oracle was specified to the sidecar as {"type":"release_oracle",...}; accepting
+        // either costs one comparison and removes a whole class of "the emit shipped and the
+        // engine never saw it" failure. The `type` fallback is reachable ONLY when "event" is
+        // absent or empty, so no existing message can be re-routed by it.
+        // [ORION_RELEASE_ORACLE_TRIM 2026-09-15 owner] The reader's own post-release RETRACTION
+        // measurement, ~300-500 ms after each release -- the banner-free input to the SAME Shot
+        // Lead trim. The 09-15 framedump forensics proved this gap is the make/miss oracle:
+        // white-top -> green-bottom <= 3 px = EXCELLENT, >= 4 px = a miss, 27/27 against
+        // panel_grade and 25/25 against the live banner.
+        //
+        // `release_seq` is the SHOT-GATE EPOCH, the same key the banner verdict is attributed on,
+        // so the engine's ring is the single attribution authority for both instruments. The
+        // oracle is UNSIGNED (a distance, not a direction), which is why the engine parks it
+        // behind the banner's own 2.6 s window rather than treating it as a verdict.
+        //
+        // SCHEMA (agreed with the sidecar):
+        //   {"type":"release_oracle","release_seq":<epoch>,"gap_px":f,"gap_pct":f,
+        //    "settled_fill":f,"green_bottom_pct":f,"verdict_proxy":"green|miss|unknown",
+        //    "t_ms":<wall ms>}
+        // gap_pct / settled_fill / green_bottom_pct / t_ms are FORENSICS: relayed into the log
+        // line below and read by nothing in the timing path. Only gap_px and verdict_proxy reach
+        // the engine, so a reader that starts emitting extra fields cannot change a lead.
+        const qint64 oracleReleaseSeq =
+            static_cast<qint64>(msg.value(QStringLiteral("release_seq")).toDouble(-1.0));
+        const double gapPx = msg.value(QStringLiteral("gap_px")).toDouble(
+            std::numeric_limits<double>::quiet_NaN());
+        const double gapPct = msg.value(QStringLiteral("gap_pct")).toDouble(-1.0);
+        const double settledFill = msg.value(QStringLiteral("settled_fill")).toDouble(-1.0);
+        const double greenBottomPct =
+            msg.value(QStringLiteral("green_bottom_pct")).toDouble(-1.0);
+        const QString proxy = msg.value(QStringLiteral("verdict_proxy")).toString();
+        const qint64 oracleWallMs =
+            static_cast<qint64>(msg.value(QStringLiteral("t_ms")).toDouble(0.0));
+        // Same relay the banner verdict takes: the sidecar's own INFO line is filtered out, so
+        // this is the oracle's only route into the native log for post-mortems.
+        emit setupMessage(
+            QStringLiteral("Sidecar: RELEASE ORACLE: release_seq=%1 gap_px=%2 gap_pct=%3 "
+                           "settled_fill=%4 green_bottom_pct=%5 proxy=%6 t_ms=%7")
+                .arg(oracleReleaseSeq)
+                .arg(QString::number(gapPx, 'f', 2),
+                     QString::number(gapPct, 'f', 2),
+                     QString::number(settledFill, 'f', 2),
+                     QString::number(greenBottomPct, 'f', 2),
+                     proxy.isEmpty() ? QStringLiteral("-") : proxy.left(16))
+                .arg(oracleWallMs));
+        emit releaseOracle(oracleReleaseSeq, gapPx, proxy);
+    } else if (event == QLatin1String("shot_range")) {
+        // [ORION_SHOT_RANGE 2026-09-17 owner] The sidecar's THREE/MID reading for one press,
+        // emitted ~120 ms after the Square edge -- early enough that the engine still has ~500 ms
+        // before the release needs the lead. Same channel, same keying and the same fail-closed
+        // parse as the release oracle above: `release_seq` is the SHOT-GATE EPOCH, and a message
+        // that carries no usable word changes nothing.
+        //
+        // SCHEMA (agreed with the sidecar, shot_range.py):
+        //   {"event":"shot_range","release_seq":<epoch>,"range":"three|mid|unknown","conf":f,
+        //    "samples":n,"source":"anchor|no_plate|plate_stale|cell_unreadable",
+        //    "reason":"vote|split|uncalibrated|too_few_samples|no_samples",
+        //    "evidence":"three|mid|unknown","mean":f,"dark":f,"bright":f,"t_ms":<wall ms>}
+        // Only release_seq/range/conf reach the engine. Everything else is FORENSICS, relayed
+        // into the log below and read by nothing in the timing path -- the same contract the
+        // oracle's gap_pct/settled_fill have, so a reader that starts emitting extra fields can
+        // never change a lead.
+        const qint64 rangeReleaseSeq =
+            static_cast<qint64>(msg.value(QStringLiteral("release_seq")).toDouble(-1.0));
+        const QString rangeWord =
+            msg.value(QStringLiteral("range")).toString().trimmed().toLower().left(16);
+        const double rangeConf = msg.value(QStringLiteral("conf")).toDouble(0.0);
+        const int rangeSamples = msg.value(QStringLiteral("samples")).toInt(0);
+        const QString rangeSource =
+            msg.value(QStringLiteral("source")).toString().left(24);
+        const QString rangeReason =
+            msg.value(QStringLiteral("reason")).toString().left(24);
+        const QString rangeEvidence =
+            msg.value(QStringLiteral("evidence")).toString().left(16);
+        // The sidecar's own INFO line is filtered out of the relay, so this is the reading's only
+        // route into the native log. `evidence` is deliberately printed next to `range`: while
+        // the sidecar classifier is uncalibrated they differ, and a session log has to show that
+        // the measurement happened even though the verdict was withheld.
+        emit setupMessage(
+            QStringLiteral("Sidecar: SHOT RANGE: release_seq=%1 range=%2 conf=%3 samples=%4 "
+                           "source=%5 reason=%6 evidence=%7")
+                .arg(rangeReleaseSeq)
+                .arg(rangeWord.isEmpty() ? QStringLiteral("-") : rangeWord,
+                     QString::number(rangeConf, 'f', 2))
+                .arg(rangeSamples)
+                .arg(rangeSource.isEmpty() ? QStringLiteral("-") : rangeSource,
+                     rangeReason.isEmpty() ? QStringLiteral("-") : rangeReason,
+                     rangeEvidence.isEmpty() ? QStringLiteral("-") : rangeEvidence));
+        emit shotRange(rangeReleaseSeq, rangeWord, rangeConf);
     }
 }
 

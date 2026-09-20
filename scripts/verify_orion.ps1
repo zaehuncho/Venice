@@ -108,6 +108,11 @@ function Assert-OrionCMakeOwnership {
         [switch]$RequireTests
     )
 
+    # PowerShell's Set-Location does not update System.IO's process cwd. Resolve
+    # relative build names against this verifier's checkout, never its caller.
+    if (-not [IO.Path]::IsPathRooted($BuildDirectory)) {
+        $BuildDirectory = Join-Path $Root $BuildDirectory
+    }
     $cache = Join-Path $BuildDirectory "CMakeCache.txt"
     if (-not (Test-Path -LiteralPath $cache)) {
         throw "CMake cache missing from '$BuildDirectory'."
@@ -133,6 +138,44 @@ function Assert-OrionCMakeOwnership {
                 throw "CTest metadata for $testExe does not target this checkout: '$testFile'."
             }
         }
+    }
+}
+
+function Invoke-OrionNativeTests {
+    param([Parameter(Mandatory = $true)][string]$BuildDirectory)
+
+    if (-not [IO.Path]::IsPathRooted($BuildDirectory)) {
+        $BuildDirectory = Join-Path $Root $BuildDirectory
+    }
+    Assert-OrionCMakeOwnership -BuildDirectory $BuildDirectory -RequireTests
+    $runId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N')
+    $buildFull = [IO.Path]::GetFullPath($BuildDirectory)
+    $evidenceBase = Join-Path $buildFull 'Testing\OrionVerification'
+    if (-not [string]::IsNullOrWhiteSpace($env:ORION_VERIFY_LOG_ROOT)) {
+        # Opt in to a short evidence root for Windows PowerShell path limits.
+        # Keep dev/prod build identity and the full unique invocation ID; no
+        # test, transcript, timeout, or failure status is omitted or retried.
+        $buildLeaf = Split-Path -Leaf $buildFull.TrimEnd('\')
+        $evidenceBase = Join-Path ([IO.Path]::GetFullPath($env:ORION_VERIFY_LOG_ROOT)) $buildLeaf
+    }
+    $runDirectory = Join-Path $evidenceBase $runId
+    New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+    $ctestLog = Join-Path $runDirectory 'ctest.txt'
+    $previousLogRoot = $env:ORION_QTEST_LOG_ROOT
+    $ctestExit = 125
+    try {
+        $env:ORION_QTEST_LOG_ROOT = Join-Path $runDirectory 'qtest'
+        Write-Host "    Native test evidence: $runDirectory"
+        # QtTest wrappers retain their first invocation and enforce the original
+        # 120 s child bound. CTest allows wrapper termination/evidence grace.
+        ctest --test-dir $BuildDirectory -C Release --output-on-failure --timeout 135 --no-tests=error --output-log $ctestLog
+        $ctestExit = $LASTEXITCODE
+    } finally {
+        $env:ORION_QTEST_LOG_ROOT = $previousLogRoot
+        Write-Host "    CTest exit=$ctestExit; retained log: $ctestLog"
+        # Printing logs/environment restoration must not turn a failed CTest
+        # gate green when Invoke-OrionStep inspects LASTEXITCODE.
+        $global:LASTEXITCODE = $ctestExit
     }
 }
 
@@ -191,9 +234,12 @@ Write-Host "[orion] Python compile checks"
     controller_remap.py `
     decoder_pipe_identity.py `
     meter_detector.py `
+    meter_detector_yolo.py `
     remote_play_client.py `
     remote_play_cv.py `
     remote_play_orchestrator.py `
+    async_diagnostic_csv.py `
+    shot_records.py `
     rtt_sync_engine.py `
     simple_meter_reader.py `
     virtual_controller.py `
@@ -203,8 +249,11 @@ Write-Host "[orion] Python compile checks"
     tools\diagnostics\meter_stability_report.py `
     tools\diagnostics\session_report.py `
     tools\sidecar_bundle_manifest.py `
+    tools\quality\consistency_bench.py `
+    tools\timing\epoch_table.py `
+    tools\training\eval_meter_occlusion.py `
     tools\security_audit.py `
-    tools\security\pack_orion_release.py `
+    tools\security\pack_lethe_release.py `
     tools\admin\orion_admin.py `
     tools\admin\check_backend_contract.py
 if ($LASTEXITCODE -ne 0) { throw "Python compile checks failed with exit code $LASTEXITCODE" }
@@ -212,6 +261,29 @@ if ($LASTEXITCODE -ne 0) { throw "Python compile checks failed with exit code $L
 Invoke-OrionStep "[orion] Python sidecar tests" {
     & $Python -m pytest tests\test_controller_remap.py tests\test_orchestrator_capture.py `
         tests\test_decoder_pipe_identity.py `
+        tests\test_decoder_ordering_reliability.py `
+        tests\test_wgc_lifecycle_reliability.py `
+        tests\test_xbox_remote_play.py `
+        tests\test_decoder_payload_assembly.py `
+        tests\test_meter_detector_yolo_geometry.py `
+        tests\test_meter_locator_cv.py `
+        tests\test_meter_locator_crop_context.py `
+        tests\test_meter_detector_async_priority.py `
+        tests\test_meter_detector_async_lifecycle.py `
+        tests\test_detector_source_transition.py `
+        tests\test_meter_update_idempotence.py `
+        tests\test_async_diagnostic_csv.py `
+        tests\test_framedump_census_reliability.py `
+        tests\test_shot_record_framedump_completion.py `
+        tests\test_shot_records.py `
+        tests\test_shot_records_wiring.py `
+        tests\test_detcsv_frame_identity.py `
+        tests\test_detcsv_authority.py `
+        tests\test_detector_frame_wakeup.py `
+        tests\test_simple_reader_occlusion_template.py `
+        tests\test_simple_reader_occlusion_search_origin.py `
+        tests\test_meter_detector_provider_priority.py `
+        tests\test_readiness_incident.py `
         tests\test_remote_play_client_lifecycle.py `
         tests\test_remote_play_frame_pipe.py `
         tests\test_verify_remote_play_backend.py `
@@ -220,22 +292,40 @@ Invoke-OrionStep "[orion] Python sidecar tests" {
         tests\test_rtt_sync_engine.py `
         tests\test_chiaki_decoder_geometry.py tests\test_orchestrator_feed_gate.py `
         tests\test_capture_card_backend.py tests\test_capture_pts_lock.py `
+        tests\test_capture_publication_lifecycle.py `
+        tests\test_capture_timing_epoch.py `
+        tests\test_capture_pts_continuity.py `
         tests\test_frame_integrity_pipeline.py tests\test_stream_quality.py `
         tests\test_export_rate_stats.py tests\test_pipe_bt709.py `
         tests\test_stall_staleness.py `
         tests\test_simple_meter_reader.py tests\test_reader_robust.py `
         tests\test_reader_camera_adaptive.py tests\test_meter_reader_y.py `
+        tests\test_simple_reader_lock_lifecycle.py `
+        tests\test_simple_reader_tracking_geometry.py `
+        tests\test_simple_reader_fade_tracking.py `
+        tests\test_simple_reader_template_cadence.py `
+        tests\test_simple_reader_source_lifecycle.py `
+        tests\test_compressed_reader_source_lifecycle.py `
+        tests\test_simple_reader_ghost_press.py `
+        tests\test_simple_reader_box_width_gate.py `
+        tests\test_simple_reader_floating_white.py `
+        tests\test_simple_reader_session_ruler.py `
+        tests\test_simple_reader_partial_occlusion.py `
         tests\test_simple_reader_sidecar_wiring.py `
         tests\test_event_driven_meter_emission.py `
         tests\test_live_session_diagnostics.py `
         tests\test_sidecar_bundle_manifest.py `
+        tests\test_sidecar_detector_smoke.py `
+        tests\test_shipped_reader_defaults.py `
+        tests\test_consistency_bench.py `
+        tests\test_epoch_table.py `
+        tests\test_eval_meter_occlusion.py `
+        tests\test_finetune_meter_lowfill.py `
         tests\test_correlate_releases_parse.py `
         tests\test_security_audit.py `
         tests\test_release_packaging.py `
         tests\test_packing_workflow.py `
-        tests\test_orionpack_container.py `
-        tools\security\packer\tests\test_orionpack_container_abi.py `
-        tools\security\packer\tests\test_polymorphism.py `
+        tests\test_native_qtest_diagnostics.py `
         tests\test_orion_admin.py `
         tests\test_backend_contract_check.py `
         tests\test_backend_staff_auth.py `
@@ -252,34 +342,20 @@ Invoke-OrionStep "[orion] Custom Remote Play runtime" {
     & $Python tools\verify_remote_play_backend.py
 }
 
-# OrionPack end-to-end round-trip: builds a sample EXE/DLL, packs each, runs
-# packed vs original, diffs stdout + exit code. The harness returns exit 2 when
-# a prerequisite is missing (no MSVC on PATH, or the prebuilt stub_x64.bin
-# hasn't been built yet), so treat exit 2 as a self-skip -- everything else is
-# a real failure. Once the stub ships, exit 2 disappears and this becomes hard.
-Write-Host "[orion] OrionPack round-trip"
-& powershell -NoProfile -ExecutionPolicy Bypass -File `
-    tools\security\packer\tests\roundtrip.ps1
-if ($LASTEXITCODE -eq 2) {
-    Write-Host "  (skipped: OrionPack prerequisites missing -- stub not built yet)"
-} elseif ($LASTEXITCODE -ne 0) {
-    throw "[orion] OrionPack round-trip failed with exit code $LASTEXITCODE"
-}
+# Lethe (the PE packer/protector) is now a standalone repo at
+# C:\Users\aaron\Desktop\Lethe; its build + end-to-end round-trip gate lives
+# there and is no longer part of the NexusVision release verification. The
+# NexusVision-side release wrapper (tools\security\pack_lethe_release.py) and
+# its unit test (tests\test_packing_workflow.py) remain gated above.
 
 Invoke-OrionStep "[orion] Native build" {
     Assert-OrionCMakeOwnership -BuildDirectory "native_orion\build"
-    cmake --build native_orion\build --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests
+    cmake --build native_orion\build --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionXboxPolicyTests OrionLauncherResponseTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionShmNotificationTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests
 }
 
 Invoke-OrionStep "[orion] Native tests" {
-    # OrionNativeTests is a GUI-subsystem QtTest binary (no streamed per-case output). It now runs in
-    # ~1s: the engine uses an injectable mock clock in tests (advanceTestClock), so cases advance time
-    # instantly instead of real qWait sleeps. (One 2-engine race test still uses real qWait, ~0.7s.)
-    # --timeout 120 still bounds a genuine hang.
     Ensure-OrionLibCrypto (Join-Path $Root "native_orion\build\Release")
-    Assert-OrionCMakeOwnership -BuildDirectory "native_orion\build" -RequireTests
-    Write-Host "    (OrionNativeTests: GUI-subsystem, no streamed output; ~1s via the injectable mock clock)"
-    ctest --test-dir native_orion\build -C Release --output-on-failure --timeout 120
+    Invoke-OrionNativeTests -BuildDirectory "native_orion\build"
 }
 
 if ($StrictSecurity) {
@@ -307,7 +383,7 @@ if ($StrictSecurity) {
     }
     Invoke-OrionStep "[orion] Production native build" {
         Assert-OrionCMakeOwnership -BuildDirectory $ProdBuild
-        cmake --build $ProdBuild --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests
+        cmake --build $ProdBuild --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionXboxPolicyTests OrionLauncherResponseTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionShmNotificationTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests
     }
     Invoke-OrionStep "[orion] Production dev-hook marker audit" {
         $ProdNative = Join-Path $Root "$ProdBuild\Release\OrionNative.exe"
@@ -327,10 +403,7 @@ if ($StrictSecurity) {
         }
     }
     Invoke-OrionStep "[orion] Production native tests" {
-        # Same GUI-subsystem QtTest as the dev step; ~1s via the injectable mock clock.
-        Write-Host "    (OrionNativeTests: GUI-subsystem, no streamed output; ~1s via the injectable mock clock)"
-        Assert-OrionCMakeOwnership -BuildDirectory $ProdBuild -RequireTests
-        ctest --test-dir $ProdBuild -C Release --output-on-failure --timeout 120
+        Invoke-OrionNativeTests -BuildDirectory $ProdBuild
     }
     # Deploy the Qt runtime (Qt6 DLLs + platforms/qml/styles/tls plugin trees) into the
     # production tree. CMake POST_BUILD already stages ViGEmClient + OpenCV next to the exe.
@@ -340,10 +413,10 @@ if ($StrictSecurity) {
     Invoke-OrionStep "[orion] Current compiled detection sidecar" {
         & powershell -ExecutionPolicy Bypass -File scripts\build_orion_sidecar.ps1 -Python $Python -Force
     }
-    Invoke-OrionStep "[orion] Hardened runtime package (production build)" {
-        & $Python tools\package_orion_release.py --strict --build-dir "$ProdBuild\Release"
+    Invoke-OrionStep "[orion] Hardened internal package (production build)" {
+        & $Python tools\package_orion_release.py --strict --no-customer --skip-archive --build-dir "$ProdBuild\Release"
     }
-    Invoke-OrionStep "[orion] Release security audit" {
+    Invoke-OrionStep "[orion] Internal release security audit" {
         # Strict means the source tree as well as the staged package. Package-only scanning
         # previously let a concrete dev key or webhook secret sit in tracked docs/tests while the
         # release gate printed OK, ready to be copied into a later build or support bundle.
@@ -376,6 +449,12 @@ if ($StrictSecurity) {
         } finally {
             Remove-Item $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+    Invoke-OrionStep "[orion] Hardened customer package (production build)" {
+        & $Python tools\package_orion_release.py --strict --customer --build-dir "$ProdBuild\Release"
+    }
+    Invoke-OrionStep "[orion] Customer release security audit" {
+        & $Python tools\security_audit.py
     }
 }
 

@@ -1,0 +1,19 @@
+/* Legal pages (terms, privacy, refunds) — layered on top of styles.css. */
+.legal-header { position: sticky; top: 0; z-index: 20; border-bottom: 1px solid var(--line); background: rgba(6, 8, 12, .9); -webkit-backdrop-filter: saturate(160%) blur(14px); backdrop-filter: saturate(160%) blur(14px); }
+.legal-nav { height: var(--header-h); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.legal { max-width: 760px; padding: clamp(40px, 6vw, 64px) 0 56px; }
+.legal h1 { margin: 12px 0 10px; font-size: clamp(1.8rem, 1.3rem + 2vw, 2.6rem); line-height: 1.1; letter-spacing: -.03em; }
+.legal .updated { color: var(--text-3); font-size: 14.5px; }
+.legal-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 26px 0 8px; padding: 4px; width: fit-content; max-width: 100%; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, .025); }
+.legal-tabs a { padding: 7px 14px; border-radius: 7px; color: var(--text-2); font-size: 14.5px; font-weight: 500; transition: color .2s, background-color .2s; }
+.legal-tabs a:hover { color: var(--text); background: rgba(255, 255, 255, .05); }
+.legal-tabs a[aria-current="page"] { color: var(--text); background: rgba(61, 134, 255, .16); box-shadow: inset 0 0 0 1px rgba(111, 180, 255, .3); }
+.legal-body { margin-top: 24px; padding: clamp(20px, 3vw, 32px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.legal-body h2 { margin: 28px 0 8px; font-size: 17px; letter-spacing: -.02em; }
+.legal-body h2:first-child { margin-top: 0; }
+.legal-body p { color: var(--text-2); font-size: 15px; line-height: 1.75; }
+.legal-body h2:not(:first-child) { padding-top: 24px; border-top: 1px solid var(--line); }
+.legal-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; padding: 22px 0 40px; border-top: 1px solid var(--line); color: var(--text-3); font-size: 13px; }
+@media (max-width: 640px) {
+  .legal-footer { flex-direction: column; }
+}

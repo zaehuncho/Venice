@@ -59,11 +59,105 @@ private slots:
     // the real OrionAppController TU (see the file header); same vanishing-property class of
     // bug as the meter-delay toggle, same protection.
     void shotLeadConflictSurfaceContractForQml();
+    // [METER DETECTION CARD 2026-09-10] MeterConfigPanel.qml binds orion.meterProposer
+    // (Detector combo) and orion.detectorHealthLine / orion.detectorProvider (health
+    // line) exactly like the meter-delay properties above — same vanishing-property
+    // protection, plus the settings.json round-trip + normalisation for meter_proposer.
+    void meterDetectionPropertiesExistForQml();
+    void meterProposerRoundTripThroughAppConfig();
     void shotLeadMaxUsableMirrorsEngineMargin();
     void outcomeIdentityArtifactVerdictIsDemoted();
     void measuredPhaseMedianPersistsCanonically();
+    // [PROFILE BLOCK 2026-09-14, moved to the licence strip 2026-09-15 owner]
+    // components/Sidebar.qml binds twelve orion.profile* properties plus
+    // machineIdMasked. Same vanishing-property class of bug as the meter-delay
+    // toggle: QML resolves them at RUNTIME, so a renamed or dropped Q_PROPERTY
+    // ships a silently blank licence strip in the sidebar footer.
+    void profilePropertiesExistForQml();
+    void daysLeftIsUnknownLifetimeOrWholeDaysRoundedUp();
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14 owner] components/ShotVerdictTally.qml binds ten
+    // orion.banner* properties and calls orion.resetBannerTally(), from inside BOTH
+    // NoMeterCard and ShotLeadCard. Same vanishing-property class of bug as the meter-delay
+    // toggle, and worse here: the tally would render "no shots yet" forever while the
+    // sidecar happily graded every banner, which is indistinguishable from "the reader is
+    // off" and would send the owner back to counting by eye.
+    void bannerVerdictTallyPropertiesExistForQml();
 };
 
+void MeterDelaySettingsPropertyTests::profilePropertiesExistForQml()
+{
+    const QMetaObject& meta = OrionAppController::staticMetaObject;
+
+    const struct {
+        const char* name;
+        QMetaType::Type type;
+    } expectations[] = {
+        {"profileKnown", QMetaType::Bool},
+        {"profileDiscordId", QMetaType::QString},
+        {"profileDiscordName", QMetaType::QString},
+        {"profilePlan", QMetaType::QString},
+        {"profileExpiryEpochS", QMetaType::Double},
+        {"profileDaysLeft", QMetaType::Int},
+        {"profileLifetime", QMetaType::Bool},
+        {"profileActivatedEpochS", QMetaType::Double},
+        {"profileHwidResetsUsed", QMetaType::Int},
+        {"profileHwidResetsFreeTotal", QMetaType::Int},
+        {"profileHwidResetsFreeRemaining", QMetaType::Int},
+        {"profileHwidPaidCredits", QMetaType::Int},
+    };
+
+    for (const auto& expected : expectations) {
+        const int index = meta.indexOfProperty(expected.name);
+        QVERIFY2(index >= 0,
+                 qPrintable(QStringLiteral(
+                     "Q_PROPERTY \"%1\" is missing from OrionAppController - "
+                     "Sidebar.qml binds orion.%1, so without it the licence strip "
+                     "silently renders a blank row.")
+                     .arg(QLatin1String(expected.name))));
+        const QMetaProperty property = meta.property(index);
+        QCOMPARE(property.typeId(), static_cast<int>(expected.type));
+        QVERIFY(property.isReadable());
+        QVERIFY2(property.hasNotifySignal(),
+                 qPrintable(QStringLiteral(
+                     "%1 must notify or the page never refreshes")
+                     .arg(QLatin1String(expected.name))));
+        // Its OWN low-fanout notifier: the Profile page must not re-evaluate on
+        // every broad status tick, and a heartbeat must refresh it without one.
+        QCOMPARE(QByteArray(property.notifySignal().name()),
+                 QByteArrayLiteral("profileChanged"));
+    }
+
+    // Support identity + the two clipboard actions the page offers.
+    QVERIFY(meta.indexOfProperty("machineIdMasked") >= 0);
+    QVERIFY(meta.indexOfProperty("licenseKeyMasked") >= 0);
+    QVERIFY(meta.indexOfMethod("copyProfileDiscordId()") >= 0);
+    QVERIFY(meta.indexOfMethod("copyLicenseKey()") >= 0);
+    // The customer Activity feed the Live page and LogViewer bind.
+    const int activity = meta.indexOfProperty("activityText");
+    QVERIFY(activity >= 0);
+    QCOMPARE(meta.property(activity).typeId(), static_cast<int>(QMetaType::QString));
+    QCOMPARE(QByteArray(meta.property(activity).notifySignal().name()),
+             QByteArrayLiteral("logsChanged"));
+}
+
+void MeterDelaySettingsPropertyTests::daysLeftIsUnknownLifetimeOrWholeDaysRoundedUp()
+{
+    constexpr qint64 kDay = 86400;
+    constexpr qint64 now = 1800000000;
+    // No server profile yet (the CURRENT live Lambda): unknown, never "0 days",
+    // which a customer would read as expired.
+    QCOMPARE(OrionAppController::licenseDaysLeft(false, now + 10 * kDay, now), -1);
+    // expiry 0 with a known profile is LIFETIME, not "expired in 1970".
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, 0, now), -2);
+    // Whole days, rounded UP: four hours left is still a day you can play.
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, now + 4 * 3600, now), 1);
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, now + kDay, now), 1);
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, now + kDay + 1, now), 2);
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, now + 30 * kDay, now), 30);
+    // Past expiry floors at zero rather than going negative.
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, now - kDay, now), 0);
+    QCOMPARE(OrionAppController::licenseDaysLeft(true, now, now), 0);
+}
 void MeterDelaySettingsPropertyTests::meterDelayPropertiesExistForQml()
 {
     const QMetaObject& meta = OrionAppController::staticMetaObject;
@@ -72,6 +166,10 @@ void MeterDelaySettingsPropertyTests::meterDelayPropertiesExistForQml()
         const char* name;
         QMetaType::Type type;
     } expectations[] = {
+        {"inputTimedEnabled", QMetaType::Bool},
+        {"inputTimedPaused", QMetaType::Bool},
+        {"inputTimedDelayMs", QMetaType::Double},
+        {"inputTimedRhythmEnabled", QMetaType::Bool},
         {"meterDelayEnabled", QMetaType::Bool},
         {"meterDelayMs", QMetaType::Int},
         {"meterDelayBypassOnDefense", QMetaType::Bool},
@@ -113,6 +211,13 @@ void MeterDelaySettingsPropertyTests::meterDelayPropertiesExistForQml()
 
 void MeterDelaySettingsPropertyTests::meterDelaySettingsRoundTripThroughAppConfig()
 {
+#ifdef ORION_PRODUCTION_BUILD
+    // AppConfig deliberately redirects mutable state to the per-user data
+    // directory in production and ignores the supplied checkout root. This is
+    // a development-path persistence fixture; running it in production would
+    // read and overwrite the tester's live customer settings.
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
 
@@ -154,8 +259,86 @@ void MeterDelaySettingsPropertyTests::meterDelaySettingsRoundTripThroughAppConfi
              AppConfigData::kMeterDelayLeadOffsetMaxMs);
 }
 
+void MeterDelaySettingsPropertyTests::meterDetectionPropertiesExistForQml()
+{
+    const QMetaObject& meta = OrionAppController::staticMetaObject;
+
+    const struct {
+        const char* name;
+        bool writable;
+        const char* notify;
+    } expectations[] = {
+        // The user's choice: persisted, so it rides the broad settings notifier.
+        {"meterProposer", true, "settingsChanged"},
+        // Sidecar-fed presentation strings: read-only, own low-fanout notifier.
+        {"detectorHealthLine", false, "detectorHealthChanged"},
+        {"detectorProvider", false, "detectorHealthChanged"},
+    };
+
+    for (const auto& expected : expectations) {
+        const int index = meta.indexOfProperty(expected.name);
+        QVERIFY2(index >= 0,
+                 qPrintable(QStringLiteral(
+                     "Q_PROPERTY \"%1\" is missing from OrionAppController — the Meter "
+                     "Detection card binds orion.%1 and would silently go dead.")
+                     .arg(QLatin1String(expected.name))));
+        const QMetaProperty property = meta.property(index);
+        QCOMPARE(property.typeId(), static_cast<int>(QMetaType::QString));
+        QVERIFY(property.isReadable());
+        QCOMPARE(property.isWritable(), expected.writable);
+        QVERIFY2(property.hasNotifySignal(),
+                 qPrintable(QStringLiteral("%1 must notify or the card never refreshes")
+                     .arg(QLatin1String(expected.name))));
+        QCOMPARE(QByteArray(property.notifySignal().name()), QByteArray(expected.notify));
+    }
+}
+
+void MeterDelaySettingsPropertyTests::meterProposerRoundTripThroughAppConfig()
+{
+    // The normaliser is the single source of truth for settings.json, the controller
+    // setter and the sidecar env (ORION_METER_PROPOSER): only "cv" | "yolo" ever escape it.
+    QCOMPARE(orion::normalizedMeterProposer(QStringLiteral("cv")), QStringLiteral("cv"));
+    QCOMPARE(orion::normalizedMeterProposer(QStringLiteral("  YOLO ")), QStringLiteral("yolo"));
+    QCOMPARE(orion::normalizedMeterProposer(QStringLiteral("onnx")), QStringLiteral("yolo"));
+    QCOMPARE(orion::normalizedMeterProposer(QStringLiteral("tensorrt")), QStringLiteral("cv"));
+    QCOMPARE(orion::normalizedMeterProposer(QString{}), QStringLiteral("cv"));
+
+#ifdef ORION_PRODUCTION_BUILD
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    AppConfig first(dir.path());
+    first.load();  // no settings.json yet -> seeds defaults, writes nothing
+    // Shipped default: the pure-CV proposer (a change here is a product decision).
+    QCOMPARE(first.data().meterProposer, QStringLiteral("cv"));
+
+    AppConfigData data = first.data();
+    data.meterProposer = QStringLiteral("yolo");
+    QString error;
+    QVERIFY2(first.save(data, &error), qPrintable(error));
+
+    AppConfig second(dir.path());
+    QVERIFY(second.load());
+    QCOMPARE(second.data().meterProposer, QStringLiteral("yolo"));
+
+    // An unknown value (hand-edited settings.json, stale profile) converges on the
+    // default on the way through — the sidecar must never see a proposer name that
+    // get_locator() does not understand.
+    AppConfigData wild = second.data();
+    wild.meterProposer = QStringLiteral("tensorrt");
+    QVERIFY2(second.save(wild, &error), qPrintable(error));
+    AppConfig third(dir.path());
+    QVERIFY(third.load());
+    QCOMPARE(third.data().meterProposer, QStringLiteral("cv"));
+}
+
 void MeterDelaySettingsPropertyTests::meterDelayMsIsClampedOnLoad()
 {
+#ifdef ORION_PRODUCTION_BUILD
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
 
@@ -484,6 +667,20 @@ void MeterDelaySettingsPropertyTests::shotLeadConflictSurfaceContractForQml()
         {"leadAuthoritySdMs", QMetaType::Double, "leadDiagnosticsChanged"},
         {"leadAuthoritySamples", QMetaType::Int, "leadDiagnosticsChanged"},
         {"tipTimingMeasuredMs", QMetaType::Double, "tipTimingChanged"},
+        // [ORION_BANNER_LEAD_TRIM 2026-09-15] The banner closed loop's caption binds these two.
+        // Same argument as the pair above: nothing in the build fails when a Q_PROPERTY vanishes,
+        // and without them the owner silently loses the only surface that says what the loop has
+        // added on top of the value they set.
+        {"bannerLeadTrimMs", QMetaType::Double, "bannerLeadTrimChanged"},
+        {"bannerLeadTrimEnabled", QMetaType::Bool, "bannerLeadTrimChanged"},
+        // [ORION_LEAD_AUTO_SEED 2026-09-15] The plug-and-play Shot Lead's caption binds these
+        // five. Losing them is worse than losing a warning: an untuned install would fly a lead
+        // nobody set and say nothing at all about where it came from.
+        {"leadAutoSeedActive", QMetaType::Bool, "leadAutoSeedChanged"},
+        {"leadAutoSeedMs", QMetaType::Double, "leadAutoSeedChanged"},
+        {"leadAutoSeedKind", QMetaType::QString, "leadAutoSeedChanged"},
+        {"leadAutoSeedMeasuredMs", QMetaType::Double, "leadAutoSeedChanged"},
+        {"leadAutoSeedMarginMs", QMetaType::Double, "leadAutoSeedChanged"},
     };
 
     for (const auto& expected : expectations) {
@@ -562,6 +759,12 @@ void MeterDelaySettingsPropertyTests::outcomeIdentityArtifactVerdictIsDemoted()
 // (whose body this free function is) the key stays empty and the warning dies at restart.
 void MeterDelaySettingsPropertyTests::measuredPhaseMedianPersistsCanonically()
 {
+#ifdef ORION_PRODUCTION_BUILD
+    // This fixture intentionally writes settings.json and learning.json. Keep
+    // production verification hermetic instead of touching the tester's real
+    // per-user timing state.
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
 
@@ -585,6 +788,71 @@ void MeterDelaySettingsPropertyTests::measuredPhaseMedianPersistsCanonically()
     AppConfig reader2(dir.path());
     QVERIFY(reader2.load());
     QCOMPARE(reader2.learning().measuredPhasePhysicalMs, -1.0);
+}
+
+// [ORION_BANNER_VERDICT_LIVE 2026-09-14] The meta-object half of the live tally contract.
+// The bucketing/suggestion RULES are pinned in ShotVerdictTallyTests.cpp against the pure
+// policy; what can only be checked here is that the controller still publishes the names
+// QML binds, on their own low-fanout notifier, with resetBannerTally() invokable.
+void MeterDelaySettingsPropertyTests::bannerVerdictTallyPropertiesExistForQml()
+{
+    const QMetaObject& meta = OrionAppController::staticMetaObject;
+
+    const struct {
+        const char* name;
+        QMetaType::Type type;
+    } expectations[] = {
+        {"bannerGreen10", QMetaType::Int},
+        {"bannerEarly10", QMetaType::Int},
+        {"bannerLate10", QMetaType::Int},
+        {"bannerOther10", QMetaType::Int},
+        {"bannerCount10", QMetaType::Int},
+        {"bannerContested10", QMetaType::Int},
+        {"bannerLastTiming", QMetaType::QString},
+        {"bannerLastCoverage", QMetaType::QString},
+        {"bannerPattern10", QMetaType::QString},
+        {"bannerSuggestion", QMetaType::QString},
+    };
+
+    for (const auto& expected : expectations) {
+        const int index = meta.indexOfProperty(expected.name);
+        QVERIFY2(index >= 0,
+                 qPrintable(QStringLiteral(
+                     "Q_PROPERTY \"%1\" is missing from OrionAppController - "
+                     "components/ShotVerdictTally.qml binds orion.%1 from inside both "
+                     "NoMeterCard and ShotLeadCard, so without it the live shot tally "
+                     "renders empty forever while the sidecar keeps grading banners.")
+                     .arg(QLatin1String(expected.name))));
+        const QMetaProperty property = meta.property(index);
+        QCOMPARE(property.typeId(), static_cast<int>(expected.type));
+        QVERIFY(property.isReadable());
+        // Read-only by construction: the tally is EVIDENCE. QML must never be able to
+        // write a count.
+        QVERIFY2(!property.isWritable(),
+                 qPrintable(QStringLiteral("%1 must stay read-only")
+                                .arg(QLatin1String(expected.name))));
+        QVERIFY2(property.hasNotifySignal(),
+                 qPrintable(QStringLiteral("%1 must notify or the tally never refreshes")
+                                .arg(QLatin1String(expected.name))));
+        // Its OWN notifier, not statusChanged: one signal per graded shot must not drag
+        // the ~98-property broad status fan-out through the GUI thread mid-session.
+        QCOMPARE(QByteArray(property.notifySignal().name()),
+                 QByteArrayLiteral("bannerTallyChanged"));
+    }
+
+    // The card's Reset link, and the automatic clear behind every committed slider change.
+    QVERIFY2(meta.indexOfMethod("resetBannerTally()") >= 0,
+             "resetBannerTally() must stay Q_INVOKABLE - ShotVerdictTally.qml calls it");
+    const QMetaMethod reset = meta.method(meta.indexOfMethod("resetBannerTally()"));
+    QCOMPARE(reset.methodType(), QMetaMethod::Method);
+
+    // The three setters that must silently restart the count, so the tally can never
+    // straddle a value change. Their presence is what the auto-reset hangs off.
+    for (const char* setter : {"actuationLeadMs", "noMeterHoldMs", "noMeterFadeTrimMs"}) {
+        const int index = meta.indexOfProperty(setter);
+        QVERIFY2(index >= 0, setter);
+        QVERIFY2(meta.property(index).isWritable(), setter);
+    }
 }
 
 QTEST_GUILESS_MAIN(MeterDelaySettingsPropertyTests)

@@ -8,6 +8,8 @@ from cryptography.hazmat.primitives import serialization
 TEST_TOKEN_SECRET   = "test-token-secret-xxxx"
 TEST_ADMIN_SECRET   = "test-admin-secret-xxxx"
 TEST_BOT_SECRET     = "test-bot-secret-xxxx"
+TEST_PAIR_SECRET    = "test-website-pair-secret-xxxx"
+TEST_WORKER_SECRET  = "test-worker-secret-xxxx"
 TEST_SELLHUB_SECRET = "test-sellhub-secret-xxxx"
 TEST_EDGE_SECRET    = "test-edge-secret-xxxx"
 TEST_DISCORD_PUBKEY = "a" * 64  # 32-byte hex
@@ -17,6 +19,7 @@ TEST_CUSTOMER_ROLE  = "111111111"
 TEST_LIFETIME_ROLE  = "222222222"
 TEST_STAFF_TOKEN_SECRET = "test-staff-token-secret-xxxx"
 TEST_ENROLL_KEY     = "test-enroll-key-xxxx"
+TEST_SHARD_ENC_KEY  = "11" * 32
 
 # ── Test Ed25519 keypairs (update-manifest signer + lease signer) ──────────────
 # Derived from FIXED seeds (not .generate()) so that when pytest imports this
@@ -40,6 +43,8 @@ SSM_PARAMS = {
     "/orion/token_secret":              TEST_TOKEN_SECRET,
     "/orion/admin_secret":              TEST_ADMIN_SECRET,
     "/orion/bot_service_secret":        TEST_BOT_SECRET,
+    "/orion/website_pair_secret":       TEST_PAIR_SECRET,
+    "/orion/worker_bot_secret":         TEST_WORKER_SECRET,
     "/orion/sellhub_webhook_secret":    TEST_SELLHUB_SECRET,
     "/orion/discord_public_key":        TEST_DISCORD_PUBKEY,
     "/orion/discord_bot_token":         TEST_DISCORD_BOT,
@@ -51,6 +56,7 @@ SSM_PARAMS = {
     "/orion/staff_enroll_key_hash":     hashlib.sha256(TEST_ENROLL_KEY.encode()).hexdigest(),
     "/orion/ed25519_public_key":        UPDATE_PUB_B64,
     "/orion/lease_signing_key":         LEASE_PRIV_PEM,
+    "/orion/shard_encryption_key":      TEST_SHARD_ENC_KEY,
 }
 
 
@@ -80,12 +86,30 @@ def verify_lease_sig(license_key, machine_id, lease_expires_at, sig_b64url):
         return False
 
 TABLE_DEFS = [
+    # Admin Panel V2 §2: discord_user_id GSI on orion-licenses (the Lambda falls
+    # back to a scan and reports lookup_mode="scan" when it is absent).
     ("orion-licenses",     {"KeySchema": [{"AttributeName": "license_key", "KeyType": "HASH"}],
-                            "AttributeDefinitions": [{"AttributeName": "license_key", "AttributeType": "S"}]}),
+                            "AttributeDefinitions": [
+                                {"AttributeName": "license_key", "AttributeType": "S"},
+                                {"AttributeName": "discord_user_id", "AttributeType": "S"},
+                            ],
+                            "GlobalSecondaryIndexes": [{
+                                "IndexName": "discord_user_id-index",
+                                "KeySchema": [{"AttributeName": "discord_user_id", "KeyType": "HASH"}],
+                                "Projection": {"ProjectionType": "ALL"},
+                            }]}),
     ("orion-nonces",       {"KeySchema": [{"AttributeName": "nonce", "KeyType": "HASH"}],
                             "AttributeDefinitions": [{"AttributeName": "nonce", "AttributeType": "S"}]}),
     ("orion-staff",        {"KeySchema": [{"AttributeName": "staff_id", "KeyType": "HASH"}],
-                            "AttributeDefinitions": [{"AttributeName": "staff_id", "AttributeType": "S"}]}),
+                            "AttributeDefinitions": [
+                                {"AttributeName": "staff_id", "AttributeType": "S"},
+                                {"AttributeName": "discord_user_id", "AttributeType": "S"},
+                            ],
+                            "GlobalSecondaryIndexes": [{
+                                "IndexName": "discord_user_id-index",
+                                "KeySchema": [{"AttributeName": "discord_user_id", "KeyType": "HASH"}],
+                                "Projection": {"ProjectionType": "ALL"},
+                            }]}),
     ("orion-staff-audit",  {"KeySchema": [{"AttributeName": "audit_id", "KeyType": "HASH"}],
                             "AttributeDefinitions": [{"AttributeName": "audit_id", "AttributeType": "S"}]}),
     ("orion-tokens",       {"KeySchema": [{"AttributeName": "token_id", "KeyType": "HASH"}],
@@ -100,10 +124,25 @@ TABLE_DEFS = [
                             }]}),
     ("orion-config",       {"KeySchema": [{"AttributeName": "config_key", "KeyType": "HASH"}],
                             "AttributeDefinitions": [{"AttributeName": "config_key", "AttributeType": "S"}]}),
+    # Admin Panel V2 §4: day-ts-index backs the paged audit reader. The live table
+    # is keyed on event_id (DynamoDB cannot change a PK), so the ULID is written to
+    # BOTH event_id and audit_id.
     ("orion-audit",        {"KeySchema": [{"AttributeName": "event_id", "KeyType": "HASH"}],
-                            "AttributeDefinitions": [{"AttributeName": "event_id", "AttributeType": "S"}]}),
+                            "AttributeDefinitions": [
+                                {"AttributeName": "event_id", "AttributeType": "S"},
+                                {"AttributeName": "day", "AttributeType": "S"},
+                                {"AttributeName": "ts", "AttributeType": "N"},
+                            ],
+                            "GlobalSecondaryIndexes": [{
+                                "IndexName": "day-ts-index",
+                                "KeySchema": [{"AttributeName": "day", "KeyType": "HASH"},
+                                              {"AttributeName": "ts", "KeyType": "RANGE"}],
+                                "Projection": {"ProjectionType": "ALL"},
+                            }]}),
     ("orion-ratelimit",    {"KeySchema": [{"AttributeName": "rl_key", "KeyType": "HASH"}],
-                            "AttributeDefinitions": [{"AttributeName": "rl_key", "AttributeType": "S"}]}),
+                             "AttributeDefinitions": [{"AttributeName": "rl_key", "AttributeType": "S"}]}),
+    ("orion-shards",       {"KeySchema": [{"AttributeName": "build_id", "KeyType": "HASH"}],
+                             "AttributeDefinitions": [{"AttributeName": "build_id", "AttributeType": "S"}]}),
     ("orion-update-manifest", {"KeySchema": [{"AttributeName": "record_id", "KeyType": "HASH"}],
                             "AttributeDefinitions": [{"AttributeName": "record_id", "AttributeType": "S"}]}),
 ]
@@ -212,7 +251,16 @@ def put_license(lf, key, **kwargs):
         "created_at": now,
         "activations": kwargs.get("activations", 0),
         "max_devices": kwargs.get("max_devices", 1),
+        # Test licenses represent a paid Discord-linked entitlement by default.
+        # Tests for unsubscribed/manual keys insert their rows explicitly.
+        "source": kwargs.get("source", "gumroad"),
     }
+    discord_user_id = kwargs.get("discord_user_id", "test-discord-account")
+    order_id = kwargs.get("order_id", "test-paid-order")
+    if discord_user_id:
+        item["discord_user_id"] = str(discord_user_id)
+    if order_id:
+        item["order_id"] = str(order_id)
     item.update(kwargs.get("extra", {}))
     lf.licenses_table().put_item(Item=item)
     return item
@@ -228,10 +276,60 @@ def put_staff(lf, staff_id, **kwargs):
         "disabled": kwargs.get("disabled", False),
         "machine_id": kwargs.get("machine_id", ""),
         "created_at": now,
+        "enrolled_at": now,
     }
+    if kwargs.get("discord_user_id"):
+        item["discord_user_id"] = str(kwargs["discord_user_id"])
+    if kwargs.get("caps"):
+        item["caps"] = kwargs["caps"]
     item.update(kwargs.get("extra", {}))
     lf.staff_table().put_item(Item=item)
     return item
+
+
+# ── Admin Panel V2 helpers ────────────────────────────────────────────────────
+OWNER_H = {"x-orion-admin-secret": TEST_ADMIN_SECRET}
+BOT_H   = {"x-orion-bot-secret": TEST_BOT_SECRET}
+
+
+def staff_login(lf, staff_id, role="support", machine_id=None, **kw):
+    """Create a staff row with `role` and log in. Returns the auth headers."""
+    machine_id = machine_id or ("MACHINE-" + staff_id.upper())
+    put_staff(lf, staff_id, role=role, machine_id="", **kw)
+    nt = make_staff_nonce_ts()
+    s, b, _ = invoke(lf, "POST", "/api/staff/login",
+                     body={"staff_id": staff_id, "machine_id": machine_id, **nt})
+    assert s == 200, b
+    return {"authorization": f"Bearer {b['token']}", "x-machine-id": machine_id}
+
+
+def no_dm(lf, monkeypatch, fail=False):
+    """Stub the Discord DM sender. The real one makes a live HTTPS call, which is
+    why the two baseline trial tests failed offline (the DM bounced and the trial
+    correctly rolled back). We stub the transport, never the rollback."""
+    sent = []
+
+    def _dm(discord_user_id, embed):
+        if fail:
+            raise RuntimeError("stubbed DM failure")
+        sent.append((str(discord_user_id), embed))
+        return {"id": "stub"}
+
+    monkeypatch.setattr(lf, "_discord_dm", _dm)
+    monkeypatch.setattr(lf, "_discord_add_role", lambda *a, **k: True)
+    return sent
+
+
+def set_config(lf, key, value):
+    """Write a V2 config key straight into orion-config."""
+    lf.config_set(key, value)
+
+
+def audit_rows(lf, action=None):
+    rows = lf.audit_table().scan().get("Items", [])
+    if action:
+        rows = [r for r in rows if r.get("action") == action]
+    return sorted(rows, key=lambda r: int(r.get("ts", 0)), reverse=True)
 
 
 def sellhub_hmac(raw_body_str):

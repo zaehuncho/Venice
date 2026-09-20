@@ -187,11 +187,11 @@ def test_profile_card_routes_through_the_single_slot():
     assert 'orion.runVeniceProfileAction("export", selectedFile)' in card
     assert 'orion.runVeniceProfileAction("import", selectedFile)' in card
     assert "venice-profile.json" in card
-    # The card is on the Debug page (owner-visible, low-traffic), NOT the meter panel.
+    # Profile controls are retired from pages; saved data and import/export remain compatible.
     debug = (_ROOT / "native_orion" / "qml" / "pages" / "DebugPage.qml").read_text(
         encoding="utf-8", errors="replace"
     )
-    assert "VeniceProfileCard" in debug
+    assert "VeniceProfileCard" not in debug
     meter_panel = (
         _ROOT / "native_orion" / "qml" / "components" / "MeterConfigPanel.qml"
     ).read_text(encoding="utf-8", errors="replace")

@@ -27,6 +27,36 @@ using namespace orion;
 
 namespace {
 
+// EXACT_PRESENTED_REGRESSION_HELPER_BEGIN
+// Baseline builds execute the old production backfill operation. The same
+// scenarios then execute the real new method when that method is available.
+template <typename Store>
+bool applyPresentedExactCorrection(Store& store, int acknowledged,
+                                   const QSize& captureSize, int sourceFrame,
+                                   const QRect& box, quint64 shot)
+{
+    if constexpr (requires {
+                      store.backfillPresentedExact(
+                          acknowledged, captureSize, sourceFrame, box, shot);
+                  }) {
+        return store.backfillPresentedExact(
+            acknowledged, captureSize, sourceFrame, box, shot);
+    } else {
+        // The old callback could amend only pending textures. Its already-
+        // acknowledged snapshot necessarily remains unchanged in this scenario.
+        static_cast<void>(store.backfillUnacknowledged(
+            acknowledged, captureSize, 2,
+            [&](int requestedFrame, QRect& out, int& matched) {
+                if (requestedFrame != sourceFrame) return false;
+                out = box;
+                matched = sourceFrame;
+                return true;
+            }));
+        return false;
+    }
+}
+// EXACT_PRESENTED_REGRESSION_HELPER_END
+
 QImage imageWithMarker(QRgb marker)
 {
     QImage image(2, 2, QImage::Format_RGB32);
@@ -63,6 +93,36 @@ public:
         insert(QStringLiteral("accentColor"), QStringLiteral("#2563EB"));
         insert(QStringLiteral("iconSource"), QString{});
         insert(QStringLiteral("displayVersion"), QStringLiteral("smoke"));
+        insert(QStringLiteral("updateChannel"), QStringLiteral("stable"));
+        insert(QStringLiteral("activeProfile"), QStringLiteral("Default"));
+        insert(QStringLiteral("licenseState"), QStringLiteral("Verified"));
+        insert(QStringLiteral("licenseKeyMasked"), QStringLiteral("****-****-****-A1B2"));
+        insert(QStringLiteral("machineIdMasked"), QStringLiteral("******ABCDEF"));
+        // [LICENCE STRIP 2026-09-15] The controller's own expiry phrasing, which the
+        // sidebar strip falls back to when the backend has sent no profile block.
+        // "-" is exactly what OrionAppController publishes with no expiry loaded.
+        insert(QStringLiteral("timeLeft"), QStringLiteral("-"));
+        insert(QStringLiteral("timeLeftDetail"), QStringLiteral("No expiry loaded"));
+        insert(QStringLiteral("motdVisible"), false);
+        insert(QStringLiteral("motdText"), QString{});
+        insert(QStringLiteral("motdLevel"), QStringLiteral("info"));
+        // [PROFILE BLOCK 2026-09-14] The backend `profile` block, as the controller
+        // republishes it. These are the production DEFAULTS for a launcher whose
+        // backend has not sent one yet (profileKnown == false), which is exactly the
+        // state the sidebar licence strip must render without inventing an expiry.
+        insert(QStringLiteral("profileKnown"), false);
+        insert(QStringLiteral("profileDiscordId"), QString{});
+        insert(QStringLiteral("profileDiscordName"), QString{});
+        insert(QStringLiteral("profilePlan"), QString{});
+        insert(QStringLiteral("profileExpiryEpochS"), 0.0);
+        insert(QStringLiteral("profileDaysLeft"), -1);
+        insert(QStringLiteral("profileLifetime"), false);
+        insert(QStringLiteral("profileActivatedEpochS"), 0.0);
+        insert(QStringLiteral("profileHwidResetsUsed"), 0);
+        insert(QStringLiteral("profileHwidResetsFreeTotal"), 0);
+        insert(QStringLiteral("profileHwidResetsFreeRemaining"), 0);
+        insert(QStringLiteral("profileHwidPaidCredits"), 0);
+        insert(QStringLiteral("activityText"), QString{});
         insert(QStringLiteral("debugUiEnabled"), false);
         insert(QStringLiteral("qmlRenderMode"), true);
         insert(QStringLiteral("previewAsync"), true);
@@ -83,6 +143,29 @@ public:
                QString::fromLatin1(AppConfigData::kMeterOverlayDefaultColor));
         insert(QStringLiteral("meterOverlayStyle"), QStringLiteral("Solid"));
         insert(QStringLiteral("meterOverlayRgb"), false);
+        // [METER DETECTION CARD 2026-09-10] MeterConfigPanel's Detector combo and health
+        // line. Production defaults: the pure-CV proposer, and no health report yet.
+        insert(QStringLiteral("meterProposer"), QStringLiteral("cv"));
+        insert(QStringLiteral("detectorHealthLine"), QString{});
+        insert(QStringLiteral("detectorProvider"), QString{});
+        // [ORION_BANNER_VERDICT_LIVE 2026-09-14] The live shot-verdict tally, as
+        // components/ShotVerdictTally.qml reads it from inside BOTH tuning cards.
+        // Production defaults for a launcher that has not graded a banner yet, so the
+        // page under test resolves real values instead of undefined.
+        insert(QStringLiteral("bannerGreen10"), 0);
+        insert(QStringLiteral("bannerEarly10"), 0);
+        insert(QStringLiteral("bannerLate10"), 0);
+        insert(QStringLiteral("bannerOther10"), 0);
+        insert(QStringLiteral("bannerCount10"), 0);
+        insert(QStringLiteral("bannerContested10"), 0);
+        insert(QStringLiteral("bannerLastTiming"), QString{});
+        insert(QStringLiteral("bannerLastCoverage"), QString{});
+        insert(QStringLiteral("bannerPattern10"), QString{});
+        insert(QStringLiteral("bannerSuggestion"), QString{});
+        // [ORION_BANNER_LEAD_TRIM 2026-09-15] The Shot Lead card's auto-trim caption binds these.
+        // 0 is the state the caption HIDES in, which is what an untuned smoke should render.
+        insert(QStringLiteral("bannerLeadTrimMs"), 0.0);
+        insert(QStringLiteral("bannerLeadTrimEnabled"), true);
         // Live meter-side HUD lines, production placeholders. The three rows
         // bind these pre-formatted native strings directly; the HUD test
         // overwrites them to prove QML surfaces the native values verbatim.
@@ -92,6 +175,8 @@ public:
         insert(QStringLiteral("meterHudLive"), false);
         insert(QStringLiteral("meterHudCommandLate"), false);
         insert(QStringLiteral("meterHudFillLine"), QStringLiteral("--"));
+        insert(QStringLiteral("meterDelayMaxUsableMs"), 118.0);
+        insert(QStringLiteral("meterDelayLeadOffsetAppliedMs"), 0.0);
         insert(QStringLiteral("meterHudTipLine"), QStringLiteral("--"));
         insert(QStringLiteral("meterHudFireLine"), QStringLiteral("--"));
         insert(QStringLiteral("noMeterAvailable"), true);
@@ -113,6 +198,14 @@ public:
         insert(QStringLiteral("tipTimingLearnedActive"), false);
         insert(QStringLiteral("tipTimingMinMs"), 314.0);
         insert(QStringLiteral("tipTimingMaxMs"), 504.0);
+        // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] Everything RhythmCard binds, at the production
+        // defaults: the flick ON (otherwise the style row is correctly hidden and the test would
+        // be asserting against an invisible control) and the shipped "flick" style.
+        insert(QStringLiteral("tempoEnabled"), true);
+        insert(QStringLiteral("tempoInputPath"), QStringLiteral("Button"));
+        insert(QStringLiteral("inputTimedRhythmEnabled"), false);
+        insert(QStringLiteral("rhythmFlickDelayMs"), 0.0);
+        insert(QStringLiteral("tempoReleaseStyle"), QStringLiteral("flick"));
     }
 
     Q_INVOKABLE void startCapturePreview() {}
@@ -622,6 +715,177 @@ private slots:
                  QStringLiteral("Connecting"));
     }
 
+    // Retiring the advice strip must remove its live QML instances, not just hide text.
+    void bannerVerdictTallyIsAbsentFromTheLivePage()
+    {
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
+        QmlOrionSmokeStub stub;
+        // A part-filled window: four shots, 3 green + 1 late, the last one wide open. The
+        // headline must say FOUR, never "last 10" -- a thin sample that reads as a full one
+        // is exactly how a tuning session goes wrong.
+        stub.insert(QStringLiteral("bannerCount10"), 4);
+        stub.insert(QStringLiteral("bannerGreen10"), 3);
+        stub.insert(QStringLiteral("bannerLate10"), 1);
+        stub.insert(QStringLiteral("bannerPattern10"), QStringLiteral("gggl"));
+        stub.insert(QStringLiteral("bannerLastTiming"), QStringLiteral("LATE"));
+        stub.insert(QStringLiteral("bannerLastCoverage"), QStringLiteral("WIDE OPEN"));
+        stub.insert(QStringLiteral("bannerSuggestion"),
+                    QStringLiteral("collecting (5 shots minimum)"));
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+
+        QQmlComponent component(
+            &engine, QUrl::fromLocalFile(
+                         qmlRoot + QStringLiteral("/pages/RemotePlayPage.qml")));
+        if (component.isLoading()) {
+            QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        }
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) {
+            errorLines.append(error.toString());
+        }
+        std::unique_ptr<QObject> page(component.create());
+        QVERIFY2(page != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
+
+        const QList<QObject*> mounts =
+            page->findChildren<QObject*>(QStringLiteral("shotVerdictTally"));
+        QCOMPARE(mounts.size(), 0);
+        QVERIFY(page->findChild<QObject*>(QStringLiteral("releasePathSelector")) != nullptr);
+
+    }
+
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] The closed loop's ONE line of UI, read back
+    // through the real QML tree. The owner's slider value is never written by the loop, so the
+    // card has to SAY what has been added on top of it -- and has to say nothing at all when
+    // nothing has, or an untuned install would carry a permanent "+0 ms" nobody asked for.
+    void shotLeadAutoTrimCaptionShowsTheBannerTrimAndHidesAtZero()
+    {
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
+        QmlOrionSmokeStub stub;
+        stub.insert(QStringLiteral("bannerLeadTrimEnabled"), true);
+        stub.insert(QStringLiteral("bannerLeadTrimMs"), 6.0);
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+
+        QQmlComponent component(
+            &engine, QUrl::fromLocalFile(
+                         qmlRoot + QStringLiteral("/pages/RemotePlayPage.qml")));
+        if (component.isLoading()) {
+            QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        }
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) {
+            errorLines.append(error.toString());
+        }
+        std::unique_ptr<QObject> page(component.create());
+        QVERIFY2(page != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
+
+        QObject* caption =
+            page->findChild<QObject*>(QStringLiteral("shotLeadAutoTrimCaption"));
+        QVERIFY2(caption != nullptr,
+                 "the Shot Lead card must carry the auto-trim caption");
+        QCOMPARE(caption->property("text").toString(),
+                 QStringLiteral("Auto-trim from game feedback: +6 ms"));
+        QVERIFY(caption->property("visible").toBool());
+
+        // A negative trim reads as a MINUS SIGN, not a hyphen: the card is the only place the
+        // owner sees the loop's direction and it has to be unambiguous next to the number.
+        stub.insert(QStringLiteral("bannerLeadTrimMs"), -4.0);
+        QTRY_COMPARE(caption->property("text").toString(),
+                     QStringLiteral("Auto-trim from game feedback: \u2212" "4 ms"));
+
+        // Nothing earned, nothing said.
+        stub.insert(QStringLiteral("bannerLeadTrimMs"), 0.0);
+        QTRY_VERIFY(!caption->property("visible").toBool());
+        // ...and the kill switch hides it whatever the stored trim is.
+        stub.insert(QStringLiteral("bannerLeadTrimMs"), 9.0);
+        stub.insert(QStringLiteral("bannerLeadTrimEnabled"), false);
+        QTRY_VERIFY(!caption->property("visible").toBool());
+    }
+
+    // [ORION_LEAD_AUTO_SEED 2026-09-15 owner] "How will every user find their tip timing lead...
+    // I'm trying to get it as plug and play as possible." An untuned install now flies this rig's
+    // measured latency plus the shipped game-side aim margin, and the card has to SAY so: a lead
+    // that moves on its own with no explanation is how a user concludes the app is broken. Read
+    // back through the real QML tree, both phrasings, and hidden the moment the owner has a value
+    // of their own.
+    void shotLeadAutoSeedCaptionExplainsTheAutoValueAndHidesOnceUserSet()
+    {
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
+        QmlOrionSmokeStub stub;
+        // Calibrating: no authoritative latency for this rig yet, so the shipped placeholder.
+        stub.insert(QStringLiteral("leadAutoSeedActive"), true);
+        stub.insert(QStringLiteral("leadAutoSeedKind"), QStringLiteral("placeholder"));
+        stub.insert(QStringLiteral("leadAutoSeedMs"), 269.0);
+        stub.insert(QStringLiteral("leadAutoSeedMeasuredMs"), 0.0);
+        stub.insert(QStringLiteral("leadAutoSeedMarginMs"), 69.0);
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+
+        QQmlComponent component(
+            &engine, QUrl::fromLocalFile(
+                         qmlRoot + QStringLiteral("/pages/RemotePlayPage.qml")));
+        if (component.isLoading()) {
+            QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        }
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) {
+            errorLines.append(error.toString());
+        }
+        std::unique_ptr<QObject> page(component.create());
+        QVERIFY2(page != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
+
+        QObject* caption =
+            page->findChild<QObject*>(QStringLiteral("shotLeadAutoSeedCaption"));
+        QVERIFY2(caption != nullptr,
+                 "the Shot Lead card must carry the auto-seed caption");
+        QCOMPARE(caption->property("text").toString(),
+                 QStringLiteral("Auto: calibrating… using 269 ms until your latency is "
+                                "measured"));
+        QVERIFY(caption->property("visible").toBool());
+
+        // Measured: the arithmetic is spelled out, because "277" on its own is a number the user
+        // has no way to check and every reason to distrust.
+        stub.insert(QStringLiteral("leadAutoSeedKind"), QStringLiteral("measured"));
+        stub.insert(QStringLiteral("leadAutoSeedMeasuredMs"), 208.3);
+        stub.insert(QStringLiteral("leadAutoSeedMs"), 277.3);
+        QTRY_COMPARE(caption->property("text").toString(),
+                     QStringLiteral("Auto: measured latency 208 ms + 69 ms margin = 277 ms"));
+        QVERIFY(caption->property("visible").toBool());
+
+        // The owner sets their own value: the seed goes inert and the caption disappears. From
+        // then on the slider above is the whole answer.
+        stub.insert(QStringLiteral("leadAutoSeedActive"), false);
+        QTRY_VERIFY(!caption->property("visible").toBool());
+
+        // The banner-trim caption is a SEPARATE line and must still be there alongside it --
+        // the two say different things (what the app assumed vs what the game has since said).
+        QObject* trimCaption =
+            page->findChild<QObject*>(QStringLiteral("shotLeadAutoTrimCaption"));
+        QVERIFY2(trimCaption != nullptr,
+                 "the auto-seed caption must not have displaced the banner-trim caption");
+
+        // Every objectName the card shipped with is still mounted.
+        for (const char* name : {"shotLeadValue", "shotLeadStatePill", "shotLeadResetAction",
+                                 "shotLeadSlider", "shotLeadDirectionHint",
+                                 "shotLeadMaxUsableTick", "shotLeadConflictBanner",
+                                 "shotLeadDisagreementBanner"}) {
+            QVERIFY2(page->findChild<QObject*>(QLatin1String(name)) != nullptr, name);
+        }
+    }
+
     void captureCardFreshMeterOverlayIsVisibleAbovePreviewTextures()
     {
         const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
@@ -679,6 +943,8 @@ private slots:
         auto* captureHost = page->findChild<QQuickItem*>(QStringLiteral("captureHost"));
         auto* layer = page->findChild<QQuickItem*>(QStringLiteral("meterDebugLayer"));
         auto* lock = page->findChild<QQuickItem*>(QStringLiteral("meterLockBox"));
+        auto* telemetryHud = page->findChild<QQuickItem*>(
+            QStringLiteral("meterTelemetryHud"));
         auto* metricsOverlay = page->findChild<QQuickItem*>(
             QStringLiteral("liveMeterMetricsOverlay"));
         auto* etaMetric = page->findChild<QQuickItem*>(QStringLiteral("meterEtaMetric"));
@@ -688,6 +954,7 @@ private slots:
         QVERIFY(captureHost != nullptr);
         QVERIFY(layer != nullptr);
         QVERIFY(lock != nullptr);
+        QVERIFY(telemetryHud != nullptr);
         QVERIFY(metricsOverlay != nullptr);
         QVERIFY(etaMetric != nullptr);
         QVERIFY(holdMetric != nullptr);
@@ -724,11 +991,12 @@ private slots:
         QCOMPARE(previewA->opacity(), 1.0);
         QVERIFY(layer->isVisible());
         QVERIFY(lock->isVisible());
-        QVERIFY(metricsOverlay->isVisible());
-        QCOMPARE(etaMetric->property("text").toString(), QStringLiteral("ETA  18 ms"));
-        QCOMPARE(holdMetric->property("text").toString(), QStringLiteral("HOLD 487 ms"));
-        QVERIFY(etaMetric->isVisible());
-        QVERIFY(holdMetric->isVisible());
+        // The attached reference-style instrument is primary while a lock is
+        // visible; the optional ETA/HOLD corner readout must not duplicate it.
+        QVERIFY(telemetryHud->isVisible());
+        QVERIFY(!metricsOverlay->isVisible());
+        QCOMPARE(etaMetric->property("text").toString(), QString{});
+        QCOMPARE(holdMetric->property("text").toString(), QString{});
 
         // The distant 9x64 capture box is uniformly aspect-fit into the live
         // image. Width and height use the same scale, so the meter cannot be
@@ -739,12 +1007,44 @@ private slots:
         QCOMPARE(lock->height(), 64.0 * drawScale);
         QVERIFY(lock->height() > lock->width());
 
-        // The user toggle is presentation-only: it hides the overlay without
-        // changing the detector box or either native metric value.
+        // The reference treatment is compact, unboxed text above the lock.
+        // There is no Rectangle/card surface, and placement stays inside the
+        // preview while sharing the exact joined box's coordinate clock.
+        QVERIFY(!telemetryHud->property("color").isValid());
+        QVERIFY(telemetryHud->property("fitsAbove").toBool());
+        QVERIFY(telemetryHud->y() + telemetryHud->height()
+                <= telemetryHud->property("lockTop").toReal());
+        QVERIFY(telemetryHud->x()
+                >= telemetryHud->property("layerLeft").toReal());
+        QVERIFY(telemetryHud->x() + telemetryHud->width()
+                <= telemetryHud->property("layerRight").toReal());
+        QCOMPARE(telemetryHud->width(), 76.0);
+        const qreal telemetryXBeforeDigits = telemetryHud->x();
+        stub.insert(QStringLiteral("meterHudMeasured"), true);
+        stub.insert(QStringLiteral("meterHudLive"), true);
+        stub.insert(QStringLiteral("meterHudFillLine"), QStringLiteral("8%"));
+        stub.insert(QStringLiteral("meterHudTipLine"), QStringLiteral("9ms"));
+        stub.insert(QStringLiteral("meterHudFireLine"), QStringLiteral("-148ms"));
+        QCoreApplication::processEvents();
+        QCOMPARE(telemetryHud->width(), 76.0);
+        QCOMPARE(telemetryHud->x(), telemetryXBeforeDigits);
+
+        // When the lock leaves, the corner readout may take over without
+        // overlapping the primary instrument. The user toggle remains
+        // presentation-only and cannot mutate either native metric value.
+        stub.insert(QStringLiteral("meterConfirmed"), false);
+        QCoreApplication::processEvents();
+        QVERIFY(!layer->isVisible());
+        QVERIFY(!telemetryHud->isVisible());
+        QVERIFY(metricsOverlay->isVisible());
+        QCOMPARE(etaMetric->property("text").toString(), QStringLiteral("ETA  18 ms"));
+        QCOMPARE(holdMetric->property("text").toString(), QStringLiteral("HOLD 487 ms"));
+        QVERIFY(etaMetric->isVisible());
+        QVERIFY(holdMetric->isVisible());
         stub.insert(QStringLiteral("showLiveMeterMetrics"), false);
         QCoreApplication::processEvents();
         QVERIFY(!metricsOverlay->isVisible());
-        QVERIFY(layer->isVisible());
+        QVERIFY(!layer->isVisible());
         QCOMPARE(stub.value(QStringLiteral("shotEtaToTargetMs")).toDouble(), 18.0);
         QCOMPARE(stub.value(QStringLiteral("shotHoldMs")).toDouble(), 487.0);
         stub.insert(QStringLiteral("showLiveMeterMetrics"), true);
@@ -780,7 +1080,7 @@ private slots:
         QVERIFY(layer->z() > previewB->z());
     }
 
-    // 2026-08-06 display work: (1) the factory lock colour is the bright blue
+    // 2026-08-31 display work: (1) the factory lock colour is the shipped blue
     // and the QML stroke resolves it purely from the controller-published draw
     // colour; (2) the meter-side HUD's five rows (FILL/TIP/FIRE + the new
     // COURT/JITTER) surface the native pre-formatted strings verbatim — no
@@ -791,8 +1091,10 @@ private slots:
         // (owner: colour customisation removed entirely) the loader pins EVERY
         // persisted meter_overlay_color / meter_overlay_rgb back to this
         // default; the legacy violet stays pinned as a named constant so the
-        // migration history remains asserted.
-        QCOMPARE(AppConfigData{}.meterOverlayColor, QStringLiteral("#00A8FF"));
+        // migration history remains asserted. 2026-09-14: magenta #FF2BD6 ->
+        // blue #1E90FF (owner: blue, visible on light and dark). Theme.meterLock
+        // carries the same hex on the QML side.
+        QCOMPARE(AppConfigData{}.meterOverlayColor, QStringLiteral("#1E90FF"));
         QCOMPARE(QString::fromLatin1(AppConfigData::kMeterOverlayLegacyDefaultColor),
                  QStringLiteral("#CC44FF"));
 
@@ -829,15 +1131,30 @@ private slots:
         QVERIFY2(page != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
 
         // (1) The lock stroke is exactly the controller-published draw colour —
-        // the stub carries the production default, so this pins the bright
+        // the stub carries the production default, so this pins the shipped
         // blue end-to-end without any QML-side colour math.
         auto* lockFrame =
             page->findChild<QQuickItem*>(QStringLiteral("meterLockFrame"));
         QVERIFY(lockFrame != nullptr);
+        auto* lockBox =
+            page->findChild<QQuickItem*>(QStringLiteral("meterLockBox"));
+        auto* outerFrame =
+            page->findChild<QQuickItem*>(QStringLiteral("meterLockOuterFrame"));
+        QVERIFY(lockBox != nullptr);
+        QVERIFY(outerFrame != nullptr);
+        // The clean lock is one blue stroke plus one restrained contrast
+        // keyline. The former third/inner ring made a tiny meter look cluttered.
+        QVERIFY(page->findChild<QQuickItem*>(QStringLiteral("meterLockInnerFrame"))
+                == nullptr);
+        QCOMPARE(lockBox->property("airGap").toReal(), 1.0);
+        QCOMPARE(lockBox->property("strokeW").toReal(), 2.0);
+        QCOMPARE(lockBox->property("frameInset").toReal(), 4.0);
+        QCOMPARE(outerFrame->property("opacity").toReal(), 0.68);
+        QCOMPARE(lockFrame->property("opacity").toReal(), 0.96);
         QObject* border = qvariant_cast<QObject*>(lockFrame->property("border"));
         QVERIFY(border != nullptr);
         QCOMPARE(border->property("color").value<QColor>(),
-                 QColor(QStringLiteral("#00A8FF")));
+                 QColor(QStringLiteral("#1E90FF")));
 
         // (2) EXACTLY the three rows exist, and they start on native's own
         // placeholder. COURT/JITTER were removed 2026-08-06 on owner direction
@@ -887,6 +1204,167 @@ private slots:
         QCOMPARE(fireRow->property("value").toString(), QStringLiteral("--"));
     }
 
+    void licenceStripDegradesWithoutABackendProfileAndCountsDaysWhenKnown()
+    {
+        // [PROFILE TAB -> LICENCE STRIP 2026-09-15 owner: "remove the profile tab,
+        // license info and days left should be displayed on the bottom left corner"]
+        // The strip is now on EVERY page, so it must instantiate on the shipped Qt
+        // runtime -- and it must do so against the CURRENT live backend, which sends
+        // no profile block. In that state the day line reads "Not reported", never
+        // "0 days left" (which a customer would read as "expired today").
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
+        QmlOrionSmokeStub stub;
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+
+        QQmlComponent component(
+            &engine, QUrl::fromLocalFile(
+                         qmlRoot + QStringLiteral("/components/Sidebar.qml")));
+        if (component.isLoading()) {
+            QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        }
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) {
+            errorLines.append(error.toString());
+        }
+        std::unique_ptr<QObject> sidebar(component.create());
+        QVERIFY2(sidebar != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
+
+        auto* strip = sidebar->findChild<QQuickItem*>(QStringLiteral("licenseStrip"));
+        QVERIFY(strip != nullptr);
+        auto* stateLine = sidebar->findChild<QQuickItem*>(
+            QStringLiteral("licenseStripState"));
+        QVERIFY(stateLine != nullptr);
+        auto* daysLine = sidebar->findChild<QQuickItem*>(
+            QStringLiteral("licenseStripDays"));
+        QVERIFY(daysLine != nullptr);
+        // The flyout is a Popup (not a QQuickItem), so it is looked up as a QObject.
+        QVERIFY(sidebar->findChild<QObject*>(QStringLiteral("licenseFlyout")) != nullptr);
+
+        // No profile block: a verified key with no plan, and an honestly unknown expiry.
+        QCOMPARE(stateLine->property("text").toString(), QStringLiteral("Active"));
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("Not reported"));
+        QVERIFY(!sidebar->property("licenseExpiringSoon").toBool());
+
+        // A real backend profile fills both lines in place.
+        stub.insert(QStringLiteral("profileKnown"), true);
+        stub.insert(QStringLiteral("profilePlan"), QStringLiteral("1 Month"));
+        stub.insert(QStringLiteral("profileDaysLeft"), 27);
+        QCoreApplication::processEvents();
+        QCOMPARE(stateLine->property("text").toString(),
+                 QStringLiteral("Active \u00B7 1 Month"));
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("27 days left"));
+        QVERIFY(!sidebar->property("licenseExpiringSoon").toBool());
+
+        // The last three days take the subtle warning tone.
+        stub.insert(QStringLiteral("profileDaysLeft"), 3);
+        QCoreApplication::processEvents();
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("3 days left"));
+        QVERIFY(sidebar->property("licenseExpiringSoon").toBool());
+        // The tone crossfades (Behavior on color), so let the animation land.
+        QTRY_COMPARE_WITH_TIMEOUT(
+            qvariant_cast<QColor>(daysLine->property("color")),
+            QColor(QStringLiteral("#F59E0B")), 3000);
+
+        // 1 == less than a day of runway; 0 == the expiry already passed.
+        stub.insert(QStringLiteral("profileDaysLeft"), 1);
+        QCoreApplication::processEvents();
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("Expires today"));
+        stub.insert(QStringLiteral("profileDaysLeft"), 0);
+        QCoreApplication::processEvents();
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("Expired"));
+
+        // Lifetime is a word on BOTH lines, never a zero-day countdown.
+        stub.insert(QStringLiteral("profileLifetime"), true);
+        stub.insert(QStringLiteral("profileDaysLeft"), -2);
+        QCoreApplication::processEvents();
+        QCOMPARE(stateLine->property("text").toString(), QStringLiteral("Lifetime"));
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("Lifetime"));
+        QVERIFY(!sidebar->property("licenseExpiringSoon").toBool());
+
+        // An unactivated launcher says so rather than claiming a plan.
+        stub.insert(QStringLiteral("profileLifetime"), false);
+        stub.insert(QStringLiteral("profilePlan"), QString{});
+        stub.insert(QStringLiteral("profileKnown"), false);
+        stub.insert(QStringLiteral("profileDaysLeft"), -1);
+        stub.insert(QStringLiteral("licenseState"), QStringLiteral("Locked"));
+        QCoreApplication::processEvents();
+        QCOMPARE(stateLine->property("text").toString(), QStringLiteral("Not activated"));
+        QCOMPARE(daysLine->property("text").toString(), QStringLiteral("Not reported"));
+    }
+
+    void staleProfileRouteFallsThroughToLiveAndTheStripReplacesTheTab()
+    {
+        // [PROFILE TAB REMOVED 2026-09-15 owner] A settings.json that still carries
+        // current_page="profile" must land on Live exactly the way a stale "general"
+        // does -- never on a blank panel from a null component.
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
+        QmlOrionSmokeStub stub;
+        stub.insert(QStringLiteral("currentPage"), QStringLiteral("profile"));
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+
+        QQmlComponent component(
+            &engine, QUrl::fromLocalFile(qmlRoot + QStringLiteral("/Main.qml")));
+        if (component.isLoading()) {
+            QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        }
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) {
+            errorLines.append(error.toString());
+        }
+        std::unique_ptr<QObject> rootObject(component.create());
+        QVERIFY2(rootObject != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
+        QCoreApplication::processEvents();
+
+        // The page is gone from the tree AND from the source tree.
+        QVERIFY(rootObject->findChild<QQuickItem*>(QStringLiteral("profilePage"))
+                == nullptr);
+        QVERIFY(!QFile::exists(qmlRoot + QStringLiteral("/pages/ProfilePage.qml")));
+
+        // The licence strip instantiates inside the real shell, on every page.
+        QVERIFY(rootObject->findChild<QQuickItem*>(QStringLiteral("licenseStrip"))
+                != nullptr);
+        QVERIFY(rootObject->findChild<QQuickItem*>(QStringLiteral("licenseStripState"))
+                != nullptr);
+        QVERIFY(rootObject->findChild<QQuickItem*>(QStringLiteral("licenseStripDays"))
+                != nullptr);
+
+        // Nothing routes to "profile", and the nav rail no longer lists it.
+        QFile shell(qmlRoot + QStringLiteral("/components/AppShell.qml"));
+        QVERIFY2(shell.open(QIODevice::ReadOnly | QIODevice::Text),
+                 qPrintable(shell.errorString()));
+        const QByteArray shellSource = shell.readAll();
+        QVERIFY(!shellSource.contains("ProfilePage"));
+        QVERIFY(!shellSource.contains("currentPage === \"profile\""));
+        QVERIFY(!shellSource.contains("currentPage !== \"profile\""));
+
+        QFile rail(qmlRoot + QStringLiteral("/components/Sidebar.qml"));
+        QVERIFY2(rail.open(QIODevice::ReadOnly | QIODevice::Text),
+                 qPrintable(rail.errorString()));
+        const QByteArray railSource = rail.readAll();
+        QVERIFY(!railSource.contains("key: \"profile\""));
+        QVERIFY(railSource.contains("objectName: \"licenseStrip\""));
+        QVERIFY(railSource.contains("objectName: \"licenseFlyout\""));
+
+        // Setup still does not carry the Account card the Profile page replaced.
+        QFile dashboard(qmlRoot + QStringLiteral("/pages/DashboardPage.qml"));
+        QVERIFY2(dashboard.open(QIODevice::ReadOnly | QIODevice::Text),
+                 qPrintable(dashboard.errorString()));
+        const QByteArray setup = dashboard.readAll();
+        QVERIFY(!setup.contains("title: \"Account\""));
+        QVERIFY(!setup.contains("orion.copyLicenseKey()"));
+        QVERIFY(!setup.contains("orion.licenseKeyMasked"));
+    }
+
     void productionSetupHasNoManualTimingOrNetworkTelemetrySurface()
     {
         QFile dashboard(QStringLiteral(ORION_QML_SOURCE_DIR)
@@ -895,7 +1373,18 @@ private slots:
                  qPrintable(dashboard.errorString()));
         const QByteArray source = dashboard.readAll();
 
-        QVERIFY(source.contains("objectName: \"passiveTimingStatus\""));
+        // [2026-09-14 UI REVAMP] The passive "timing is off" pill is GONE from the
+        // Dashboard (and its Live-page twin, liveTimingStatus, with it): the revamped
+        // shell has a single Connect action and no preview-versus-live status chrome,
+        // so a pill explaining a state the user can no longer be parked in was pure
+        // noise. Asserted as an ABSENCE so it cannot quietly return — what this test
+        // actually guards is that no manual-timing or network-telemetry surface exists
+        // on the production setup page, and a removed pill satisfies that strictly
+        // more than a present one did.
+        QVERIFY(!source.contains("passiveTimingStatus"));
+        QVERIFY(!source.contains("liveTimingStatus"));
+        QVERIFY(!source.contains("PREVIEW ONLY"));
+        QVERIFY(!source.contains("Enable Bot"));
         QVERIFY(!source.contains("timingSetupAction"));
         QVERIFY(!source.contains("startLatencyCalibration"));
         QVERIFY(!source.contains("networkDash"));
@@ -912,7 +1401,12 @@ private slots:
         engine.addImportPath(qmlRoot);
         engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
         QmlOrionSmokeStub stub;
-        stub.insert(QStringLiteral("logText"), QStringLiteral(
+        // [ORION_ACTIVITY_FEED 2026-09-14] The live Activity panel reads the
+        // CUSTOMER ring (orion.activityText): the native rule
+        // (ui_notifications::shouldEnterActivityRing) has already removed the
+        // engineering telemetry. orion.logText stays the RAW ring the Debug
+        // page shows, so the QML pass below is only the Live-page filter.
+        stub.insert(QStringLiteral("activityText"), QStringLiteral(
             "09:00:00  Connected\n09:00:01  Meter found\n09:00:01  Meter found"));
         engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
 
@@ -941,7 +1435,7 @@ private slots:
 
         // Periodic transport diagnostics still reach the disk-backed native log,
         // but must not mutate/re-layout the live activity model.
-        stub.insert(QStringLiteral("logText"), QStringLiteral(
+        stub.insert(QStringLiteral("activityText"), QStringLiteral(
             "09:00:00  Connected\n09:00:01  Meter found\n09:00:01  Meter found\n"
             "09:00:05  qml_preview_pipeline: set_fps=60.0\n"
             "09:00:05  preview_pipeline: transport=shm present_fps=60.0\n"
@@ -956,7 +1450,7 @@ private slots:
 
         // Ring-prefix loss plus one new line is one incremental remove/append;
         // identical adjacent lines remain distinct rows.
-        stub.insert(QStringLiteral("logText"), QStringLiteral(
+        stub.insert(QStringLiteral("activityText"), QStringLiteral(
             "09:00:01  Meter found\n09:00:01  Meter found\n09:00:06  Shot owned"));
         QVERIFY(syncLogModel());
         QCoreApplication::processEvents();
@@ -970,13 +1464,13 @@ private slots:
         QCOMPARE(model->data(model->index(2, 0), lineRole).toString(),
                  QStringLiteral("09:00:06  Shot owned"));
 
-        stub.insert(QStringLiteral("logText"), QString{});
+        stub.insert(QStringLiteral("activityText"), QString{});
         QVERIFY(syncLogModel());
         QCoreApplication::processEvents();
         QCOMPARE(page->property("captureLogLines").toInt(), 0);
 
         // A fresh page reconstructs the bounded view from current native state.
-        stub.insert(QStringLiteral("logText"), QStringLiteral("09:01:00  Reloaded"));
+        stub.insert(QStringLiteral("activityText"), QStringLiteral("09:01:00  Reloaded"));
         std::unique_ptr<QObject> reloaded(component.create());
         QVERIFY(reloaded != nullptr);
         QCOMPARE(reloaded->property("captureLogLines").toInt(), 1);
@@ -1032,6 +1526,117 @@ private slots:
         QCOMPARE(ready102->meterConfirmed, false);
         QCOMPARE(ready102->frameSize, QSize(960, 540));
         QVERIFY(!overlays.lookup(99).has_value());
+    }
+
+    void meterOverlayJoinMissHoldsOnlyWhileDetectorIsRecent()
+    {
+        QCOMPARE(meterOverlayBoxAction(true, true),
+                 MeterOverlayBoxAction::UpdateFromJoinedBox);
+        QCOMPARE(meterOverlayBoxAction(true, false),
+                 MeterOverlayBoxAction::HoldLastJoinedBox);
+        QCOMPARE(meterOverlayBoxAction(false, true),
+                 MeterOverlayBoxAction::Clear);
+        QCOMPARE(meterOverlayBoxAction(false, false),
+                 MeterOverlayBoxAction::Clear);
+    }
+
+    void meterOverlayVisualLeaseBridgesMeasuredDetectorCadenceOnly()
+    {
+        const qint64 seenAt = 1000;
+
+        // The supplied trace's ordinary p90 and worst observed gaps remain
+        // visible even though they exceed the separate 120ms timing TTL.
+        QVERIFY(meterOverlayVisualRecent(true, seenAt, seenAt + 167));
+        QVERIFY(meterOverlayVisualRecent(true, seenAt, seenAt + 299));
+
+        // After the shot ends, the outline needs only the measured p90 plus
+        // bounded presentation slack. It must not inherit the full
+        // in-animation continuity TTL.
+        QVERIFY(meterOverlayVisualRecent(
+            true, seenAt, seenAt + 199, false));
+        QVERIFY(!meterOverlayVisualRecent(
+            true, seenAt, seenAt + kMeterOverlayIdleVisualFreshMs, false));
+
+        // The lease is bounded and fails closed with runtime authority.
+        QVERIFY(!meterOverlayVisualRecent(
+            true, seenAt, seenAt + kMeterOverlayVisualFreshMs));
+        QVERIFY(!meterOverlayVisualRecent(false, seenAt, seenAt + 1));
+        QVERIFY(!meterOverlayVisualRecent(true, 0, seenAt + 1));
+        QVERIFY(!meterOverlayVisualRecent(true, seenAt, seenAt - 1));
+    }
+
+    void meterOverlayRejectsEmptyEchoesAndUnstructuredIdleTeleports()
+    {
+        DetectionResult sample;
+        sample.detected = true;
+        sample.frameAgeMs = 10.0;
+        sample.stage = QStringLiteral("track");
+        sample.rejectionReason.clear();
+        sample.x = 500;
+        sample.y = 240;
+        sample.width = 24;
+        sample.height = 112;
+        sample.fillPct = 0.0;
+        sample.greenStartPct = -1.0;
+        sample.greenEndPct = -1.0;
+        sample.fillEstimatorMode = QStringLiteral("none");
+        sample.fillEstimatorGeneration = 0;
+
+        // The two observed post-shot payloads (detected=1/fill=0/no ruler/no
+        // green) may not renew the presentation lease. During an active shot,
+        // the same low-fill observation remains visible and cannot cause blink.
+        QVERIFY(!isLiveMeterOverlayVisualEvidence(sample, 50.0, false));
+        QVERIFY(isLiveMeterOverlayVisualEvidence(sample, 50.0, true));
+        sample.gameplayStructureVerified = true;
+        sample.gameplayStructureEpoch = 91;
+        // A structure bit may arrive on a trailing post-shot echo; outside the
+        // active shot it does not turn zero visual content back into a meter.
+        QVERIFY(!isLiveMeterOverlayVisualEvidence(sample, 50.0, false));
+        sample.fillPct = 18.0;
+        QVERIFY(isLiveMeterOverlayVisualEvidence(sample, 50.0, false));
+
+        constexpr quint64 epoch = 91;
+        const QRect prior(498, 238, 24, 112);
+        // A fresh box cannot appear in a menu or on the court without current
+        // shot-specific structure proof.
+        sample.gameplayStructureVerified = false;
+        sample.gameplayStructureEpoch = 0;
+        QVERIFY(!meterOverlayMayAcquireOrContinue(
+            sample, epoch, false, {}));
+        sample.gameplayStructureVerified = true;
+        sample.gameplayStructureEpoch = epoch;
+        QVERIFY(meterOverlayMayAcquireOrContinue(
+            sample, epoch, false, {}));
+        sample.gameplayStructureVerified = false;
+        sample.gameplayStructureEpoch = 0;
+
+        // Once established, exact joined frames may follow the same identity,
+        // but not teleport to a distant court mark or stretch into a new shape.
+        QVERIFY(meterOverlayMayAcquireOrContinue(
+            sample, epoch, true, prior));
+
+        // Moving/fade continuation compares each exact joined observation to
+        // the last accepted one. It follows the meter without lag or a
+        // hardcoded court region, and does not need renewed structure each frame.
+        QRect movingPrior = prior;
+        for (int i = 0; i < 12; ++i) {
+            sample.x = movingPrior.x() + 9;
+            sample.y = movingPrior.y() + 3;
+            sample.width = 24;
+            sample.height = 112;
+            QVERIFY(meterOverlayMayAcquireOrContinue(
+                sample, epoch, true, movingPrior));
+            movingPrior = QRect(
+                sample.x, sample.y, sample.width, sample.height);
+        }
+
+        sample.x = 900;
+        QVERIFY(!meterOverlayMayAcquireOrContinue(
+            sample, epoch, true, prior));
+        sample.x = 500;
+        sample.width = 80;
+        QVERIFY(!meterOverlayMayAcquireOrContinue(
+            sample, epoch, true, prior));
     }
 
     void previewBeforeDetectionBackfillsOnlyBeforeAcknowledgement()
@@ -1097,6 +1702,108 @@ private slots:
             });
         QCOMPARE(newerOnOlder, std::size_t{0});
         QCOMPARE(overlays.lookup(101)->joinedDetectionFrameNumber, 500);
+    }
+
+    void meterOverlayPresentationIsZeroLagWithBoundedExtentJitter()
+    {
+        const QSize preview(1280, 720);
+        MeterOverlayPresentationTracker tracker;
+
+        // Quantized extent noise is presentation-only.  Twenty alternating
+        // 18/19 x 64/65 observations have 38 px of raw total variation; the
+        // deadband removes it while never moving either extent >1 px away.
+        int rawExtentVariation = 0;
+        int drawnExtentVariation = 0;
+        QRect previousRaw;
+        QRect previousDrawn;
+        for (int i = 0; i < 20; ++i) {
+            const QRect raw(100 - (i & 1), 300 - (i & 1),
+                            18 + (i & 1), 64 + (i & 1));
+            const QRect drawn = tracker.update(raw, 7, preview, 100 + i);
+            QVERIFY(drawn.isValid());
+            QVERIFY(std::abs(drawn.width() - raw.width()) <= 1);
+            QVERIFY(std::abs(drawn.height() - raw.height()) <= 1);
+            QVERIFY(std::abs(drawn.center().x() - raw.center().x()) <= 1);
+            QVERIFY(std::abs(drawn.center().y() - raw.center().y()) <= 1);
+            if (i > 0) {
+                rawExtentVariation += std::abs(raw.width() - previousRaw.width())
+                    + std::abs(raw.height() - previousRaw.height());
+                drawnExtentVariation += std::abs(drawn.width() - previousDrawn.width())
+                    + std::abs(drawn.height() - previousDrawn.height());
+            }
+            previousRaw = raw;
+            previousDrawn = drawn;
+        }
+        QCOMPARE(rawExtentVariation, 38);
+        QCOMPARE(drawnExtentVariation, 0);
+
+        // The reader and exact/prior-frame join own position tracking. Presentation
+        // follows the joined box on this frame, including motion onset, without
+        // acquiring another velocity estimate behind it.
+        for (int i = 0; i < 24; ++i) {
+            const QRect raw(140 + 3 * i, 320 + i, 18, 64);
+            const QRect drawn = tracker.update(raw, 7, preview, 120 + i);
+            QCOMPARE(drawn.size(), raw.size());
+            const int tol = 0;
+            QVERIFY2(std::abs(drawn.center().x() - raw.center().x()) <= tol,
+                     qPrintable(QStringLiteral("frame %1: drawn x %2 raw x %3")
+                                    .arg(i).arg(drawn.center().x()).arg(raw.center().x())));
+            QVERIFY2(std::abs(drawn.center().y() - raw.center().y()) <= tol,
+                     qPrintable(QStringLiteral("frame %1: drawn y %2 raw y %3")
+                                    .arg(i).arg(drawn.center().y()).arg(raw.center().y())));
+        }
+
+        // A distant identity never animates across the court.
+        const QRect identity(900, 120, 18, 64);
+        QCOMPARE(tracker.update(identity, 7, preview, 144), identity);
+
+        // Dropout is an immediate reset; the next valid observation is an exact
+        // relock, with no stale center or extent carried across the gap.
+        QVERIFY(!tracker.update({}, 7, preview, 145).isValid());
+        QVERIFY(!tracker.valid());
+        const QRect relock(420, 410, 24, 110);
+        QCOMPARE(tracker.update(relock, 7, preview, 146), relock);
+
+        // A decoder discontinuity is the same hard boundary.
+        const QRect afterGap(430, 408, 26, 112);
+        QCOMPARE(tracker.update(afterGap, 7, preview, 151), afterGap);
+    }
+
+    void meterOverlayExactFrameTracksSlowStartStopAndReversalWithoutAddedLag()
+    {
+        const QSize preview(1280, 720);
+        MeterOverlayPresentationTracker tracker;
+        // One-pixel motion is not distinguishable from quantization noise at
+        // this presentation boundary. Do not suppress measured motion here.
+        const std::vector<QPoint> points{
+            {100, 300}, {101, 300}, {102, 301}, {104, 302},
+            {108, 304}, {112, 306}, {112, 306}, {112, 306},
+            {111, 305}, {109, 303}, {105, 300}, {101, 297}};
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const QRect raw(points[i], QSize(18, 64));
+            const QRect drawn = tracker.update(raw, 7, preview, 100 + static_cast<int>(i));
+            QCOMPARE(drawn, raw);
+        }
+    }
+
+    void meterOverlayPositionIsIndependentOfEarlyOrLateMetadataArrival()
+    {
+        const QSize preview(1280, 720);
+        MeterOverlayPresentationTracker tracker;
+        const std::vector<QPoint> points{
+            {200, 310}, {203, 311}, {206, 312}, {209, 313},
+            {209, 313}, {207, 312}, {205, 311}, {204, 310}};
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const int sourceFrame = 200 + static_cast<int>(i);
+            const QRect captureBox(points[i], QSize(20, 80));
+            const QRect mapped = mapCaptureBoxAspectFit(captureBox, preview, preview);
+            const QRect atPublication = tracker.update(mapped, 8, preview, sourceFrame);
+            const QRect atImageReady = resolveLateMeterOverlayBox(
+                captureBox, preview, preview, 8, sourceFrame);
+            // Both paths use identical frame/geometry evidence. The order in
+            // which their independent channels arrived must not change position.
+            QCOMPARE(atPublication, atImageReady);
+        }
     }
 
     void overlayMetadataHistoryCoversBoundedQuarterSecondStall()
@@ -1234,6 +1941,191 @@ private slots:
         QVERIFY(!clearedFrame->joinedCaptureBox.isValid());
         QCOMPARE(clearedFrame->joinedDetectionFrameNumber, -1);
     }
+
+    // EXACT_PRESENTED_REGRESSION_CASES_BEGIN
+    void exactMetadataAfterReadyCorrectsOnlyCurrentProvisionalBox()
+    {
+        const QSize size(1280, 720);
+        const QRect provisional(430, 300, 30, 140);
+        const QRect exact(410, 295, 28, 138); // meter stopped/reversed; old bridge overshot
+        RemoteFrameOverlaySnapshotStore overlays;
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            100, provisional, {}, true, size, size, 499, provisional, 498, 12});
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            101, provisional, {}, true, size, size, 500, provisional, 498, 12});
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            102, provisional, {}, true, size, size, 501, provisional, 498, 12});
+        QVERIFY(applyPresentedExactCorrection(overlays, 101, size, 500, exact, 12));
+        const auto corrected = overlays.lookup(101);
+        QVERIFY(corrected.has_value());
+        QCOMPARE(corrected->serial, 101);
+        QCOMPARE(corrected->sourceFrameNumber, 500);
+        QCOMPARE(corrected->shotToken, quint64{12});
+        QCOMPARE(corrected->frameSize, size);
+        QVERIFY(corrected->meterConfirmed);
+        QVERIFY(!corrected->meterBox.isValid()); // normal exact mapping at publication
+        QCOMPARE(corrected->joinedCaptureBox, exact);
+        QCOMPARE(corrected->joinedDetectionFrameNumber, 500);
+        QCOMPARE(overlays.lookup(100)->meterBox, provisional);
+        QCOMPARE(overlays.lookup(102)->meterBox, provisional);
+        QCOMPARE(overlays.lookup(100)->joinedDetectionFrameNumber, 498);
+        QCOMPARE(overlays.lookup(102)->joinedDetectionFrameNumber, 498);
+        // Repeated metadata cannot chatter or mutate an already-exact texture.
+        QVERIFY(!applyPresentedExactCorrection(
+            overlays, 101, size, 500, QRect(999, 111, 28, 138), 12));
+        QCOMPARE(overlays.lookup(101)->joinedCaptureBox, exact);
+    }
+
+    void exactMetadataAfterReadyCanCorrectPreviouslyHeldGeometry()
+    {
+        const QSize capture(1920, 1080);
+        const QSize preview(1280, 720);
+        const QRect held(90, 180, 30, 180);
+        const QRect measured(190, 265, 45, 270);
+        RemoteFrameOverlaySnapshotStore overlays;
+        // An existing visible lock, but this presentation had no usable frame join.
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            201, held, {}, true, preview, capture, 900, {}, -1, 40});
+        QVERIFY(applyPresentedExactCorrection(overlays, 201, capture, 900, measured, 40));
+        const auto corrected = overlays.lookup(201);
+        QCOMPARE(corrected->joinedCaptureBox, measured);
+        QCOMPARE(corrected->joinedDetectionFrameNumber, 900);
+        QCOMPARE(corrected->frameSize, preview);
+        QCOMPARE(corrected->captureSize, capture);
+        QVERIFY(corrected->meterConfirmed);
+    }
+
+    void exactMetadataAfterReadyRejectsMismatchedIdentity_data()
+    {
+        QTest::addColumn<int>("variant");
+        QTest::newRow("older_source_frame") << 0;
+        QTest::newRow("future_source_frame") << 1;
+        QTest::newRow("old_shot") << 2;
+        QTest::newRow("changed_capture_dimensions") << 3;
+        QTest::newRow("invalid_source_identity") << 4;
+        QTest::newRow("invalid_geometry") << 5;
+        QTest::newRow("missing_or_evicted_serial") << 6;
+        QTest::newRow("already_exact") << 7;
+        QTest::newRow("cleared_or_absent_lock") << 8;
+        QTest::newRow("texture_advanced_during_detection") << 9;
+        QTest::newRow("old_serial_metadata_after_new_ack") << 10;
+        QTest::newRow("confirmed_but_geometry_absent") << 11;
+    }
+
+    void exactMetadataAfterReadyRejectsMismatchedIdentity()
+    {
+        QFETCH(int, variant);
+        const QSize size(1280, 720);
+        const QRect prior(430, 300, 30, 140);
+        QRect candidate(410, 295, 28, 138);
+        RemoteFrameOverlaySnapshotStore overlays;
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            100, prior, {}, true, size, size, 499, prior, 498, 12});
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            101, variant == 11 ? QRect{} : prior, {}, variant != 8,
+            size, size, 500, variant == 11 ? QRect{} : prior,
+            variant == 7 ? 500 : 498, 12});
+        overlays.publish(RemoteFrameOverlaySnapshot{
+            102, prior, {}, true, size, size, 501, prior, 499, 12});
+        int current = 101;
+        int source = 500;
+        quint64 shot = 12;
+        QSize dimensions = size;
+        switch (variant) {
+        case 0: source = 499; break;
+        case 1: source = 501; break;
+        case 2: shot = 11; break;
+        case 3: dimensions = QSize(1920, 1080); break;
+        case 4: source = -1; break;
+        case 5: candidate = {}; break;
+        case 6: current = 999; break;
+        case 9: current = 102; break;
+        case 10: current = 102; source = 499; break;
+        default: break;
+        }
+        const auto before = overlays.lookup(current);
+        QVERIFY(!applyPresentedExactCorrection(
+            overlays, current, dimensions, source, candidate, shot));
+        const auto after = overlays.lookup(current);
+        QCOMPARE(after.has_value(), before.has_value());
+        if (before.has_value()) {
+            QCOMPARE(after->meterBox, before->meterBox);
+            QCOMPARE(after->joinedCaptureBox, before->joinedCaptureBox);
+            QCOMPARE(after->joinedDetectionFrameNumber, before->joinedDetectionFrameNumber);
+            QCOMPARE(after->meterConfirmed, before->meterConfirmed);
+        }
+        QCOMPARE(overlays.lookup(100)->meterBox, prior);
+    }
+    // EXACT_PRESENTED_REGRESSION_CASES_END
+
+    // Exercise the real QML control, including external settings updates after a click.
+    void tempoToggleRevealsSelectorAndTracksExternalChanges()
+    {
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        engine.addImageProvider(QStringLiteral("remote"), new SmokeFrameProvider);
+        QmlOrionSmokeStub stub;
+        stub.insert(QStringLiteral("tempoEnabled"), false);
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+        QSignalSpy writes(&stub, &QQmlPropertyMap::valueChanged);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(
+            qmlRoot + QStringLiteral("/components/RhythmCard.qml")));
+        if (component.isLoading()) QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) errorLines.append(error.toString());
+        std::unique_ptr<QObject> card(component.create());
+        QVERIFY2(card != nullptr, qPrintable(errorLines.join(QChar::LineFeed)));
+        auto* selector = card->findChild<QQuickItem*>(QStringLiteral("releasePathSelector"));
+        auto* toggle = card->findChild<QQuickItem*>(QStringLiteral("tempoToggle"));
+        QVERIFY(selector != nullptr);
+        QVERIFY(toggle != nullptr);
+        QCOMPARE(selector->property("count").toInt(), 2);
+        QVERIFY(!selector->isVisible());
+        QVERIFY(!toggle->property("checked").toBool());
+        QCOMPARE(selector->property("value").toString(), QStringLiteral("Button"));
+        QCOMPARE(writes.count(), 0); // Creation must not rewrite saved/legacy settings.
+        QVERIFY(card->findChild<QQuickItem*>(QStringLiteral("rhythmFlickSlider")) == nullptr);
+        QVERIFY(card->findChild<QQuickItem*>(QStringLiteral("rhythmReleaseStyle")) == nullptr);
+        QVERIFY(QMetaObject::invokeMethod(toggle, "toggled", Q_ARG(bool, true)));
+        QCOMPARE(stub.value(QStringLiteral("tempoEnabled")).toBool(), true);
+        QVERIFY(selector->isVisible());
+        QVERIFY(toggle->property("checked").toBool());
+        QVERIFY(QMetaObject::invokeMethod(selector, "activated", Q_ARG(int, 1)));
+        QCOMPARE(stub.value(QStringLiteral("tempoInputPath")).toString(), QStringLiteral("Stick"));
+        QCOMPARE(selector->property("value").toString(), QStringLiteral("Stick"));
+        const int beforeExternal = writes.count();
+        stub.insert(QStringLiteral("tempoInputPath"), QStringLiteral("Button"));
+        QCOMPARE(selector->property("value").toString(), QStringLiteral("Button"));
+        QCOMPARE(writes.count(), beforeExternal);
+        QVERIFY(QMetaObject::invokeMethod(selector, "activated", Q_ARG(int, 1)));
+        QVERIFY(QMetaObject::invokeMethod(toggle, "toggled", Q_ARG(bool, false)));
+        QVERIFY(!selector->isVisible());
+        QCOMPARE(stub.value(QStringLiteral("tempoInputPath")).toString(), QStringLiteral("Stick"));
+        const int beforeHidden = writes.count();
+        QVERIFY(QMetaObject::invokeMethod(card.get(), "selectPath", Q_ARG(QVariant, QVariant(0))));
+        QCOMPARE(writes.count(), beforeHidden);
+        QVERIFY(QMetaObject::invokeMethod(toggle, "toggled", Q_ARG(bool, true)));
+        QVERIFY(selector->isVisible());
+        QCOMPARE(selector->property("value").toString(), QStringLiteral("Stick"));
+        const int beforeInvalid = writes.count();
+        QVERIFY(QMetaObject::invokeMethod(card.get(), "selectPath", Q_ARG(QVariant, QVariant(-1))));
+        QVERIFY(QMetaObject::invokeMethod(card.get(), "selectPath", Q_ARG(QVariant, QVariant(2))));
+        QCOMPARE(writes.count(), beforeInvalid);
+        stub.insert(QStringLiteral("tempoEnabled"), false);
+        QVERIFY(!selector->isVisible());
+        QVERIFY(!toggle->property("checked").toBool());
+        card->setProperty("inputTimed", true);
+        QVERIFY(QMetaObject::invokeMethod(toggle, "toggled", Q_ARG(bool, true)));
+        QCOMPARE(stub.value(QStringLiteral("inputTimedRhythmEnabled")).toBool(), true);
+        QCOMPARE(stub.value(QStringLiteral("tempoEnabled")).toBool(), false);
+        QVERIFY(selector->isVisible());
+        QVERIFY(!selector->isEnabled());
+        QCOMPARE(selector->property("value").toString(), QStringLiteral("Button"));
+    }
+
+
 };
 
 QTEST_MAIN(PreviewPresentationBufferTests)

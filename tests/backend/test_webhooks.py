@@ -73,9 +73,13 @@ def webhooks(monkeypatch):
         # Stub network egress. provision_license just returns a fresh key + counts.
         state = {"provision_calls": 0}
 
-        def fake_provision(plan, days, discord_user_id, order_id):
+        # provision_license returns the WHOLE backend reply (it grew `renewed`
+        # when the monthly membership became recurring), not just the key.
+        def fake_provision(plan, days, discord_user_id, order_id, renew=False):
             state["provision_calls"] += 1
-            return f"ORION-MINT-{state['provision_calls']:04d}"
+            state["last_renew"] = renew
+            key = f"ORION-MINT-{state['provision_calls']:04d}"
+            return {"ok": True, "license_key": key, "plan": plan, "renewed": bool(renew)}
 
         monkeypatch.setattr(gum, "provision_license", fake_provision)
         monkeypatch.setattr(gum, "send_discord_dm", lambda *a, **k: None)
@@ -187,11 +191,12 @@ class TestOrphanedPaidKeyRetry:
         gum = webhooks["gum"]
         calls = {"n": 0}
 
-        def flaky(plan, days, discord_user_id, order_id):
+        def flaky(plan, days, discord_user_id, order_id, renew=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("transient provision failure")
-            return f"ORION-RETRY-{calls['n']:04d}"
+            return {"ok": True, "license_key": f"ORION-RETRY-{calls['n']:04d}",
+                    "plan": plan, "renewed": bool(renew)}
 
         monkeypatch.setattr(gum, "provision_license", flaky)
 

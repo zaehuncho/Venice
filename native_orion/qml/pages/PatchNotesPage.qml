@@ -9,9 +9,10 @@ ScrollView {
     clip: true
     ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
     ScrollBar.vertical: ScrollBar {
+        id: pageScrollBar
         policy: ScrollBar.AsNeeded
         width: 6
-        contentItem: Rectangle { radius: 3; color: parent.pressed ? Theme.scrollbarThumbActive : Theme.scrollbarThumb }
+        contentItem: Rectangle { radius: 3; color: pageScrollBar.pressed ? Theme.scrollbarThumbActive : Theme.scrollbarThumb }
         background: Rectangle { color: "transparent" }
     }
 
@@ -29,17 +30,17 @@ ScrollView {
                     text: "Updates"
                     color: Theme.textPrimary
                     font.family: Theme.fontUi
-                    font.pixelSize: 24
+                    font.pixelSize: Theme.fontDisplay
                     font.weight: Font.DemiBold
                 }
                 Text {
                     text: "Release notes delivered by the update service"
                     color: Theme.textMuted
                     font.family: Theme.fontUi
-                    font.pixelSize: 12
+                    font.pixelSize: Theme.fontSmall
                 }
             }
-            StatusPill { statusText: orion.displayVersion; tone: "success" }
+            StatusPill { statusText: orion.displayVersion; tone: "success"; Layout.alignment: Qt.AlignVCenter }
         }
 
         Card {
@@ -49,8 +50,11 @@ ScrollView {
             subtitle: orion.updateNotes.length > 0 ? "Verified server release notes" : Theme.productName + " " + orion.displayVersion
             tone: orion.updateAvailable ? "accent" : "neutral"
             Layout.fillWidth: true
+            // No height cap: the Text is not clipped, so a long notes body used to
+            // spill past the card border at 420px. The page already scrolls, so the
+            // card simply grows to fit.
             Layout.preferredHeight: orion.updateNotes.length > 0
-                                    ? Math.min(releaseNotes.implicitHeight + 90, 420)
+                                    ? releaseNotes.implicitHeight + 90
                                     : 132
 
             Text {
@@ -61,7 +65,7 @@ ScrollView {
                       : "No newer release notes are available. Venice checks signed updates automatically at launch; live timing and the meter profile stay beside Live Capture."
                 color: Theme.textSecondary
                 font.family: Theme.fontUi
-                font.pixelSize: 13
+                font.pixelSize: Theme.fontBody
                 lineHeight: 1.35
                 wrapMode: Text.WordWrap
             }

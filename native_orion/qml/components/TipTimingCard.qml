@@ -48,7 +48,8 @@ Card {
     // string silently truncates mid-word instead of wrapping (it was rendering as
     // "...your jumpshot's animatio…"). Detail belongs in the InfoTip, not here.
     subtitle: "Where Venice releases in your jumpshot"
-    Layout.preferredHeight: col.implicitHeight + 70
+    // +80 = Card header (title + subtitle + 16px margins + 12px gap).
+    Layout.preferredHeight: col.implicitHeight + 80
 
     // Typed intermediates so every binding below is total: with a partial test stub the
     // raw properties coerce to NaN/false instead of throwing on toFixed().
@@ -84,7 +85,7 @@ Card {
             visible: root.measuredDiverges
             Layout.fillWidth: true
             implicitHeight: divergenceText.implicitHeight + 16
-            radius: 6
+            radius: Theme.radiusChip
             color: Theme.warningDim
             border.color: Theme.warningBorder
             border.width: 1
@@ -95,7 +96,7 @@ Card {
                 wrapMode: Text.WordWrap
                 color: Theme.warning
                 font.family: Theme.fontUi
-                font.pixelSize: 12
+                font.pixelSize: Theme.fontSmall
                 text: "Venice measured your jumpshot at " + orion.tipTimingMeasuredMs.toFixed(0)
                       + " ms; shots are timed to your value of " + root.shownTiming.toFixed(0)
                       + " ms. Your value stays in charge — press Reset to use the measured "
@@ -147,7 +148,7 @@ Card {
                     color: root.userSet || root.locked ? Theme.textPrimary
                            : root.learned ? Theme.success : Theme.textFaint
                     font.family: Theme.fontUi
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontCaption
                     font.weight: Font.DemiBold
                 }
             }
@@ -160,7 +161,7 @@ Card {
                 text: "Reset"
                 color: resetHover.hovered ? Theme.accentHover : Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontCaption
                 font.underline: resetHover.hovered
                 HoverHandler { id: resetHover; cursorShape: Qt.PointingHandCursor }
                 TapHandler { onTapped: orion.resetTipTiming() }
@@ -183,20 +184,22 @@ Card {
             implicitHeight: 28
             hoverEnabled: true
             font.family: Theme.fontUi
-            font.pixelSize: 11
+            font.pixelSize: Theme.fontCaption
             onClicked: orion.nudgeTipTimingMs(deltaMs)
             contentItem: Text {
                 text: nudge.text
-                color: Theme.textSecondary
+                color: nudge.hovered ? Theme.textPrimary : Theme.textSecondary
                 font: nudge.font
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
+                Behavior on color { ColorAnimation { duration: Theme.motionFast } }
             }
             background: Rectangle {
                 radius: Theme.radiusControl
                 color: nudge.down ? Theme.bgInset : Theme.bgField
                 border.width: 1
                 border.color: nudge.hovered ? Theme.borderStrong : Theme.borderSoft
+                Behavior on border.color { ColorAnimation { duration: Theme.motionFast } }
             }
         }
 
@@ -210,7 +213,7 @@ Card {
                 text: "← Earlier"
                 color: Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 10
+                font.pixelSize: Theme.fontMicro
                 font.weight: Font.DemiBold
             }
             Item { Layout.fillWidth: true }
@@ -218,7 +221,7 @@ Card {
                 text: "Later →"
                 color: Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 10
+                font.pixelSize: Theme.fontMicro
                 font.weight: Font.DemiBold
             }
         }
@@ -239,7 +242,7 @@ Card {
                 text: "Hold steady"
                 color: Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontCaption
             }
             InfoTip { text: "Locked: your current value is used for every shot and Venice's learner cannot move it, this session or after a restart. Unlocked: Venice keeps refining the value from your landings — required after changing your jumpshot, since a different animation needs a different timing." }
             Item { Layout.fillWidth: true }
@@ -269,7 +272,7 @@ Card {
                 text: "Watch the TIMING banner: EARLY → Later, LATE → Earlier."
                 color: Theme.textSecondary
                 font.family: Theme.fontUi
-                font.pixelSize: 12
+                font.pixelSize: Theme.fontSmall
                 wrapMode: Text.WordWrap
             }
 

@@ -14,8 +14,21 @@ plus the _arm_shot_gate return contract the receipt line is built from.
 import logging
 
 import numpy as np
+import pytest
 
 from simple_meter_reader import SimpleMeterReader
+
+
+# [ORION_READER_IDLE_PUBLISH_GATE 2026-09-15] The fixtures below feed a meter with NO press
+# armed and (mostly) a constant fill -- byte for byte the shape the reader's idle publication
+# gate now withholds from the engine and the overlay (see SimpleMeterReader._idle_publish_ok).
+# The gate is a PUBLICATION policy with its own suite (tests/test_idle_publish_gate.py); these
+# tests are about what the reader MEASURES, so the gate is switched off here and they keep
+# measuring it.
+@pytest.fixture(autouse=True)
+def _idle_publish_gate_off(monkeypatch):
+    monkeypatch.setenv("ORION_READER_IDLE_PUBLISH_GATE", "0")
+
 
 
 def _meter_frame(fill_frac=1.0):
@@ -70,6 +83,109 @@ def test_duplicate_native_arm_reports_no_notify_and_keeps_epoch(monkeypatch, cap
     assert "effective_epoch=90" in msgs[0]
     assert "notify=0" in msgs[0]
     assert orch._meter_detector._physical_shot_epoch == 90
+
+
+# --------------------------------------------------------------------------- #
+#  [ORION_SHOT_GATE_TYPE 2026-09-15] the type/rhythm channel on the same receipt
+# --------------------------------------------------------------------------- #
+
+def test_receipt_carries_the_shot_type_and_forwards_it_to_the_reader(monkeypatch, caplog):
+    orch = _build_orch(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="RemotePlayOrchestrator"):
+        assert orch.arm_shot_gate("square_edge", "101", "Left Fade", True) is True
+    m = [r.getMessage() for r in caplog.records if "SHOT-GATE ARM RECEIPT" in r.getMessage()][0]
+    assert "shot_type=Left_Fade" in m        # one whitespace-free token, like every other field
+    assert "rhythm=1" in m
+    assert "typed=1" in m
+    assert orch._meter_detector._pa_shot_type == "Left Fade"
+    assert orch._meter_detector._pa_shot_type_epoch == 101
+    assert orch._meter_detector._pa_rhythm is True
+
+
+def test_old_format_arm_without_a_shot_type_still_parses(monkeypatch, caplog):
+    """BACKWARD COMPATIBILITY: an old native sends source+epoch only. The receipt must still
+    be emitted, the reader must still be armed, and the type must read `unclassified`."""
+    orch = _build_orch(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="RemotePlayOrchestrator"):
+        assert orch.arm_shot_gate("square_edge", "102") is True
+    m = [r.getMessage() for r in caplog.records if "SHOT-GATE ARM RECEIPT" in r.getMessage()][0]
+    assert "epoch=102" in m and "notify=1" in m
+    assert "shot_type=unclassified" in m and "rhythm=0" in m and "typed=0" in m
+    assert orch._meter_detector._physical_shot_epoch == 102
+    assert orch._meter_detector._pa_shot_type == ""
+
+
+def test_type_upgrade_refreshes_the_type_without_a_new_reader_epoch(monkeypatch, caplog):
+    """The blind 200 ms grace re-sends the SAME epoch with source=type_upgrade. That is a
+    duplicate arm (notify=0 -- the early trajectory is kept) that changes only the type."""
+    orch = _build_orch(monkeypatch)
+    assert orch.arm_shot_gate("square_edge", "103", "Standstill", False) is True
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="RemotePlayOrchestrator"):
+        assert orch.arm_shot_gate("type_upgrade", "103", "Right Fade", True) is True
+    m = [r.getMessage() for r in caplog.records if "SHOT-GATE ARM RECEIPT" in r.getMessage()][0]
+    assert "src=type_upgrade" in m and "notify=0" in m and "shot_type=Right_Fade" in m
+    assert orch._meter_detector._physical_shot_epoch == 103
+    assert orch._meter_detector._pa_shot_type == "Right Fade"
+    assert orch._meter_detector._pa_rhythm is True
+
+
+# --------------------------------------------------------------------------- #
+#  [ORION_SHOT_GATE_RELEASE 2026-09-15] the closing half of the arm
+# --------------------------------------------------------------------------- #
+
+def test_release_marker_logs_one_receipt_and_closes_the_press(monkeypatch, caplog):
+    orch = _build_orch(monkeypatch)
+    orch._frame_seq = 77
+    assert orch.arm_shot_gate("square_edge", "110", "Standstill") is True
+    with caplog.at_level(logging.WARNING, logger="RemotePlayOrchestrator"):
+        assert orch.release_shot_gate("110", 1757913600123.4) is True
+    msgs = [r.getMessage() for r in caplog.records if "SHOT-GATE RELEASE RECEIPT" in r.getMessage()]
+    assert len(msgs) == 1
+    assert "epoch=110" in msgs[0]
+    assert "reason=release" in msgs[0]
+    assert "release_ms=1757913600123.4" in msgs[0]
+    assert "frame_seq=77" in msgs[0]
+    assert orch._meter_detector._pa_released_epoch == 110
+
+
+def test_disarm_marker_logs_its_own_receipt_with_the_reason(monkeypatch, caplog):
+    orch = _build_orch(monkeypatch)
+    assert orch.arm_shot_gate("square_edge", "111", "Standstill") is True
+    with caplog.at_level(logging.WARNING, logger="RemotePlayOrchestrator"):
+        assert orch.disarm_shot_gate("111", "square_early_release") is True
+    msgs = [r.getMessage() for r in caplog.records if "SHOT-GATE DISARM RECEIPT" in r.getMessage()]
+    assert len(msgs) == 1
+    assert "epoch=111" in msgs[0] and "reason=square_early_release" in msgs[0]
+    assert orch._meter_detector._pa_released_epoch == 111
+
+
+def test_a_close_never_touches_the_post_release_detector_deadlines(monkeypatch):
+    """The latency oracle and the release-window diagnostic still need ~1.2 s of post-release
+    meter frames: _settle_shot_gate stays the only owner of those deadlines."""
+    orch = _build_orch(monkeypatch)
+    assert orch.arm_shot_gate("square_edge", "112", "Standstill") is True
+    before = (orch._shot_gate_deadline_seq, orch._shot_gate_deadline_monotonic,
+              orch._shot_gate_hw_deadline_seq, orch._shot_gate_hw_deadline_monotonic,
+              orch._shot_gate_edge_pending)
+    orch.release_shot_gate("112", 1.0)
+    after = (orch._shot_gate_deadline_seq, orch._shot_gate_deadline_monotonic,
+             orch._shot_gate_hw_deadline_seq, orch._shot_gate_hw_deadline_monotonic,
+             orch._shot_gate_edge_pending)
+    assert before == after
+    assert orch._meter_detector._shot_armed is True
+
+
+def test_a_close_for_a_retired_press_does_not_close_the_live_one(monkeypatch, caplog):
+    orch = _build_orch(monkeypatch)
+    assert orch.arm_shot_gate("square_edge", "120", "Standstill") is True
+    assert orch.arm_shot_gate("square_edge", "121", "Standstill") is True
+    with caplog.at_level(logging.WARNING, logger="RemotePlayOrchestrator"):
+        assert orch.release_shot_gate("120", 5.0) is True     # the PREVIOUS shot's marker
+    m = [r.getMessage() for r in caplog.records if "SHOT-GATE RELEASE RECEIPT" in r.getMessage()][0]
+    assert "epoch=120" in m and "closed=0" in m
+    assert orch._meter_detector._pa_released_epoch == 0
+    assert orch._meter_detector._physical_shot_epoch == 121
 
 
 def test_arm_shot_gate_return_contract(monkeypatch):
@@ -166,3 +282,114 @@ if __name__ == "__main__":
     import sys
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ----------------------------------------------------- [ORION_CV_TIPLESS_ARMED] the press window
+# The locator's tip-less acceptance path needs WHEN (a press is open and the meter is due) but
+# not WHERE (the nameplate anchor, which costs a plate search per frame). The reader is the only
+# place a press epoch and a frame timestamp are known together, so it publishes the press window
+# whenever EITHER consumer wants it -- and the anchor's own forensics stay behind the anchor's
+# own switch, so a tipless-only install does not start emitting blank PICKUP: lines.
+#
+# [SHIP CONFIG 2026-09-17] ORION_PLAYER_ANCHOR now defaults ON, so the tests below turn it OFF
+# explicitly instead of taking the default. What they measure -- that the press window is
+# published for the TIPLESS consumer alone, with no anchor in play -- is unchanged, and that is
+# still a real configuration (it is what the anchor's kill switch leaves behind).
+import types
+
+import player_anchor as _pa
+
+
+def _armed_reader(epoch=9, ts=1000.0, shot_type="Right Fade"):
+    r = SimpleMeterReader(1920, 1080)
+    r.notify_physical_shot_start(epoch)
+    r.notify_physical_shot_type(epoch, shot_type)
+    r.set_shot_state(True, 1.0, True)
+    r.detect(_meter_frame(1.0), ts=ts)
+    return r
+
+
+def test_press_window_is_published_with_the_anchor_switched_off(monkeypatch):
+    monkeypatch.setenv("ORION_PLAYER_ANCHOR", "0")   # [SHIP CONFIG 2026-09-17] now ON by default
+    monkeypatch.delenv("ORION_CV_TIPLESS_ARMED", raising=False)
+    _pa.ARM.reset()
+    try:
+        assert _pa.enabled() is False
+        _armed_reader(epoch=9, ts=1000.0)
+        st = _pa.ARM.state()
+        assert st[3] is True and st[0] == 9
+        assert st[1] == pytest.approx(1000.0)        # the FRAME clock, not wall time
+        assert st[2] == "Right Fade"
+    finally:
+        _pa.ARM.reset()
+
+
+def test_press_window_stays_unpublished_when_neither_consumer_wants_it(monkeypatch):
+    monkeypatch.setenv("ORION_PLAYER_ANCHOR", "0")   # [SHIP CONFIG 2026-09-17] now ON by default
+    monkeypatch.setenv("ORION_CV_TIPLESS_ARMED", "0")
+    _pa.ARM.reset()
+    try:
+        _armed_reader(epoch=9, ts=1000.0)
+        assert _pa.ARM.state()[3] is False
+    finally:
+        _pa.ARM.reset()
+
+
+def test_the_release_closes_the_arm_only_window(monkeypatch):
+    monkeypatch.setenv("ORION_PLAYER_ANCHOR", "0")   # [SHIP CONFIG 2026-09-17] now ON by default
+    monkeypatch.delenv("ORION_CV_TIPLESS_ARMED", raising=False)
+    _pa.ARM.reset()
+    try:
+        r = _armed_reader(epoch=9, ts=1000.0)
+        assert _pa.ARM.state()[3] is True
+        r.set_shot_state(False, 0.0, False)
+        r.detect(_meter_frame(1.0), ts=1000.1)
+        assert _pa.ARM.state()[3] is False
+    finally:
+        _pa.ARM.reset()
+
+
+def test_anchor_forensics_stay_behind_the_anchor_switch(monkeypatch, caplog):
+    """PICKUP: describes what the ANCHOR did; with the anchor off every field but the epoch
+    would be blank, so an arm-only publication must not start a census of empty lines."""
+    monkeypatch.setenv("ORION_PLAYER_ANCHOR", "0")   # [SHIP CONFIG 2026-09-17] now ON by default
+    monkeypatch.delenv("ORION_CV_TIPLESS_ARMED", raising=False)
+    _pa.ARM.reset()
+    try:
+        with caplog.at_level(logging.ERROR, logger="simple_reader"):
+            r = _armed_reader(epoch=9, ts=1000.0)
+            r.set_shot_state(False, 0.0, False)
+            r.detect(_meter_frame(1.0), ts=1000.1)
+        assert not [m for m in caplog.records if m.getMessage().startswith("PICKUP:")]
+    finally:
+        _pa.ARM.reset()
+
+
+def _reader_with_tipless_record(rec):
+    r = SimpleMeterReader(1920, 1080)
+    r._meter_detector = types.SimpleNamespace(_base=types.SimpleNamespace(tipless=rec))
+    return r
+
+
+def test_tipless_lock_line_is_emitted_once_per_press_at_error_level(caplog):
+    """ERROR, like PICKUP:, because every sidecar WARNING shares one 1 s throttle slot that the
+    press's own arm receipt has already taken -- a WARNING here dies on every press."""
+    rec = {"epoch": 8, "fill": 42.0, "rise_frames": 2, "conf": 0.70, "logged": 0}
+    r = _reader_with_tipless_record(rec)
+    with caplog.at_level(logging.ERROR, logger="simple_reader"):
+        r._flush_tipless_line()
+        r._flush_tipless_line()
+    lines = [m.getMessage() for m in caplog.records
+             if m.getMessage().startswith("TIPLESS LOCK:")]
+    assert lines == ["TIPLESS LOCK: epoch=8 fill=42.0 rise_frames=2 conf=0.70"]
+    assert rec["logged"] == 1
+
+
+def test_no_tipless_line_for_a_press_the_path_never_produced(caplog):
+    rec = {"epoch": 8, "fill": -1.0, "rise_frames": 0, "conf": 0.0, "logged": 0}
+    r = _reader_with_tipless_record(rec)
+    with caplog.at_level(logging.ERROR, logger="simple_reader"):
+        r._flush_tipless_line()
+    assert not [m for m in caplog.records
+                if m.getMessage().startswith("TIPLESS LOCK:")]
+    assert rec["logged"] == 0

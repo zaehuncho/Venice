@@ -93,11 +93,13 @@ FORBIDDEN_NAME_SUFFIXES = (
 # absent because the current package still ships those separately.
 CROWN_JEWEL_PY_NAMES = frozenset(
     {
+        "autogreen_sidecar.py",
         "compressed_meter_reader.py",
         "controller_remap.py",
         "decoder_pipe_identity.py",
         "luma_meter.py",
         "meter_detector.py",
+        "meter_detector_yolo.py",
         "pose_timing.py",
         "remote_play_orchestrator.py",
         "simple_meter_reader.py",
@@ -106,13 +108,14 @@ CROWN_JEWEL_PY_NAMES = frozenset(
 )
 
 
-# The detector remains pure CV, but autonomous timing loads two small, reviewed
-# JSON data models from the source-bound OrionSidecar bundle. Any other models/
-# file is experimental/development baggage. Paths are relative to models/ and
-# compared case-insensitively because the production filesystem is Windows.
+# Autonomous timing loads two reviewed JSON models and one learned ONNX meter
+# locator from the source-bound OrionSidecar bundle. Any other models/ file is
+# experimental/development baggage. Paths are relative to models/ and compared
+# case-insensitively because the production filesystem is Windows.
 APPROVED_MODEL_FILES = frozenset(
     {
         "latency_factory_prior.json",
+        "orion_meter_detector.onnx",
         "tip_registration.json",
     }
 )

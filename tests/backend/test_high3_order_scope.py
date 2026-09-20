@@ -1,6 +1,6 @@
 """HIGH-3: bot mint endpoints are order-scoped (spend-once) and behind edge auth.
 A replayed provision cannot mint a second license for the same order_id."""
-from conftest import invoke, TEST_BOT_SECRET
+from conftest import invoke, put_staff, TEST_BOT_SECRET
 
 BOT_H = {"x-orion-bot-secret": TEST_BOT_SECRET}
 
@@ -34,7 +34,11 @@ class TestProvisionOrderScope:
         assert rows[0]["order_id"] == "ORDER-XYZ"
 
     def test_deliver_dedupes_when_order_id_present(self, lf):
-        payload = {"plan": "week", "order_id": "DLV-1", "discord_id": "7"}
+        # §4 BREAKING: /deliver now requires actor_discord_id resolved to a staff
+        # row with role admin+.
+        put_staff(lf, "adm1", role="admin", discord_user_id="9001")
+        payload = {"plan": "week", "order_id": "DLV-1", "discord_id": "7",
+                   "actor_discord_id": "9001", "reason": "manual delivery"}
         s1, b1, _ = invoke(lf, "POST", "/api/bot/deliver", body=payload, headers=BOT_H)
         assert s1 == 200 and b1["ok"] is True
         first_key = b1["license_key"]

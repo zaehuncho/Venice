@@ -174,6 +174,8 @@ temp/
 *.ckpt
 *.pth
 *.onnx
+# The source-bound production meter detector is an explicit release input.
+!models/orion_meter_detector.onnx
 *.task
 *.tflite
 events.out.tfevents.*
@@ -217,3 +219,23 @@ installer/OrionSetup/build/
 # Build/test artifact trees that leaked into staging during the 2026-08-04 session
 native_orion/Testing/
 native_orion/build_input_path/
+
+# Side build trees (e.g. native_orion/build-timing: builds tests while the running app holds build/Release DLLs)
+native_orion/build-*/
+native_orion/build-*.log
+
+# [ORION_BANNER_VERDICT_LIVE] Build artefact: scripts/build_orion_sidecar.ps1 copies
+# tools/timing/panel_grade.py here for the duration of the Nuitka compile (--include-module
+# needs a nameable repo-root module) and deletes it afterwards. Never commit it.
+/orion_panel_grade.py
+
+# Local verification output and dependency installs (never source inputs)
+/.codex_artifacts/
+/.audit_raw/
+/.pytest_codex_strict*/
+/Usersaaron*pytest*/
+/website/node_modules/
+
+# 2026-09-17 pre-ship audit: settings/learning/model backups carry the dev console IP + licence key
+*.json.bak-*
+/probe.txt

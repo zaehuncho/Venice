@@ -47,7 +47,7 @@ Item {
             text: tip.text
             color: Theme.textPrimary
             font.family: Theme.fontUi
-            font.pixelSize: 12
+            font.pixelSize: Theme.fontSmall
             wrapMode: Text.WordWrap
             lineHeight: 1.12
             width: Math.min(320, implicitWidth)
@@ -58,7 +58,7 @@ Item {
         }
 
         background: Rectangle {
-            radius: 8
+            radius: Theme.radiusControl
             color: Theme.modalSurface
             border.color: Theme.borderStrong
             border.width: 1

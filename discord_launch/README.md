@@ -12,6 +12,33 @@ Everything needed to stand up a clean, professional **Orion** Discord server + *
 | `EMBEDS.md` | Every embed's exact content (welcome, rules, ToS, pricing, FAQ, …), brand-colored, copy-paste ready. |
 | `SELLHUB_AND_BOTS.md` | SellHub store + products, the `/purchase` bot, Wick security, the ticket bot. |
 
+## Deploy checklist — Admin Panel V2 (do these in order)
+The license/admin surface (`orion_worker.js`, `orion_bot.py`, `gumroad_webhook/`) implements
+`docs/ADMIN_PANEL_V2_CONTRACT.md`. Full instructions: `CLOUDFLARE_WORKER_GUIDE.md` (Worker),
+`BOT_DEPLOY_GUIDE.md` (gateway bot). The short version:
+
+1. **Confirm the Worker name from Discord's Interactions Endpoint URL before you deploy.**
+   `wrangler.toml`'s `name = "orion-license-bot"` does **not** exist on the account; the real
+   Workers are `orion-discord-bot` and `license-redeem-proxy`, and the docs disagree about which
+   one Discord calls. Read Dev Portal → General Information → **Interactions Endpoint URL**, match
+   it with `wrangler deployments list` / the dashboard, set `name` to that Worker, *then* deploy.
+   Deploying as-is silently publishes a third Worker and the commands keep running the old code.
+2. Backend first — the `/api/bot/*` contract changes are BREAKING (contract §8 rollout).
+3. Worker secrets: `wrangler secret put DISCORD_PUBLIC_KEY | DISCORD_APP_ID | ORION_BOT_SECRET |
+   ORION_EDGE_AUTH`. Worker `[vars]`: `ORION_API_BASE`, **`STORE_URL`** (the website `/purchase`
+   links to), `STAFF_ROLE_IDS`. `GUMROAD_BASE` is now only a fallback for `STORE_URL`;
+   `GUMROAD_HWID_RESET_SLUG` is **removed** — customers cannot buy a reset any more.
+4. Gateway bot env (if you run it instead of the Worker): `DISCORD_BOT_TOKEN`, `ORION_BOT_SECRET`,
+   `ORION_EDGE_AUTH`, `ORION_API_BASE`, `ORION_GUILD_ID`, role ids, plus `STAFF_ROLE_IDS`,
+   `ORION_STAFF_ID`, `ORION_STAFF_MACHINE_ID`. `HWID_RESET_BUY_URL` is **removed**;
+   `LIFETIME_ROLE_ID` is legacy (staff comps only).
+5. Gumroad webhook Lambda env: `GUMROAD_ACTIVATION_PRODUCT` (default `orion-activation`),
+   `OWNER_DISCORD_USER_ID` (or SSM `/orion/owner_discord_user_id`), optional `ORION_API_BASE`.
+   `GUMROAD_HWID_RESET_PRODUCT` is legacy — keep it set only while an in-flight reset sale
+   could still land, then set it to `""`.
+6. `python register_commands.py`, then Server Settings → Integrations → Command Permissions →
+   give the Staff role access to `/deliver` and `/keygen` (they are hidden by default).
+
 ## Brand facts (use everywhere)
 - **Name:** Orion **Tagline:** *Precision Shot-Timing*
 - **Accent color:** `#2563EB` (royal blue) → Discord embed color int **`2450411`**
@@ -20,9 +47,21 @@ Everything needed to stand up a clean, professional **Orion** Discord server + *
 - **Banner:** `assets/orion_banner.png` (server banner, invite splash, top of #welcome)
 - **What Orion is (1-liner):** an AI-vision assistant that reads the on-screen shot meter and times your release to the green — for NBA 2K.
 
+## Pricing (owner rule 2026-09-15)
+One product line, and the price is written down in exactly ONE place — the website.
+
+| | |
+|---|---|
+| Free trial | 3 days, `/claim_trial`, one per Discord account **and** per PC |
+| Subscription | **$25 / month, recurring** (Gumroad *membership* `orion-monthly`) |
+| Activation fee | one-time, cheap (Gumroad one-off `orion-activation`) — mints **no key** |
+| Lifetime / Day / Week | **not sold.** Still accepted on existing keys and for staff comps. |
+
+The bot never prints a price: `/purchase` is one embed and one button to `STORE_URL`. HWID resets
+are **3 free per key, then 1 day off the subscription** — there is no reset to buy.
+
 ## You must fill these placeholders (search for `{{ }}`)
-- `{{STORE_URL}}` — your SellHub store link (e.g. `https://orion.sellhub.cx`)
-- `{{PRICE_DAY}}` `{{PRICE_WEEK}}` `{{PRICE_MONTH}}` `{{PRICE_LIFETIME}}` — set the real prices in SellHub; mirror them in the pricing embed
+- `{{STORE_URL}}` — your website / checkout link (also set as the Worker's `STORE_URL` var)
 - `{{SUPPORT_EMAIL}}` — support contact (optional)
 - `{{INVITE_URL}}` — the server's permanent invite (after creation)
 

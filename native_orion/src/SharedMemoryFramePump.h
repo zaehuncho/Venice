@@ -12,12 +12,13 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace orion {
 
 // Narrow source contract used by the persistent SHM pump. Production supplies
 // SharedMemoryFrameReader; tests inject a deterministic blocking source to pin
-// thread affinity, epoch cancellation, and one-deep backpressure without
+// thread affinity, epoch cancellation, and bounded backpressure without
 // weakening the production reader API.
 class ORION_REMOTEPLAY_API SharedMemoryFrameSource {
 public:
@@ -44,6 +45,16 @@ public:
     [[nodiscard]] virtual QString lastError() const = 0;
 };
 
+// An owned preview frame kept with its original identities and timestamps.
+// These images are display-only, never detector or release-timing inputs.
+struct ORION_REMOTEPLAY_API SharedMemoryFramePumpImage final {
+    QImage image;
+    int mappedFrameNumber = 0;
+    int eventFrameNumber = 0;
+    quint64 sourceTimestampNs = 0;
+    quint64 pumpReadCompletedTimestampNs = 0;
+};
+
 // One coalesced GUI delivery. Counters are source-epoch totals/runs rather than
 // per-callback deltas, so replacing a ready image while the GUI is busy cannot
 // hide transport health or corrupt the existing open/read failure semantics.
@@ -61,6 +72,10 @@ struct ORION_REMOTEPLAY_API SharedMemoryFramePumpBatch final {
     QString notificationError;
     quint64 framesRead = 0;
     QImage image;
+    // At most two preceding frames, oldest first. The newest frame remains in
+    // image for health/latency diagnostics and freshness-first fallback. A short
+    // GUI scheduling hiccup must not empty the downstream presentation reserve.
+    std::vector<SharedMemoryFramePumpImage> precedingFrames;
     int mappedFrameNumber = 0;
     int eventFrameNumber = 0;
     // The producer timestamp is read from the same committed SHM header as
@@ -106,12 +121,19 @@ struct ORION_REMOTEPLAY_API SharedMemoryFramePumpStats final {
 // Persistent off-GUI-thread reader for the display-only shared-memory preview.
 //
 // There is exactly one in-flight read, one pending latest notification, one
-// ready latest image, and at most one queued GUI wake-up. Detector frames and
+// bounded three-image ready burst, and at most one queued GUI wake-up. No extra
+// holdback is introduced: every wake immediately drains the available burst.
+// Preceding images older than 50 ms at delivery are dropped, and overflow keeps
+// only the newest three. The presentation queue's own capacity stays unchanged.
+// Detector frames and
 // timing never enter this object. Every result is tagged with a source epoch;
 // a sidecar restart/retire invalidates an in-flight completion before delivery.
 class ORION_REMOTEPLAY_API SharedMemoryFramePump final : public QObject {
     Q_OBJECT
 public:
+    static constexpr std::size_t kMaxReadyFrames = 3;
+    static constexpr quint64 kMaxBufferedAgeNs = 50'000'000;
+
     explicit SharedMemoryFramePump(QObject* parent = nullptr);
     explicit SharedMemoryFramePump(
         std::unique_ptr<SharedMemoryFrameSource> source,

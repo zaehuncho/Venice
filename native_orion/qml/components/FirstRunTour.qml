@@ -19,8 +19,14 @@ import OrionNative
 //     real session runs on — so the standalone Preflight page isn't needed.
 //
 // Persistence: start() is driven by orion.preflightComplete (the first-run "seen"
-// flag). finish()/skip() call orion.markPreflightComplete() so it auto-shows once;
-// the sidebar "Setup Guide" entry re-opens it any time.
+// flag).
+//
+// [ORION_UI_BUBBLES 2026-09-15 owner: "quick start should just be shown when the
+// customer first launches the UI"] AppShell.qml now marks the flag the moment it
+// auto-opens this, not when the user reaches Finish/Skip — an abandoned tour used
+// to leave the flag false and re-show on every later launch. finish() still marks
+// it (idempotent), and the sidebar's "Quick Start" re-open button is gone: the ONLY
+// way this appears is the customer's first launch.
 Item {
     id: tour
     anchors.fill: parent
@@ -38,19 +44,21 @@ Item {
     // page to switch to first. kind "ready" swaps the body for the live readiness list.
     readonly property var steps: [
         {
-            page: "general", target: "",
+            page: "remotePlay", target: "",
             title: "Welcome to Venice",
-            body: "A quick tour of the launcher — where to connect, match your meter profile, and check readiness. You can skip any time and reopen this from Quick Start."
+            // [ORION_UI_BUBBLES 2026-09-15] No longer points at a "Quick Start"
+            // button — that footer action is gone and this runs on first launch only.
+            body: "A quick tour of the launcher — where to connect, match your meter profile, and check readiness. It only shows on your first launch, and you can skip any time."
         },
         {
-            page: "general", target: "nav:remotePlay",
+            page: "remotePlay", target: "nav:remotePlay",
             title: "Your navigation",
-            body: "Live is where you connect and play. Overview shows readiness, Setup holds stream and profile configuration, and Updates carries release notes."
+            body: "Live is where you connect and play. Setup holds your console, video source, and audio settings, and Updates carries release notes."
         },
         {
             page: "remotePlay", target: "rp:connect",
             title: "Connect to your PS5",
-            body: "Enable Bot + Controller brings the live feed up and arms Venice's controller route. Make sure Remote Play is enabled on the PS5 first."
+            body: "Connect brings the live feed up and hands Venice your controller. Make sure Remote Play is enabled on the PS5 first."
         },
         {
             page: "remotePlay", target: "rp:controllerFix", kind: "controller",
@@ -65,13 +73,11 @@ Item {
         {
             page: "remotePlay", target: "rp:meter",
             title: "Match your meter",
-            // TRUTHFUL COPY (2026-08-06). This used to say "there is no calibration
-            // step". There is one, and on a fresh install it is mandatory: the engine
-            // refuses to drive any shot until measured-lead timing authority exists
-            // (measuredLeadAuthoritative), and until then every press passes through
-            // manually. Telling the user the opposite made a warming-up bot read as a
-            // broken product.
-            body: "Pick the Style and Color that match the in-game meter. Detection adapts on its own while you play. Shot timing first has to verify itself on your setup — the Live page shows a warming-up notice, and your shots stay manual until Timing reads Ready."
+            // TRUTHFUL COPY (2026-08-06): a fresh install does have a warm-up. The
+            // 2026-09-14 rewrite drops the pointer to the "Timing" pill and the
+            // warming-up banner — both surfaces are gone — without going back to the
+            // old lie that there is no warm-up at all.
+            body: "Pick the Style and Color that match the in-game meter. Detection adapts on its own while you play, and Venice keeps refining its timing on your setup over your first shots."
         },
         {
             page: "remotePlay", target: "rp:shotType",
@@ -84,9 +90,9 @@ Item {
             body: "A quick pre-game look at the three things that must work. Green across the board means your first real game will just work — no mid-game surprises."
         },
         {
-            page: "general", target: "nav:dashboard",
+            page: "dashboard", target: "nav:dashboard",
             title: "Review your setup",
-            body: "Setup keeps your source, controller, and profiles in one place. That's the tour—press Finish and jump into a game."
+            body: "Setup keeps your connection and stream settings in one place. That's the tour — press Finish and jump into a game."
         }
     ]
 
@@ -165,7 +171,7 @@ Item {
                 text: rowRoot.rowLabel
                 color: Theme.textPrimary
                 font.family: Theme.fontUi
-                font.pixelSize: 12
+                font.pixelSize: Theme.fontSmall
                 font.weight: Font.DemiBold
             }
             Text {
@@ -173,7 +179,7 @@ Item {
                 text: rowRoot.rowDetail
                 color: Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 11
+                font.pixelSize: Theme.fontCaption
                 wrapMode: Text.WordWrap
             }
         }
@@ -199,10 +205,11 @@ Item {
             id: btnText
             anchors.centerIn: parent
             text: btn.label
-            color: btn.primary ? "#FFFFFF" : (mouse.containsMouse ? Theme.textPrimary : Theme.textSecondary)
+            color: btn.primary ? Theme.textOnAccent : (mouse.containsMouse ? Theme.textPrimary : Theme.textSecondary)
             font.family: Theme.fontUi
-            font.pixelSize: 13
+            font.pixelSize: Theme.fontBody
             font.weight: btn.primary ? Font.DemiBold : Font.Normal
+            Behavior on color { ColorAnimation { duration: Theme.motionFast } }
         }
         MouseArea {
             id: mouse
@@ -397,9 +404,9 @@ Item {
                     text: "STEP " + (tour.index + 1) + " OF " + tour.steps.length
                     color: Theme.accentBorder
                     font.family: Theme.fontUi
-                    font.pixelSize: 10
+                    font.pixelSize: Theme.fontMicro
                     font.weight: Font.Bold
-                    font.letterSpacing: 1.4
+                    font.letterSpacing: 1.2
                 }
                 Item { Layout.fillWidth: true }
                 Row {
@@ -425,7 +432,7 @@ Item {
                 text: tour.step.title
                 color: Theme.textPrimary
                 font.family: Theme.fontUi
-                font.pixelSize: 16
+                font.pixelSize: Theme.fontTitle
                 font.weight: Font.DemiBold
                 wrapMode: Text.WordWrap
             }
@@ -435,7 +442,7 @@ Item {
                 text: tour.step.body
                 color: Theme.textSecondary
                 font.family: Theme.fontUi
-                font.pixelSize: 13
+                font.pixelSize: Theme.fontBody
                 lineHeight: 1.32
                 wrapMode: Text.WordWrap
             }
@@ -458,8 +465,8 @@ Item {
                     rowLabel: "Remote Play"
                     ok: tour.remotePass
                     rowDetail: tour.remotePass ? ("Streaming — " + orion.uniqueFrameFps + " fps.")
-                               : (orion.consoleIp.length === 0 ? "Set your console IP, then enable Bot + Controller."
-                                                               : "Press Enable Bot + Controller to connect.")
+                               : (orion.consoleIp.length === 0 ? "Set your console IP, then press Connect."
+                                                               : "Press Connect to start.")
                 }
                 ReadyRow {
                     rowLabel: "Meter lock"

@@ -1185,3 +1185,849 @@ frame timestamps) — run it before/after any reader change.
 Next: live framedump batch → command-fill rMAD (target ≤1.5 pp, was 3.7–5.0 on n4), first-read fill
 (15 → <8), zero-fill lock tail (26/329 → ~0), `hot_submit`/`reseat_x` diag counters; then D_session
 from the landmarks (apex+H) so the first shot of a session is on the stable ruler from frame one.
+
+### 2026-09-08 late evening — per-shot GAME-VERDICT diagnostic (banner OCR ⨝ engine), first findings
+
+`tools/timing/banner_reader.py scan --session <framedump dir> --out events.csv --crops <dir> --auto-scale`
+reads 2K27's TIMING panel (EXCELLENT / EARLY / LATE; colour = severity: white slight, yellow, red) —
+verified on session_20260903_133124 (39 events) and 151910 (70). New `tools/timing/banner_join.py
+--day <UTC day> --events ... [--logs ...] [--csv ...]` joins each verdict to the engine release
+0.2–3.5 s before it (FIFO) and prints per-verdict medians + separation from GREEN in rMAD units.
+Analysis-only (owner directive: a banner read never reaches the engine).
+
+09-03 (n3, old reader, leads 287–293), 95 joined shots: GREEN 47, LATE 30 (red 17, white 9, yellow 4),
+EARLY 18 (white 12). **Severe (red) lates fired late**: fill@release 54.0 vs green 40.5 (d=+5.0 rMAD),
+hold→rel 212 vs 121 ms, travel 41.7 vs 56.4 pp — a late COMMAND class (token kill/held/registration),
+not console jitter. Slight (white) lates and earlies are indistinguishable from greens in every engine
+variable (|d| < 1: fill@release, anchor→freeze, frame_age, stop_shift) — that is the residual.
+Landing (peak) does NOT separate slight late from green on the old reader (97.0 vs 97.1).
+Tonight (new reader, lead 285/290/311): only 2/36 command-late outliers (far 67, 51), so the red class
+is mostly gone; remaining lates are the slight class. Lead blocks: 285 → landing 93.4 rMAD 1.9;
+290 → 94.9 rMAD 1.7 (+12 ms anchor→freeze, frame_age +6 ms: a session-level latency shift, not the
+lead); 311 → 92.55 rMAD 0.47 (n=9).
+**Blocker for the next step**: framedump and detcsv were silently disabled tonight — disk floor
+(free 9.4 GB < max(10 GB, 2 % of 930 GB = 18.6 GB); knobs ORION_FRAMEDUMP_MIN_FREE_GB/_PCT). No frames
+= no verdict labels. Next: free disk, batch with framedump, then landing-vs-verdict scatter on the new
+reader (if landing predicts the verdict, the residual is pure release-time spread and the window top
+in our scale gives the exact aim; if not, the game grades on something the capture does not show).
+
+### 2026-09-09 night — lead sweep, session-fps probe, capture-phase lock (Experiment C) and its bug
+
+Seven labelled batches tonight (banner ⨝ engine, n3 detector, landmark reader): lead 285/290/305/
+300/303, session 30 fps and 120 fps, then the phase lock. Findings that held across all of them:
+fill@release identical for greens and lates (rMAD 0.7–2 pp); ~50 % green at every lead; the lead only
+moves the early/late split; the PC path ends at `CHIAKI_ORION_DELIVERY_UDP_ACCEPTED` within ~1 ms
+of the fire; link is Ethernet. Session fps moves the mean only (30 fps freeze +17 ms, 120 fps −10 ms).
+By shot type over the 7 batches: Standstill n=98 49 G / 26 L / 23 E; Right Fade 33: 15/13/5; Left
+Fade 30: 14/13/3 — the stationary meter carries the same early/late randomness, which refutes any
+"stale box on moving shots" mechanism (Gemini #95/#97).
+Refuted and retired tonight: press-latency trim (no correlation on a clean batch), colour-only
+reader, the pasted 2K Vision red reader (4/86 shots), fork 8 ms pacing (unused constant), sender
+thread priority (0.5 ms), YOLO frame budget (11 ms async), sessionLeadProbe (off). Curve stretch was
+firing spuriously on early locks (fit on the 16–17 % segment) → launcher pins ORION_CURVE_STRETCH_ALPHA=0.
+Phase effect (69 shots, no lock): late rate vs release phase in the capture frame cycle 26→39→43→61 %
+by quartile → [ORION_CAPTURE_PHASE_LOCK] (nearest-phase rounding at the scheduleFire choke point,
+target 2.0 ms, env ORION_CAPTURE_PHASE_LOCK / _TARGET_MS, log `CAPTURE PHASE:`).
+
+**Experiment C batch (session_20260909_194153, lead 300/303, lock on)**: 27 labelled = 13 G / 9 E /
+5 L. The lock engaged on 10 (coherence ≥ 0.90): 5 G / 4 E / 1 L; unlocked 17: 8 G / 5 E / 4 L.
+**Bug**: every applied shift was −10.7..−23.1 ms (median −14.6). The fold-back check compared the
+locked time against the MEMBER `schedFireAuthorityExpiryMs_` (previous arm's lease, already past;
+−1 on the first arm) instead of this arm's local `authorityExpiryMs`, so every lock was folded back
+a full period — a hidden +15 ms lead on 10 shots, which is the early swing. Fixed: compares this
+arm's lease; a forward rounding the lease cannot cover leaves the deadline alone (no fold-back,
+`suppressed=1`), a would-be-past lock likewise (`suppressed=2`); the log line now carries
+`lease_eta_ms` and `suppressed`. Regression test `capturePhaseLockUsesThisArmsLeaseAndNeverFoldsBack`
+fails on the old code (shift −11.67 for a +5 forward case); suite 790 / 0 / 6. Batch C therefore says
+nothing about the phase hypothesis yet — rerun with the corrected lock is the next batch.
+Gemini (Venice bus) delivered the Takion fact that buttons live only in FEEDBACK_HISTORY and the
+release is sent twice (history + redundant history at +3 ms) → Experiment B = fork toggle
+`ORION_CHIAKI_SINGLE_RELEASE` + wire_us log (its diff prints transport_us twice; needs
+`chiaki_time_now_monotonic_us()`); deploy = build-orion-optimized-ffmpeg7, verify avcodec-61 /
+avutil-59 / swresample-5 imports, overwrite deploy/chiaki-ng-orion/chiaki-ng-Win/OrionStream.exe.
+Queued: reader candidate gates channel-spread ≤ 25 and vertical-support ≥ 12 (with tests, replay
+before/after); transport A/B (official app + ViGEm) if B is not decisive.
+
+### 2026-09-10 — pure-CV proposer A/B, the Gemini direct-trigger incident, Clean overlay
+
+Owner asked to rule the YOLO path in or out. Built `meter_locator_cv.py` (ORION_METER_PROPOSER=cv,
+explicit; dev launcher pins it): white achromatic column (V≥225, spread≤25, support 6 px, width 8–22
+@720p) + green tip confirmed 100 px above the white bottom (measured 149 boxes, rMAD 1.5); a column
+85–108 px tall passes with a washed-out tip (fill >88 %). Box mimics the YOLO box (26 wide, pads 8/8).
+Offline vs the reader's boxes: centre 0.0 ±0.7 px, off-box 0 on three sessions, ~1 ms roaming / ~5 ms
+full band; the wrapper passes the frame ts to the base (`accepts_ts`) so the ROI hold runs on frame
+time. False proposals: 5 single frames in 1,487 no-meter frames (nameplate under the green ball, menu
+text, a player); an outline gate (two light edges beside the column, best-edge support ≥0.45; real
+median 0.98) catches all five but with a one-frame confirmation it moved the replay's first read
+from 15 to 40 % on the SPARSE framedump — left OPT-IN (ORION_CV_OUTLINE_MIN=0.45) and priced live via
+`cv={outline_weak=..}` in DETECTOR HEALTH. Do not loosen the gates to V220/support 4/width 7–24
+(false locks) and do not add a "green above the tip" guard (hot-streak cloud kills real tips).
+Live: 01:25Z batch (CV, phase path, lock off) 27/27 timed, 18 labelled = 11 G / 5 E / 2 L (yellow),
+late 11 % vs 30–40 % on YOLO batches (owner moved the lead 303→263 mid-batch; n soft).
+**Incident:** Gemini (Antigravity) edited engine/AppConfig/tests/reader/detector/profile/launcher/
+settings at 21:39–22:21 local and rebuilt: a "2k_Vision Pure CV Direct Trigger" fired 9/9 shots
+reactively at fill ~82 with a 45 ms lead (no TIP RESERVATION) = "bot doesn't time shots". All of it
+reverted (engine 790/0/6, reader+detector 552 pass); launcher pins for CAPTURE_PHASE_LOCK,
+CHIAKI_SINGLE_RELEASE (fork never rebuilt) and CV_DIRECT_TRIGGER removed; its MIN_INTERVAL 0 for
+cv-contour kept. Rule restated on the bus: diffs only.
+**Overlay:** style "Clean" (1 px stroke, 3 px gap, no keyline; HUD one colour/size, still FILL/TIP/
+FIRE) — default in AppConfig, set in settings.json with colour #F2F2F2, re-signed.
+**Agents (owner-authorised):** Meter Detection card wiring (setting `meter_proposer`, sidecar env,
+detector health telemetry → `detectorHealthLine`) and `tests/test_meter_locator_cv.py` + review.
+
+### 2026-09-10 evening — Shot Lead card, Meter Delay × Shot Lead, Meter Detection card, locator review
+
+- **Shot Lead card**: the slider now shows a 100 ms window around the current value (1 ms steps;
+  field and ±1 buttons still reach 150–800). Under Meter Delay a note states what is added.
+- **Meter Delay works WITH the lead** ([ORION_METER_DELAY_LEAD_AUTO]): offset setting 0 = AUTO —
+  the engine adds the APPLIED delay to the user's Shot Lead, clamped to the schedulable headroom
+  (ceiling − lead − one frame). A manual non-zero offset still wins verbatim. Controller exposes
+  `meterDelayMaxUsableMs` (= ceiling − lead) and `meterDelayLeadOffsetAppliedMs`; the Meter Delay
+  card shows "Usable with Shot Lead X: up to Y ms" and warns past it. Physics: the visible meter
+  lags the grade clock by D, so the release must come D earlier (the 08-12 D=200/offset-90 test
+  landed 61 % late = short by ≈ D). The 08-09 "not a curve" note was a data decision, not physics.
+  VeniceNetSvc IS installed on the rig (demand-started, "authenticated packet bridge"); the delay
+  was simply disabled in settings today (meter_delay_enabled=false, applied 0).
+- **Meter Detection card** (agent): setting `meter_proposer` (cv|yolo, default cv) → sidecar env
+  ORION_METER_PROPOSER (dev env may override; production pins the setting); sidecar emits
+  `detector_health` every 2 s → `detectorHealthLine`/`detectorProvider`; Style locked to Arrow2
+  under Pure CV. Applies at the next sidecar launch.
+- **CV locator review fixes** (agent B's list, all applied): mirrored morphology anchors (even
+  kernels walked the white bottom 1–2 rows), outline bands moved off the fill column and scaled,
+  tile hits stored in full-frame coordinates, width gate before the top-12 cap, confirmed tip
+  out-ranks the meter-tall fallback, pending sightings cleared on a miss and capped at two frames
+  of tolerance, clock never regresses, `reset()` propagated from the wrapper, `error` counter,
+  pad_bot 10 (dh 0 vs the reader's tracked box). tests/test_meter_locator_cv.py 31 tests.
+
+### 2026-09-10 late — Shot Lead 1..100 scale, simplified cards, residual EARLY/LATE workflow
+
+- **Shot Lead card is a 1..100 knob** (owner: "1-100 ONLY"): value V ↔ actuation_lead_ms =
+  150 + (V−1)·250/99 (≈2.5 ms per step; 1 = 150 ms, 100 = 400 ms — the whole schedulable band on
+  2K27, ceiling ≈ Tip Timing − 30). The engine and settings stay in ms; only the card converts.
+  Live readout while dragging; hint at the bottom: EARLY → lower, LATE → raise (higher = releases
+  earlier). Conflict banner speaks in the 1..100 scale too.
+- **Cards cut to the essentials**: Meter Delay = Enable + slider (+ one usable-max line and the
+  service status); Meter Detection = Style/Color (locked) + AUTO DETECTION + health line; the YOLO
+  picker is gone (YOLO shelved; `meter_proposer` setting still exists, default cv).
+- **Tonight's CV batch (session_20260910_195958, owner swept the lead 175→268 mid-batch)**: 18
+  labelled = 4 G / 11 L (6 red, fill@release 46 vs 40 = late-command class again, hold→rel 158) /
+  3 E. Red lates sat at leads 228 median — the low-lead part of the sweep.
+- **Workflow launched** (owner-authorised): 9 angles (poll phase, late-command class, fill scale
+  drift between proposers, reader cadence, engine internals, shot type, capture timing, Chiaki fork
+  path, statistical skeptic) over `scratchpad/workflow/verdict_dataset.csv` (214 labelled shots,
+  10 batches), each finding refuted by two independent agents, then a ranked PLAN.md.
+
+### 2026-09-11 — harvested workflow findings, consensus fix, CV pads, and the INFLATED MEASUREMENT BOX
+
+- The 44-agent workflow hit the session limit; 10 agents finished. Harvested (scratchpad/workflow/
+  FINDINGS_harvested.json): phase-lock premise does NOT replicate (n=203; the 26→61 % figure was a
+  t_rel binning artifact) — lock stays off; the duplicate release datagram is NOT the spread (wire
+  gap 3.5–3.7 ms in every class, n=53); two rulers (YOLO tracked box vs CV box) put the engine's
+  rung table/tip constant on different physical fill; refused witness-spread consensus marks a
+  67 %-late population; fades ~7 ms shorter phase; stretch caused 5/12 severe lates in 0909a/b.
+- Applied: [ORION_ANCHOR_CONSENSUS_APPLY_ON_SPREAD] default ON (env "0" = legacy refusal; tests
+  updated); CV pads 4/3 (replay rise RMS 8.0→3.2 ms, landing 87.6→90.1; YOLO 93.6); stretch
+  compiled default stays 0.6 (46 mechanism tests) — the launcher pin ORION_CURVE_STRETCH_ALPHA=0 stands.
+- **Live game 11:28 (practice 29 shots, game 4 timed + 1 layup, owner 1 make):** practice at lead
+  299 (value 60) = 6/8 green; game windows read 97–99.7 (contested, narrow) vs 90.5–96.5 in practice.
+- **Plain-sight defect found in detframes.csv:** the reader MEASURES in the emit-smoothed tracked
+  box, whose dims drift from the detector's: CV boxes 107–110 px, measured boxes 118–121 px on
+  33/36 practice shots and 130–145 × 30–44 px on game shots ("inflates at fill 14–21, stage=track").
+  denom = bh−1 → a 9–30 % per-shot ruler change. Replay (sync) does NOT reproduce it (diff 0), so
+  it is a live async/coast/scale-match effect. Fix [ORION_READER_LOCK_BOX_DIMS] (default on for
+  cv-contour): measurement and display dims pinned to the fresh detector box (≤0.35 s), tracker
+  keeps x/y bottom-aligned; counter `dims_locked=` in DETECTOR HEALTH and the health snapshot.
+  LIVE-UNVERIFIED — next batch: served h must equal det h in detframes.csv.
+- Small 3-agent "plain sight" sweep workflow launched (engine / sidecar / io partitions).
+
+### 2026-09-11 — three-sweeper "plain sight" workflow (engine / sidecar / io): what it found
+
+Full findings: scratchpad/workflow/SWEEP_findings.json (and agent_out/). Applied today unless noted.
+- **Press-latency trim contaminated batches 0909a/b/c**: the 09-09 binary ran the trim ON by default
+  (cap 30, not positive-only) and displaced 19 shots by up to ±30 ms, incl. two manufactured red
+  verdicts (0909a seq19 +13 → LATE-red, seq23 −30 → EARLY-red). Off since 09-09 21:13Z. Applied:
+  the four ORION_PRESS_LATENCY_TRIM* knobs (+ CAPTURE_PHASE_LOCK*, CV_DIRECT_TRIGGER) join the
+  launcher scrub list. TODO: `trim_ms` on the Release timing line; drop/stratify the 10 trimmed
+  rows when re-using 0909a–c.
+- **Rung table vs CV ruler**: old pads 8/10 put anchor-25/30 shots +4.3–8.5 ms LATE (a between-
+  anchor-level bias inside a batch); pads 4/3 measured live today leave ≤0.7 ms at 25, +0.3 at 30;
+  the c30 consensus retarget is alive again (0/23 refused vs 116/116 the day before). The sidecar
+  sweeper: the last 3.5 pp vs YOLO is the denominator (D 109 vs 105); pads 1/2 would give exact
+  parity but only 1 px of air over the tip — kept 4/3 (constant offset absorbed by the lead).
+- **Fire path is clock-consistent end to end** (sample time = capture time, converted once at
+  receipt; precise-fire deltaMs median 0.00 p99 0.03 ms; no mixed clock or rounding adds a frame).
+  The CAPTURE PHASE "coherence collapse" is an instrument artifact (hard-coded 16.667 ms vs the
+  card's 16.64–16.65 ms period).
+- **CadenceLock false drop** (capture_card_backend.py): a read returning 12.5–20.8 ms late was
+  accepted as a 2-frame drop and the next ~5 frames stamped +16.6 ms until relock (0.5/min live,
+  1–2 shots per 50). Applied: k≥2 acceptance is PROVISIONAL — if the next read lands (k−1) periods
+  behind the advanced grid the lock steps back at once (`skip_reverts` counter). Synthetic check:
+  a 14/20 ms late read now poisons only itself (−0.2 ms after), real 1/2-frame drops unchanged;
+  37 capture tests pass.
+- learning.json learned_phase_physical_ms=289 (base-30) is ~20 ms longer than the phase measured
+  today (frozen; absorbed by the lead) → unfreeze for ONE session on the CV ruler, then refreeze
+  and re-seed the lead (bookkeeping, not a spread fix). captureAgeLeadCapMs=20 clips the sampler
+  path only. Capture device latency (~35 ms) is assumed, not measured → between-session steps.
+- **Still the top live candidate for the random split: the inflated measurement box** (see the
+  previous section) — LIVE-UNVERIFIED until the next game's detframes show served h == det h.
+
+### 2026-09-11 afternoon — game 2 (a lot better), the aborts, and a CORRECTION on the "inflated box"
+
+- Game 2 (session 120503, lead 286 = value 55): practice 18 G / 10 L (8 white) / 3 E; game 5 timed
+  shots = 4 green + 1 white late on a Right Fade (owner: "only random late was a middy fade, no
+  random earlies/lates"). 12 unowned presses: 8 no-meter (layups/taps) + 4 `ownership_proof_incomplete`
+  = the "2 aborts on wide-open shots".
+- **CORRECTION**: the "measurement box inflated to 120/139 px" finding was the DISPLAY box
+  (`_tight_display_box`, BOX_TIGHT=2, side reach 18 → w up to 44), not the measurement box; the
+  replay showed measurement == detector. `ORION_READER_LOCK_BOX_DIMS` stays (harmless, pins both).
+- **The aborts' real mechanism (frames 5020–5040 / 5837–5858):** the live reader locked a wrong
+  object at the press — first a colour-tier seat at y≈440 (CV proposer returned None on those
+  frames), then a nameplate-like bar at y≈576 (w 26, fill stuck at 12) — while the real meter rose
+  at y≈280 (the standalone CV locator and the sync replay both track it). Ownership proof restarted
+  on the false samples and the user's own release went through. Two fixes:
+  (1) `ORION_READER_DETECTOR_ONLY_SEAT` (default on for cv-contour): a colour-tier candidate that no
+  fresh detector box (≤0.12 s) overlaps at IoU ≥ 0.3 may not seat (`det_only_veto=` counter);
+  (2) the outline gate is now ON in the launcher (`ORION_CV_OUTLINE_MIN=0.45`; nameplate/text/jersey
+  candidates score ≤ 0.36 vs real meters 0.98; one-frame confirmation for outline-less sights).
+  Both LIVE-UNVERIFIED: watch `det_only_veto=`, `cv={no_outline=,outline_bridged=}`, first-read
+  fill, and the count of `ownership_proof_incomplete` in the next game.
+- Owner propositions logged: aim at the middle of the green window (engine has
+  autonomousGreenCenterFrac / ORION_GREEN_CENTER_FRAC but memory says it is inert on the subtick
+  arm — parity fix needed first; the in-game window reading (green band 97–99.7) also differs from
+  practice, so calibrate before trusting it); C++ OpenCV port (timing uses capture stamps, so
+  processing latency does not move the release; CV locator 1 ms, reader 2.5 ms — CPU headroom only);
+  drop the +3 ms redundant release datagram (measured no timing effect, n=53; needs a fork rebuild).
+
+### 2026-09-11 15:20 — outline gate REFUTED live; seat veto kept; shutdown crash fixed
+
+- Sessions 13:16 and 13:48 (gate ON): 8 ownership aborts; frames around them show the reader's
+  box jumping across the screen (y 214→191→410→569→265) with the fill flapping 88→24→10→75: the gate
+  refused the real meter on live frames and the locator's fallback candidates (conf 0.75 meter-tall
+  bars) won. Gate-off sessions (11:28, 12:05) never did this. `ORION_CV_OUTLINE_MIN` is now pinned
+  to 0 in the launcher with the live evidence; do not re-enable without a different mechanism
+  (e.g. only refuse a candidate when a BETTER outlined candidate exists in the same frame).
+- The detector-only seat veto stays (READER ACQUIRE seats 64 → 0). The 26 "unanswered" presses of
+  13:16 were genuine no-meter presses (post moves / fakes: a meter visible after only 3/26).
+- Shutdown crash (0xc0000409, two dumps: 00:21 and 11:46): std::bad_alloc thrown from Qt on the
+  precise-fire thread during teardown → uncaught on a std::thread → abort. Fixed: run() wraps
+  runLoop() in try/catch (fail the mailbox closed, keep serving, no Qt in the handler), the worker
+  is joined FIRST in prepareForApplicationExit, and Release builds now emit a PDB (/Zi, /DEBUG:FULL).
+  The 15:19 close went through cleanly.
+- Session 13:16 graded: 5 green / 1 early / 1 red late of 7 banners.
+- **Second shutdown crash (15:19, with PDB):** main thread, `QObject::~QObject` of the controller →
+  `removePostedEvents` → `~QMetaCallEvent` → `QSemaphore::release` on a dead semaphore: the
+  controller was declared AFTER the QML engine in main() so it died first, while the engine, its
+  windows and the render thread were alive and a blocking cross-thread call to it was still queued
+  from a thread that had already exited. Fix in main.cpp: controller constructed before the engine
+  (destroyed after it) + a 3-pass sendPostedEvents/processEvents drain after QApplication::exec().
+  Compiles; LIVE-UNVERIFIED until the next close (check WER Application log for OrionNative 1000/1001).
+
+## 2026-09-11 16:55 — "random controller disconnects" = silent-but-enumerated USB pad (EPM=1 port) + 2.5 s teardown
+
+Owner report: the controller randomly disconnects mid-play ("especially on dark or static screens"), and the
+TIMING WARMING UP banner shows in menus. Evidence (logs/orion_native.log + .log.1, all UTC):
+
+- 5 "Physical pad unavailable - virtual pad torn down" events this session (20:52:13, 20:52:21, 21:07:18,
+  21:07:23, 21:19:07) and 12 in the rotated log (burst 20:07:53-20:09:48, then 20:15, 20:22, 20:23, 20:30,
+  20:39 x2). Only the LAST one (21:19:05) had a GIDC_REMOVAL ("Physical controller removed") before it - the
+  owner unplugging the pad at the end. The other 16 are the poll's silence path: the raw-input worker
+  (`OrionRawInputWorker`, stamps `lastReportMs` on EVERY decoded Sony report, no dedupe) received nothing for
+  > 750 ms, `controllerSelector_.select()` went inactive, and after `physicalMissingTeardownGraceMs_`
+  (2.5 s armed) the virtual ViGEm pad was disconnected -> Chiaki -> the PS5 shows a controller drop.
+- The silences are 4.8 s, 51.7 s, 4.0 s, 10.4 s (measured from the 1 s "Input hook heartbeat" cadence, which
+  only runs while the selected pad is live) and the pad stayed ENUMERATED throughout ("Physical detected,
+  waiting for input report"; Kernel-PnP/Configuration logged nothing; no GIDC events). Idle is NOT the
+  trigger: 89 idle stretches >= 8 s in the rotated log (longest 923 s) and 13 in this one (107 s) kept
+  streaming reports with no teardown; the 21:07:15 silence began while the owner was actively moving
+  (hook writes +91 in the last second). The "dark/static screen" observation is reverse causality: the
+  teardown pauses the game.
+- The pad was on a NEW USB port today (HID instance 8&28E0002D -> USB `VID_054C&PID_0CE6&MI_03\7&17e45d63&0&0003`,
+  location 0002...005) whose `EnhancedPowerManagementEnabled` is still the default 1. Four of the nine
+  DualSense port entries are EPM=1; the five on the usual port are 0. The owner pressed Fix Controller at
+  20:09:47Z and it FAILED ("open failed ... Start Venice through its launcher (administrator)") because the
+  launcher runs `-NoElevate`. This is exactly the failure class the 2026-08-08 pad gate note documents
+  ("enumerated + silent = USB selective-suspend/resume artifact ... a wake probe can clear").
+- HidHide is installed but cloak OFF with no devices/apps -> not a factor. Lightbar is Solid (writes only on
+  colour change) -> not a factor.
+
+Shipped (built 16:49, OrionNativeTests 792/0/6, all 18 test binaries rc=0, relaunched 16:52 via the launcher):
+1. `ControllerRoutingPolicy.h`: `silentPadTeardownGraceMs(enumerated, armedOrOwning)` — enumerated+silent
+   holds the (already neutral) virtual pad for `kSilentEnumeratedPadHoldMs` = 30 s; not enumerated keeps
+   2.5 s armed / 8 s idle. Test `silentPadTeardownGraceHoldsAnEnumeratedPadNeutral`.
+2. `OrionAppController`: the poll's silence onset uses that grace; at 400 ms of silence it calls the new
+   `nudgePhysicalPadOnce()` (the open + HidD_GetInputReport half of `wakePhysicalPadAndConfirmReport()`,
+   now shared) once per episode and logs "Physical controller enumerated but silent for N ms - nudged the HID
+   collection (open= report_poll=); virtual pad held neutral for up to 30000 ms". The GIDC_REMOVAL handler pins
+   the unplug grace explicitly (it used to inherit the previous episode's value). Onset actions
+   (disarm, revoke route attestation, engine reset, neutralize) are unchanged - no gate weakened.
+3. `tools/diagnostics/fix_dualsense_usb_power.ps1`: self-elevating (one UAC prompt) EPM 1 -> 0 for every Sony
+   pad USB entry; the same registry change as the in-app button. Owner must run it and re-plug the pad.
+4. `native_orion/src/main.cpp` shutdown-order fix is now LINKED (the 16:30:27 close crashed again in Qt6Core,
+   c0000005 at +0xdd3e, WER 1000/1001). Verify on the next close.
+
+Warm-up banner "TIMING WARMING UP - SHOTS STAY MANUAL": bound to `latencyCalibrationReady` =
+`autonomousLiveMeterReady()` = `measuredLeadAuthoritative(now)`, which needs the measured/user lead's route echo
+(`measuredLatencyScopeEpoch_ != 0`, route == attested route) and a lead telemetry refresh within 250 ms.
+`automation_.reset()` (called at every silence onset and pad removal) zeroes the scope epoch and the authority,
+so after each disconnect the banner is TRUE until the sidecar re-stamps the lead on the regenerated route -
+shots really are manual then (`liveLeadReady=0` -> SHOT NOT OWNED). It is a symptom of the disconnects, not a
+separate bug; nothing changed there.
+
+Still open: the two gate-off aborts (20:44:34 wide first box w=50 + non-monotonic fill; 21:01:01 empty frame
+window) - grading agent running on the 15:19 session.
+
+### 2026-09-11 17:20 — session 0911d graded (agent; outputs scratchpad/agent_out/grade_0911d, join copied to scratchpad/banner/joined_0911d.csv)
+- Framedump `session_20260911_151926` stops at 12000 frames (ORION_FRAMEDUMP_MAX) = 20:49:36Z; the last 41 min of
+  play (incl. the 21:01:01 abort) are unverifiable. Raise the cap or rotate dumps if whole sessions must be graded.
+- INSTRUMENT DEFECT: `banner_reader.py scan` only finds the 1-cell TIMING box; it missed every 3-cell
+  TIMING|COVERAGE|DISTANCE and TIMING|FT-RATING panel on The Theater court (tool join 1/10). The agent read the
+  10 in-dump releases by eye from contact sheets and joined with the unmodified banner_join.py.
+- 9 graded: GREEN 5 / LATE 4 (red FT, yellow FT, white x2) / EARLY 0. Jump shots only 5 G / 2 white-late (71%).
+  First session where the bot released FREE THROWS: both late (FT meter ~1.6x faster than the jump-shot curve).
+- Aborts: all 9 have release_seq=-1 (never owned): 7 square_early_release on 93-130 ms taps (the owner released
+  before 3 rising frames), 1 pending_stick_fault, 1 stamp_missing. The 20:44:34 wide-open abort (ep61) was a
+  320 ms press under a jumbotron camera cut: garbage reads 12-85% on 5 boxes, no panel. 5 confirmed no-fires
+  where the owner's own release produced a panel (2 G / 2 L / 1 E).
+- 10 releases in the first 15 min, 3 in the next 55 while presses continued; engine self-grade matched 3/9.
+
+### 2026-09-11 18:55 — controller injection Q + "Options / touchpad don't work"
+Route recap: physical DualSense via Raw Input (dedicated pump thread) -> `OrionInputClient` named-pipe hook into
+the Chiaki fork (`gui/src/orioninputbridge.cpp` copies `pkt.buttons` verbatim into ChiakiControllerState; the
+bitmask IS chiaki's enum, `feedback.c` encodes OPTIONS 0xac/SHARE 0xad/TOUCHPAD 0xb1/PS 0xae) -> Takion
+FEEDBACK_HISTORY. ViGEm X360 pad is held neutral while the pipe owns input; fallback only. HidHide cloak off.
+- Options (byte 9 bit 0x20 -> START -> PS_OPTIONS bit 12), Create, PS (byte 10 bit 0x01 -> GUIDE -> bit 15) are
+  decoded and mapped end to end; no masking found on either side. Unverified live (pad unplugged).
+- TOUCHPAD CLICK WAS NEVER ON THE WIRE: `decodeSonyReport` fills `ControllerState::touchpad` (byte 10 bit 0x02)
+  but `mapButtons()` only reads the XInput word. Fixed in `OrionInputClient.cpp` (`if(state.touchpad)
+  p.buttons |= PS_TOUCHPAD;`). OrionInputProtocolTests 43/0, OrionNativeTests 792/0/6.
+- New edge-only log line "Special button edge: options= create= ps= touchpad= route=pipe|xusb hook=" in
+  `pollPhysicalController()` so the next session proves decode + route for each press.
+- Shutdown fix EVIDENCE: the 16:52 instance (first build with the main.cpp order fix) was closed by the owner at
+  17:38 with NO WER 1000/1001 - the first clean close after the 15:19/16:30 crashes. Rebuilt 18:52, relaunched
+  18:53 via the launcher.
+
+### 2026-09-11 20:20 — the aim constant was the mover; Tip Timing card UNRETIRED + frozen
+Owner question: "is there anything moving the values that should be frozen in place? ex my lead is 60".
+
+ANSWER ON THE LEAD: no. Three writers exist — the measured seed (locked out by
+`actuationLeadAcceptsMeasuredSeed`: needs !userSet && !(lead>0), and settings has
+`actuation_lead_user_set: true`), `reportLeadCalibrationVerdict` (only while the calibration wizard
+runs) and `nudgeActuationLeadMs` (Q_INVOKABLE, called from NO qml — dead). Every change tonight has
+an owner-action log line ("Shot lead set to 274 ms (your value; measurement will not change it)").
+The 286/299/261/274 values in the log are all slider moves.
+
+WHAT WAS ACTUALLY MOVING — the effective aim constant, measured on the 19:38 session (98 shots):
+`Tip phase measurement: effective_const_ms` walked **388.4 -> 369.5 ms over n=3..15, monotonic**,
+while lead_ms sat at 299. Shot Lead is a constant offset against a moving target, which is exactly
+why tuning it never removed the random earlies/lates. Two faults stacked:
+  1. `learning.json` was ZERO BYTES (created empty 19:32:22), so there was no prior to start from.
+     The app rewrote it correctly later; its own `measured_phase_physical_ms` = 286.42 landed within
+     1.3 ms of the seed below, which validates the value.
+  2. The persist gate is `if (n >= window)` with `tipPhaseLearnWindow = 20`; the session's active
+     bucket reached 15, so it never wrote one either. Every launch therefore started cold and spent
+     the whole session converging. The code's own 2026-08-06 note documents the harm (aim walked
+     439.2->431.0 in one batch, second half graded sd 8.93 -> 11.91).
+
+SHIPPED:
+- `learning.json` seeded `learned_phase_physical_ms = 287.7` (converged base-30 median, anchor_pct
+  30.0 so no base-20 shift applies and the value is already canonical).
+- `settings.tip_phase_aim_frozen = true` + re-signed.
+- **TipTimingCard UNRETIRED** (`RemotePlayPage.qml`, mounted right after ShotLeadCard). It was
+  retired 2026-08-28 ("combine timing into one control") on the premise the engine auto-aims well
+  enough — refuted above. The card already had everything: the effective aim in ms, -5/-1/+1/+5
+  nudges, Reset, the divergence banner, the EARLY->Later / LATE->Earlier guidance, and a
+  "Hold steady" toggle bound to `orion.tipTimingLocked`, which reads/writes
+  `config_.data().tipPhaseAimFrozen`. Nothing new was written; it was dead code in the tree.
+- `setTipTimingLocked` log line corrected: said "for this session", but the flag is PERSISTED, so
+  the lock survives restarts.
+
+VERIFIED LIVE (20:19 instance): the learner window filled to **n=20** and raw samples swung
+326.2 / 358.4 / 360.3 / 393.0 ms while `effective_const_ms` held at **361.7** on every one. Before
+the freeze a full window moved the aim. UI screenshot confirms the card renders "Tip Timing /
+361.7 ms / Locked". OrionNativeTests 792/0/6; qmllint clean (only the module-wide `unqualified` class).
+
+STILL OPEN: `autonomous_vision` is false and `feedforward_anchor` is `meter_appear`; both were
+true/hold_start all afternoon and flipped at the 19:38 launch, in the same window learning.json was
+zeroed. The 98-shot session ran on that path (47 EARLY / 35 EXCELLENT / 10 LATE). Two attempts to
+restore them were overwritten because the RUNNING app owns settings.json — must be set with the app
+CLOSED, and the owner has not confirmed whether he flipped them deliberately. Also still open:
+tempo remap restore (engine path intact, gated only by `tempo_remap_enabled`).
+
+### 2026-09-11 21:56 — ONE fix for the residual earlies/lates: [ORION_TIP_PHASE_SOLO]
+Owner: "this should be the single fix... less engineering and complications and more efficiency".
+
+THE MEASUREMENTS THAT DECIDED IT (all 2026-09-11, this rig):
+- The phase member (witnessed anchor crossing + frozen constant) was ALREADY the armed source on
+  81.4% of fired shots (n=506). It is not a new path; it is the majority path.
+- anchor->tip time, per shot type at anchor 30: Standstill sd 11.7 ms (n=200), Right Fade 13.1
+  (n=47), Left Fade 18.3 (n=32), Go-To 23.6 (n=23). No extrapolation, no bias to correct.
+- The sampler path extrapolates ~370 ms from a short fit. Offline A/B on 126 paired real rises
+  (fit 6 samples ending <=35% fill, predict the ground-truth 70% crossing): IQR 16.0 ms AND a
+  +37.9 ms SYSTEMATIC LATE BIAS (the meter accelerates; a line cannot see it). That bias is what
+  the horizon de-bias / ramp-shape corrections exist to cancel, and the correction then sits on
+  its own 90 ms clamp on 39.3% of reservations (n=987).
+- TESTED AND REFUTED: robust (median-of-slopes / Theil-Sen) fit on the sampler. Same 126 rises,
+  IQR 16.0 -> 17.9 ms, i.e. slightly WORSE. The spread is extrapolation distance, not outliers.
+  (Frame-level noise is genuinely tiny: inside a clean monotone rise, sub-pixel |2nd diff| median
+  0.130 pp; 3.8% outliers inflate sigma_y 0.074 -> 0.825 pp, but a 6-sample window rarely holds
+  one, so robustifying buys nothing. Do not re-propose this.)
+- ALSO REFUTED EARLIER THE SAME DAY: "commit later". The engine already re-fits the armed deadline
+  every frame; its own comment says "the fire instant is set by the LAST refinement, not the first
+  arm" (89% of shots keep a bit-identical instant when the arm window moves). The promotion line's
+  reservation_age_ms=0 / updates=1 is a LATCHED log, not the decision.
+
+SHIPPED — exactly one condition, in the phase branch of the tip decision:
+  `const bool samplerMayVeto = !config_.tipPhaseSolo;`
+  `if (horizonPlausible && (!samplerMayVeto || (!contradicted && !flatMeter))) { ...phase wins }`
+A dated, horizon-plausible phase member can no longer be withdrawn by the extrapolating sampler.
+horizonPlausible is still required (the fail-closed edge). With no phase member the old fused path
+runs untouched, so no shot is lost. `RemapConfig::tipPhaseSolo`, default OFF in code, pinned ON by
+`$env:ORION_TIP_PHASE_SOLO = "1"` in run_orion.local.ps1 (line 206, after the line-90 scrub list,
+which does not contain it). Test `tipPhaseSoloIgnoresTheSamplerVetoOnADatedPhaseMember` pins the
+gate in pure form. OrionNativeTests 793/0/6. Built + relaunched 21:56.
+
+ALSO: RhythmCard UNRETIRED (owner request) — mounted in RemotePlayPage after ShotLeadCard; binds
+only to existing orion.tempoEnabled / orion.tempoFlickHoldMs, so it was a mount, not new code.
+TipTimingCard retired again (owner: with the aim pinned it made no timing difference); the FREEZE
+stays on (settings.tip_phase_aim_frozen = true, learning.json learned_phase_physical_ms = 271 after
+the owner's own nudges to 345 ms effective).
+
+STILL OPEN: autonomous_vision=false and feedforward_anchor=meter_appear (both flipped at the 19:38
+launch, unconfirmed whether owner-intended; must be edited with the app CLOSED since the running app
+rewrites settings.json on exit). Tempo remap restore. Go-To stays the worst type (sd 23.6 ms) and
+the owner has accepted it as "alright".
+
+### 2026-09-11 22:16 — UI trim + [ORION_CV_TIP_CORROBORATE] (owner batch)
+1. RhythmCard rewritten as ONE switch (`rhythmFlickToggle` -> orion.tempoEnabled) plus a status
+   line. The hold-length slider is gone from the UI; settings tempo_flick_hold_ms and the engine's
+   50 ms floor are untouched, so restoring it is a UI change only.
+2. Rhythm MOVED into MeterConfigPanel directly above the Meter Delay card (owner placement); the
+   RemotePlayPage mount is gone.
+3. Meter Delay shortened: the permanent "added to Shot Lead automatically" line and the raw
+   meterDelayStatusText line are removed. One line remains and only when it matters -- when the
+   delay exceeds what the lead can absorb.
+4. LOCATOR: the conf-0.75 acceptance ("a meter-tall achromatic column IS the meter") took a white
+   bar on GEOMETRY ALONE with no green tip. Owner symptom: the box snaps onto the COURT for a split
+   second -- a court line at the right angle is also an 8-22 x ~90 px achromatic bar. That path now
+   needs corroboration: an unconfirmed candidate must be seen at the same place within
+   `tip_recent_s` (0.20 s, same tolerance law as the outline gate, 0.6 px/ms growth); a first
+   sighting is REMEMBERED (`_tip_pending`), not accepted. New stat `no_tip_lone`.
+   `ORION_CV_TIP_CORROBORATE` default ON (=0 to disable).
+   VALIDATED on session_20260911_201957 (5299 frames): confirmed conf-0.90 detections
+   1214 -> 1214 = 100% KEPT (zero cost to real meters); the single conf-0.75 acceptance refused.
+   The 35 boxes that land on reader-NO-METER frames are ALL conf 0.90 and are GHOST meters
+   (rejection ghost_static_press 27 / roi_not_found 8) correctly refused downstream -- not court
+   locks, so they are untouched by design.
+   Tests: test_meter_locator_cv 33 passed (the washed-tip test now pins the one-frame cost, plus
+   new `test_one_frame_court_stranger_never_locks` and
+   `test_confirmed_green_tip_is_never_delayed_by_the_corroboration`); +test_shipped_reader_defaults
+   = 39 passed. Built + relaunched 22:16.
+   CAVEAT: the offline dumps are sparse (one frame per interval) so corroboration cannot bridge in
+   replay; that the court flash is GONE needs the owner's eyes on a live session.
+
+### 2026-09-11 22:27 — the residual LATES are a RUNWAY ceiling, not a calibration offset
+Owner after the phase-solo build: "random earlies removed, now it's random LATES no matter how I
+tune the lead". That phrasing is the diagnosis: a lead that cannot fix it is not an offset problem.
+
+MEASURED (session from the 22:16 launch, 75 shots):
+- The phase member EXISTS on only 13 of 182 reservations (7%). It is the armed source on 15 of 75
+  fired shots (20%) — the other 80% fall through to the SAMPLER, which is measured to carry a
+  +37.9 ms LATE bias (see the 21:56 entry). That alone produces random lates.
+- When phase does exist: const 345 ms, lead 286 -> **runway after the anchor = 59 ms**, and the
+  observed command_eta at those reservations is median 31.7 ms, min 15.8 ms. A capture frame is
+  16.7 ms, so the engine routinely arrives with ONE FRAME or less of margin; any dropped detector
+  frame blows the deadline and the shot fires late.
+- THE CEILING, which is why no lead works: runway = constant - lead. Lower the lead -> earlies.
+  Raise the lead -> the runway shrinks (286->71 ms, 300->45, 320->25) -> more lates. There is no
+  value that satisfies both. The owner was tuning inside a trap.
+
+FIX — ONE SETTING, no code: `tip_phase_anchor_base20 = true` (anchor 20% instead of 30%).
+- Runway 71 -> 129 ms at the owner's lead of 274. Roughly double the margin.
+- The aim does NOT move: learning.json stays canonically base-30 (271) and the engine adds
+  kAnchorBase20ShiftMs (+58.3) on restore, giving an active physical prior of 329.3 ms against a
+  MEASURED anchor-20 median of 332.1 ms (n=42) — 2.8 ms apart, so the shift is correctly
+  calibrated for this rig's current constant.
+- Anchor 20 is also the TIGHTER rung on this rig: anchor-20 Standstill sd 6.18 ms (n=42) vs
+  anchor-30 sd 11.69 ms (n=200).
+Re-signed and relaunched 22:27. Revert = set the key back to false + re-sign.
+
+ALSO: the owner turned the Rhythm toggle ON, so tempo/tempo_remap_enabled/tempo_flick_enabled are
+now true — that is the tempo remap path he asked for earlier, reached through the new toggle.
+
+### 2026-09-11 23:26 — BANNER-GRADED: offset is zero, spread is the floor, type trim is real
+123 releases across session_20260911_222756 (S1) and _224102 (S2), graded on the GAME's panel.
+Outputs: scratchpad/agent_out/grade_final/ (per_shot_joined.csv, REPORT_*.txt, panel_*.py).
+
+INSTRUMENT: `banner_reader.py scan` returned **0 events on 6,542 frames**. Root cause: with the
+Rhythm toggle ON every bot shot is mode=TempoSquare and the game shows a **RHYTHM** panel, not a
+TIMING one. A replacement reader (panel-strip colour signature -> events -> NCC word clustering)
+is in grade_final/ and is reusable. Banner onset is +1.0..1.8 s after release, not +0.3 s.
+
+THE KEY NUMBERS (ordered-probit MLE over the owner's own lead sweep 261/264/269/274, bootstrap
+B=300; the Shot Lead itself is the ruler because the engine's meter numbers are blind to this
+error — fillAtRel vs severity rho=+0.19 and peak_fill/settled_fill/travel_pp run BACKWARDS,
+rho=-0.41/-0.42/-0.50):
+- **offset at lead 274 = -2.3 ms (CI -5.3..+3.2) = statistically ZERO; zero-crossing at 271.7 ms**
+- **spread sigma = 10.7 ms (CI 6.2..19.4)** against a fitted green HALF-window w = 12.1 ms, i.e.
+  sigma ~= 0.9 w. Ceiling at the perfect lead ~= **74% green**.
+- CONFIRMS the owner's "raise it -> earlies, mid -> a mix": offset 0, spread ~ the window. The
+  32-late-vs-9-early imbalance is entirely the lead (52 of 108 shots ran at 261 = +10.7 ms).
+- 108/108 shots armed from `phase` — phase-solo + base20 are working exactly as designed.
+- NOTHING engine-side explains the residual: |rho| <= 0.15 for command_eta, tip_eta, frame_age,
+  sched_delta, coherence, meter_x/y; **cycle_phase_ms +0.12 (n=61) is NULL** — the capture-phase
+  theory is refuted again on independent data.
+
+TYPE DEPENDENCE IS REAL (this supersedes the old "constant rightly global" note for FADES):
+at lead 261 fades were 1/11 green vs Standstill 26/38 (Fisher p=0.0011); at 274 fades 8/10 vs
+Standstill 16/28 (fades 1/11 -> 8/10 across 13 ms, p=0.0019; Standstill flat p=0.44). Per-type mu
+at 274: Left Fade +5.0, Right Fade +6.8, Standstill -5.0 ms. Fades want ~12 ms more lead.
+
+APPLIED (app closed, re-signed, relaunched 23:26): `actuation_lead_ms` 264 -> **272**;
+`tip_phase_type_trim_enabled` false -> **true**. The stored trims (Left Fade -4, Right Fade -6)
+were ALREADY correctly signed — trim ADDS to the constant and constant = later tip = later fire,
+so fades landing late need a NEGATIVE trim — and are within 1 ms of the graded values. They were
+simply switched off.
+
+TWO CONFIG HAZARDS FOUND, not timing bugs:
+1. **Rhythm ON is costly.** The tempo word read FAST on 49/49 non-green shots (never SLOW/good),
+   and the 6 shots where the flick did not register at all were **6/6 LATE-red**. It also breaks
+   the banner grader (RHYTHM panel, not TIMING). Recommend OFF unless the owner wants it.
+2. **Meter Delay is unusable as configured.** Enabled mid-S2 it folded into the lead (269 ->
+   357/375 ms), drove command_eta to 5-22 ms and produced **14/15 LATE-red**.
+
+### 2026-09-12 01:00 — tools/timing/panel_grade.py: one-command banner grading
+`banner_reader.py scan` returns 0 events on this court (verified, 6,542 frames): it finds only
+the 1-cell TIMING box, and with Rhythm ON every bot shot shows a RHYTHM panel. Grading was
+therefore a bespoke ~30 min job per session, which is why we tuned blind for so long.
+
+NEW: `python tools/timing/panel_grade.py <framedump_session_dir>`. Prints the green rate, the
+verdict mix, and a breakdown BY LEAD and BY SHOT TYPE; writes `<session>/panel_grade.csv`.
+How it works: per-frame colour signature of the panel strip -> runs of stable colour = one
+verdict -> the verdict WORD is fingerprinted as a binary mask and matched (NCC >= 0.90) against
+`tools/timing/panel_templates.npz`. Templates are labelled ONCE and reused forever.
+`--label` writes review/clusters.png + labels.template.json; fill it in, re-run with
+`--seed <that file>`. An unlabelled word is reported UNKNOWN and EXCLUDED, never guessed.
+
+Three gates were needed and each was found by looking at the cluster sheet, not by theory:
+1. fingerprint the word INSIDE the cell's coloured border (the border alone is identical for
+   every verdict of a colour -- without this, 31 clusters for ~4 words);
+2. require the panel's DARK BACKING PLATE inside the border (the wooden court is saturated
+   yellow and clears the strip's darkness floor);
+3. a WHITE-severity cell is unsaturated -- fall back to a brightness mask, or 3 of 14 lates are
+   silently dropped (and the green rate reads better than it is, the worst direction to err).
+
+VALIDATED against the hand grade of session_20260911_222756: tool 33 EXCELLENT / 14 LATE /
+3 EARLY = 66% green; hand grade 33 G / 14 LATE / 3 EARLY = 66%. EXACT on all four numbers.
+Then run on session_20260911_224102 with NO labelling: 35 G / 24 LATE / 8 EARLY (hand: 35 / 32 /
+6) -- greens EXACT, and it independently reproduced the meter-delay disaster (lead 356.6/357:
+14 LATE, 0 green, 0%). The ~8 lates it misses there are verdict/background combos not yet in the
+library; one more `--label` pass closes them. The library only ever grows.
+
+NOTE for the next session: the per-lead table on 224102 reads 261 -> 60%, 264 -> 91% (n=11),
+269 -> 100% (n=3), 274 -> 53% with SIX earlies. Small n, but it does NOT support 274 being the
+optimum on that session; 264-269 looks better. Grade the next clean run before moving the lead.
+
+### 2026-09-12 20:14 — the two "ship blockers": aborts with a clear meter, and contest
+ABORTS. 53 abort-identity records across the logs; ALL 53 carried a located meter (meter_x>0), so
+every one is literally "an abort with a clear meter on screen". ownership_proof_incomplete 30,
+live_tip_deadline_missed 17, ownership_structure_stamp_missing 4, detector_authority_lost 2.
+- proof_incomplete SITE: square_early_release 28, pending_stick_fault 2 -> it is NOT Rhythm.
+- The proof needs >=3 samples (2 with ownership_proof_two_frame) AND a rise >= anchorRiseMinPct
+  (3.0 pp) from the first sample. ownershipProofRunwayAware is already ON by default.
+- The 30 by fill trajectory:
+  * DEFLATING 10: first_fill median 58.5 %, 9/10 at >=40 %, 9/10 with ZERO proof samples, and they
+    arrive a median 4.0 s (max 14.1 s) after the previous shot = the PRIOR shot's leftover feedback
+    meter. The gate is correctly refusing a ghost.
+  * FLAT 17: first_fill median 23.6 %, e.g. 7 samples at 13.3 -> 13.2 %. A stationary meter during
+    the gather, nothing to time. Not cadence: completed proofs span exactly 3 consecutive frames.
+    No tie to the prior shot (median 15.3 s, up to 324 s).
+  * RISING 3.
+- So ~90 % of proof aborts are CORRECT refusals. The 2-frame proof cannot rescue FLAT (the rise rule
+  binds, ~2.6 pp across two early-meter frames), and lowering the 3 pp rise weakens a false-shot
+  gate. Do not "fix" these.
+- deadline_missed in the 09-13T00Z session (7): press_anchored 4 (tip_eta 202-254 ms vs lead 272 --
+  the predictor re-enabled 09-12 for the owner's no-meter test, the same hijack memory already
+  recorded), phase 3 (anchor 35/40, meter first seen at 40-51 % fill).
+- FIX APPLIED: press_anchored_predictor_enabled -> false (app closed first, re-signed, relaunched
+  20:13). Returns to the validated config that armed 108/108 from phase. Trade-off: the no-meter
+  test path is off again.
+
+CONTEST. All three candidate signals REFUTED:
+1. There is no defender/contest classifier at runtime. learning.json per_level nudge slots are
+   never read; `contested*` in AutomationEngine means ESTIMATOR disagreement, not defence.
+2. green_obs_width is post-release and outcome-contaminated: with 4 artifact widths >6 pp removed,
+   the WIDEST tertile is worst (46 % green, 0 % early / 54 % late, n=35). A late shot makes the
+   window look wide -- reverse causality.
+3. PRE-release green centre (<=450 ms before release, 98/123 graded shots) is effectively constant:
+   median 94.75, middle tertile spans only 94.57-94.94. Tertiles 55/76/56 % green with the SAME
+   early/late split at both extremes (T1 E12 L33, T3 E9 L34). A raised window bottom would push
+   high-centre shots EARLY; it does not. The extremes track read quality, not contest.
+Surviving explanation: contested misses are the same sigma ~10.7 ms precision floor landing on a
+narrower window (owner-confirmed mechanic: invariant top, tip aim correct). No contest-specific
+offset has been shown to exist.
+THE ONLY CANDIDATE NEXT STEP: the game's own COVERAGE cell is ground-truth contest, but it is
+COURT/MODE DEPENDENT, not merely "Rhythm off". A 3-cell TIMING|COVERAGE|DISTANCE panel was reported
+on The Theater court (09-11), while panels read on 09-12 were RHYTHM|DISTANCE (Rhythm on) and one
+plain TIMING|DISTANCE with NO coverage cell. So FIRST confirm a COVERAGE cell actually appears on a
+real Rhythm-off panel from the owner's current court; only then extend tools/timing/panel_grade.py
+to read it and split green rate by coverage. Directional misses -> a fixable per-contest
+offset; symmetric -> the precision floor, and contest cannot be tuned away.
+
+### 2026-09-12 20:50 — COVERAGE ground truth on the owner's court: contest MEASURED
+- With Rhythm OFF this court shows TIMING|COVERAGE|DISTANCE. Coverage labels seen: WIDE OPEN,
+  OPEN, SEMI-OPEN, BOTHERED, LIGHT CONTEST, SOLID CONTEST. This resolves the "court-dependent"
+  caveat above FOR THIS COURT.
+- session_20260912_201355, lead 269, phase-solo, 34/34 shots armed from phase, press-anchored OFF.
+  Dump hit the 12000-frame cap (01:14:48-01:44:49Z): 28 of 34 shots inside, 26 with a readable
+  panel (seq 17 and 24 blank). Read by eye from review/wide_panels.png + panels_p1.png + panels_p2.png.
+- Green by coverage: WIDE OPEN 6/8, OPEN 5/6, SEMI-OPEN 1/2, BOTHERED 3/4, LIGHT CONTEST 3/5,
+  SOLID CONTEST 0/1. Contested (BOTHERED+LIGHT+SOLID) 6/10 = 60 % vs open (WIDE OPEN+OPEN)
+  11/14 = 79 %.
+- SEVERITY is the signal: contested misses 4/4 medium-or-severe (3 red, 1 yellow); open misses 2 of 3
+  slight (white). A narrower window makes the same error land harder = the sigma ~10.7 ms precision
+  floor on a smaller target, now confirmed with the game's own contest label.
+- DIRECTION is not separable: all misses 6 late / 2 early. The one contested EARLY-red (seq 22)
+  released at fill 30.1 vs a 36-41 norm = an engine early release, not contest. The overall late lean
+  fits lead 269 sitting ~2.7 ms under the graded zero-offset point (271.7). No contest-specific
+  offset at n=10.
+- COVERAGE is drawn only AFTER the shot: validation ground truth, never a fire-time input. There is
+  still no pre-release contest signal; a contest-aware aim needs a real-time defender detector.
+- TOOL GAP: panel_grade.py is not 3-cell aware. With TIMING and COVERAGE both coloured, word_mask's
+  saturated bounding box spans both borders and fuses the two words, so it cannot grade Rhythm-off
+  sessions until it splits the panel into cells.
+
+### 2026-09-12 22:40 — the three ship-blockers are ONE locator defect + one USB entry (owner batch)
+Owner after the park session (20:48-21:27 local, no framedump): "still shot aborts on meters",
+"false detections on white jersey/people in the park", "sometimes button presses dont register".
+- ABORTS (24 of 106 shots, user log): 12 ownership_proof_incomplete, 7 detector_authority_lost, 3
+  live_tip_deadline_missed, 2 ownership_structure_stamp_missing. The native log ROTATED at 21:19:10
+  (orion_native.log keeps ~780 KB), so only the last 10 have engine detail:
+  * RISING meters refused on `break_geometry=1` (6.7->45.4 over 20 samples; 17.1->44.0 over 33;
+    8.3->12.6 over 20, all Right_Fade) — the proof episode was torn down by the geometry-continuity
+    check (IoU>=0.10, dim scale 1.5, aspect 1.25) and could not reopen above the 40 % first-sight
+    bound. The court dump shows the mechanism: at 20:43:47 the reader's box was (260,312,36,119)
+    — 36 px wide, not a meter — then jumped 51 px to (209,318,26,115): a FALSE LOCK RE-SEATING
+    onto the real meter mid-rise. IoU 0, aspect scale 0.75 -> break -> live_tip_deadline_missed.
+  * FLAT "meters" at two recurring screen spots, (0.32,0.20) and (0.98,0.69): 20.4->19.8 over 28
+    samples, 21.7->20.8 unstamped, and the detector_authority_lost at the same coordinates. Static
+    white things in the park scene, not meters.
+  So the abort blocker and the false-detection blocker are the same defect: the CV proposer takes
+  white columns that are not the meter; at the press they sit ON the shooter (his own jersey) and
+  the real meter is found late (deadline) or displaces them (geometry break).
+- FALSE DETECTIONS, quantified on session_20260912_201355 (owner's court, 12,000 frames, 60 rise
+  runs): production `_find` accepted 222 columns OUTSIDE any shot on a 6,000-frame half-sample.
+  Contact sheets (scratchpad sheet_offshot_raw.png): the owner's OWN white FEVER 22 jersey with the
+  green alien head as the "tip" (conf 0.90!), other white jerseys/shorts/socks, the scoreboard's
+  white bar, the shot chart, menus. Live: 1,120 "Shot meter detected" user-log events for 106
+  shots; DETECTOR HEALTH found=31 % of all frames; 572 locks/485 drops in 7 minutes.
+- WHY THE EXISTING GUARDS MISS THEM: the outline gate (7) measures the translucent track edge, which
+  takes the court's colour — median support 0.00 on this wood floor for REAL meters (it was 0.98 on
+  the court it was designed on). Tip corroboration only refuses one-frame strangers; a jersey is
+  co-located with itself every frame. A dark-track test was tried and REFUTED: the unfilled track is
+  translucent white over a light floor (real track V p90 = 212), it cut 31 % of real meters.
+- FIX SHIPPED: gate 9, [ORION_CV_SHAPE_GATE] (default ON) in meter_locator_cv.py, judged INSIDE the
+  candidate loop so a refused jersey hands the frame to the next candidate (the meter, which loses
+  on area). Only the meter's OPAQUE parts are trusted: the white fill must be a straight rectangle
+  (row-width spread <= 0.35 of the median above the notch, both edge sd <= 1.2 px, solidity >=
+  0.75) and a confirmed tip must be compact (green in the 8-14 px ring beside the centre line <=
+  0.25*g_in + 4). Fills < 14 px are deferred (a real fill grows ~4 px/frame at 60 fps: one frame;
+  a static 8x10 px jersey bit never grows). A candidate co-located with the box accepted within
+  0.20 s is bridged (tracking a full/occluded fill is not first sight).
+  Offline (both2 rule, 6,000 frames): every "real" it refused was a jersey the sidecar itself had
+  locked; the 9 remaining false were all h<=13 (now deferred) + one mascot pole on the 0.75 path.
+  PRODUCTION PATH replay (detect_box with frame ts, gate ON vs OFF, 6,000 frames):
+    other_det 157 -> 19, nodet 48 -> 2, ghost 177 -> 161, rise 49 -> 34; ROI holds 499 -> 223.
+    The 21 remaining off-shot finds are ALL real meters by eye (mid-rise and post-release meters
+    the label logic missed) = zero false finds outside shots on this corpus. The first cut lost
+    ghosts (177 -> 54): a FULL fill takes the capsule's arrow shape at the top and cold-failed the
+    constant-width test; the judged body now skips the arrow rows (top ~10 px below the tip), so a
+    post-release meter re-acquired cold is still proposed and the landing grade survives. Rise
+    losses are the jersey "rises" + the one-frame <14 px deferral, which the 10 fps dump
+    overstates 6x (100 ms per sampled frame vs 17 ms live) — the live cost is unproven until the
+    next session: watch DETECTOR HEALTH lifecycle(locks/drops) and cv stats shape_short /
+    shape_irregular / tip_spill / shape_bridged.
+  Tests: tests/test_meter_locator_cv.py 40 pass (7 new: jersey strip under a green blob, straight
+  strip with a wide green band, green court line behind the meter is not a spill, short fill
+  deferred then taken at 15 %, bridging through an occluded fill, full meter with its arrow top
+  taken cold, meter wins over a bigger jersey).
+  A/B switch: ORION_CV_SHAPE_GATE=0. Needs an app RELAUNCH (the sidecar imports the module once).
+- BUTTON PRESSES: no swallowed Square in the surviving log window — all 23 idle-state
+  "SQUARE SUPPRESSED" lines are the 0.45 s post-fire drain (Releasing -> Cooldown -> Idle), hook
+  heartbeat failures=0. BUT the pad the owner is using RIGHT NOW is USB instance
+  VID_054C&PID_0CE6&MI_03\7&10A57DC9 and it is the ONE Sony entry still at
+  EnhancedPowerManagementEnabled=1 (nine older instances are 0 — the fix script ran before this
+  port was first used). That is the 09-11 silent-pad stall (4-52 s of no reports while enumerated)
+  = "presses don't register". Owner step: re-run tools\diagnostics\fix_dualsense_usb_power.ps1
+  (UAC), unplug/re-plug.
+- Also: the owner moved Shot Lead 269 -> 279 in the UI this session (SHOT LEAD DISAGREEMENT lines);
+  graded optimum was 272. Left as set.
+- LIVE RESULT 22:34-22:48 local (relaunch, no framedump, lead 279): 38 presses of which 12 were
+  <200 ms taps with no meter (pass/fake), 18 real shots -> 17 bot-fired, 0 ownership_proof_incomplete,
+  0 live_tip_deadline_missed, 1 detector_authority_lost. Locator found-rate 31 % -> 5.1 % of frames;
+  "Shot meter detected" 10.5 per shot -> 1.5; locks +33 / drops +24 in 13 min (the outline gate did
+  309 drops on 330 locks — this one does not churn). Owner: "BIG MILESTONE NO ABORTS".
+
+### 2026-09-12 23:10 — owner's ship batch: gate-only band top, Meter Delay shelved, warm-up banner gone
+- [ORION_METER_GATE_TOP] meter_locator_cv.py: the ACCEPTANCE gate's top is now its own knob,
+  default = the scan's own top (band_top - 0.12 = 0.08). The scan band is untouched, so no infer
+  cost (the 09-12 band_top=0.12 attempt moved both and was reverted). Motivation stands from the
+  7,509-frame measurement: highest meter centre 0.216 vs a 0.20 gate = clipped meters on jumping
+  fades / far shots = press_unanswered_no_meter on real holds (tonight: 3 holds of 732/882/1548 ms
+  with no meter ever found, Left Fade / Right Fade / Standstill). The scoreboard that lives in the
+  0.08-0.20 strip is refused by the shape gate. Replay with the wide gate: identical to the 0.20
+  run (other_det 19, nodet 2, ghost 161, rise 34) -- no new false finds. Old behaviour:
+  ORION_METER_GATE_TOP=0.20. tests: 46 pass (scoreboard-band test rewritten to the new contract).
+- Meter Delay card REMOVED from MeterConfigPanel.qml (owner: "port and shelve"). Backend,
+  VeniceNetSvc, D-pad Up bypass, profile keys, MeterDelaySettingsPropertyTests untouched; a
+  persisted meter_delay_enabled still applies (shipped default OFF).
+- "TIMING WARMING UP — SHOTS STAY MANUAL" banner REMOVED from RemotePlayPage.qml (owner
+  screenshot). State, Setup-page Timing pill and log line untouched.
+- Both QML removals are compiled into OrionNative (qt_add_qml_module): rebuilt
+  native_orion/build/Release after the owner closed the app.
+- AIM POLICY question ("aim at the tip of the green window, else the meter tip"): already the
+  behaviour and the two points coincide. The pre-release "green" the reader observes IS the tip
+  triangle in fill coordinates: green_end p10/50/90 = 95.2/95.8/96.4 (sd 1.0 pp), the same for
+  Standstill / Left Fade / Right Fade / Go-To (35 releases 22:34-22:48). The autonomous path
+  targets kTipTargetPct=100 on every shot; GreenWindowTracker::targetPct (start/center/tip/end)
+  only serves the legacy path. Aiming at observed green_end would land in the same place after a
+  lead re-grade and add ~4 ms of reading noise. NOT changed.
+- CONTEST question ("the window shrinks on contest, how does the bot adapt"): on this meter style
+  nothing shrinks on screen -- the drawn green is the tip triangle, constant. Adapting per shot
+  needs either (a) a meter style that draws the real window band, which the tracker would read
+  (then target mode "center" on the live path is a small change), or (b) a pre-release defender
+  detector. Measured 09-12 the contested misses were the precision floor on a narrower window with
+  no separable offset (6 late / 2 early overall), so (b) has no aim to move; (a) is the only
+  honest lever and it is a GAME setting.
+- Rhythm: rides the same ownership gate + phase timing as Square (tempo_tip_parity only touches
+  stick-initiated TempoStick). Never ON in a graded session; nothing measured to improve.
+
+### 2026-09-13 00:30 — Chiaki fork feedback-send audit (read-only, agent) + NO METER rework
+- FORK SEND PATH: the release edge is NOT rate-limited. FEEDBACK_STATE_TIMEOUT_MIN_MS (8) is
+  defined but referenced nowhere in the fork; a flagged Square-up goes pipe -> bridge thread
+  (HIGHEST, blocking ReadFile, never coalesced) -> lossless orion_queue + cond signal -> the
+  Chiaki Feedback Sender thread dequeues it on its next iteration and sends FEEDBACK_HISTORY
+  (takion_send_feedback_packet: encrypt + GMAC + blocking send()). Left-stick packets are
+  latest-wins and outranked by the queue, so a fade's stick traffic cannot delay the release.
+- REMAINING FORK-SIDE JITTER (us-typical, ms tails): (1) the sender thread runs at DEFAULT
+  priority pinned to physical core 1 (streamsession.cpp orion_thread_affinity_cb) - the largest
+  wake-tail risk; (2) CHIAKI_LOGI calls held under orion_pending_mutex / state_mutex on the edge
+  path; (3) the fork has timeBeginPeriod(1) but NO PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+  opt-out (the native app has it), so an occluded OrionStream window can coarsen its timed waits
+  to 15.6 ms (only the redundant-copy / retry / keep-alive waits, not the edge itself);
+  (4) the redundant-copy head-of-line hold (3 ms after a Square-up, 8 ms after a Tempo flick) only
+  delays the NEXT edge - i.e. Tempo flick->neutral, never a button-shot release.
+- PROPOSED MINIMAL FORK PATCH (not applied): SetThreadPriority(HIGHEST) on the feedback sender
+  in orion_thread_affinity_cb; move the two edge CHIAKI_LOGI calls after the unlock; add the
+  power-throttling opt-out in main.cpp. Verify with the fork log: `ack_local_delivery ...
+  queue_wait_us=` minus `local_udp_accept kind=history ... transport_us=` isolates the
+  sender-wake jitter - histogram before/after.
+- NOTHING measures PS5 receipt (console_ack=0 everywhere); the last observable point is send().
+  Native side: `Release submit: hook_write_us / hook_ack_wait_us` - the ack wait spans the Takion
+  send() plus the return leg, so forward delay <= hook_ack_wait_us.
+- NO METER REWORK [ORION_NO_METER_LEAD] (owner: "values should span 1-100 like the shot lead; two
+  separate paths"): processInputTimedIdle now classifies the shot type from the stick (same
+  classifier as the meter path) and holds Square for pressAnchoredTipMs[type] - inputTimedLeadMs
+  (new setting input_timed_lead_ms, 150..400, default 272) when the prior carries weight >= 8;
+  otherwise the old global input_timed_delay_ms (kept, no UI). Floor 100 ms. NoMeterCard.qml is now
+  a 1..100 "No Meter Lead" slider on Shot Lead's scale; the page's METER/NO METER switch hides the
+  other path's cards (MeterConfigPanel + ShotLeadCard vs NoMeterCard + noMeterRhythmCard).
+  Tests: inputTimedUsesPerTypePriorMinusLead (prior-lead, fallback, floor) + round-trip clamps.
+- BUILD/TEST STATE 01:50 local: OrionNativeTests 802 pass / 0 fail / 6 skipped (the owner-settings
+  round-trip allowlist gained input_timed_lead_ms); OrionNative rebuilt (01:46) with the NO METER
+  rework + page switch + the two earlier QML removals and relaunched (pid 27232, "Input timer:
+  enabled=0 delay_ms=500.0 lead_ms=272.0"). Live sessions tonight on the shape gate: 22:34-22:48
+  18 shots / 0 proof aborts; 23:xx-00:31 32 fired / 2 ownership_proof_incomplete (both
+  square_early_release, meter_jump ~0 = the owner let go before the proof) / 3 real holds with
+  no meter found (366 ms Left Fade, 1215 + 494 ms Standstill) = the far/fade recall item.
+- FORK TAIL MEASURED, LEVER CLOSED: `Release submit: hook_ack_wait_us` over the 91 releases in
+  the current native log = p50 299 us / p90 476 / p99 985 / max 985 us. That interval spans the
+  Takion send() plus the ack return leg, so the forward pipe->fork->send delay is < 1 ms worst
+  case tonight. Against sigma ~10.7 ms it is not a contributor; the fork priority/log/throttling
+  patch is NOT worth applying. (The fork's own OrionStream log is not relayed into
+  orion_native.log, so queue_wait_us/transport_us could not be histogrammed directly.)
+- NO METER PUMP-FAKE BUG (owner, 01:5x local): a high No Meter Lead made the hold shorter than the
+  game's set point -> pump fake instead of a shot. Holds tried tonight: lead 400 -> 270 ms, 362 ->
+  308, 337 -> 333, 312 -> 358, 302 -> 368, 281 -> 389, 272 -> 398 ... 150 -> 520. Owner bracket:
+  slider >= 60 (hold <= 371 ms) pump-faked, 53 (389 ms) shot. FIX: kInputTimedMinHoldMs = 390
+  (the meter path's proven Standstill hold at lead 272-279); log says
+  source=prior-lead_FLOORED_pump_fake_guard when it engages. Standstill's usable slider range is
+  therefore 1..53; fades never reach the floor. The meter path cannot fire that early (deadline
+  cannot precede the witnessed anchor) which is why it never showed there.
+
+### 2026-09-13 02:15 — fade / far-shot forensics on the old dumps (read-only, agent)
+- Replayed the CURRENT locator (shape gate ON, gate top 0.08) and three variants over sessions
+  145457, 201355, 124114 (10 fps dumps + the sidecar's 60 fps detframes for verdicts; native log
+  .1 for engine outcomes). Artifacts: scratchpad\fades\ (shots_*.csv, traj_*.txt, sheet_*.png,
+  replay_*.csv, replay_locator.py/shots.py/rle.py/sheet.py/census.py/gatediag.py).
+- VERDICT: the locator is not the fade problem. On every frame where a meter is on screen with
+  its tip the current locator finds it; RELEASED shots were first seen at fill 15-17 % (p90 19).
+  The failures are METER ONSET: on fades the meter is not on the capture feed until ~+695 ms
+  median after the press (up to +1.7 s, first-seen fill ~11), and in the fade-heavy 201355 session
+  21 of 54 fades never showed a meter within 2.5 s (crops: gather / pump-fake, no meter graphic).
+  CAVEAT: 201355's second half is the disk-full stall (frame age 2-7 s) — its 44/54 NOT_OWNED
+  fades are contaminated; 145457 (healthy rig) released 10/12 fades and its 2 fade failures were
+  late onset (+744 ms). Aborts that did reach the engine had first_fill 24-36 %, i.e. acquired
+  late against a short runway (fade tip ~1000 ms after the press, onset ~650-700 -> ~300 ms of
+  visible rise minus lead 279).
+- ORION_METER_GATE_TOP is INERT on these dumps: cur vs gate20 byte-identical on every frame (no
+  meter centre above 0.20 H in gameplay; min box-top ~91 px). Harmless; kept for the extreme
+  far/high case it was measured for (centre 0.216 on 09-12).
+- ORION_CV_SHAPE_GATE costs a handful of single first-sight frames on fades at fill 5-22 (e.g.
+  145457 idx 1053 tip_spill = the green-ball cosmetic beside the tip; idx 3277/3282; 201355 idx
+  5852, 8612, 9427-9430, 11859), each followed by a confirmed co-located frame -> ~1 frame live.
+  It correctly rejects the previous shot's spent meter (145457 idx 3302, 2146). Keep it.
+- Remaining fade lever (engine, not locator): runway. The validated 2-frame ownership proof
+  (settings ownership_proof_two_frame, OFF; saves ~14 ms; never pair with a 4.0 pp rise — rise is
+  3.0) buys one frame on exactly these late-onset fades. Flip it at the next app close and grade
+  fades on the banner. Nothing else measured is cheaper.
+
+### 2026-09-13 02:30 — panel_grade.py is 3-cell aware (agent; validated)
+- tools/timing/panel_grade.py rewritten around a per-frame cell splitter (find_cells: the grey
+  frame's long bright top/bottom rows + vertical dividers -> spans with a dark plate; per-cell
+  colour; coloured cell fingerprint = saturated pixels inside the border, white cell = white text
+  of the lower line). Roles: 3 cells = TIMING|COVERAGE|DISTANCE; 2 cells = TIMING + COVERAGE-or-
+  DISTANCE; a first cell reading a coverage word is re-roled. Vocabulary adds WIDE OPEN, OPEN,
+  SEMI-OPEN, BOTHERED, LIGHT CONTEST, SOLID CONTEST, HEAVY CONTEST, SMOTHERED. LAG_MIN_S 0.7 ->
+  0.4 (greens land 0.51-0.91 s after the release on this court). CSV gains timing_color,
+  coverage, cov_ncc, cells; new PER SHOT table + coverage-by-timing summary; --review DIR.
+  Templates 8 -> 29 (backup of the old .npz in the session scratchpad). DISTANCE is located, not read.
+- VALIDATION: session_20260912_201355 28/28 vs the hand table (WIDE OPEN 6/8, OPEN 5/6, SEMI-OPEN
+  1/2, BOTHERED 3/4, LIGHT 3/5, SOLID 0/1; 6 LATE / 2 EARLY); legacy Rhythm-ON session_20260911_
+  222756 51/51 reproduced. This is THE instrument for the owner's "95 % wide open" question: play a
+  framedump session on the court, run the grader, read open-shot green % and the EARLY/LATE split.
+- panel_grade.py + panel_templates.npz are UNTRACKED in git (never committed) - commit them.
+
+### 2026-09-13 02:45 — NO METER compiled out of the shipped app (owner: "compile out the no meter section")
+- [ORION_INPUT_TIMED_COMPILED_OUT] AppConfig::load()/save() force input_timed_enabled=false and
+  OrionAppController::setInputTimedEnabled(true) is a no-op unless the build defines
+  ORION_ENABLE_INPUT_TIMED (only OrionNativeTests defines it, CMakeLists.txt, so the engine path
+  and its tests stay live). RemotePlayPage.qml: the METER/NO METER switch card, NoMeterCard and
+  noMeterRhythmCard mounts are removed; MeterConfigPanel/ShotLeadCard are unconditional; the
+  timing pill no longer references inputTimedEnabled. NoMeterCard.qml stays in the tree. The
+  owner's settings still carry input_timed_enabled=true from tonight's test; the forced-false on
+  load means the meter path is active on the next launch and the file is rewritten false on exit.
+- The 390 ms pump-fake floor and the per-type prior-minus-lead hold remain in the engine for a
+  future re-enable; the owner's final feedback test is meter-only "just like yesterday".
+- 14:09 local: the NO METER gate is a RUNTIME test opt-in (AppConfig::inputTimedAllowed /
+  setInputTimedAllowedForTesting, inside namespace orion) because AppConfig lives in the
+  OrionCommon SHARED library and a compile define on the test target cannot reach it. Full suite
+  802 pass / 0 fail / 6 skipped; OrionNative rebuilt 14:09 and relaunched for the owner's final
+  meter-only feedback session.
+
+### 2026-09-13 21:40 local — the "4-5 straight lates" streak: a reader stall, not the aim
+- Session 21:10-21:16 local (13 releases, 0 aborts). Shots 6-10 (21:15:15-26) sit on the only
+  reader stall: sidecar `Capture health ... cv_fps=51 detect_ms=21.3` at 21:15:12 (over the 16.7 ms
+  budget -> skipped frames), preview gap max 40.5 ms at 21:15:17, locator infer 12-13 ms (normal
+  2-8). PHASE SAMPLE anchor->freeze on those shots: 349/333/339/289/351 vs 336 +- 3 elsewhere =
+  noisy anchor dating = lates. Delivery clean (hook_ack_wait 342-795 us), no card dups, all five
+  at meter x~0.70 (crowd behind). Greens resumed when the reader caught up.
+- CAUSE in the locator: the gate-8 lone-column check was a Python loop over every white
+  component per candidate (O(cands x keep)): 12.4 ms alone on a crowd frame with 306 components
+  (profile on the 201355 dump: mask 3-8 ms, morph 2.6-3.3, CCL 1.3-6.7, lone loop 0-12.4).
+- FIX (meter_locator_cv.py `_find`): component table as numpy arrays; keep/cands/order and the
+  twin test vectorized, same rules. Worst frame 29.4 -> 11.3 ms, p99 19.5 -> 17.6, p50 10.75 ->
+  9.9 (the fixed mask/morph/CCL cost dominates the median). 40/40 locator tests; in-process A/B
+  vs the loop version on 6,000 dump frames: result-identical. Live on the next relaunch.
+- REMAINING LEVER if streaks recur: the full-band scan is ~10 ms median on a bright scene, so
+  idle (un-armed) frames could be scanned at half cadence to keep armed frames inside the budget
+  (reader-side policy, untested). Disk still 11-12 GB, so the next occurrence is not dumped.

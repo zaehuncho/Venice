@@ -1,0 +1,39 @@
+{
+  "_meta": {
+    "channel": "#📋-rules",
+    "channel_id": "1485337632832753736",
+    "replaces_message_id": "1549685816404746273",
+    "replaces_note": "Venice Guard's single welcome message (3 embeds: Welcome / Rules / Terms). Its third embed still says 'Website checkout is currently in test mode; test orders do not make a real payment', and the welcome embed still promises trial delivery by DM. Extra file, not on the original list, added because this is the last customer-facing 'test mode' string in the server.",
+    "post_as": "Venice Guard ONLY — it owns the message and the Verify button (custom_id venice_guard:verify). Triton cannot edit it.",
+    "method": "PATCH /channels/1485337632832753736/messages/1549685816404746273",
+    "warning": "Send the components block unchanged; dropping it removes the Verify button and new members can no longer get Verified."
+  },
+  "message": {
+    "embeds": [
+      {
+        "title": "Welcome to Venice",
+        "color": 2450411,
+        "description": "Venice is a precision shot-timing companion for NBA 2K27 on PS5. This is the only Start Here channel—read it, then verify below.\n\n**1. Verify** with the button below.\n**2. Try it free:** a 7-day trial, no card — claim it at zaeorion.com or run `/claim_trial`.\n**3. Install:** once Trial or Customer access is granted, open <#1549499799861067876> and unlock the app with a one-time code from zaeorion.com/connect.\n**4. Membership:** the only paid plan is **$25/month** at zaeorion.com, linked to your Discord account."
+      },
+      {
+        "title": "Rules of the server",
+        "color": 2450411,
+        "description": "**Respect members and staff.** No harassment, hate, threats, scams, or unsolicited DMs.\n**No spam or self-promotion.** Do not flood messages, mass-mention, post invite links, or use alts/bots to evade moderation.\n**Keep access personal.** Do not share, sell, leak, or transfer accounts or one-time connect codes.\n**Use private support.** Purchase and account questions belong in <#1549499767321534464>; never post codes, passwords, or payment data publicly.\n**Follow Discord's rules.** Moderation actions are recorded and may be appealed through a ticket."
+      },
+      {
+        "title": "Terms, trial, and checkout",
+        "color": 2450411,
+        "description": "The 7-day trial is **one per Discord account and one per PC**. No card is needed. Access is linked to your Discord account — there is no licence key — and it unlocks one PC at a time through zaeorion.com/connect. Use `/hwid_reset` to move PCs: the first **3 resets are free**, after that each reset takes one day off an eligible subscription.\n\nThe monthly plan is **$25/month** and renews until you cancel. Cancel any time in the billing portal: https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00 — you keep access to the end of the period you have already paid for. To buy, sign in with Discord at zaeorion.com and stay a member of this server. Full terms: https://zaeorion.com/terms.html · refunds: https://zaeorion.com/refunds.html · privacy: https://zaeorion.com/privacy.html.\nQuestions? Open <#1549499767321534464>."
+      }
+    ],
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          { "type": 2, "style": 1, "label": "Verify to enter", "emoji": { "name": "✅" }, "custom_id": "venice_guard:verify" },
+          { "type": 2, "style": 5, "label": "Venice website", "url": "https://zaeorion.com/#pricing" }
+        ]
+      }
+    ]
+  }
+}

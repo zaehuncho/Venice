@@ -46,6 +46,37 @@ namespace orion {
         && shotType.contains(QStringLiteral("Fade"), Qt::CaseInsensitive);
 }
 
+// === [ORION_TEMPO_RELEASE_STYLE 2026-09-15 owner] RHYTHM'S RELEASE EDGE ====================
+//
+// Flick (default, and every build before this existed): the owned gather is ended with one
+// full-scale OPPOSING deflection — the direction-change edge documented above.
+//
+// LetGo: at the SAME release-decision instant the stick is driven to NEUTRAL and held there for
+// the same pulse window instead of flicking the other way. The player keeps the stick pulled
+// down and Venice performs the let-go for them, so the console sees a clean stick-RELEASE edge.
+//
+// NOTHING ELSE MOVES. The arm, the hold law, the vision timing, the hold band, the blind
+// backstop, the trims, the learners and the latency marker all work on the release INSTANT, and
+// the instant is identical under both styles — only the packet differs. The still-held physical
+// stick is covered by the existing ReleasedUntilPhysicalEnd drain and the three-neutral-poll
+// rearm fence: applyShotReleaseEdge keeps writing 0 over the user's deflection for the whole
+// drain, so the let-go cannot be immediately undone by the hand that is still holding down.
+enum class TempoReleaseStyle { Flick, LetGo };
+
+// Ignore-unknown, never guess: anything that is not exactly "letgo" is the shipped flick. The
+// failure mode of guessing here is a release packet the console does not read as a shot at all.
+[[nodiscard]] inline TempoReleaseStyle tempoReleaseStyleFromString(const QString& style) noexcept
+{
+    return style.compare(QStringLiteral("letgo"), Qt::CaseInsensitive) == 0
+        ? TempoReleaseStyle::LetGo
+        : TempoReleaseStyle::Flick;
+}
+
+[[nodiscard]] inline const char* tempoReleaseStyleToken(TempoReleaseStyle style) noexcept
+{
+    return style == TempoReleaseStyle::LetGo ? "letgo" : "flick";
+}
+
 // isFadeGesture is the ALREADY-DECIDED gesture for this press, not the config flag.
 // Callers that own a shot pass the arm-time latch (ShotContext::tempoFadeGesture);
 // pre-arm/pass-through callers pass tempoGestureIsFade(type, flag) explicitly. Keeping
@@ -54,12 +85,18 @@ namespace orion {
 inline void applyShotReleaseEdge(ControllerState& output,
                                  ShotMode mode,
                                  const QString& shotType,
-                                 bool isFadeGesture = false) noexcept
+                                 bool isFadeGesture = false,
+                                 TempoReleaseStyle tempoStyle = TempoReleaseStyle::Flick) noexcept
 {
     static_cast<void>(shotType); // retained for call-site readability/telemetry only
     // A fade releases by flicking DOWN (+127), the mirror of the normal RS-up
     // flick, because it gathered UP. See the fade-exception note above.
-    const int tempoFlick = isFadeGesture ? 127 : -127;
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] ...unless the owner chose "letgo", in which case the
+    // release edge is the stick RETURNING TO REST (0) rather than deflecting the other way. The
+    // default argument is Flick, so every caller that does not opt in is byte-identical.
+    const int tempoFlick = tempoStyle == TempoReleaseStyle::LetGo
+        ? 0
+        : (isFadeGesture ? 127 : -127);
     switch (mode) {
     case ShotMode::ButtonShot:
         // Square is the owned shot control; leave both sticks and every other
@@ -103,9 +140,21 @@ inline void applyShotReleaseEdge(ControllerState& output,
 // control that defines the selected shot mode is authoritative here.  The
 // precise-fire worker checks this again under its final submit fence so a stale
 // held packet or mode/output mismatch can never be accepted by either route.
+// [ORION_TEMPO_RELEASE_STYLE 2026-09-15] The fence must move in lockstep with the edge
+// applyShotReleaseEdge emits, exactly as it had to for the Go-To down flick and the fade mirror:
+// under "letgo" the legitimate tempo release packet IS the neutral one, and pinning ±127 here
+// would reject every let-go release at the final submit fence and silently drop the shot. Under
+// "flick" the predicate is unchanged, so a stale held BUTTON packet, a packet built for another
+// stick mode and a partial deflection all still fail exactly as before. What the let-go branch
+// gives up is the ability to distinguish a NEUTRAL release packet from a blank one — acceptable
+// for the same reason the fade mirror gave up gather-vs-release: the mailbox is armed from
+// applyShotReleaseEdge's own output by construction, and the arm path is fenced by
+// token/route/generation checks.
 [[nodiscard]] inline bool isValidShotReleaseOutput(
-    const ControllerState& output, ShotMode mode) noexcept
+    const ControllerState& output, ShotMode mode,
+    TempoReleaseStyle tempoStyle = TempoReleaseStyle::Flick) noexcept
 {
+    const bool letGo = tempoStyle == TempoReleaseStyle::LetGo;
     switch (mode) {
     case ShotMode::ButtonShot:
         return !output.square();
@@ -137,11 +186,13 @@ inline void applyShotReleaseEdge(ControllerState& output,
     // and the arm path is itself fenced by token/route/generation checks.
     case ShotMode::TempoStick:
         return output.rightStickX == 0
-            && (output.rightStickY == -127 || output.rightStickY == 127);
+            && (letGo ? output.rightStickY == 0
+                      : (output.rightStickY == -127 || output.rightStickY == 127));
     case ShotMode::TempoSquare:
         return !output.square()
             && output.rightStickX == 0
-            && (output.rightStickY == -127 || output.rightStickY == 127);
+            && (letGo ? output.rightStickY == 0
+                      : (output.rightStickY == -127 || output.rightStickY == 127));
     }
     return false;
 }

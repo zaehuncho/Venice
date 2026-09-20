@@ -118,14 +118,17 @@ class _FakeWake(types.ModuleType):
     """Injectable stand-in for the ps5_wake module inside the launch gate."""
 
     def __init__(self, state, key="cafe1234", port_opens=True,
-                 send_ok=True, probe_raises=False):
+                 send_ok=True, probe_raises=False, port_open_now=None):
         super().__init__("ps5_wake")
         self._state = state
+        # Explicit "port is open right now" override; default derives it from the state.
+        self._port_open_now = port_open_now
         self._key = key
         self._port_opens = port_opens
         self._send_ok = send_ok
         self._probe_raises = probe_raises
         self.wakeups_sent = []
+        self.port_budgets = []
 
     def is_ip_literal(self, host):
         return ps5_wake.is_ip_literal(host)
@@ -142,11 +145,81 @@ class _FakeWake(types.ModuleType):
         self.wakeups_sent.append((host, regist_key, ps5))
         return self._send_ok
 
-    def wait_for_session_port(self, host, budget_s):
+    def wait_for_session_port(self, host, budget_s, **_kw):
+        self.port_budgets.append(float(budget_s))
         return self._port_opens
 
     def session_port_open(self, host, timeout_s=0.6):
-        return self._port_opens
+        # "Is the port open RIGHT NOW" (the pre-wake TCP fast-path) is true only for an
+        # awake console; `_port_opens` models whether it opens AFTER a wakeup.
+        if self._port_open_now is not None:
+            return bool(self._port_open_now)
+        return self._state == "ready"
+
+    # ---- console address drift (discover_consoles / subnet_broadcast) ----
+    discovered = ()          # what a broadcast finds; set per test
+    broadcasts = None        # broadcast addresses the resolver asked for
+
+    def subnet_broadcast(self, host):
+        return ps5_wake.subnet_broadcast(host)
+
+    def discover_consoles(self, broadcast, timeout_s=1.2):
+        if self.broadcasts is None:
+            self.broadcasts = []
+        self.broadcasts.append(broadcast)
+        return [ps5_wake.DiscoveredConsole(h, s, 9302) for h, s in self.discovered]
+
+
+def _resolve(manager, fake, monkeypatch, host="192.0.2.10"):
+    monkeypatch.setitem(sys.modules, "ps5_wake", fake)
+    return manager._resolve_console_host(host)
+
+
+def test_drift_silent_host_with_one_answering_console_is_adopted(manager, monkeypatch):
+    fake = _FakeWake("no_answer")
+    fake.discovered = (("192.0.2.77", "ready"),)
+    assert _resolve(manager, fake, monkeypatch) == "192.0.2.77"
+    assert fake.broadcasts == ["192.0.2.255"]
+    assert manager._console_host_adopted == "192.0.2.77"
+
+
+def test_drift_never_guesses_between_two_consoles(manager, monkeypatch):
+    fake = _FakeWake("no_answer")
+    fake.discovered = (("192.0.2.77", "ready"), ("192.0.2.78", "standby"))
+    assert _resolve(manager, fake, monkeypatch) == "192.0.2.10"
+    assert manager._console_host_adopted == ""
+
+
+def test_drift_nothing_found_keeps_the_configured_host(manager, monkeypatch):
+    fake = _FakeWake("no_answer")
+    fake.discovered = ()
+    assert _resolve(manager, fake, monkeypatch) == "192.0.2.10"
+
+
+def test_drift_answering_host_is_never_touched(manager, monkeypatch):
+    # session port open: no discovery at all
+    fake = _FakeWake("ready")
+    fake.discovered = (("192.0.2.77", "ready"),)
+    assert _resolve(manager, fake, monkeypatch) == "192.0.2.10"
+    assert fake.broadcasts is None
+    # port closed but discovery answers (rest mode): the wake path owns it, no swap
+    fake = _FakeWake("standby")
+    fake.discovered = (("192.0.2.77", "ready"),)
+    assert _resolve(manager, fake, monkeypatch) == "192.0.2.10"
+    assert fake.broadcasts is None
+
+
+def test_drift_discovery_can_be_disabled(manager, monkeypatch):
+    monkeypatch.setenv("ORION_PS5_DISCOVER_DRIFT", "0")
+    fake = _FakeWake("no_answer")
+    fake.discovered = (("192.0.2.77", "ready"),)
+    assert _resolve(manager, fake, monkeypatch) == "192.0.2.10"
+
+
+def test_subnet_broadcast_is_the_slash24_directed_broadcast():
+    assert ps5_wake.subnet_broadcast("192.168.137.126") == "192.168.137.255"
+    assert ps5_wake.subnet_broadcast("ps5.local") == ""
+    assert ps5_wake.subnet_broadcast("") == ""
 
 
 @pytest.fixture
@@ -167,11 +240,14 @@ def test_gate_ready_console_proceeds(manager, monkeypatch):
     assert manager._last_console_probe == "ready"
 
 
-def test_gate_no_answer_proceeds_without_wakeup(manager, monkeypatch):
-    # A firewall eating UDP replies must not change launch behavior.
+def test_gate_no_answer_still_launches_but_wakes_first(manager, monkeypatch):
+    # A firewall eating UDP replies must not change launch behavior (launch proceeds and
+    # the failure path adds evidence). Since 2026-08-29 the wakeup is sent BEFORE the
+    # probe: it is a no-op to an awake console and inert to an off one, and it means a
+    # resting console behind such a firewall is already booting for the next Connect.
     fake = _FakeWake("no_answer")
     assert _gate(manager, fake, monkeypatch) is None
-    assert fake.wakeups_sent == []
+    assert fake.wakeups_sent == [("192.0.2.10", "cafe1234", True)]
 
 
 def test_gate_standby_wakes_and_proceeds_when_port_opens(manager, monkeypatch):
@@ -197,6 +273,41 @@ def test_gate_standby_without_key_fails_fast_with_manual_instruction(
     assert status is not None and status.ok is False
     assert "manually" in status.message
     assert fake.wakeups_sent == []
+
+
+def test_gate_wake_first_then_short_probe(manager, monkeypatch):
+    # 2026-08-29: the wakeup packet is sent BEFORE the discovery probe (the console's
+    # ~10-25s boot starts at +0.4s instead of after a 2.5s probe), and the probe budget
+    # shrinks to 1.0s because it now only decides messaging.
+    fake = _FakeWake("standby", port_opens=True)
+    calls = []
+    real_probe = fake.probe_console_state
+    def probe(host, timeout_s=2.5):
+        calls.append(("probe", timeout_s, list(fake.wakeups_sent)))
+        return real_probe(host, timeout_s=timeout_s)
+    fake.probe_console_state = probe
+    assert _gate(manager, fake, monkeypatch) is None
+    assert calls and calls[0][1] == 1.0                 # short probe
+    assert calls[0][2] == [("192.0.2.10", "cafe1234", True)]   # wake already sent when probed
+
+
+def test_gate_standby_budget_is_deadline_sized_without_host_extension(manager, monkeypatch):
+    fake = _FakeWake("standby", port_opens=True)
+    assert _gate(manager, fake, monkeypatch) is None
+    # wait_timeout_s 18 (native 20s deadline) - ~5s spent/still needed -> 13s, never the old 9s
+    assert fake.port_budgets == [13.0]
+
+
+def test_gate_standby_reports_budget_to_host_and_waits_full_boot(monkeypatch):
+    # With a host callback the native extends its deadline, so cover the documented
+    # 15-25s rest-mode boot instead of failing at 9s and demanding "Connect again".
+    seen = []
+    manager = remote_play_client.RemotePlayClientManager(
+        remote_play_client.RemotePlayClientConfig(on_console_waking=seen.append))
+    fake = _FakeWake("standby", port_opens=True)
+    assert _gate(manager, fake, monkeypatch) is None
+    assert seen == [25.0]
+    assert fake.port_budgets == [25.0]
 
 
 def test_gate_probe_exception_fails_open(manager, monkeypatch):
@@ -297,7 +408,7 @@ def test_failure_evidence_silent_when_console_is_up(monkeypatch):
     manager = remote_play_client.RemotePlayClientManager(
         remote_play_client.RemotePlayClientConfig(console_ip="192.0.2.10"))
     monkeypatch.setitem(
-        sys.modules, "ps5_wake", _FakeWake("no_answer", port_opens=True))
+        sys.modules, "ps5_wake", _FakeWake("no_answer", port_open_now=True))
     assert manager._console_failure_evidence() == ""
 
 

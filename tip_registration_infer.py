@@ -275,6 +275,8 @@ class RegistrationPredictor:
         if not self.enabled:
             return
         try:
+            # Absence is subtractive lifecycle information, including health-loss
+            # reports without a usable timestamp. It must still clear the old fit.
             if not present:
                 if self._t or self._pending_reset is not None:
                     self._archive_shot()
@@ -285,6 +287,13 @@ class RegistrationPredictor:
             timestamp = float(t_ms)
             fill = float(fill_pct)
             if not np.isfinite(timestamp) or not np.isfinite(fill):
+                return
+            # Only genuine present observations can grow/confirm a trajectory.
+            # Repeated or out-of-order reports neither reweight the fit nor turn
+            # one low-fill outlier into two witnesses of a new shot.
+            if self._t and timestamp <= self._t[-1]:
+                return
+            if self._pending_reset is not None and timestamp <= self._pending_reset[0]:
                 return
 
             # Confirm a reset on two genuine reports. A one-frame low outlier is discarded rather
@@ -318,9 +327,20 @@ class RegistrationPredictor:
         self._f.clear()
         self._t0_shot = None
         self._accepted_since_fit = 0
+        self._last_fit = None
         self._last_prediction = None
         self._pending_reset = None
         self._shot_id += 1
+
+    def reset_tracking(self) -> None:
+        """Discard trajectory/ruler history without reloading the meter model.
+
+        A source or fill-ruler change is not a completed shot and must not archive
+        a mixed trajectory as a post-hoc timing label. Keep archive IDs monotonic.
+        """
+        self._clear_current_shot()
+        self._last_shot_t = None
+        self._last_shot_f = None
 
     def _archive_shot(self) -> None:
         try:
@@ -360,7 +380,12 @@ class RegistrationPredictor:
         normalized = steepness * (y - amplitude[:, None] * shape) / 8.0
         prior_T = 1.5 * (durations - T0) / T0
         prior_A = (amplitude - A0) / A0
-        objective = np.sum(np.sqrt(1.0 + normalized * normalized) - 1.0, axis=1)
+        point_objective = np.sqrt(1.0 + normalized * normalized) - 1.0
+        objective = np.sum(point_objective, axis=1)
+        if point_objective.shape[1] >= 8:
+            # One detector spike must not select a different phase/duration basin. Keep the
+            # residual in confidence and uncertainty, but trim its leverage during registration.
+            objective -= np.max(point_objective, axis=1)
         objective += np.sqrt(1.0 + prior_T * prior_T) - 1.0
         objective += np.sqrt(1.0 + prior_A * prior_A) - 1.0
         return {

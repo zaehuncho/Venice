@@ -5,13 +5,35 @@ import "../pages"
 Item {
     id: root
 
-    // First-run onboarding is now a coach-mark TOUR overlaid on the real launcher
-    // (FirstRunTour.qml) instead of a standalone Setup Guide / Preflight tab. On the
-    // first launch (until orion.preflightComplete — reused as the "onboarding seen"
-    // flag) it auto-opens; the sidebar "Setup Guide" entry re-opens it any time.
+    // First-run onboarding is a coach-mark TOUR overlaid on the real launcher
+    // (FirstRunTour.qml) instead of a standalone Setup Guide / Preflight tab.
+    //
+    // [ORION_UI_BUBBLES 2026-09-15 owner: "quick start should just be shown when the
+    // customer first launches the UI"] This auto-open is now the ONLY way the tour
+    // appears — the sidebar's "Quick Start" button that re-opened it is gone. Two
+    // things made it re-show after the customer had already seen it:
+    //
+    //   1. "Seen" was only persisted when the user reached Finish/Skip/Esc
+    //      (FirstRunTour.finish() -> orion.markPreflightComplete()). A customer who
+    //      closed the app, or was force-quit, mid-tour left the flag false, so it
+    //      opened again on EVERY later launch. It is now marked the moment it
+    //      auto-opens: first launch means first launch, however it ends.
+    //   2. This handler runs on every AppShell CREATION, and Main.qml's gate Loader
+    //      destroys and rebuilds AppShell whenever updateGatePhase / authenticated /
+    //      legalAccepted / streamSetupComplete changes — so a mid-session licence
+    //      re-check that blipped a gate re-opened the tour over a live game. Marking
+    //      it seen up-front closes that too: the very next creation reads the flag
+    //      as true. (markPreflightComplete only updates the in-memory config on a
+    //      SUCCESSFUL write, so a launcher that cannot write its settings at all can
+    //      still see it again — that install has louder problems.)
+    //
+    // A future Setup control can re-open it with firstRunTour.start(); nothing does
+    // today, and TourRegistry anchors stay registered across the app either way.
     Component.onCompleted: {
-        if (!orion.preflightComplete)
+        if (!orion.preflightComplete) {
+            orion.markPreflightComplete()
             firstRunTour.start()
+        }
     }
 
     RowLayout {
@@ -22,8 +44,9 @@ Item {
         Sidebar {
             Layout.preferredWidth: 214
             Layout.fillHeight: true
-            // "Setup Guide" is no longer a page — it launches the guided tour.
-            onTourRequested: firstRunTour.start()
+            // [ORION_UI_BUBBLES 2026-09-15] The rail raises no tour signal any more:
+            // its "Quick Start" footer button is gone and its nav delegate is a pure
+            // page router. The tour is first-launch onboarding only (above).
         }
 
         ColumnLayout {
@@ -43,9 +66,15 @@ Item {
                 // "remotePlay") and is anything that isn't one of the other known
                 // pages — matches the original Loader fallback so an unset/unknown
                 // page still lands on Remote Play instead of a blank panel.
+                //
+                // [OVERVIEW REMOVED 2026-09-14 owner] "general" is no longer a page.
+                // [PROFILE REMOVED 2026-09-15 owner] neither is "profile" — the
+                // licence/account truth moved to the Sidebar's footer strip.
+                // Both are deliberately NOT listed here, so a settings.json that
+                // still carries current_page="general" or "profile" falls through to
+                // Remote Play rather than loading a null component into a blank panel.
                 readonly property bool isRemotePage:
-                    orion.currentPage !== "general"
-                    && orion.currentPage !== "dashboard"
+                    orion.currentPage !== "dashboard"
                     && orion.currentPage !== "patchNotes"
                     && orion.currentPage !== "debug"
 
@@ -72,8 +101,6 @@ Item {
                         Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
                     }
                     sourceComponent: {
-                        if (orion.currentPage === "general")
-                            return generalPage
                         if (orion.currentPage === "dashboard")
                             return dashboardPage
                         if (orion.currentPage === "patchNotes")
@@ -120,7 +147,6 @@ Item {
         anchors.fill: parent
     }
 
-    Component { id: generalPage; GeneralPage {} }
     Component { id: dashboardPage; DashboardPage {} }
     Component { id: patchNotesPage; PatchNotesPage {} }
     Component { id: debugPage; DebugPage {} }

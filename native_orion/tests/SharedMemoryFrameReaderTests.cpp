@@ -1,6 +1,7 @@
 #include "SharedMemoryFrameReader.h"
 #include "SharedMemoryFramePump.h"
 #include "RemotePlaySession.h"
+#include "ControllerRoutingPolicy.h"
 
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
@@ -10,6 +11,7 @@
 #include <QtCore/QThread>
 #include <QtCore/QUuid>
 #include <QtGui/QColor>
+#include <QtTest/QSignalSpy>
 #include <QtTest/QTest>
 
 #include <atomic>
@@ -56,6 +58,22 @@ public:
                                 const SharedMemoryFramePumpBatch& batch)
     {
         session.handleShmPumpBatch(batch);
+    }
+
+    static void enableRenderClockPreview(RemotePlaySession& session)
+    {
+        session.previewPresentationAccepting_ = true;
+        session.previewPresentationRenderClockActive_ = true;
+    }
+
+    static std::optional<PreviewPresentationBuffer::Frame> takePreview(RemotePlaySession& session)
+    {
+        return session.previewPresentationBuffer_.take();
+    }
+
+    static quint64 previewDrops(const RemotePlaySession& session)
+    {
+        return session.previewPresentationDroppedFrames_;
     }
 
     static void submitJpeg(RemotePlaySession& session, int frameNumber)
@@ -111,6 +129,26 @@ public:
     static quint64 shmPresentationTimestampRejects(const RemotePlaySession& session)
     {
         return session.shmPresentationTimestampRejects_;
+    }
+
+    static void armInputRecovery(RemotePlaySession& session)
+    {
+        session.state_ = RemotePlayState::Running;
+        session.statusText_ = QStringLiteral("Streaming");
+        session.inputRecoveryPending_ = true;
+        session.rejectLateInputRecoveryReady_ = false;
+        ++session.inputRecoveryGeneration_;
+    }
+
+    static void deliverSidecarMessage(RemotePlaySession& session,
+                                      const QJsonObject& message)
+    {
+        session.handleSidecarMessage(message);
+    }
+
+    static bool rejectsLateInputRecovery(const RemotePlaySession& session)
+    {
+        return session.rejectLateInputRecoveryReady_;
     }
 };
 
@@ -760,6 +798,47 @@ private slots:
         QCOMPARE(stats.framesRead, quint64{1});
     }
 
+    void pumpRetainsShortDisplayBurstWithoutExtraGuiWakes()
+    {
+        auto source = std::make_unique<ControlledFrameSource>();
+        SharedMemoryFramePump pump(std::move(source));
+        SharedMemoryFramePumpBatch received;
+        connect(&pump, &SharedMemoryFramePump::batchReady, this,
+            [&](const auto& batch) { received = batch; });
+        pump.beginSourceEpoch(52);
+        // Hold the GUI event loop while three owned display frames arrive.
+        // This pins the handoff loss independently of GPU or live gameplay.
+        for (int frame = 1; frame <= 3; ++frame) {
+            pump.submitFrameNotification(52, frame);
+            QElapsedTimer wait;
+            wait.start();
+            while (pump.stats().framesRead < quint64(frame) && wait.elapsed() < 1000)
+                QThread::yieldCurrentThread();
+            QCOMPARE(pump.stats().framesRead, quint64(frame));
+        }
+        QThread::msleep(5); // let the last publish finish, without dispatching Qt
+        const auto stats = pump.stats();
+        qInfo().noquote() << QStringLiteral("HANDOFF reads=%1 retained=%2 replaced=%3 gui_deliveries=%4")
+            .arg(stats.framesRead).arg(stats.maxReadyDepth)
+            .arg(stats.readyFrameReplaced).arg(stats.deliveredBatches);
+        QCOMPARE(stats.deliveredBatches, quint64{0});
+        QCOMPARE(stats.maxReadyDepth, std::size_t{3});
+        QCOMPARE(stats.readyFrameReplaced, quint64{0});
+        QCoreApplication::sendPostedEvents(&pump, QEvent::MetaCall);
+        QCOMPARE(received.precedingFrames.size(), std::size_t{2});
+        QCOMPARE(received.mappedFrameNumber, 3);
+        for (std::size_t i = 0; i < received.precedingFrames.size(); ++i) {
+            const auto& frame = received.precedingFrames[i];
+            QCOMPARE(frame.mappedFrameNumber, int(i + 1));
+            QCOMPARE(frame.eventFrameNumber, int(i + 1));
+            QCOMPARE(frame.image.pixelColor(0, 0).red(), int(i + 1));
+            QVERIFY(frame.sourceTimestampNs > 0);
+            QVERIFY(frame.pumpReadCompletedTimestampNs >= frame.sourceTimestampNs);
+            QVERIFY(received.presentationDispatchTimestampNs >= frame.pumpReadCompletedTimestampNs);
+        }
+        QCOMPARE(pump.stats().deliveredBatches, quint64{1});
+    }
+
     void pumpReadsOffOwnerThreadAndDeliversOnOwnerThread()
     {
         auto source = std::make_unique<ControlledFrameSource>();
@@ -853,7 +932,7 @@ private slots:
         stats = pump.stats();
         QCOMPARE(stats.readAttempts, quint64{2});
         QCOMPARE(stats.maxPendingDepth, std::size_t{1});
-        QCOMPARE(stats.maxReadyDepth, std::size_t{1});
+        QVERIFY(stats.maxReadyDepth <= std::size_t{2});
         QVERIFY(deliveredImageBatches <= 2);
         // One additional batch may report the reader-open transition before
         // either image; it is state, not a queued frame backlog.
@@ -946,7 +1025,7 @@ private slots:
         QTest::qWait(10);
     }
 
-    void pumpGuiStallDeliversOnlyNewestReadyFrame()
+    void pumpLongGuiStallCapsBurstThenDeliversOnlyNewestReadyFrame()
     {
         auto source = std::make_unique<ControlledFrameSource>();
         SharedMemoryFramePump pump(std::move(source));
@@ -961,8 +1040,8 @@ private slots:
                 });
 
         // Deliberately do not process Qt events while the worker completes
-        // eight reads. This models a 40 ms GUI/render stall and proves that the
-        // single posted wake-up owns one replaceable ready slot, not a FIFO.
+        // eight reads. Only the newest three can survive overflow; a long
+        // stall then expires the two preceding frames, not the latest image.
         pump.beginSourceEpoch(51);
         constexpr int kFrames = 8;
         for (int frame = 1; frame <= kFrames; ++frame) {
@@ -975,13 +1054,13 @@ private slots:
             }
             QCOMPARE(pump.stats().framesRead, static_cast<quint64>(frame));
         }
-        QThread::msleep(40);
+        QThread::msleep(80);
 
         const auto stalledStats = pump.stats();
         QCOMPARE(stalledStats.deliveredBatches, quint64{0});
-        QCOMPARE(stalledStats.maxReadyDepth, std::size_t{1});
+        QCOMPARE(stalledStats.maxReadyDepth, std::size_t{3});
         QCOMPARE(stalledStats.readyFrameReplaced,
-                 static_cast<quint64>(kFrames - 1));
+                 static_cast<quint64>(kFrames - 3));
 
         QTRY_COMPARE_WITH_TIMEOUT(imageBatches, 1, 2000);
         QTest::qWait(20);
@@ -990,10 +1069,87 @@ private slots:
         QCOMPARE(newestBatch.framesRead, quint64{kFrames});
         QCOMPARE(newestBatch.mappedFrameNumber, kFrames);
         QCOMPARE(newestBatch.eventFrameNumber, 1000 + kFrames);
+        QVERIFY(newestBatch.precedingFrames.empty());
         QCOMPARE(newestBatch.readyFrameReplaced,
                  static_cast<quint64>(kFrames - 1));
         QCOMPARE(newestBatch.deliveryScheduleFailures, quint64{0});
         QCOMPARE(pump.stats().deliveredBatches, quint64{1});
+    }
+
+    void pumpQueuedBurstIsDiscardedOnRetireOrNewEpoch()
+    {
+        auto source = std::make_unique<ControlledFrameSource>();
+        SharedMemoryFramePump pump(std::move(source));
+        int images = 0;
+        connect(&pump, &SharedMemoryFramePump::batchReady, this, [&](const auto& batch) {
+            if (!batch.image.isNull()) ++images;
+        });
+        pump.beginSourceEpoch(53);
+        for (int frame = 1; frame <= 3; ++frame) {
+            pump.submitFrameNotification(53, frame);
+            QElapsedTimer wait;
+            wait.start();
+            while (pump.stats().framesRead < quint64(frame) && wait.elapsed() < 1000)
+                QThread::yieldCurrentThread();
+            QCOMPARE(pump.stats().framesRead, quint64(frame));
+        }
+        pump.retireSourceEpoch(53);
+        pump.beginSourceEpoch(54);
+        QCoreApplication::sendPostedEvents(&pump, QEvent::MetaCall);
+        QCOMPARE(images, 0);
+        pump.submitFrameNotification(54, 4);
+        QTRY_COMPARE_WITH_TIMEOUT(images, 1, 2000);
+    }
+
+    void remoteSessionDrainsBurstWithExactIdsAndUnchangedPresentationCap()
+    {
+        RemotePlaySession session;
+        RemotePlaySessionTestAccess::armShmEpoch(session, 55, QStringLiteral("OrionPreviewReady_burst"));
+        RemotePlaySessionTestAccess::enableRenderClockPreview(session);
+        SharedMemoryFramePumpBatch batch;
+        batch.sourceEpoch = 55;
+        batch.readerOpen = true;
+        batch.image = QImage(4, 4, QImage::Format_RGB32);
+        batch.image.fill(Qt::blue);
+        batch.mappedFrameNumber = 3;
+        batch.eventFrameNumber = 999;
+        for (int i = 1; i <= 2; ++i) {
+            SharedMemoryFramePumpImage frame;
+            frame.image = QImage(4, 4, QImage::Format_RGB32);
+            frame.image.fill(QColor(i, 0, 0));
+            // Exercise both real mapped identity and notification fallback.
+            frame.mappedFrameNumber = i == 1 ? i : 0;
+            frame.eventFrameNumber = i == 1 ? 998 : i;
+            batch.precedingFrames.push_back(frame);
+        }
+        RemotePlaySessionTestAccess::deliverShmBatch(session, batch);
+        for (int i = 1; i <= 3; ++i) {
+            const auto frame = RemotePlaySessionTestAccess::takePreview(session);
+            QVERIFY(frame.has_value());
+            QCOMPARE(frame->frameNumber, i);
+            QCOMPARE(frame->image.pixelColor(0, 0), i < 3 ? QColor(i, 0, 0) : QColor(Qt::blue));
+        }
+        QVERIFY(!RemotePlaySessionTestAccess::takePreview(session).has_value());
+        // A stale source's entire burst is rejected, not just its newest image.
+        batch.sourceEpoch = 54;
+        RemotePlaySessionTestAccess::deliverShmBatch(session, batch);
+        QVERIFY(!RemotePlaySessionTestAccess::takePreview(session).has_value());
+        batch.sourceEpoch = 55;
+        RemotePlaySessionTestAccess::deliverShmBatch(session, batch);
+        for (auto& frame : batch.precedingFrames) {
+            frame.mappedFrameNumber += 3;
+            frame.eventFrameNumber += 3;
+        }
+        batch.precedingFrames[1].mappedFrameNumber = 5;
+        batch.mappedFrameNumber = 6;
+        RemotePlaySessionTestAccess::deliverShmBatch(session, batch);
+        QCOMPARE(RemotePlaySessionTestAccess::previewDrops(session), quint64{2});
+        for (int i = 3; i <= 6; ++i) {
+            const auto frame = RemotePlaySessionTestAccess::takePreview(session);
+            QVERIFY(frame.has_value());
+            QCOMPARE(frame->frameNumber, i);
+        }
+        QVERIFY(!RemotePlaySessionTestAccess::takePreview(session).has_value());
     }
 
     void remoteSessionAcceptsOnlyCurrentEpochJpegHandoff()
@@ -1094,6 +1250,158 @@ private slots:
         QCOMPARE(RemotePlaySessionTestAccess::shmSourceToDispatchAgeMs(session), 35.0);
         QCOMPARE(RemotePlaySessionTestAccess::shmPresentationTimestampRejects(session),
                  quint64{1});
+    }
+
+    void inputRecoveryReadyRetainsRunningCaptureGeneration()
+    {
+        RemotePlaySession session;
+        RemotePlaySessionTestAccess::armShmEpoch(
+            session, 93, QStringLiteral("OrionPreviewReady_recovery"));
+        RemotePlaySessionTestAccess::armInputRecovery(session);
+        QVERIFY(!directInputWriteAllowed(session.state(), session.inputRecoveryPending()));
+        QSignalSpy stateSpy(&session, &RemotePlaySession::stateChanged);
+
+        RemotePlaySessionTestAccess::deliverSidecarMessage(
+            session,
+            QJsonObject{{QStringLiteral("event"), QStringLiteral("input_recovery")},
+                        {QStringLiteral("state"), QStringLiteral("ready")},
+                        {QStringLiteral("input_ready"), true}});
+
+        QVERIFY(session.state() == RemotePlayState::Running);
+        QVERIFY(!session.inputRecoveryPending());
+        QVERIFY(directInputWriteAllowed(session.state(), session.inputRecoveryPending()));
+        QVERIFY(!RemotePlaySessionTestAccess::rejectsLateInputRecovery(session));
+        QVERIFY(RemotePlaySessionTestAccess::shmActive(session));
+        QCOMPARE(RemotePlaySessionTestAccess::shmFramesRead(session), quint64{7});
+        QCOMPARE(RemotePlaySessionTestAccess::pipelineBaseline(session), qint64{1234});
+        QCOMPARE(stateSpy.count(), 1);
+        QVERIFY(stateSpy.at(0).at(0).value<RemotePlayState>()
+                == RemotePlayState::Running);
+    }
+
+    void inputRecoveryBeginAndInvalidReadyKeepWriteFenceClosed()
+    {
+        for (bool omitReady : {false, true}) {
+            RemotePlaySession session;
+            RemotePlaySessionTestAccess::armInputRecovery(session);
+            RemotePlaySessionTestAccess::deliverSidecarMessage(session,
+                QJsonObject{{"event", "input_recovery"}, {"state", "begin"}});
+            QVERIFY(session.state() == RemotePlayState::Running);
+            QVERIFY(!directInputWriteAllowed(session.state(), session.inputRecoveryPending()));
+            QJsonObject invalid{{"event", "input_recovery"}, {"state", "ready"}};
+            if (!omitReady) invalid.insert("input_ready", false);
+            RemotePlaySessionTestAccess::deliverSidecarMessage(session, invalid);
+            QVERIFY(session.state() == RemotePlayState::Error);
+            QVERIFY(!directInputWriteAllowed(session.state(), session.inputRecoveryPending()));
+            // A ready from the abandoned attempt must not resurrect the route.
+            RemotePlaySessionTestAccess::deliverSidecarMessage(session,
+                QJsonObject{{"event", "input_recovery"}, {"state", "ready"}, {"input_ready", true}});
+            QVERIFY(session.state() == RemotePlayState::Error);
+            QVERIFY(!directInputWriteAllowed(session.state(), session.inputRecoveryPending()));
+        }
+    }
+
+    void inputRecoveryErrorFailsClosedWithoutReclassifyingCapture()
+    {
+        RemotePlaySession session;
+        RemotePlaySessionTestAccess::armShmEpoch(
+            session, 94, QStringLiteral("OrionPreviewReady_recovery_error"));
+        RemotePlaySessionTestAccess::armInputRecovery(session);
+        QSignalSpy stateSpy(&session, &RemotePlaySession::stateChanged);
+        QSignalSpy failureSpy(&session, &RemotePlaySession::inputSessionFailure);
+
+        RemotePlaySessionTestAccess::deliverSidecarMessage(
+            session,
+            QJsonObject{{QStringLiteral("event"), QStringLiteral("input_recovery")},
+                        {QStringLiteral("state"), QStringLiteral("error")},
+                        {QStringLiteral("msg"), QStringLiteral("test recovery failure")}});
+
+        QVERIFY(session.state() == RemotePlayState::Error);
+        QVERIFY(!directInputWriteAllowed(session.state(), session.inputRecoveryPending()));
+        QVERIFY(!session.inputRecoveryPending());
+        QVERIFY(RemotePlaySessionTestAccess::rejectsLateInputRecovery(session));
+        QCOMPARE(stateSpy.count(), 1);
+        QVERIFY(stateSpy.at(0).at(0).value<RemotePlayState>()
+                == RemotePlayState::Error);
+        QCOMPARE(failureSpy.count(), 1);
+        // The verdict itself revokes authority but does not silently mutate or
+        // close the still-owned capture generation; retry/teardown policy remains
+        // the controller's explicit responsibility.
+        QVERIFY(RemotePlaySessionTestAccess::shmActive(session));
+        QCOMPARE(RemotePlaySessionTestAccess::shmFramesRead(session), quint64{7});
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19 owner] The WIRE half of "a panel with no
+    // coverage cell is open". `coverage` alone cannot say which of two opposite things an
+    // empty word means -- "this 2-cell TIMING | DISTANCE panel has no coverage cell" (a
+    // drill, or any no-defender context: 98 of the 281 graded releases across the
+    // 2026-09-18 sessions) versus "it has one and it was unreadable" -- and those two take
+    // opposite paths in the engine's trim. The sidecar reports the LAYOUT separately
+    // (banner_verdict_live.py `has_coverage`); this pins the parse of it, and above all
+    // pins that a sidecar which does NOT send the field reads back as TRUE, which is the
+    // 2026-09-18 strict coverage gate byte-for-byte.
+    // ══════════════════════════════════════════════════════════════════════════════════
+    void bannerVerdictCarriesTheCoverageCellsPresence()
+    {
+        RemotePlaySession session;
+        QSignalSpy verdicts(&session, &RemotePlaySession::bannerVerdict);
+        QSignalSpy setup(&session, &RemotePlaySession::setupMessage);
+        auto panel = [](const QString& coverage) {
+            return QJsonObject{
+                {QStringLiteral("event"), QStringLiteral("banner_verdict")},
+                {QStringLiteral("timing"), QStringLiteral("LATE")},
+                {QStringLiteral("timing_color"), QStringLiteral("red")},
+                {QStringLiteral("coverage"), coverage},
+                {QStringLiteral("ncc"), 0.97},
+                {QStringLiteral("seq"), 1},
+                {QStringLiteral("attributed"), 1},
+                {QStringLiteral("release_seq"), 4242.0},
+                {QStringLiteral("release_delay_ms"), 1200.0}};
+        };
+
+        // 1) The 2-cell drill panel: the sidecar says positively that there is no cell.
+        QJsonObject absent = panel(QString());
+        absent.insert(QStringLiteral("has_coverage"), false);
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, absent);
+
+        // 2) A 3-cell panel, cell present and readable.
+        QJsonObject present = panel(QStringLiteral("WIDE OPEN"));
+        present.insert(QStringLiteral("has_coverage"), true);
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, present);
+
+        // 3) An OLDER SIDECAR: the field is simply absent from the payload. It must read as
+        //    TRUE -- fail-closed onto the strict gate, never onto the new admission.
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, panel(QString()));
+
+        // 4) A field that is not a bool at all is the same case: leave the strict gate alone.
+        QJsonObject junk = panel(QString());
+        junk.insert(QStringLiteral("has_coverage"), QStringLiteral("maybe"));
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, junk);
+
+        QCOMPARE(verdicts.count(), 4);
+        QCOMPARE(verdicts.at(0).at(9).toBool(), false);
+        QCOMPARE(verdicts.at(1).at(9).toBool(), true);
+        QCOMPARE(verdicts.at(2).at(9).toBool(), true);
+        QCOMPARE(verdicts.at(3).at(9).toBool(), true);
+        // The relayed log line is the verdict's only route into the native log, and
+        // `coverage=-` alone was ambiguous there for exactly the same reason.
+        QStringList lines;
+        for (const QList<QVariant>& row : setup) {
+            const QString line = row.at(0).toString();
+            if (line.contains(QStringLiteral("BANNER VERDICT:"))) {
+                lines << line;
+            }
+        }
+        QCOMPARE(lines.count(), 4);
+        QCOMPARE(lines.at(0), QStringLiteral(
+            "Sidecar: BANNER VERDICT: timing=LATE coverage=- has_cov=0 ncc=0.970"));
+        QCOMPARE(lines.at(1), QStringLiteral(
+            "Sidecar: BANNER VERDICT: timing=LATE coverage=WIDE OPEN has_cov=1 ncc=0.970"));
+        const QString strict = QStringLiteral(
+            "Sidecar: BANNER VERDICT: timing=LATE coverage=- has_cov=1 ncc=0.970");
+        QCOMPARE(lines.at(2), strict);
+        QCOMPARE(lines.at(3), strict);
     }
 };
 

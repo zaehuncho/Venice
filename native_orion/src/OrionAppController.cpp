@@ -1,4 +1,5 @@
 #include "OrionAppController.h"
+#include "ReleasePathPolicy.h"
 #include "LeadCalibrationPolicy.h"
 #include "OrionPaths.h"
 #include "PacketBridgeAuthority.h"
@@ -6,6 +7,7 @@
 
 #include "AutomationAccessPolicy.h"
 #include "ControllerRoutingPolicy.h"
+#include "FireEpochClock.h"
 #include "MeterOverlayPolicy.h"
 #include "PreciseFirePolicy.h"
 #include "RawInputDeviceIdentityCache.h"
@@ -50,12 +52,17 @@
 #include <QtNetwork/QTcpSocket>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <iterator>
 #include <limits>
 #include <mutex>
+#include <tuple>
 #include <thread>
 #include <vector>
 
@@ -97,6 +104,61 @@ RemotePlaySession::BandwidthMode bandwidthModeFromString(const QString& value)
 }
 
 #ifdef Q_OS_WIN
+// [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] Who actually produced the desktop UI
+// message we are looking at right now.
+//
+// GetCurrentInputMessageSource() (user32, Windows 8+) reports the origin of the
+// message the calling thread is currently processing. A pad mapper -- Steam
+// Input's desktop configuration, DS4Windows, DualSenseX -- is a user-mode process
+// synthesizing mouse/keyboard input with SendInput(), which the OS tags
+// IMO_INJECTED. The owner's own mouse and keyboard are IMO_HARDWARE. That is the
+// exact discriminator the 2026-09-11 timing guard lacked, and unlike a time
+// window it cannot lose a race with the 4 ms input poll.
+//
+// Resolved dynamically so the build does not depend on the SDK's WINVER, and
+// fails to Unknown (never to Injected) so an unavailable API can only ever fall
+// back to the timing guard.
+orion::DesktopUiInputOrigin currentDesktopUiInputOrigin()
+{
+    struct OrionInputMessageSource {
+        DWORD deviceType;
+        DWORD originId;
+    };
+    using GetSourceFn = BOOL(WINAPI*)(OrionInputMessageSource*);
+    static const GetSourceFn getSource = []() -> GetSourceFn {
+        if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+            return reinterpret_cast<GetSourceFn>(
+                reinterpret_cast<void*>(
+                    GetProcAddress(user32, "GetCurrentInputMessageSource")));
+        }
+        return nullptr;
+    }();
+    if (!getSource) {
+        return orion::DesktopUiInputOrigin::Unknown;
+    }
+    OrionInputMessageSource source{};
+    if (!getSource(&source)) {
+        return orion::DesktopUiInputOrigin::Unknown;
+    }
+    constexpr DWORD kOriginUnavailable = 0;  // IMO_UNAVAILABLE
+    constexpr DWORD kOriginHardware = 1;     // IMO_HARDWARE
+    constexpr DWORD kOriginInjected = 2;     // IMO_INJECTED
+    constexpr DWORD kOriginSystem = 4;       // IMO_SYSTEM
+    switch (source.originId) {
+    case kOriginInjected:
+        return orion::DesktopUiInputOrigin::Injected;
+    case kOriginHardware:
+        return orion::DesktopUiInputOrigin::Hardware;
+    // IMO_SYSTEM is the OS synthesizing a message on its own behalf (menu
+    // tracking, a window move). It is deliberately NOT treated as injected:
+    // fail open to the timing guard rather than eat a legitimate system message.
+    case kOriginSystem:
+    case kOriginUnavailable:
+    default:
+        return orion::DesktopUiInputOrigin::Unknown;
+    }
+}
+
 // --- GRACEFUL CHIAKI DISCONNECT -------------------------------------------------------------
 //
 // Every chiaki termination used to be a TerminateProcess (a blanket `taskkill /F /T` sweep), so
@@ -671,9 +733,9 @@ HWND findChiakiWindow()
         const QString lower = QString::fromWCharArray(title).trimmed().toLower();
         const bool titleMatch = lower.contains(QStringLiteral("chiaki"))
             || lower.contains(QStringLiteral("orion stream"));
-        bool match = titleMatch;
+        bool match = false;
 
-        if (!match) {
+        {
             HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
             if (!proc) {
                 return TRUE;
@@ -985,6 +1047,18 @@ enum class PreciseFireArmResult {
     MailboxBusy,
 };
 
+enum class PreciseFireRetargetResult {
+    Retargeted,
+    EngineDisarmed,
+    InvalidToken,
+    WrongToken,
+    NotWaiting,
+    OutcomePending,
+    RouteRejected,
+    WindowRejected,
+    EngineRejected,
+};
+
 class OrionPreciseFireThread {
 public:
     explicit OrionPreciseFireThread(OrionAppController* owner)
@@ -1027,12 +1101,17 @@ public:
 #endif
     }
 
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] The style travels WITH the packet, sampled once at
+    // arm time exactly as the mode and the route generation are. The final submit fence
+    // re-validates the packet against it, so a settings write between arm and fire can never make
+    // an already-armed release look malformed and drop the shot.
     PreciseFireArmResult arm(quint64 token, double absoluteDeadlineMs,
                              double absoluteAuthorityExpiryMs,
                              ShotMode releaseMode,
                              const ControllerState& releaseOutput,
                              quint64 routeGeneration,
-                             LatencyControllerRoute route)
+                             LatencyControllerRoute route,
+                             TempoReleaseStyle releaseStyle)
     {
         // Pair arm with disarmCurrent() under the same outer submit fence. A
         // watchdog first clears AutomationEngine::armed_; an in-flight GUI arm
@@ -1078,9 +1157,11 @@ public:
         target_ = target;
         authorityExpiry_ = authorityExpiry;
         releaseMode_ = releaseMode;
+        releaseStyle_ = releaseStyle;
         releaseOutput_ = releaseOutput;
         routeGeneration_ = routeGeneration;
         route_ = route;
+        ++targetRevision_;
         armed_ = true;
         aborted_ = false;   // [CONCURRENCY N2] fresh arm clears any stale abort
         owner_->lastArmedFireToken_.store(token, std::memory_order_release);
@@ -1095,6 +1176,109 @@ public:
         }
 #endif
         return PreciseFireArmResult::Armed;
+    }
+
+    PreciseFireRetargetResult retarget(
+        const PhaseAnchorRefinementProposal& proposal)
+    {
+        // This is a true replacement transaction, not the ordinary
+        // invalidateUnconfirmedVisionSchedule()->scheduleFire() sequence. The old worker target
+        // stays live until every mailbox, route, time-window and engine-identity gate passes.
+        // Holding submitMutex_ also prevents the worker from crossing its physical-submit
+        // boundary while the engine deadline and worker target are changed together.
+        QMutexLocker submitLock(&owner_->submitMutex_);
+        std::lock_guard<std::mutex> lock(m_);
+        if (!owner_->automation_.armed()) {
+            return PreciseFireRetargetResult::EngineDisarmed;
+        }
+        switch (PreciseFirePolicy::evaluateRetargetMailbox(
+                    proposal.scheduleToken, token_, armed_, fired_, failed_)) {
+        case PreciseFireRetargetGate::InvalidToken:
+            return PreciseFireRetargetResult::InvalidToken;
+        case PreciseFireRetargetGate::WrongToken:
+            return PreciseFireRetargetResult::WrongToken;
+        case PreciseFireRetargetGate::NotWaiting:
+            return PreciseFireRetargetResult::NotWaiting;
+        case PreciseFireRetargetGate::OutcomePending:
+            return PreciseFireRetargetResult::OutcomePending;
+        case PreciseFireRetargetGate::Allowed:
+            break;
+        }
+        const PreciseFireRouteBinding binding{
+            proposal.routeGeneration, proposal.route};
+        const LatencyControllerRoute liveRoute = PreciseFirePolicy::liveControllerRoute(
+            owner_->remotePlay_.state() == RemotePlayState::Running,
+            owner_->orionInput_.enabled(), owner_->orionInput_.connected(),
+            owner_->controller_.isConnected(), owner_->controller_.isDs4Backend());
+        if (!owner_->automation_.scheduledFireRouteBindingMatches(
+                proposal.routeGeneration, proposal.route)
+            || !PreciseFirePolicy::routeBindingMatches(
+                binding, liveRoute, proposal.routeGeneration, proposal.route)) {
+            return PreciseFireRetargetResult::RouteRejected;
+        }
+        const auto retargetNow = std::chrono::steady_clock::now();
+        const PreciseFireArmWindow window = PreciseFirePolicy::evaluate(
+            proposal.refinedDeadlineMs, proposal.refinedAuthorityExpiryMs,
+            owner_->automation_.engineNowMs());
+        if (!window.allowed) {
+            return PreciseFireRetargetResult::WindowRejected;
+        }
+        const auto refinedTarget = retargetNow
+            + std::chrono::microseconds(
+                static_cast<long long>(window.delayMs * 1000.0));
+        const auto refinedAuthorityExpiry = !window.finiteAuthority
+            ? std::chrono::steady_clock::time_point::max()
+            : retargetNow + std::chrono::microseconds(static_cast<long long>(
+                  window.authorityRemainingMs * 1000.0));
+        // commitPhaseAnchorRefinement rechecks the proposal/token/shot identity and BOTH old/new
+        // deadline runways at the instant of this call. If it refuses, none of the worker fields
+        // below have changed and the c30 (or original c20) target still fires normally.
+        if (!owner_->automation_.commitPhaseAnchorRefinement(
+                proposal.id, proposal.scheduleToken, proposal.refinedDeadlineMs)) {
+            return PreciseFireRetargetResult::EngineRejected;
+        }
+        target_ = refinedTarget;
+        authorityExpiry_ = refinedAuthorityExpiry;
+        ++targetRevision_;
+        cv_.notify_all();
+#ifdef Q_OS_WIN
+        if (hiresWait_) {
+            SetEvent(wakeEvent_);
+        }
+#endif
+        return PreciseFireRetargetResult::Retargeted;
+    }
+
+    // [ORION_BLIND_WAITER 2026-09-15 owner] Replace the RELEASE PACKET of an already-armed token
+    // without touching its deadline, its lease or its revision.
+    //
+    // WHY IT EXISTS: the NO METER blind token is now armed AT THE PRESS so a stalled GUI thread
+    // cannot lose the release (see AutomationEngine::armBlindPreciseFire). arm() copies the pad
+    // packet once, so without this the packet the worker presses would be up to a whole hold
+    // (~950 ms) old — the exact hazard the old "don't copy the whole controller packet into the
+    // worker hundreds of milliseconds early" comment named. With it the packet is at most ONE
+    // GUI tick old: strictly fresher than the 24 ms the pre-arm horizon used to allow.
+    //
+    // SAFETY: token-scoped and armed-only, so it cannot touch another shot's token and becomes a
+    // no-op the instant the fire loop claims the shot (the claim sets armed_ = false and copies
+    // releaseOutput_ under this same mutex before unlocking for its final spin — there is no
+    // window in which a refresh can tear the packet the worker is about to submit).
+    // targetRevision_ is deliberately NOT bumped: a bump makes the waiting worker abandon this
+    // target, which at the deadline would DROP the fire. Timing is untouched here by construction.
+    bool refreshReleaseOutput(quint64 token, ShotMode releaseMode,
+                              const ControllerState& releaseOutput,
+                              TempoReleaseStyle releaseStyle)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        if (!armed_ || token == 0 || token_ != token) {
+            return false;
+        }
+        releaseMode_ = releaseMode;
+        // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] The refreshed packet was generated under THIS
+        // style, so the fence's copy must move with it or the two would disagree.
+        releaseStyle_ = releaseStyle;
+        releaseOutput_ = releaseOutput;
+        return true;
     }
 
     void disarm(quint64 token)
@@ -1242,6 +1426,8 @@ public:
 
 private:
     void run();
+    void runLoop();
+    std::atomic<quint64> exceptions_{0};     // fire-thread exceptions survived (see run())
 
     OrionAppController* owner_ = nullptr;
     mutable std::mutex m_;
@@ -1256,6 +1442,7 @@ private:
     bool fired_ = false;
     bool failed_ = false;
     quint64 token_ = 0;
+    quint64 targetRevision_ = 0;
     quint64 firedToken_ = 0;
     quint64 failedToken_ = 0;
     double firedActualMs_ = -1.0;
@@ -1275,11 +1462,15 @@ private:
     std::atomic<long long> lastAuthorityDeclineOverdueUs_{0};
     quint64 authorityDeclinesReported_ = 0;   // GUI-thread only
     ShotMode releaseMode_ = ShotMode::ButtonShot;
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] The style the armed packet was built under; the
+    // final submit fence validates against it. Flick is the shipped default.
+    TempoReleaseStyle releaseStyle_ = TempoReleaseStyle::Flick;
     ControllerState releaseOutput_;
     quint64 routeGeneration_ = 0;
     LatencyControllerRoute route_ = LatencyControllerRoute::None;
 #ifdef Q_OS_WIN
-    // [ORION_PRECISE_WAIT] Optional high-resolution wait (ORION_PRECISE_WAIT_HIRES=1). The
+    // [ORION_PRECISE_WAIT] Default-on high-resolution wait (ORION_PRECISE_WAIT_HIRES=0 opts
+    // out). The
     // condvar timed wait quantizes to the process timer resolution, and Windows 11 ignores this
     // process's timeBeginPeriod(1) while its window is occluded/minimized — measured as a
     // 4-15.6ms uniform submit-lateness tail on 15% of precise releases and as the
@@ -1308,6 +1499,33 @@ private:
 };
 
 void OrionPreciseFireThread::run()
+{
+    // [2026-09-11] Two shutdown crash dumps (00:21 and 11:46) show std::bad_alloc thrown from Qt
+    // on THIS thread while the application was tearing down -- an uncaught exception on a
+    // std::thread is std::terminate, i.e. the whole process aborts (0xc0000409 FAST_FAIL_FATAL_APP_EXIT).
+    // A fire-thread exception must never take the process with it: note it, fail the mailbox
+    // closed (the engine sees a failed token and re-arms or aborts the shot through its normal
+    // paths) and keep serving. Qt is deliberately not used here -- it may be the thing failing.
+    for (;;) {
+        try {
+            runLoop();
+            return;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[orion] precise-fire thread exception: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[orion] precise-fire thread exception (unknown)\n");
+        }
+        std::lock_guard<std::mutex> guard(m_);
+        exceptions_.fetch_add(1, std::memory_order_relaxed);
+        if (quit_) {
+            return;
+        }
+        armed_ = false;
+        failed_ = true;
+    }
+}
+
+void OrionPreciseFireThread::runLoop()
 {
 #ifdef Q_OS_WIN
     // top priority for the final spin.
@@ -1346,6 +1564,7 @@ void OrionPreciseFireThread::run()
         assertTbp();
 #endif
         const quint64 token = token_;
+        const quint64 targetRevision = targetRevision_;
         const auto target = target_;
         constexpr auto kSpinLead = std::chrono::microseconds(1200);
 #ifdef Q_OS_WIN
@@ -1359,12 +1578,14 @@ void OrionPreciseFireThread::run()
             // A Failed wait (timer machinery broke) falls back to one condvar wait so the leg
             // can never busy-loop; the fire semantics downstream are untouched either way.
             while (!quit_ && armed_ && token_ == token
+                   && targetRevision_ == targetRevision
                    && std::chrono::steady_clock::now() + kSpinLead < target) {
                 lock.unlock();
                 const auto waitResult = hiresTimer_.waitUntil(target - kSpinLead, wakeEvent_);
                 lock.lock();
                 if (waitResult == orion::PreciseWaitTimer::WaitResult::Failed
                     && !quit_ && armed_ && token_ == token
+                    && targetRevision_ == targetRevision
                     && std::chrono::steady_clock::now() + kSpinLead < target) {
                     cv_.wait_until(lock, target - kSpinLead);
                 }
@@ -1373,6 +1594,7 @@ void OrionPreciseFireThread::run()
 #endif
         {
             while (!quit_ && armed_ && token_ == token
+                   && targetRevision_ == targetRevision
                    && std::chrono::steady_clock::now() + kSpinLead < target) {
                 cv_.wait_until(lock, target - kSpinLead);
             }
@@ -1380,12 +1602,13 @@ void OrionPreciseFireThread::run()
         if (quit_) {
             break;
         }
-        if (!armed_ || token_ != token) {
-            continue;   // disarmed or re-armed while waiting
+        if (!armed_ || token_ != token || targetRevision_ != targetRevision) {
+            continue;   // disarmed, re-armed, or transactionally retargeted while waiting
         }
         // Claim the fire atomically so a late disarm can't race the write.
         armed_ = false;
         const ShotMode mode = releaseMode_;
+        const TempoReleaseStyle releaseStyle = releaseStyle_;
         const ControllerState out = releaseOutput_;
         const quint64 routeGeneration = routeGeneration_;
         const LatencyControllerRoute route = route_;
@@ -1470,7 +1693,7 @@ void OrionPreciseFireThread::run()
             // different stick mode is a failed release, not a route write.  Keep
             // m_ held while publishing the failure mailbox; neither OrionInput
             // nor ViGEm has been touched and fired_ remains false.
-            if (!isValidShotReleaseOutput(out, mode)) {
+            if (!isValidShotReleaseOutput(out, mode, releaseStyle)) {
                 failed_ = true;
                 failedToken_ = token;
                 failedDetail_ = QStringLiteral(
@@ -1486,12 +1709,31 @@ void OrionPreciseFireThread::run()
             InputRouteWriteResult pipeWrite = InputRouteWriteResult::Failed;
             ControllerState virtualOut;
             virtualOut.lightbarSet = false;
+            bool virtualSubmitOk = false;
+            OrionInputTransactionTiming pipeTiming;
+            PreciseFireDispatchTiming dispatchTiming;
             if (route == LatencyControllerRoute::Pipe) {
-                pipeWrite = owner_->orionInput_.sendDetailed(out, true, true);
+                // This is the scheduler timestamp: take it immediately before
+                // entering the active route. sendDetailed() includes the
+                // bounded local-delivery ACK wait, which is telemetry and must
+                // never become release-command time.
+                dispatchTiming = timePreciseFireDispatch(
+                    [this] { return owner_->automation_.engineNowMs(); },
+                    [&] {
+                        pipeWrite = owner_->orionInput_.sendDetailed(
+                            out, true, true, &pipeTiming);
+                    });
+                // Keep the inactive ViGEm representation neutral, but keep its
+                // submit cost outside both active-route timing samples.
+                virtualSubmitOk = owner_->controller_.submit(virtualOut, &error);
             } else {
                 virtualOut = out;
+                dispatchTiming = timePreciseFireDispatch(
+                    [this] { return owner_->automation_.engineNowMs(); },
+                    [&] {
+                        virtualSubmitOk = owner_->controller_.submit(virtualOut, &error);
+                    });
             }
-            const bool virtualSubmitOk = owner_->controller_.submit(virtualOut, &error);
             const PreciseFireDeliveryDecision delivery =
                 PreciseFirePolicy::evaluateBoundDelivery(
                     pipeWrite, virtualSubmitOk, route);
@@ -1503,7 +1745,11 @@ void OrionPreciseFireThread::run()
                         std::chrono::steady_clock::now().time_since_epoch()).count(),
                     std::memory_order_relaxed);
             }
-            const double actual = owner_->automation_.engineNowMs();
+            const double fireEpochMs = delivery.confirmScheduledFire
+                ? captureFireEpochMs(dispatchTiming.commandIssuedMs, [this] {
+                      return owner_->automation_.engineNowMs();
+                  })
+                : -1.0;
             lock.lock();
             if (delivery.confirmScheduledFire) {
                 PreciseFireDeliverySnapshot snapshot;
@@ -1511,13 +1757,23 @@ void OrionPreciseFireThread::run()
                 snapshot.outputValid = true;
                 snapshot.routeGeneration = routeGeneration;
                 snapshot.route = route;
+                snapshot.commandIssuedMs = dispatchTiming.commandIssuedMs;
+                snapshot.activeRouteCompleteMs = dispatchTiming.activeRouteCompleteMs;
+                snapshot.activeRouteDurationMs = dispatchTiming.activeRouteDurationMs;
+                snapshot.fireEpochMs = fireEpochMs;
                 if (delivery.pipeAccepted && owner_->orionInput_.haveSent()) {
                     snapshot.pipePacket = owner_->orionInput_.lastSent();
                     snapshot.pipePacketValid = true;
+                    if (pipeTiming.matches(snapshot.pipePacket.seq)) {
+                        snapshot.pipeTiming = pipeTiming;
+                    }
                 }
                 fired_ = true;
                 firedToken_ = token;
-                firedActualMs_ = actual;
+                // AutomationEngine's scheduledFireDeltaMs, release marker and
+                // learning anchors all consume this value. It is intentionally
+                // the pre-dispatch command instant, never ACK completion.
+                firedActualMs_ = dispatchTiming.commandIssuedMs;
                 firedDeliveryStage_ = delivery.stage;
                 firedTransportSeq_ = snapshot.pipePacketValid
                     ? snapshot.pipePacket.seq : 0;
@@ -1781,11 +2037,16 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // (remote_play_client.py keys on the env). ViGEm stays the always-submitted fallback, so a missing
     // pipe / stock chiaki degrades cleanly to ViGEm.
     if (envDefaultOn("ORION_INPUT_HOOK")) {
-        orionInput_.setEnabled(true);
+        orionInput_.setEnabled(!isXboxRemotePlay(config_.data()));
         appendLog(QStringLiteral("Input hook ENABLED (pre-encryption pipe; ViGEm fallback active)"));
     } else {
         appendLog(QStringLiteral("Input hook disabled by ORION_INPUT_HOOK=0 (ViGEm only)"));
     }
+    squareOutputWatchdogEnabled_ =
+        qEnvironmentVariableIntValue("ORION_SQUARE_OUTPUT_WATCHDOG") == 1;
+    appendLog(QStringLiteral("SQUARE OUTPUT WATCHDOG: enabled=%1 timeout_ms=1500 "
+                             "copies=2 abort_drain_owned=1 knob=ORION_SQUARE_OUTPUT_WATCHDOG default=0")
+                  .arg(squareOutputWatchdogEnabled_ ? 1 : 0));
     const bool captureCardVideoSource =
         config_.data().videoSource.compare(QLatin1String("capture_card"),
                                           Qt::CaseInsensitive) == 0;
@@ -1877,6 +2138,24 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     }
 #endif
 
+    // [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] Two knobs, read once at startup so
+    // the native event filter stays a pure read on the hot message path:
+    //   ORION_CONTROLLER_UI_PASSTHROUGH=1        -> disable the isolation entirely
+    //     (deliberate controller-driven UI, or the owner's way back to the
+    //     pre-2026-09-19 behaviour if a mapper turns out to report as hardware).
+    //   ORION_CONTROLLER_UI_INJECTED_ISOLATION=0 -> keep the timing guards but stop
+    //     trusting GetCurrentInputMessageSource's injected verdict.
+    controllerUiPassthrough_ =
+        qEnvironmentVariableIntValue("ORION_CONTROLLER_UI_PASSTHROUGH") == 1;
+    controllerUiInjectedIsolation_ =
+        !qEnvironmentVariableIsSet("ORION_CONTROLLER_UI_INJECTED_ISOLATION")
+        || qEnvironmentVariableIntValue("ORION_CONTROLLER_UI_INJECTED_ISOLATION") != 0;
+    if (controllerUiPassthrough_) {
+        appendLog(QStringLiteral(
+            "Controller UI isolation DISABLED (ORION_CONTROLLER_UI_PASSTHROUGH=1): "
+            "mapped pad input may activate Venice controls during a session."));
+    }
+
     serverState_ = licenseClient_.serverUrl().host();
     sessionStartMs_ = 0;  // session clock starts when live capture goes Running (see stateChanged)
 
@@ -1890,9 +2169,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     }
 
 #ifdef Q_OS_WIN
-    // [ORION_PRECISE_WAIT] Default-OFF OS-timing guard for the fire path (evidence in
-    // PreciseWaitTimer.h). ORION_TIMER_RES_GUARD=1 opts this process out of Windows 11
-    // timer-resolution throttling so the fire thread's timeBeginPeriod(1) request stays honored
+    // [ORION_PRECISE_WAIT] Default-on OS-timing guard for the fire path (evidence in
+    // PreciseWaitTimer.h). ORION_TIMER_RES_GUARD=0 disables the guard; otherwise the process
+    // opts out of Windows 11 timer-resolution throttling so the fire thread's timeBeginPeriod(1) stays honored
     // while the window is occluded/minimized. Wake-time-only: no submit is created, moved later,
     // or retried by this flag.
     // [ORION_METER_DELAY 2026-08-07] Default ON. Opt out with ORION_TIMER_RES_GUARD=0.
@@ -1913,6 +2192,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             remotePlay_.state() == RemotePlayState::Running;
         if (onAc || sessionRunning) {
             const bool timerGuardOk = orion::disableTimerResolutionThrottling();
+            timerResolutionThrottleOptOutApplied_ = timerGuardOk;
             appendLog(QStringLiteral(
                 "Timer-resolution throttle opt-out (ORION_TIMER_RES_GUARD): %1 "
                 "(kernel timer resolution now %2 ms)")
@@ -1970,12 +2250,37 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
 
     connect(&licenseClient_, &LicenseClient::activationFinished, this, [this](const LicenseResult& result) {
         authBusy_ = false;
+        if (result.ok && authLicenseKey_.startsWith(QStringLiteral("PAIR-"))) {
+            static const QRegularExpression canonicalKey(
+                QStringLiteral("^[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}$"));
+            if (!canonicalKey.match(result.canonicalLicenseKey).hasMatch()) {
+                if (authenticated_) {
+                    disconnectRemotePlay(true);
+                }
+                authenticated_ = false;
+                leaseGate_.recordHeartbeatKill();
+                authToken_.clear();
+                authTokenId_.clear();
+                authTokenExpires_ = 0;
+                licenseHeartbeatTimer_.stop();
+                licenseState_ = QStringLiteral("Locked");
+                authMessage_ = QStringLiteral("Discord connection did not return a valid license. Connect again.");
+                updateSecurityStatus();
+                emit authChanged();
+                emit statusChanged();
+                return;
+            }
+            authLicenseKey_ = result.canonicalLicenseKey;
+        }
         if (result.ok) {
             authenticated_ = true;
             currentPage_ = QStringLiteral("remotePlay");
             licenseState_ = result.plan.isEmpty() ? QStringLiteral("Verified") : result.plan;
             authMessage_ = result.message.isEmpty() ? QStringLiteral("License verified. Opening Venice.") : result.message;
             appendLog(QStringLiteral("License verified for %1").arg(result.user.isEmpty() ? QStringLiteral("current device") : result.user));
+            // Profile page data rides the activation verdict (and every heartbeat
+            // after it). Absent on the current live Lambda -> no-op.
+            applyLicenseProfile(result.profile);
             // CRIT-1: keep the server session token client-side (it was discarded
             // before — only a token_present bool survived) and seed the fire
             // lease. The /api/license/check heartbeat is the authoritative lease
@@ -2004,6 +2309,13 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             }
             emit navigationChanged();
             licenseHeartbeatTimer_.start();
+            // Pre-warm the capture-card preview the instant auth succeeds, so the sidecar +
+            // Elgato open (~2-4s) overlaps the remaining gate screens and the Live Capture
+            // card is already live when RemotePlayPage mounts — instead of a black panel for
+            // a few seconds. Fully guarded inside (capture-card source only, no-op if a
+            // session/preview is already up); RemotePlayPage's own onCompleted call stays as
+            // the idempotent fallback.
+            startCapturePreview();
         } else {
             // An activation failure is never allowed to leave authority from an
             // earlier attempt resident in memory.
@@ -2016,7 +2328,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             authTokenId_.clear();
             authTokenExpires_ = 0;
             licenseState_ = QStringLiteral("Locked");
-            authMessage_ = result.message.isEmpty() ? QStringLiteral("License verification failed.") : result.message;
+            // Contract §5: /api/activate answers with the same CODES as the heartbeat;
+            // frozen / blacklisted / version_blocked get their own copy here too.
+            authMessage_ = licenseErrorUserText(result, QStringLiteral("License verification failed."));
             appendLog(QStringLiteral("License activation failed: %1").arg(authMessage_));
         }
         // License authority/cache mutation is a synchronous checkpoint. This
@@ -2027,10 +2341,19 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     });
 
     connect(&licenseClient_, &LicenseClient::validationFinished, this, [this](const LicenseResult& result) {
+        // MOTD rides the heartbeat (contract §5). Only a STRUCTURED server response
+        // (ok, or ok:false with an error code) may set or clear it — a transport
+        // failure leaves error empty and must keep the last notice on screen.
+        if (result.ok || !result.error.isEmpty()) {
+            applyServerMotd(result.motd);
+        }
         if (result.ok) {
             if (!result.plan.isEmpty()) {
                 licenseState_ = result.plan;
             }
+            // Keep the Profile page's days-left / reset allowance fresh without a
+            // second round trip. Tolerant: no `profile` in the body -> no change.
+            applyLicenseProfile(result.profile);
             // CRIT-1: a successful heartbeat is the authoritative fire lease.
             // Once the backend signs the lease (07-15) the embedded verify key
             // makes a valid Ed25519 signature MANDATORY for a refresh; until
@@ -2050,9 +2373,11 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // blip must never lock out a paying user mid-session). (With the lease
         // gate enabled, a sustained outage still fails closed on max-staleness.)
         const QString& e = result.error;
-        const bool kill = e == QLatin1String("service_disabled") || e == QLatin1String("revoked")
-            || e == QLatin1String("expired") || e == QLatin1String("device_mismatch")
-            || e == QLatin1String("invalid_key") || e == QLatin1String("inactive");
+        // Contract §5 revoke-fast codes: service_disabled | revoked | expired |
+        // device_mismatch | invalid_key | inactive | frozen | blacklisted |
+        // version_blocked (isLicenseKillCode, LicenseClient.h). Exact CODE match —
+        // prose or an unknown string is never a kill.
+        const bool kill = isLicenseKillCode(e);
         if (!kill) {
             return;
         }
@@ -2065,9 +2390,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         authTokenId_.clear();
         authTokenExpires_ = 0;
         licenseState_ = QStringLiteral("Locked");
-        authMessage_ = result.message.isEmpty()
-            ? QStringLiteral("Venice has been disabled. Check the Discord for updates.")
-            : result.message;
+        // frozen / blacklisted / version_blocked (+ min_client_version) get their own
+        // copy; the other codes show the server's `message` prose as before.
+        authMessage_ = licenseErrorUserText(
+            result, QStringLiteral("Venice has been disabled. Check the Discord for updates."));
         emit authChanged();
         emit navigationChanged();
         emit statusChanged();
@@ -2078,6 +2404,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             licenseClient_.validate(authLicenseKey_, security_.machineId());
         }
     });
+    // MOTD `until` expiry: re-evaluate the stored notice when its deadline passes so
+    // the banner hides between heartbeats instead of lingering up to 5 minutes.
+    motdExpiryTimer_.setSingleShot(true);
+    connect(&motdExpiryTimer_, &QTimer::timeout, this, [this]() { applyServerMotd(motd_); });
 
     connect(&licenseClient_, &LicenseClient::versionCheckFinished, this, [this](const VersionResult& result) {
         if (!result.ok) {
@@ -2087,6 +2417,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             emit statusChanged();
             return;
         }
+
+        // Contract §5: /api/version carries the MOTD as well as the heartbeat.
+        applyServerMotd(result.motd);
 
         const int versionCompare = compareSemanticVersions(appVersion(), result.version);
         updateState_ = versionCompare < 0
@@ -2203,9 +2536,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     updateRecheckTimer_.start();
 
     connect(&remotePlay_, &RemotePlaySession::stateChanged, this, [this](RemotePlayState state, const QString& status) {
+        hookIdleNeutralSinceMs_ = -1;
         const QString prevRemoteState = remoteState_;   // [ORION_USER_LOG] dedupe user lines
-        remoteState_ = stateText(state);
-        remoteStatus_ = status;
+        remoteState_ = remotePlayTeardownActive_ ? QStringLiteral("Disconnecting") : stateText(state);
+        remoteStatus_ = remotePlayTeardownActive_ ? QStringLiteral("Disconnecting…") : status;
         remoteRunning_ = state == RemotePlayState::Running || state == RemotePlayState::Connecting;
         // The pre-Connect capture preview only exists while Disconnected. Once the real session
         // takes the panel over (Connecting/Running) drop the preview flag — this is also what makes
@@ -2227,6 +2561,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         } else if (state == RemotePlayState::Disconnected || state == RemotePlayState::Error) {
             setCaptureSourceHealth(QStringLiteral("capture_source_lost"));
             sessionStartMs_ = 0;  // session clock stops + resets when the stream ends
+            // [ORION_BANNER_VERDICT_LIVE 2026-09-14] The banner tally is a LIVE reading; it
+            // must not survive the stream that produced it. resetBannerTallyForSession also
+            // drops the de-dupe watermark, because the sidecar's verdict seq restarts at 1.
+            resetBannerTallyForSession();
         }
         // A fresh stream session = fresh capture geometry/latency — silently drop every
         // shot type to ACQUIRE (clocks stay as warm starts; an unchanged setup re-locks in
@@ -2244,6 +2582,29 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         }
         if (nowRunning && !wasRunning) {
             sessionStartMs_ = QDateTime::currentMSecsSinceEpoch();  // session time starts at live capture
+            // [ORION_BANNER_VERDICT_LIVE 2026-09-14] Fresh stream = fresh tally (and a fresh
+            // sidecar verdict counter, which restarts at seq 1).
+            resetBannerTallyForSession();
+#ifdef Q_OS_WIN
+            // Startup intentionally defers the process timer-throttling opt-out
+            // on battery. Complete that deferred transition as soon as a live
+            // session actually needs precision timing. An explicit opt-out
+            // remains authoritative, and a startup failure is retried here.
+            const bool timerGuardDisabled =
+                qEnvironmentVariableIsSet("ORION_TIMER_RES_GUARD")
+                && qEnvironmentVariableIntValue("ORION_TIMER_RES_GUARD") == 0;
+            if (!timerGuardDisabled && !timerResolutionThrottleOptOutApplied_) {
+                timerResolutionThrottleOptOutApplied_ =
+                    orion::disableTimerResolutionThrottling();
+                appendLog(QStringLiteral(
+                    "Timer-resolution throttle deferred apply on stream start: %1 "
+                    "(kernel timer resolution now %2 ms)")
+                              .arg(timerResolutionThrottleOptOutApplied_
+                                       ? QStringLiteral("applied")
+                                       : QStringLiteral("FAILED"))
+                              .arg(orion::currentTimerResolutionMs(), 0, 'f', 3));
+            }
+#endif
             automation_.recalibrateAllShotTypes();
             appendLog(QStringLiteral("Calibration: all shot types -> Acquire (stream start)"));
         }
@@ -2276,11 +2637,55 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 userLog_.append(QStringLiteral("Disconnected from the console."));
             }
         }
+        // [ORION_INPUT_DEAD_UX] A healthy Running session closes the failure episode: the
+        // bounded retry budget belongs to an episode, never to the session. Any other state
+        // simply re-evaluates the overlay from the same shared predicate.
+        if (state == RemotePlayState::Running) {
+            inputRetryPlanner_.reset();
+            inputRetryPendingAttempt_ = 0;
+            inputRetryGaveUp_ = false;
+        }
+        refreshInputDeliveryState();
         emit statusChanged();
         // A stream just ended: apply any update that was deferred while live.
         if (!nowRunning && (state == RemotePlayState::Disconnected || state == RemotePlayState::Error)) {
             maybeAutoApplyUpdate();
         }
+    });
+    // [ORION_INPUT_DEAD_UX 2026-08-30] Terminal input-session failures, classified by
+    // RemotePlaySession (promotion verdict / native deadline / lost command / identity block).
+    // Drives the bounded auto-retry so a failed promote no longer strands the player on live
+    // HDMI with dead input and NO retry (measured 08-28: 2m18s of presses into a Disconnected
+    // session after one failed promote).
+    connect(&remotePlay_, &RemotePlaySession::inputSessionFailure,
+            this, &OrionAppController::handleInputSessionFailure);
+    connect(&remotePlay_, &RemotePlaySession::inputRecoveryStarted,
+            this, [this]() {
+        // Input-only recovery keeps the current stream/capture generation alive, so it must not
+        // flow through Running -> Connecting -> Running (which recalibrates every shot type).
+        // Revoke only controller/fire authority until a forced neutral write proves the fresh
+        // direct pipe. Failure/timeout still transitions RemotePlaySession to Error below.
+        inputRouteAwaitingRecovery_ = true;
+        preciseFireRecoveryNeutralFrames_ = 0;
+        automation_.setArmed(false);
+        automation_.reset();
+        shot_ = automation_.context();
+        shotState_ = holdStateText(shot_.state);
+        observeBotOwnership(shot_);
+        syncEngineArmed();
+        {
+            // syncEngineArmed has drained the precise worker. Retire the old
+            // handle/snapshot before a replacement input child can be spawned;
+            // cleanup and idle probes must not inherit its ownership proof.
+            QMutexLocker submitLock(&submitMutex_);
+            orionInput_.resetConnection();
+            directPipeOwnsInput_ = false;
+        }
+        appendLog(QStringLiteral(
+            "Input-only recovery started: controller/fire authority revoked; existing "
+            "sidecar, capture, detector, and learned timing retained."));
+        refreshInputDeliveryState();
+        emit statusChanged();
     });
     connect(&remotePlay_, &RemotePlaySession::sidecarProcessGenerationStarted,
             this, [this]() {
@@ -2300,6 +2705,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             return;
         }
         capturePreviewActive_ = active;
+        // [ORION_INPUT_DEAD_UX] Preview restore after a failed promotion is exactly the moment
+        // video goes live over a dead session — re-evaluate the overlay on the same event.
+        refreshInputDeliveryState();
         emit statusChanged();
     });
 
@@ -2434,6 +2842,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         const bool overlayIntegrityAllowed = automationSecurityAllowed();
         if (overlayIntegrityAllowed) {
             automation_.updateDetection(result);
+            // Rung-30/35 consensus may have produced a better anchor on this exact fresh
+            // sample. Commit it together with the already-copied precise target (or before the
+            // first worker arm) so reevaluation never has to tear down the fallback token.
+            applyPendingPhaseAnchorRefinement();
             // Sub-tick decision-latency win: a fresh meter sample can move the scheduled fire deadline
             // EARLIER right now instead of waiting up to a full 4ms inputPollTimer_ tick. Reschedule-only
             // (never fires in-tick / never advances the tracking-history/tempo cadence).
@@ -2453,6 +2865,17 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             && result.frameAgeMs <= recoveryMaxAgeMs;
         const bool genuineOverlayFrame = genuineOverlayDetection
             && overlaySourceHealthy && uniqueCaptureProof;
+        const bool shotVisuallyActive = isShooting();
+        const bool priorOverlayVisualRecent = meterOverlayVisualRecent(
+            overlaySourceHealthy, lastMeterOverlayVisualSeenMs_, nowMeterMs,
+            shotVisuallyActive);
+        const bool genuinePresentationFrame = genuineOverlayFrame
+            && isLiveMeterOverlayVisualEvidence(
+                result, automation_.config().staleFrameMaxMs,
+                shotVisuallyActive)
+            && meterOverlayMayAcquireOrContinue(
+                result, shot_.physicalShotEpoch, priorOverlayVisualRecent,
+                meterBoxCapture_);
         const QSize overlaySampleCaptureSize(
             result.bboxFrameWidth, result.bboxFrameHeight);
         if (overlaySampleCaptureSize.isValid()
@@ -2469,10 +2892,13 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 uniqueCaptureProof);
         const bool trustedOverlayPosition = continuityObservation
             == MeterOverlayContinuityObservation::TrustedPosition;
-        const bool overlayPositionDetection = genuineOverlayFrame
+        const bool overlayPositionDetection = genuinePresentationFrame
             || trustedOverlayPosition;
         if (genuineOverlayFrame) {
             lastRealMeterSeenMs_ = nowMeterMs;
+        }
+        if (genuinePresentationFrame) {
+            lastMeterOverlayVisualSeenMs_ = nowMeterMs;
         }
         const qint64 visibilityFreshnessMs = isShooting()
             ? kMeterConfirmShotMs_ : kMeterConfirmFreshMs_;
@@ -2616,6 +3042,29 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                                     outCaptureBox,
                                     &matchedDetectionFrameNumber);
                             }));
+                    // The exact observation can also arrive just AFTER Ready.
+                    // Correct the visible provisional bridge only while this
+                    // same serial/source/shot/coordinate space is still front.
+                    // Do not change future computed boxes or any timing input.
+                    if (genuinePresentationFrame && meterConfirmed_ && meterBox_.isValid()
+                        && remoteFrameOverlaySnapshots_.backfillPresentedExact(
+                            qmlPreviewLastAcknowledgedSerial_, captureSize,
+                            result.frameNumber, meterBoxCapture_, shot_.armToken)) {
+                        const auto presented = remoteFrameOverlaySnapshots_.lookup(
+                            qmlPreviewLastAcknowledgedSerial_);
+                        if (presented.has_value()) {
+                            const QRect exactBox = resolveLateMeterOverlayBox(
+                                presented->joinedCaptureBox, presented->captureSize,
+                                presented->frameSize, presented->shotToken,
+                                presented->sourceFrameNumber);
+                            if (exactBox.isValid()
+                                && (meterBox_ != exactBox || !meterRejectedBox_.isNull())) {
+                                meterBox_ = exactBox;
+                                meterRejectedBox_ = {};
+                                emit meterBoxChanged();
+                            }
+                        }
+                    }
                 }
             }
             lastResult_ = QStringLiteral("%1 %2 fill %3%")
@@ -2629,16 +3078,18 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 || !std::isfinite(result.frameAgeMs)
                 || result.frameAgeMs < 0.0
                 || result.frameAgeMs > recoveryMaxAgeMs);
+        const bool overlayVisualExpired = !meterOverlayVisualRecent(
+            overlaySourceHealthy, lastMeterOverlayVisualSeenMs_, nowMeterMs,
+            shotVisuallyActive);
         if (hardOverlayFailure
-            || (!genuineOverlayFrame && !meterOverlayContinuityLease_.active()
-                && nowMeterMs - lastRealMeterSeenMs_ > kMeterConfirmShotMs_)) {
-            // B2a (2026-07-25): keyed on lastRealMeterSeenMs_ (clean RAW detections only), NOT
-            // lastMeterSeenMs_ — which is refreshed by ANY result.detected, including the
-            // meter_memory/stale ECHOES the detector emits after the meter is gone. A steady echo
-            // stream therefore held this branch off forever.
-            // Authoritative detector lost the meter for longer than the sticky window —
-            // clear the overlay box so it doesn't linger when no meter is on screen. A brief
-            // (<=300ms) miss keeps the box in place so a 1-frame miss mid-shot doesn't flicker.
+            || (!genuinePresentationFrame
+                && !meterOverlayContinuityLease_.active()
+                && overlayVisualExpired)) {
+            // The presentation clock is stricter than generic raw-detection
+            // presence: empty post-shot echoes and unstructured idle candidates
+            // cannot renew it. In-shot misses retain the measured 350ms bridge;
+            // after the shot it contracts to 200ms so an empty-court outline
+            // cannot outlive the useful meter by another third of a second.
             // Detector payloads continue at capture cadence while no meter is
             // present. Clearing and emitting on every one of those frames woke
             // QML at up to 60 Hz and could make the preview miss its deadline.
@@ -2673,6 +3124,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 meterBoxRing_.clear();
                 emit meterBoxChanged();
             }
+            lastMeterOverlayVisualSeenMs_ = 0;
         }
         if (!remotePlay_.algorithmText().isEmpty()) {
             visionPipeline_ = remotePlay_.algorithmText();
@@ -2731,6 +3183,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // The Tip Timing card shows this measurement beside a diverging manual value
         // (tipTimingMeasuredMs), so re-notify on the same cadence as the aim slot above.
         emit tipTimingChanged();
+    });
+    // [ORION_SESSION_LEAD_PROBE 2026-09-01] persist the (anchor->freeze median, lead) reference
+    // pair the engine captured for the current Shot Lead; see AppConfigData::sessionLeadProbeEnabled.
+    connect(&automation_, &AutomationEngine::leadReferenceCaptured, this,
+            [this](double physicalMs, double leadMs) {
+        LearningData data = config_.learning();
+        data.leadReferencePhysicalMs = physicalMs;
+        data.leadReferenceLeadMs = leadMs;
+        config_.saveLearning(data);
     });
     // [ORION_LEAD_CONFLICT 2026-08-08] The two engine diagnoses that name the lost-session trap
     // (Shot Lead unschedulable against Tip Timing; user lead >3*sd from the validated
@@ -2801,6 +3262,54 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         data.shotTypeVelocityPriorPctMs = priors;
         config_.saveLearning(data);
     });
+    // [ORION_NO_METER_V2 2026-09-14] The per-shot-type press->release hold the VISION path
+    // measured. It is what lets the blind release law prefer this owner's own Δ over the
+    // shipped table once both the type and Standstill carry >= 8 of his holds.
+    connect(&automation_, &AutomationEngine::noMeterHoldLearned, this,
+            [this](const QMap<QString, NoMeterHoldRecord>& holds) {
+        LearningData data = config_.learning();
+        data.noMeterHoldByType = holds;
+        config_.saveLearning(data);
+    });
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] The banner closed loop's per-type trim. Persisted
+    // to learning.json (the engine decays it 50 % at the next start -- contexts change between
+    // sessions) and published to the caption under the Shot Lead slider in the same handler, so
+    // the number on screen is always the number the scheduler is spending.
+    connect(&automation_, &AutomationEngine::bannerLeadTrimUpdated, this,
+            [this](const QMap<QString, double>& trims) {
+        LearningData data = config_.learning();
+        data.bannerLeadTrimByType = trims;
+        config_.saveLearning(data);
+        // [ORION_BANNER_TRIM_TEMPO 2026-09-16] The card shows the REFERENCE sub-bucket --
+        // Standstill at a normal tempo, the shot the owner tunes the slider on. The bare
+        // "Standstill" key is the fallback for a snapshot taken with ORION_BANNER_TRIM_TEMPO=0,
+        // so one caption serves both keying modes.
+        const double shown = trims.contains(QStringLiteral("Standstill/normal"))
+            ? trims.value(QStringLiteral("Standstill/normal"), 0.0)
+            : trims.value(QStringLiteral("Standstill"), 0.0);
+        if (!qFuzzyCompare(1.0 + shown, 1.0 + bannerLeadTrimMs_)) {
+            bannerLeadTrimMs_ = shown;
+            emit bannerLeadTrimChanged();
+        }
+    });
+    // [ORION_LEAD_AUTO_SEED 2026-09-15 owner] The plug-and-play Shot Lead's caption. NOTHING is
+    // persisted here on purpose: the seed is derived state (this rig's measured latency + the
+    // shipped aim margin, or the placeholder until that latency exists), and writing it anywhere
+    // near actuation_lead_ms is precisely what the feature promises not to do.
+    connect(&automation_, &AutomationEngine::leadAutoSeedUpdated, this,
+            [this](double leadMs, double measuredMs, const QString& kind) {
+        const bool active = !kind.isEmpty();
+        if (active == leadAutoSeedActive_ && kind == leadAutoSeedKind_
+            && qFuzzyCompare(1.0 + leadMs, 1.0 + leadAutoSeedMs_)
+            && qFuzzyCompare(1.0 + measuredMs, 1.0 + leadAutoSeedMeasuredMs_)) {
+            return;
+        }
+        leadAutoSeedActive_ = active;
+        leadAutoSeedKind_ = kind;
+        leadAutoSeedMs_ = active ? leadMs : 0.0;
+        leadAutoSeedMeasuredMs_ = active ? measuredMs : 0.0;
+        emit leadAutoSeedChanged();
+    });
     // Persist the hybrid global phase-clock self-learned globals (autonomous_vision path) so they
     // survive a restart. Emitted only from clean, vision-timed, non-fallback releases.
     connect(&automation_, &AutomationEngine::globalTimingLearned, this,
@@ -2843,6 +3352,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                                      AppConfigData::kActuationLeadMaxMs);
         data.actuationLeadMs = seeded;
         data.actuationLeadUserSet = false;   // measured, not chosen — the user can still be shown so
+        // [ORION_LEAD_BY_SOURCE 2026-09-14] the seed was measured on THIS video route; it must
+        // not follow the user to the other one.
+        mirrorActuationLeadIntoSourceStash(data);
         if (!saveConfigSilently(data)) {
             return;
         }
@@ -2930,6 +3442,24 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         }
         emit statusChanged();
     });
+
+    // Reader detector health -> the Meter Detection card's status line. Presentation only:
+    // the object never reaches the engine, the telemetry snapshot, or any timing path.
+    connect(&remotePlay_, &RemotePlaySession::detectorHealthReady, this,
+            &OrionAppController::observeDetectorHealth);
+
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14 owner] One graded shot off the GAME'S OWN
+    // feedback banner -> the rolling 10-shot tally the owner tunes against, plus one plain
+    // Activity line. Presentation only: it never reaches the engine, the telemetry snapshot
+    // or any timing path.
+    connect(&remotePlay_, &RemotePlaySession::bannerVerdict, this,
+            &OrionAppController::observeBannerVerdict);
+    // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] The banner-free input to the same trim.
+    connect(&remotePlay_, &RemotePlaySession::releaseOracle, this,
+            &OrionAppController::observeReleaseOracle);
+    // [ORION_SHOT_RANGE 2026-09-17] The press's THREE/MID reading -> the engine's live shot.
+    connect(&remotePlay_, &RemotePlaySession::shotRange, this,
+            &OrionAppController::observeShotRange);
 
     // [Track B / B3] Sidecar ColorCalibrator lifecycle -> the meterCalibration* properties +
     // the MeterConfigPanel badge. The sidecar emits per committed shot and per state
@@ -3049,7 +3579,28 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // open SimpleMeterReader's bounded hardware shot gate.
     connect(&automation_, &AutomationEngine::shotArmed, this,
             [this](orion::ShotMode, const QString&, quint64 armToken) {
-        remotePlay_.armPose(armToken);
+        if (!config_.data().inputTimedEnabled) remotePlay_.armPose(armToken);
+    });
+
+    // [ORION_SHOT_GATE_TYPE 2026-09-15] The shot gate's TYPE/CLOSE channel, all three relayed
+    // straight through: the engine is on the real-time path and never talks to the sidecar
+    // itself. Unconditional (no inputTimedEnabled gate like armPose above): the shot gate serves
+    // the METER reader on every path, and the blind 200 ms type grace exists on both the NO METER
+    // and the METER BACKSTOP clocks. Each is fenced to one emission per physical epoch inside the
+    // engine, so these connections add no per-tick or per-frame traffic -- at most two sidecar
+    // lines per shot (an optional re-type, and exactly one close).
+    connect(&automation_, &AutomationEngine::shotGateShotType, this,
+            [this](quint64 physicalShotEpoch, const QString& shotType, bool rhythm) {
+        remotePlay_.armMeterGate(QStringLiteral("type_upgrade"), physicalShotEpoch,
+                                 shotType, rhythm);
+    });
+    connect(&automation_, &AutomationEngine::shotGateRelease, this,
+            [this](quint64 physicalShotEpoch, double releaseWallMsEpoch) {
+        remotePlay_.sendShotGateRelease(physicalShotEpoch, releaseWallMsEpoch);
+    });
+    connect(&automation_, &AutomationEngine::shotGateDisarm, this,
+            [this](quint64 physicalShotEpoch, const QString& reason) {
+        remotePlay_.sendShotGateDisarm(physicalShotEpoch, reason);
     });
 
     // Stage each release's timing intent, but do not teach the sidecar yet.  The existing seq-paired
@@ -3059,6 +3610,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
              [this](int seq, double wallMs, bool latencyCalibration,
                     double validationTargetPct, double validationTolerancePct,
                     quint64 physicalShotEpoch, quint64 shotAttempt) {
+                 if (automation_.context().inputTimedShot) return; // no meter-learner labels
                  releaseMarkerDeliveryGate_.stage(
                      seq, wallMs, latencyCalibration,
                      validationTargetPct, validationTolerancePct,
@@ -3330,9 +3882,13 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     connect(&automation_, &AutomationEngine::shotAborted, this, [this](const QString& reason) {
         appendLog(QStringLiteral("Shot automation aborted: %1").arg(reason));
         // [ORION_USER_LOG] (5b) plain-language abort line (translate the common token).
-        if (userLog_.enabled()) {
+        // [ORION_ACTIVITY_FEED 2026-09-14] These go through appendCustomerEvent now,
+        // so the same prose reaches the Activity feed whether or not the optional
+        // orion_user.log file sink is enabled. The raw enum line above is
+        // unchanged (tooling greps it) and is deny-listed out of the feed.
+        {
             if (reason == QLatin1String("ls_cancel")) {
-                userLog_.append(QStringLiteral(
+                appendCustomerEvent(QStringLiteral(
                     "Shot canceled — you moved the stick to change the play."));
             } else if (reason == QLatin1String("live_tip_deadline_missed")
                        && shotLeadConflictActiveNow()) {
@@ -3342,15 +3898,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 // whole session died shot by shot with nothing naming the cause. Say the cause
                 // and the fix. The conflict test runs against the CURRENT pair, so a genuine
                 // transient miss on a schedulable pair keeps the raw reason below.
-                userLog_.append(QStringLiteral(
+                appendCustomerEvent(QStringLiteral(
                     "Shot not taken — Shot Lead %1 ms is more than Tip Timing %2 ms can "
                     "schedule (the release deadline is already past when the shot starts). "
                     "Lower Shot Lead to %3 ms or less, or raise/reset Tip Timing.")
-                                    .arg(actuationLeadMs(), 0, 'f', 0)
-                                    .arg(tipTimingMs(), 0, 'f', 0)
-                                    .arg(shotLeadMaxUsableMs(), 0, 'f', 0));
+                                        .arg(actuationLeadMs(), 0, 'f', 0)
+                                        .arg(tipTimingMs(), 0, 'f', 0)
+                                        .arg(shotLeadMaxUsableMs(), 0, 'f', 0));
             } else {
-                userLog_.append(QStringLiteral("Shot not taken (%1).").arg(reason));
+                appendCustomerEvent(QStringLiteral("Shot not taken (%1).").arg(reason));
             }
         }
     });
@@ -3390,6 +3946,18 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // greenConfirmed=0/targetMode=meter_full => block 2 (velocity) fired at the floor.
         // greenConfirmFill/Ms expose the green-confirmation race. All values are single
         // space-free tokens; shot=<type> is LAST (it may contain spaces, like the issued line).
+        //
+        // [ORION_ATTRIBUTION_RISE] READ THIS BEFORE CONCLUDING ANYTHING FROM expectedRise /
+        // withinReach ON A PRE-2026-08-31 LOG. Both fields were written ONLY by processHolding's
+        // legacy vision-crossing block, and processHolding delegates every autonomous-vision shot
+        // to processAutonomousLiveMeterHolding and returns before reaching that block — so on a
+        // shipped build they read expectedRise=0.0 withinReach=0 on 100% of fires REGARDLESS of
+        // timing quality. That is a stamping gap, not a dormant lever: the live path's aim is the
+        // tip (targetPct 100) with the rate compensation applied in the TIME domain as
+        // tipAbs - lead, and withinReach was never an aim term in either path — it is a
+        // reachability gate. Both paths now stamp expectedRise = velocity x lead (unclamped), so
+        // 100 - expectedRise is the fill the command should have been issued at to land on the
+        // tip; compare it with the `fill` on the Release issued line above.
         appendLog(QStringLiteral("Release attribution: seq=%1 greenConfirmed=%2 targetMode=%3 "
                                  "greenWidth=%4 greenConfirmFill=%5 greenConfirmMs=%6 vel=%7 "
                                  "crossingEta=%8 expectedRise=%9 withinReach=%10 shot=%11")
@@ -3420,8 +3988,22 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             ? context.releaseTriggerMs - context.firstMeterSeenMs : -1.0;
         const double holdToRelMs = context.holdStartMs >= 0.0
             ? context.releaseTriggerMs - context.holdStartMs : -1.0;
+        // [2026-09-11] every per-shot deadline displacement rides on this line so a dataset
+        // built from it can never miss one (the 09-09 press-latency trim moved 19 shots by up to
+        // 30 ms and the verdict dataset was built without a column for it).
+        // [ORION_VISION_HOLD_BAND 2026-09-15] APPEND-ONLY (key=value parsers are unaffected; every
+        // field above keeps its position, including pressTrimMs, which has sat after shot=<type>
+        // since 2026-09-11). hold_band names whether
+        // the vision path's release INSTANT was clamped onto the press-anchored hold band for
+        // this shot, and which edge: late (the prediction sat past press + law + band and was
+        // pulled back), early (it sat before press + law − band and was held until it), or none.
+        // A value other than none is also the marker-suppression and learner-fence record: that
+        // release taught neither the latency estimator, nor no_meter_hold_by_type, nor the phase
+        // constant, so a dataset built from this line can separate "the aim moved" from "the
+        // band moved it" without joining another line.
         appendLog(QStringLiteral("Release timing: seq=%1 code=%2 anchorAppearMs=%3 appearToRelMs=%4 "
-                                 "holdToRelMs=%5 plannedClockMs=%6 fillAtRel=%7 peakFill=%8 shot=%9")
+                                 "holdToRelMs=%5 plannedClockMs=%6 fillAtRel=%7 peakFill=%8 shot=%9 "
+                                 "pressTrimMs=%10 hold_band=%11")
                       .arg(context.releaseSeq)
                       .arg(context.releaseReasonCode)
                       .arg(anchorAppearMs, 0, 'f', 0)
@@ -3430,7 +4012,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                       .arg(context.plannedFlickMs, 0, 'f', 0)
                       .arg(context.fillPct, 0, 'f', 1)
                       .arg(context.peakFillPct, 0, 'f', 1)
-                      .arg(context.shotType));
+                      .arg(context.shotType)
+                      .arg(context.pressLatencyTrimMs, 0, 'f', 1)
+                      .arg(context.holdBandKind.isEmpty() ? QStringLiteral("none")
+                                                          : context.holdBandKind));
         // NEW seq-paired line (add-only): SHADOW-MODE autonomous-model decision
         // (autonomous_vision_shadow). COMPUTED but it did NOT control this release. The
         // global-velocity phase-aligned model: shadowAppearToRelMs = when it WOULD have fired,
@@ -3458,15 +4043,27 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // thread submitted this release; deltaMs = actual fire - scheduled deadline (target
         // sub-ms). wifi/jitter = the auto wifi-mode state latched at shot start; clockVisionDiv
         // = feedforward-clock vs vision-crossing disagreement at release.
+        // [ORION_TIP_FRAME_NATIVE 2026-09-17] APPEND-ONLY (key=value parsers are unaffected; every
+        // field above keeps its name and position). The two fire instants this shot's last
+        // SUCCESSFUL vision arm held, in absolute engine ms: aligned_ms is what was actually armed
+        // (the frame-centred target less the lead) and unaligned_ms is what the bare tip alone
+        // would have armed (tip - lead). aligned_ms - unaligned_ms IS the frame-centre offset the
+        // console received, so a graded batch can price frame-native firing against the banner
+        // without reconstructing the tip -- which is exactly what docs/POLL_PHASE_TRACKER.md §10
+        // had to do offline, and why the offset's disappearance went unnoticed for two weeks.
+        // Both are -1 on a shot that never reached a vision arm (blind, feedforward, pose).
         appendLog(QStringLiteral("Scheduled fire: seq=%1 scheduled=%2 deltaMs=%3 wifi=%4 "
-                                 "jitterMs=%5 heldOffsetMs=%6 clockVisionDivMs=%7")
+                                 "jitterMs=%5 heldOffsetMs=%6 clockVisionDivMs=%7 "
+                                 "aligned_ms=%8 unaligned_ms=%9")
                       .arg(context.releaseSeq)
                       .arg(context.firedByScheduler ? 1 : 0)
                       .arg(context.scheduledFireDeltaMs, 0, 'f', 2)
                       .arg(context.wifiMode ? 1 : 0)
                       .arg(context.networkJitterMs, 0, 'f', 1)
                       .arg(context.networkOffsetMs, 0, 'f', 1)
-                      .arg(context.clockVisionDivergenceMs, 0, 'f', 1));
+                      .arg(context.clockVisionDivergenceMs, 0, 'f', 1)
+                      .arg(context.fireAlignedFireAtMs, 0, 'f', 3)
+                      .arg(context.fireUnalignedFireAtMs, 0, 'f', 3));
         // NEW seq-paired line (add-only, key=value): per-shot detection-sample census.
         // Attributes a detector-authority abort to the gate that starved it:
         // fresh=0 + staleMem high = sidecar fed only held/echoed fills (detector or
@@ -3536,8 +4133,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             : context.mode == ShotMode::GoToStick ? QStringLiteral("GoToStick")
             : context.mode == ShotMode::TempoStick ? QStringLiteral("TempoStick")
             : QStringLiteral("ButtonShot");
+        // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] APPEND-ONLY (key=value parsers are unaffected;
+        // every field above keeps its position, shot=<type> included -- it may contain spaces, so
+        // release_style is appended AFTER it exactly as pressTrimMs is on the Release timing
+        // line). release_style names which release EDGE this shot actually emitted: flick (the
+        // opposing full-scale deflection) or letgo (the stick driven to neutral at the same
+        // instant). It is the setting in force at the release, so a returned log can separate
+        // "the timing was wrong" from "the game did not read the edge".
         appendLog(QStringLiteral("Release tempo: seq=%1 mode=%2 bucket=%3 path=%4 plannedFlickMs=%5 "
-                                 "flickDir=%6 shot=%7")
+                                 "flickDir=%6 shot=%7 release_style=%8")
                       .arg(context.releaseSeq)
                       .arg(modeName)
                       .arg(QString(context.bucketKey).replace(QLatin1Char(' '), QLatin1Char('_')))
@@ -3546,11 +4150,20 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                       // Both Tempo representations use one invariant gather-down /
                       // flick-up packet for every shot type. "-" means this mode has
                       // no generated tempo flick.
+                      // [ORION_TEMPO_RELEASE_STYLE] flickDir is deliberately LEFT ALONE -- it is a
+                      // parsed field and this change is append-only. release_style at the end of
+                      // the line is what says whether that "up" was a flick or a let-go.
                       .arg(context.mode == ShotMode::TempoSquare
                                    || context.mode == ShotMode::TempoStick
                                ? QStringLiteral("up")
                                : QStringLiteral("-"))
-                      .arg(context.shotType));
+                      .arg(context.shotType)
+                      // The ENGINE's effective style, not the file's: the env override
+                      // (ORION_TEMPO_RELEASE_STYLE) is applied in applyConfig, and the log must
+                      // report the edge that was actually emitted.
+                      .arg(QString::fromLatin1(tempoReleaseStyleToken(
+                          tempoReleaseStyleFromString(
+                              automation_.config().tempoReleaseStyle)))));
         // Pair engine telemetry with the exact output-route proof. A precise fire already carries
         // its sequence-tagged local ACK; a non-precise release is classified from this GUI tick's
         // active route below. Never infer precise delivery from a later de-duplicated pipe write.
@@ -3564,6 +4177,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         pendingSubmitFireToken_ = confirmedPreciseFireToken_;
         pendingSubmitTransportSeq_ = confirmedPreciseFireTransportSeq_;
         pendingSubmitSnapshot_ = confirmedPreciseFireSnapshot_;
+        // [ORION_TIP_FRAME_NATIVE 2026-09-17] The shot's own grid, its last vision arm's target
+        // rule, and the lead that arm spent — taken HERE because the engine resets the shot (and
+        // with it framePhase) well before the post-submit line below is written.
+        pendingSubmitFrameGrid_ = ReleaseFrameGridSnapshot{};
+        pendingSubmitFrameGrid_.grid = context.framePhase.estimate();
+        pendingSubmitFrameGrid_.fireTargetMode = context.fireTargetMode;
+        pendingSubmitFrameGrid_.leadMs = context.effectiveLatencyMs;
+        pendingSubmitFrameGrid_.alignedFireAtMs = context.fireAlignedFireAtMs;
+        pendingSubmitFrameGrid_.unalignedFireAtMs = context.fireUnalignedFireAtMs;
         confirmedPreciseFireStage_ = PreciseFireDeliveryStage::None;
         confirmedPreciseFireToken_ = 0;
         confirmedPreciseFireTransportSeq_ = 0;
@@ -3587,6 +4209,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             // on the next physical poll, which may never reach AutomationEngine::process when the
             // physical pad disappeared in the same PnP transition.
             automation_.reset();
+            // The direct pipe can still own a held button when ViGEm goes away.
+            // Normal submit polling is gated on the virtual target, so teardown
+            // must clear that state even when the optional timeout watchdog is off.
+            neutralizeOwnedInput();
             shot_ = automation_.context();
             shotState_ = holdStateText(shot_.state);
             observeBotOwnership(shot_);
@@ -3682,7 +4308,25 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             });
     });
     connect(&networkBridge_, &NetworkBridge::connectionChanged, this, [this](bool ok, const QString& msg) {
-        appendLog(QStringLiteral("Network bridge: %1 - %2").arg(ok ? QStringLiteral("connected") : QStringLiteral("disconnected"), msg));
+        // [ORION_ACTIVITY_FEED 2026-09-14] ROOT CAUSE of 470 identical
+        // "Network bridge: connected - Bridge: [WinError 5] Access is denied."
+        // lines in one hour: NetworkBridge::handleMessage maps EVERY `error`
+        // event from the service to connectionChanged(connected_.load(), ...).
+        // While the loopback link is authenticated but WinDivert cannot open
+        // without elevation, the service answers `error` on every verb, so a
+        // STATE-UNCHANGED signal fired every few seconds and each one logged.
+        // connectionChanged is a state signal, so log state CHANGES only: the
+        // same (ok, message) pair never logs twice in a row. Everything below
+        // (court-IP revocation, bridge restart, the QML notifies) still runs on
+        // every signal — only the log line is deduplicated.
+        const QString bridgeState = QStringLiteral("%1 - %2")
+                                        .arg(ok ? QStringLiteral("connected")
+                                                : QStringLiteral("disconnected"),
+                                             msg);
+        if (bridgeState != lastNetworkBridgeStateLine_) {
+            lastNetworkBridgeStateLine_ = bridgeState;
+            appendLog(QStringLiteral("Network bridge: %1").arg(bridgeState));
+        }
         if (!ok) {
             // The bridge owns display-only diagnostics, so disconnect revokes
             // only that identity and cannot mutate sidecar timing authority.
@@ -4080,6 +4724,12 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         authMessage_ = QStringLiteral("Local native dev license accepted. Opening Venice.");
         currentPage_ = QStringLiteral("remotePlay");
         appendLog(QStringLiteral("Local UI smoke-test unlock accepted."));
+        // Pre-warm the capture preview so the Live Capture card is live at launch instead of
+        // a black panel. This auto-unlock path AUTHENTICATES DIRECTLY and skips the license
+        // activationFinished handler where the other pre-warm lives, so it needs its own call.
+        // Deferred to the event loop so remotePlay_ is fully wired before it spawns the sidecar;
+        // startCapturePreview() is idempotent/guarded (capture-card source, no-op if already up).
+        QTimer::singleShot(0, this, [this]() { startCapturePreview(); });
     }
 
     // Dev convenience: auto-submit a license key from the ORION_LICENSE_KEY env var so a
@@ -4101,6 +4751,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // --- Watchdogs -------------------------------------------------------
     // Sidecar crash while streaming: restart it once; a repeat inside the
     // 5-minute window escalates to safe mode. Any trip disarms + neutrals first.
+    connect(&remotePlay_, &RemotePlaySession::sidecarStopFinished, this, [this]() {
+        if (remotePlayTeardownActive_) finishRemotePlayTeardown();
+    });
     connect(&remotePlay_, &RemotePlaySession::sidecarExited, this, [this](bool whileStreaming) {
         // Frame numbers restart with the sidecar. Drop the entire old join
         // namespace before any restart path can paint a low-number new frame.
@@ -4116,7 +4769,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         meterConfirmed_ = false;
         meterBoxCaptureSize_ = {};
         lastRealMeterSeenMs_ = 0;
+        lastMeterOverlayVisualSeenMs_ = 0;
         userMeterVisible_ = false;
+        // The health line describes the reader that just died; a restarted sidecar
+        // re-publishes within ~2 s, and until then the card must not quote a ghost.
+        if (!detectorHealthLine_.isEmpty() || !detectorProvider_.isEmpty()) {
+            detectorHealthLine_.clear();
+            detectorProvider_.clear();
+            emit detectorHealthChanged();
+        }
         botOwnershipArmToken_ = 0;
         botOwnershipStartedMs_ = -1.0;
         botOwnershipEndedMs_ = -1.0;
@@ -4299,6 +4960,97 @@ OrionAppController::~OrionAppController()
 #endif
 }
 
+// ── MOTD (docs/ADMIN_PANEL_V2_CONTRACT.md §5) ─────────────────────────────────
+// The banner shows iff there is text, `until` has not passed, and the user has not
+// dismissed THIS text. Dismissal is process memory only — never written to settings.
+bool OrionAppController::motdVisible() const
+{
+    return !motdDismissed_ && motd_.activeAt(QDateTime::currentSecsSinceEpoch());
+}
+
+void OrionAppController::dismissMotd()
+{
+    if (motd_.isEmpty() || motdDismissed_) {
+        return;
+    }
+    motdDismissed_ = true;
+    appendLog(QStringLiteral("MOTD dismissed for this session."));
+    emit motdChanged();
+}
+
+void OrionAppController::applyServerMotd(const LicenseMotd& motd)
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // An absent, blank or already-expired notice clears the slot (contract: hidden
+    // when absent or until < now). A changed text re-arms the banner even if the
+    // previous one was dismissed; the same text keeps the user's dismissal.
+    const LicenseMotd next = motd.activeAt(now) ? motd : LicenseMotd{};
+    const bool textChanged = next.text != motd_.text;
+    const bool changed = textChanged || next.level != motd_.level || next.untilEpochS != motd_.untilEpochS;
+    if (textChanged) {
+        motdDismissed_ = false;
+        if (!next.text.isEmpty()) {
+            appendLog(QStringLiteral("MOTD (%1%2): %3")
+                          .arg(next.level,
+                               next.untilEpochS > 0
+                                   ? QStringLiteral(", until %1").arg(
+                                         QDateTime::fromSecsSinceEpoch(next.untilEpochS).toString(Qt::ISODate))
+                                   : QString(),
+                               next.text.left(200)));
+        } else if (!motd_.text.isEmpty()) {
+            appendLog(QStringLiteral("MOTD cleared."));
+        }
+    }
+    motd_ = next;
+
+    // Hide on the dot when `until` passes rather than waiting for the next 5-min
+    // heartbeat. Capped at 24 h per arm; the timeout re-applies motd_ and re-arms.
+    motdExpiryTimer_.stop();
+    if (motd_.untilEpochS > now) {
+        const qint64 waitMs = std::min<qint64>((motd_.untilEpochS - now) * 1000 + 250, qint64(24) * 60 * 60 * 1000);
+        motdExpiryTimer_.start(static_cast<int>(waitMs));
+    }
+
+    if (changed) {
+        emit motdChanged();
+    }
+}
+
+int OrionAppController::profileDaysLeft() const noexcept
+{
+    return licenseDaysLeft(profile_.known, profile_.expiryEpochS,
+                           QDateTime::currentSecsSinceEpoch());
+}
+
+void OrionAppController::applyLicenseProfile(const LicenseProfile& profile)
+{
+    // TOLERANT: the current live backend sends no `profile`. A response without
+    // one must never blank a page the previous response already populated, so an
+    // unknown block is simply ignored.
+    if (!profile.known) {
+        return;
+    }
+    const bool changed =
+        profile.discordUserId != profile_.discordUserId
+        || profile.discordUsername != profile_.discordUsername
+        || profile.plan != profile_.plan
+        || profile.expiryEpochS != profile_.expiryEpochS
+        || profile.activatedAtEpochS != profile_.activatedAtEpochS
+        || profile.hwidResetsUsed != profile_.hwidResetsUsed
+        || profile.hwidResetsFreeTotal != profile_.hwidResetsFreeTotal
+        || profile.hwidResetsFreeRemaining != profile_.hwidResetsFreeRemaining
+        || profile.hwidPaidCredits != profile_.hwidPaidCredits
+        || !profile_.known;
+    profile_ = profile;
+    if (changed) {
+        emit profileChanged();
+        // The "Time left" row on Setup/Live reads timeLeft_, which the 1 s runtime
+        // poll rewrites from licenseState_ alone. Refresh it here so the hero
+        // number on Profile and that row can never tell the user two stories.
+        emit statusChanged();
+    }
+}
+
 void OrionAppController::requestApplicationShutdown()
 {
     if (!markApplicationShutdownRequested(applicationShutdownPhase_)) {
@@ -4331,6 +5083,10 @@ void OrionAppController::prepareForApplicationExit()
     }
 
     appendLog(QStringLiteral("Application shutdown teardown started."));
+    // [2026-09-11] The precise-fire worker is joined FIRST: nothing below may race a worker that
+    // still reads automation_ / the input client / the log sink while they are being reset.
+    delete fireThread_;
+    fireThread_ = nullptr;
 
     // Stop every GUI producer that could re-arm automation, reopen capture, or
     // queue a sidecar recovery while teardown is in progress.
@@ -4364,25 +5120,10 @@ void OrionAppController::prepareForApplicationExit()
 
 void OrionAppController::killChiakiProcesses()
 {
-#ifdef Q_OS_WIN
-    if (chiakiCleanupDone_) {
-        return;
-    }
+    if (chiakiCleanupDone_) return;
     chiakiCleanupDone_ = true;
-    // Kill the sidecar process by PID FIRST — it holds the capture card open.
-    // Without this, force-killing OrionNative orphans the python sidecar which
-    // keeps the Elgato device locked, preventing the next launch from opening it.
-    const qint64 sidecarPid = remotePlay_.sidecarPid();
-    if (sidecarPid > 0) {
-        QProcess::execute(QStringLiteral("taskkill.exe"),
-                          {QStringLiteral("/PID"), QString::number(sidecarPid),
-                           QStringLiteral("/F"), QStringLiteral("/T")});
-    }
-    QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("OrionStream.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-    QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("chiaki.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-    QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("chiaki-ng.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-    QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("chiaki4deck.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-#endif
+    remotePlay_.stop();
+    remotePlay_.waitForStopped();
 }
 
 void OrionAppController::setFrameProvider(RemoteFrameProvider* provider)
@@ -4436,12 +5177,32 @@ bool OrionAppController::nativeEventFilter(const QByteArray& eventType, void* me
         case WM_XBUTTONDBLCLK:
             kind = DesktopUiInputKind::MouseButton;
             break;
+        // [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] The owner-visible half of the
+        // defect: a stick mapped to the pointer walks the cursor over Venice and
+        // lights up every hover state it crosses, and the other stick maps to the
+        // wheel (which in QML changes whatever Slider/ComboBox is under the
+        // cursor). Neither message was classified before, so neither could ever
+        // be suppressed no matter how wide the guard was.
+        case WM_MOUSEMOVE:
+        case WM_NCMOUSEMOVE:
+        case WM_MOUSEHOVER:
+            kind = DesktopUiInputKind::PointerMotion;
+            break;
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+            kind = DesktopUiInputKind::WheelScroll;
+            break;
         default:
             break;
         }
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-        if (shouldSuppressControllerMappedUiInput(
-                remoteRunning_, nowMs, controllerUiGuardUntilMs_, kind)) {
+        const DesktopUiInputOrigin origin = desktopUiInputKindDrivesUi(kind)
+            ? currentDesktopUiInputOrigin()
+            : DesktopUiInputOrigin::Unknown;
+        if (shouldIsolateDesktopUiInput(
+                remoteRunning_, controllerUiPassthrough_, controllerUiInjectedIsolation_,
+                origin, nowMs, controllerUiGuardUntilMs_,
+                controllerUiPointerGuardUntilMs_, kind)) {
             if (!controllerUiSuppressionLogged_) {
                 controllerUiSuppressionLogged_ = true;
                 appendLog(QStringLiteral("Controller UI isolation active: PS5 gameplay input cannot activate Venice controls."));
@@ -4510,6 +5271,12 @@ void OrionAppController::handleRawInputDeviceChange(
                 lightbarEffectTimer_.stop();
                 controllerSelector_.reset();
                 physicalMissingSinceMs_ = nowMs;
+                // [ORION_PAD_SILENT_HOLD 2026-09-11] The device is gone from the bus:
+                // nothing to nudge, and the poll's onset block is skipped (since != 0),
+                // so pin the unplug grace here instead of inheriting the last episode's.
+                physicalMissingNudged_ = true;
+                physicalMissingTeardownGraceMs_ = silentPadTeardownGraceMs(
+                    /*enumerated=*/false, automation_.armed() || ownSeq_ >= 0);
                 controllerLedStatus_ = QStringLiteral("LED waiting for controller");
                 appendLog(QStringLiteral("Physical controller removed - waiting for debounce before virtual teardown."));
                 disarmPreciseFire();
@@ -4551,10 +5318,32 @@ QString OrionAppController::logText() const
     return logs_.join(QLatin1Char('\n'));
 }
 
+QString OrionAppController::activityText() const
+{
+    return customerLogs_.join(QLatin1Char('\n'));
+}
+
+void OrionAppController::appendCustomerEvent(const QString& plainText)
+{
+    if (plainText.trimmed().isEmpty()) {
+        return;
+    }
+    // The optional plain-language FILE sink keeps its own (untimestamped-by-us)
+    // copy; appendLog owns the rings and the diagnostic stream.
+    userLog_.append(plainText);
+    appendLog(plainText);
+}
+
 void OrionAppController::authenticate(const QString& key)
 {
     const auto normalized = key.trimmed().toUpper();
     if (authBusy_) {
+        return;
+    }
+    static const QRegularExpression publicDiscordId(QStringLiteral("^\\d{16,22}$"));
+    if (publicDiscordId.match(normalized).hasMatch()) {
+        authMessage_ = QStringLiteral("A Discord ID is public. Select Connect Discord to verify your account.");
+        emit authChanged();
         return;
     }
     if (!security_.validateLicenseKeyFormat(normalized)) {
@@ -4949,7 +5738,7 @@ void OrionAppController::toggleDefenseMode()
 void OrionAppController::syncEngineArmed()
 {
     const bool routeReady = automationRouteReady(
-        remotePlay_.state() == RemotePlayState::Running,
+        directInputWriteAllowed(remotePlay_.state(), remotePlay_.inputRecoveryPending()),
         controller_.isConnected());
     // [ORION_METER_DELAY_ROUTE_AUTHORITY 2026-08-08] Route/security authority and
     // the meter-delay ramp gate are evaluated separately so a delay-only disarm
@@ -4960,7 +5749,9 @@ void OrionAppController::syncEngineArmed()
         && automationSecurityAllowed()
         && !applicationShutdownActive(applicationShutdownPhase_)
         && !defenseModeActive_ && !safeModeActive_
-        && !captureAwaitingFreshFrame_ && !inputRouteAwaitingRecovery_
+        && (!config_.data().inputTimedEnabled || !inputTimedPaused_)
+        && (config_.data().inputTimedEnabled || !captureAwaitingFreshFrame_)
+        && !inputRouteAwaitingRecovery_
         && !preciseFireDeliveryFault_
         && !shotIntentEdgeTracker_.transportRecoveryActive();
     // [ORION_METER_DELAY_FIRST_SHOT 2026-08-07] Use readyForArm() instead of
@@ -4973,7 +5764,7 @@ void OrionAppController::syncEngineArmed()
     // MeterDelayController.h:readyForArm() for the contract; original callsite
     // used to gate on conditionSettled() to protect frozen learned_latency_ms.
     const bool meterDelayGateOk =
-        !meterDelay_.enabled() || meterDelay_.readyForArm();
+        config_.data().inputTimedEnabled || !meterDelay_.enabled() || meterDelay_.readyForArm();
     const EngineArmDecision decision =
         engineArmDecision(routeAuthorityOk, meterDelayGateOk);
     const bool shouldArm = decision.arm;
@@ -5009,9 +5800,7 @@ void OrionAppController::syncEngineArmed()
             automation_.cancelPostReleaseGrade(pendingSubmitSeq_);
             const QString notice = userReleaseTracker_.fail(
                 pendingSubmitSeq_, UserReleaseFailureReason::ControllerRouteRevoked);
-            if (userLog_.enabled() && !notice.isEmpty()) {
-                userLog_.append(notice);
-            }
+            appendCustomerEvent(notice);
             pendingSubmitSeq_ = -1;
         }
         releaseMarkerDeliveryGate_.reset();
@@ -5024,6 +5813,7 @@ void OrionAppController::syncEngineArmed()
         pendingSubmitFireToken_ = 0;
         pendingSubmitTransportSeq_ = 0;
         pendingSubmitSnapshot_ = {};
+        pendingSubmitFrameGrid_ = {};
         confirmedPreciseFireStage_ = PreciseFireDeliveryStage::None;
         confirmedPreciseFireToken_ = 0;
         confirmedPreciseFireTransportSeq_ = 0;
@@ -5035,7 +5825,7 @@ void OrionAppController::refreshPassiveLatencyAdaptationStatus(bool routeReady)
 {
     const RemapConfig timingConfig = automation_.config();
     const bool autonomousLiveMeter = timingConfig.autonomousVision
-        && !timingConfig.noMeterEnabled;
+        && !timingConfig.noMeterEnabled && !timingConfig.inputTimedEnabled;
     if (!autonomousLiveMeter || automation_.autonomousLiveMeterReady()
         || automation_.latencyCalibrationMode()) {
         return;
@@ -5086,9 +5876,7 @@ void OrionAppController::fencePreciseFireToken(quint64 token, bool fallbackTakeo
             automation_.setArmed(false);
             const QString userNotice = UserFacingReleaseTracker::failureNotice(
                 UserReleaseFailureReason::PreciseWriteFailed);
-            if (userLog_.enabled() && !userNotice.isEmpty()) {
-                userLog_.append(userNotice);
-            }
+            appendCustomerEvent(userNotice);
             setControllerLifecycle(
                 ControllerLifecycleState::ControllerFault,
                 QStringLiteral("Precise release NOT submitted; controller route recovery required"));
@@ -5106,6 +5894,86 @@ void OrionAppController::fencePreciseFireToken(quint64 token, bool fallbackTakeo
     quint64 expected = token;
     lastArmedFireToken_.compare_exchange_strong(
         expected, 0, std::memory_order_acq_rel);
+}
+
+void OrionAppController::applyPendingPhaseAnchorRefinement()
+{
+    const PhaseAnchorRefinementProposal proposal =
+        automation_.pendingPhaseAnchorRefinement();
+    if (!proposal.valid()) {
+        return;
+    }
+    auto reject = [this, &proposal](const QString& reason) {
+        automation_.rejectPhaseAnchorRefinement(proposal.id, reason);
+        appendLog(QStringLiteral(
+            "PRECISE FIRE RETARGET: disposition=kept_fallback stage=%1 proposal=%2 "
+            "token=%3 reason=%4")
+                      .arg(proposal.stagePct)
+                      .arg(proposal.id)
+                      .arg(proposal.scheduleToken)
+                      .arg(reason.left(64)));
+    };
+    if (!fireThread_ || proposal.scheduleToken != automation_.scheduledFireToken()) {
+        reject(QStringLiteral("worker_or_engine_token_missing"));
+        return;
+    }
+    const quint64 armedToken =
+        lastArmedFireToken_.load(std::memory_order_acquire);
+    if (armedToken == 0) {
+        // The engine token exists but the controller has not copied it into the worker yet.
+        // Committing now is safe: the ordinary arm block will see only the refined deadline.
+        if (automation_.commitPhaseAnchorRefinement(
+                proposal.id, proposal.scheduleToken, proposal.refinedDeadlineMs)) {
+            appendLog(QStringLiteral(
+                "PRECISE FIRE RETARGET: disposition=committed_before_worker stage=%1 "
+                "proposal=%2 token=%3")
+                          .arg(proposal.stagePct)
+                          .arg(proposal.id)
+                          .arg(proposal.scheduleToken));
+        } else {
+            reject(QStringLiteral("engine_commit_refused"));
+        }
+        return;
+    }
+    if (armedToken != proposal.scheduleToken) {
+        reject(QStringLiteral("wrong_worker_token"));
+        return;
+    }
+
+    const PreciseFireRetargetResult result = fireThread_->retarget(proposal);
+    if (result == PreciseFireRetargetResult::Retargeted) {
+        appendLog(QStringLiteral(
+            "PRECISE FIRE RETARGET: disposition=retargeted stage=%1 proposal=%2 "
+            "token=%3 eta_ms=%4")
+                      .arg(proposal.stagePct)
+                      .arg(proposal.id)
+                      .arg(proposal.scheduleToken)
+                      .arg(proposal.refinedDeadlineMs - automation_.engineNowMs(),
+                           0, 'f', 3));
+        return;
+    }
+    QString reason;
+    switch (result) {
+    case PreciseFireRetargetResult::Retargeted:
+        return;
+    case PreciseFireRetargetResult::EngineDisarmed:
+        reason = QStringLiteral("engine_disarmed"); break;
+    case PreciseFireRetargetResult::InvalidToken:
+        reason = QStringLiteral("invalid_token"); break;
+    case PreciseFireRetargetResult::WrongToken:
+        reason = QStringLiteral("wrong_token"); break;
+    case PreciseFireRetargetResult::NotWaiting:
+        reason = QStringLiteral("worker_claimed"); break;
+    case PreciseFireRetargetResult::OutcomePending:
+        reason = QStringLiteral("outcome_pending"); break;
+    case PreciseFireRetargetResult::RouteRejected:
+        reason = QStringLiteral("route_rejected"); break;
+    case PreciseFireRetargetResult::WindowRejected:
+        reason = QStringLiteral("window_rejected"); break;
+    case PreciseFireRetargetResult::EngineRejected:
+        reason = QStringLiteral("engine_rejected"); break;
+    }
+    reject(reason);
 }
 
 void OrionAppController::confirmPreciseFire(
@@ -5168,9 +6036,32 @@ void OrionAppController::disarmPreciseFire(bool confirmSubmitted)
     fireThread_->takeFailure(&failedToken, &failedDetail);
 }
 
+bool OrionAppController::releaseStaleSquareOutputLocked(const QString& reason)
+{
+    if (!squareOutputWatchdogEnabled_) return false;
+    const auto result = orionInput_.releaseSquareForWatchdog();
+    if (result.attempted == 0) return false;
+    squareOutputWatchdog_.noteReleaseAttempt();
+    appendLog(QStringLiteral("%1: reason=%2 copies_attempted=%3 copies_accepted=%4 "
+                             "local_route_ack=%5 console_ack=0")
+                  .arg(result.accepted > 0 ? QStringLiteral("SQUARE WATCHDOG RELEASED")
+                                           : QStringLiteral("SQUARE WATCHDOG RELEASE FAILED"), reason)
+                  .arg(result.attempted).arg(result.accepted)
+                  .arg(result.accepted == 2 ? 1 : 0));
+    if (result.accepted != 2) {
+        preciseFireDeliveryFault_ = true;
+        preciseFireRecoveryNeutralFrames_ = 0;
+        automation_.setArmed(false);
+    }
+    return true;
+}
+
 void OrionAppController::neutralizeOwnedInput()
 {
     QMutexLocker submitLock(&submitMutex_);
+    // Callers already disarmed/revoked ownership. The optional watchdog adds
+    // its bounded Square-up copies; it never gates mandatory neutral cleanup.
+    releaseStaleSquareOutputLocked(QStringLiteral("owned_input_teardown"));
     ControllerState neutral;
     neutral.lightbarSet = false;
     QString ignored;
@@ -5178,11 +6069,26 @@ void OrionAppController::neutralizeOwnedInput()
     const bool directRouteOwned = directInputRouteCurrentlyOwned(
         orionInput_.connected(), orionInput_.haveSent(),
         orionInput_.haveSent() && orionInput_.lastSent().own != 0);
-    if (directRouteOwned && orionInput_.send(neutral, true)) {
-        lastFireHookWriteUs_.store(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count(),
-            std::memory_order_relaxed);
+    if (directRouteOwned) {
+        const bool previousSquare = (orionInput_.lastSent().buttons & (1u << 2)) != 0;
+        // Cleanup is a delivery transaction, not an ordinary latest-wins
+        // update. Even an identical cached neutral needs an exact local ACK.
+        // The established-owned-route gate above forbids reconnecting or
+        // seeding a new route merely because a virtual target disappeared.
+        const auto result = orionInput_.sendDetailed(neutral, true, true);
+        const bool accepted = result == InputRouteWriteResult::LocalUdpAccepted;
+        if (accepted) {
+            lastFireHookWriteUs_.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+        }
+        appendLog(QStringLiteral(
+            "Owned input cleanup: previous_square=%1 requested_square=0 "
+            "virtual_connected=%2 local_route_ack=%3 console_ack=0")
+                      .arg(previousSquare ? 1 : 0)
+                      .arg(controller_.isConnected() ? 1 : 0)
+                      .arg(accepted ? 1 : 0));
     }
 }
 
@@ -5212,7 +6118,10 @@ void OrionAppController::releaseFailedRemoteInputRoute()
             orionInput_.connected(), orionInput_.haveSent(),
             orionInput_.haveSent() && orionInput_.lastSent().own != 0);
         if (hadDirectOwnership) {
-            directOwnershipReleased = orionInput_.send(neutral, false);
+            releaseStaleSquareOutputLocked(QStringLiteral("remote_input_route_failed"));
+            // No reconnect/seed from a terminal Error if watchdog ACK failed.
+            directOwnershipReleased = orionInput_.connected()
+                && orionInput_.send(neutral, false);
         }
         // Error terminates this input-process generation even when the
         // capture-only sidecar stays alive. A retry must establish and seed a
@@ -5238,6 +6147,7 @@ void OrionAppController::releaseFailedRemoteInputRoute()
 
     shotIntentEdgeTracker_.reset();
     previousControllerUiState_ = ControllerState{};
+    squareUpAuditTracker_.reset();
     inputRouteAwaitingRecovery_ = false;
     preciseFireDeliveryFault_ = false;
     preciseFireRecoveryNeutralFrames_ = 0;
@@ -5338,6 +6248,12 @@ void OrionAppController::onWatchdogTick()
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     guiHeartbeatMs_.store(now, std::memory_order_relaxed);
 
+    // [ORION_INPUT_DEAD_UX] Periodic re-evaluation of the dead-input overlay. The direct pipe
+    // can drop without a dedicated NOTIFY, and the press latch expires on wall clock; this 2 s
+    // beat keeps the on-screen verdict honest between event-driven refreshes. Cheap (a few
+    // comparisons; emits only on change).
+    refreshInputDeliveryState();
+
     // The freeze worker tripped while the GUI was stuck — escalate now that we
     // are demonstrably alive again (the trip already neutraled + disarmed).
     if (guiFreezeTripped_.load(std::memory_order_relaxed) && !safeModeActive_) {
@@ -5395,7 +6311,7 @@ void OrionAppController::onWatchdogTick()
     // is not a dead process while raw frames continue arriving. Restart only after
     // raw transport delivery has stopped for the bounded threshold or the backend
     // explicitly reports its own terminal frozen state.
-    if (streamLive && transportFailed) {
+    if (streamLive && transportFailed && !config_.data().inputTimedEnabled) {
         // Occlusion-aware: MINIMIZING the Orion window stalls the Vulkan present, which freezes
         // the decoded-frame feed. That's expected + fully recoverable (the present resumes the
         // instant the window is restored) — NOT a sidecar fault. Escalating it to a restart +
@@ -5479,7 +6395,8 @@ void OrionAppController::onWatchdogTick()
     // error (e.g. a genuine launch failure) — restarting just loops 4x and respawns an
     // un-embeddable (floating) chiaki window. Surface the error instead of looping. (With the
     // orchestrator's HWND-decouple, a not-yet-visible window no longer errors here.)
-    if (streamLive && remotePlay_.state() != RemotePlayState::Error
+    if (streamLive && !config_.data().inputTimedEnabled
+            && remotePlay_.state() != RemotePlayState::Error
             && now < streamStartupGraceUntilMs_
             && now - streamConnectMs_ > 35000
             && decoderStalled
@@ -6008,6 +6925,8 @@ void OrionAppController::applyDefenseAssists(ControllerState& output) const
 
 void OrionAppController::detectPs5()
 {
+    if (isXboxRemotePlay(config_.data()))
+        return;
     backendMessage_ = QStringLiteral("Console discovery is Chiaki-managed; checking passive telemetry state...");
     appendLog(backendMessage_);
     emit statusChanged();
@@ -6016,6 +6935,10 @@ void OrionAppController::detectPs5()
 
 void OrionAppController::openChiaki()
 {
+    if (isXboxRemotePlay(config_.data())) {
+        openXboxRemotePlay();
+        return;
+    }
     saveRemoteSettings();
 
     // If no console IP is configured, run a quick UDP discovery sweep first so the
@@ -6067,25 +6990,38 @@ void OrionAppController::updateChiakiEmbedRect(int x, int y, int width, int heig
 
 void OrionAppController::restartSidecarWithWindowContainment()
 {
-    if (applicationShutdownActive(applicationShutdownPhase_)) {
+    // [ORION_DISCONNECT_AUDIT 2026-09-19] F8, defence in depth. All six call sites are
+    // independently gated on "the session is still live" today, so this is not a live
+    // bug -- but this function is precisely the one that re-arms chiakiEmbedVisible_
+    // and restarts chiakiEmbedWatchdog_ that disconnectRemotePlay() just stopped, and
+    // then respawns the sidecar. A restart racing a teardown is the shape of "I pressed
+    // Disconnect and it came back". The teardown flag is the authority for "the user is
+    // stopping"; honour it here too instead of trusting six callers to keep doing so.
+    if (!sidecarRestartAllowedDuringLifecycle(
+            applicationShutdownActive(applicationShutdownPhase_),
+            remotePlayTeardownActive_)) {
+        if (remotePlayTeardownActive_) {
+            appendLog(QStringLiteral(
+                "Sidecar restart refused: a Remote Play teardown is in progress."));
+        }
         return;
     }
     // A restarted detector begins a new frame/timestamp namespace. Invalidate
     // the last HUD sample now; do not wait for the exit callback or a new frame.
     clearMeterMetrics(true);
 #ifdef Q_OS_WIN
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    embedWatchdogGraceUntilMs_ = extendStreamWindowContainmentGrace(
-        embedWatchdogGraceUntilMs_, nowMs);
-    chiakiEmbedWatchdog_.setInterval(kStreamWindowWatchdogFastMs);
-    // A restarted capture-card sidecar still launches OrionStream for INPUT. It
-    // therefore has a native window even though video comes from HDMI. Keep the
-    // hunter live in every source mode and sweep once before teardown so an
-    // already-racing top-level client is hidden immediately.
-    chiakiEmbedVisible_ = true;
-    setChiakiEmbedVisible(true);
-    if (!chiakiEmbedWatchdog_.isActive()) {
-        chiakiEmbedWatchdog_.start();
+    if (!isXboxRemotePlay(config_.data())) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        embedWatchdogGraceUntilMs_ = extendStreamWindowContainmentGrace(
+            embedWatchdogGraceUntilMs_, nowMs);
+        chiakiEmbedWatchdog_.setInterval(kStreamWindowWatchdogFastMs);
+        // PS5 capture-card mode still launches OrionStream for INPUT. Xbox does
+        // not: never start its window-containment watchdog for Microsoft's app.
+        chiakiEmbedVisible_ = true;
+        setChiakiEmbedVisible(true);
+        if (!chiakiEmbedWatchdog_.isActive()) {
+            chiakiEmbedWatchdog_.start();
+        }
     }
 #endif
     {
@@ -6101,6 +7037,8 @@ void OrionAppController::restartSidecarWithWindowContainment()
 
 void OrionAppController::setChiakiEmbedVisible(bool visible)
 {
+    if (isXboxRemotePlay(config_.data()))
+        return; // Never reparent/hide Microsoft's client or a browser window.
     chiakiEmbedVisible_ = visible;
     const auto setEmbedStatus = [this](const QString& value) {
         if (chiakiEmbedStatus_ != value) {
@@ -6113,7 +7051,7 @@ void OrionAppController::setChiakiEmbedVisible(bool visible)
     if (!visible) {
         HWND chiaki = reinterpret_cast<HWND>(chiakiWindowHandle_);
         if (chiaki && IsWindow(chiaki)) {
-            ShowWindow(chiaki, SW_HIDE);
+            ShowWindowAsync(chiaki, SW_HIDE);
         }
         // Forget the applied geometry so the next show re-issues SetWindowPos (with
         // SWP_SHOWWINDOW) instead of the idempotent fast path skipping it as "unchanged".
@@ -6130,125 +7068,31 @@ void OrionAppController::setChiakiEmbedVisible(bool visible)
     // the qmlRenderMode_ branch so it is authoritative regardless of render mode.
     const bool captureCardMode =
         config_.data().videoSource.compare(QLatin1String("capture_card"), Qt::CaseInsensitive) == 0;
-    if (captureCardMode) {
-        HWND parent = mainWindowHandle();
-        HWND chiakiQ = reinterpret_cast<HWND>(chiakiWindowHandle_);
-        if (chiakiQ && IsWindow(chiakiQ) && parent && GetParent(chiakiQ) == parent) {
-            ShowWindow(chiakiQ, SW_HIDE);
-        }
-
-        // Always sweep top-level candidates even while a cached old child is
-        // valid. A restart can overlap both windows; trusting the cached child
-        // leaves the replacement standalone indefinitely.
-        for (int sweep = 0; sweep < 8; ++sweep) {
-            HWND candidate = findChiakiWindow();
-            if (!candidate || !IsWindow(candidate)) {
-                break;
+    if (captureCardMode || qmlRenderMode_) {
+        // Video is already delivered by HDMI/SHM. Parenting a foreign HWND attaches
+        // input queues and couples shutdown/DPI behavior; it is not a video input.
+        // Only a verified stream executable is eligible, never a title-only match.
+        const HWND candidate = findChiakiWindow();
+        if (candidate && IsWindow(candidate)) {
+            const bool changed = chiakiWindowHandle_ != reinterpret_cast<quintptr>(candidate);
+            chiakiWindowHandle_ = reinterpret_cast<quintptr>(candidate);
+            if (captureCardMode) {
+                ShowWindowAsync(candidate, SW_HIDE);
+            } else if (changed || lastEmbedAppliedRect_ != QRect(-4000, -4000, 320, 180)) {
+                SetWindowPos(candidate, nullptr, -4000, -4000, 320, 180,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+                lastEmbedAppliedRect_ = QRect(-4000, -4000, 320, 180);
             }
-            chiakiQ = candidate;
-            chiakiWindowHandle_ = reinterpret_cast<quintptr>(chiakiQ);
-            ShowWindow(chiakiQ, SW_HIDE);                 // kill any desktop paint immediately
-            if (parent && IsWindow(parent) && GetParent(chiakiQ) != parent) {
-                LONG_PTR style = GetWindowLongPtrW(chiakiQ, GWL_STYLE);
-                style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
-                           | WS_SYSMENU | WS_VISIBLE);
-                style |= (WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
-                LONG_PTR exStyle = GetWindowLongPtrW(chiakiQ, GWL_EXSTYLE);
-                exStyle &= ~(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME);
-                exStyle |= WS_EX_TOOLWINDOW;
-                SetWindowLongPtrW(chiakiQ, GWL_STYLE, style);
-                SetWindowLongPtrW(chiakiQ, GWL_EXSTYLE, exStyle);
-                SetParent(chiakiQ, parent);
-                SetWindowPos(chiakiQ, nullptr, -4000, -4000, 320, 180,
-                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
-                ShowWindow(chiakiQ, SW_HIDE);
-                if (GetParent(chiakiQ) == parent) {
-                    ++embedRegrabCount_;
-                    appendLog(QStringLiteral("Capture-card input window contained as hidden launcher child (hwnd=0x%1 regrab=%2)")
-                                  .arg(QString::number(reinterpret_cast<quintptr>(chiakiQ), 16))
-                                  .arg(embedRegrabCount_));
-                    continue;
-                }
-            }
-            // Already hidden/tool-style; retry reparenting on the next tick.
-            break;
-        }
-        chiakiEmbedRect_ = QRect(-4000, -4000, 320, 180);
-        setEmbedStatus(QStringLiteral("Capture card (stream window hidden)"));
-        return;
-    }
-
-    // QML render mode: the decoder-pipe preview renders in QML and IS the source. The chiaki
-    // window serves NO on-screen purpose, so do NOT SetParent/ShowWindow it at all — keep it
-    // HIDDEN and return. (Embedding it off-screen but SW_SHOWn is what made the capture loop's GDI
-    // fallback BitBlt a hidden child -> black/dup100 frames -> the 35s watchdog restart loop ->
-    // GUI-thread taskkill freeze -> safe mode + sig lock. Export is decode-driven / occlusion-safe.)
-    if (qmlRenderMode_) {
-        // AUTHORITATIVE CONTAINMENT. The live feed is drawn by QML from the decoder
-        // pipe; the chiaki/OrionStream window must NEVER appear as a separate window
-        // outside the launcher. The non-QML find/adopt path below is skipped here, so
-        // historically the handle stayed 0 and a freshly-spawned top-level stream window
-        // FLOATED on the desktop (the user-reported "stray chiaki window"). Instead, every
-        // watchdog tick: HUNT for it (even with no handle yet) and ADOPT it as an OFF-SCREEN
-        // CHILD of the launcher window. As a WS_CHILD the OS structurally forbids it from
-        // floating as a top-level / showing in the taskbar — it is strictly contained inside
-        // Orion. Keep it shown but parked off-screen (-4000,-4000) so the Vulkan present +
-        // pre-present export readback keep feeding the pipe at 60fps (decode-decoupled,
-        // occlusion-safe). The Python capture loop never GDI-grabs it while the decoder
-        // backend is active, so the old off-screen-child -> black cascade cannot recur.
-        const QRect parkRect(-4000, -4000, 320, 180);
-        HWND parent = mainWindowHandle();
-        HWND chiakiQ = reinterpret_cast<HWND>(chiakiWindowHandle_);
-        // (Re)acquire whenever we have no valid handle that is already our child — covers
-        // the first spawn, a stream-process restart, and a mid-session window recreation.
-        if (HWND candidate = findChiakiWindow()) {
-            // A top-level candidate is necessarily newer/uncontained because the
-            // finder skips every child we already adopted. Prefer it even while
-            // the cached old child remains valid during a restart overlap.
-            chiakiQ = candidate;
-            chiakiWindowHandle_ = reinterpret_cast<quintptr>(chiakiQ);
-            lastEmbedAppliedRect_ = QRect();
-        }
-        if (chiakiQ && IsWindow(chiakiQ) && parent && IsWindow(parent)) {
-            if (GetParent(chiakiQ) != parent) {
-                // Shove off-screen BEFORE restyle/reparent so it never paints on the
-                // desktop during the grab (<= one watchdog tick of exposure at worst).
-                SetWindowPos(chiakiQ, nullptr, -32000, -32000, 0, 0,
-                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                chiakiOriginalParent_ = reinterpret_cast<quintptr>(GetParent(chiakiQ));
-                chiakiOriginalStyle_ = GetWindowLongPtrW(chiakiQ, GWL_STYLE);
-                chiakiOriginalExStyle_ = GetWindowLongPtrW(chiakiQ, GWL_EXSTYLE);
-                LONG_PTR style = chiakiOriginalStyle_;
-                style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
-                style |= (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
-                LONG_PTR exStyle = chiakiOriginalExStyle_;
-                exStyle &= ~(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME);
-                exStyle |= WS_EX_TOOLWINDOW;  // no taskbar entry even for a 1-frame flash
-                SetWindowLongPtrW(chiakiQ, GWL_STYLE, style);
-                SetWindowLongPtrW(chiakiQ, GWL_EXSTYLE, exStyle);
-                SetParent(chiakiQ, parent);
-                SetWindowPos(chiakiQ, nullptr, parkRect.x(), parkRect.y(), parkRect.width(), parkRect.height(),
-                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                lastEmbedAppliedRect_ = parkRect;
+            if (changed) {
                 ++embedRegrabCount_;
-                appendLog(QStringLiteral("QML render: stream window contained off-screen as launcher child (hwnd=0x%1 regrab=%2)")
-                              .arg(QString::number(reinterpret_cast<quintptr>(chiakiQ), 16))
-                              .arg(embedRegrabCount_));
-            } else if (lastEmbedAppliedRect_ != parkRect) {
-                // Already our child — re-assert the off-screen park in case chiaki moved
-                // its own window (defensive; chiaki occasionally SetWindowPos's itself).
-                SetWindowPos(chiakiQ, nullptr, parkRect.x(), parkRect.y(), parkRect.width(), parkRect.height(),
-                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                lastEmbedAppliedRect_ = parkRect;
+                appendLog(QStringLiteral("Stream window contained asynchronously (no cross-process parenting)."));
             }
         }
-        chiakiEmbedRect_ = parkRect;
-        setEmbedStatus(QStringLiteral("QML render (stream window contained off-screen)"));
+        setEmbedStatus(captureCardMode ? QStringLiteral("Capture card (stream window hidden)")
+                                     : QStringLiteral("QML render (stream window off-screen)"));
         return;
     }
 
-    // True when we already had a live embed at function entry — used to classify a
-    // re-grab as a window "recreated" (stream churn) vs the very "firstshow".
     const bool wasEmbedded = chiakiEmbedStatus_ == QLatin1String("Embedded");
     bool embedEvicted = false;
 
@@ -6493,6 +7337,10 @@ void OrionAppController::startCapturePreview()
 
 void OrionAppController::connectRemotePlay()
 {
+    if (remotePlayTeardownActive_) {
+        appendLog(QStringLiteral("Connect waiting: previous session cleanup is still finishing."));
+        return;
+    }
     if (applicationShutdownActive(applicationShutdownPhase_)) {
         return;
     }
@@ -6504,6 +7352,25 @@ void OrionAppController::connectRemotePlay()
         appendLog(QStringLiteral("Connect ignored — a stream session is already %1.")
                       .arg(stateText(liveState)));
         return;
+    }
+
+    // [ORION_CONNECT_LATENCY 2026-09-19] The click itself, stamped. Until now the
+    // first line any connect produced was "Chiaki Remote Play settings saved." from
+    // inside this handler, so "click -> handler entry" was unmeasurable and every
+    // earlier stage had to be inferred by differencing unrelated lines. This is the
+    // t=0 every later "Connect stage:" line is relative to.
+    remotePlay_.beginConnectStopwatch();
+    appendLog(QStringLiteral("Connect pressed."));
+
+    // [ORION_INPUT_DEAD_UX] From this accepted Connect until a user Disconnect, the player has
+    // ASKED for a session: a dead input state under live video is now a stranding, not a browse.
+    // A fresh MANUAL Connect also grants a fresh bounded retry budget; the retry machinery's own
+    // reconnects (inputRetryInFlightReconnect_) must not — that would unbound the loop.
+    inputSessionIntentActive_ = true;
+    if (!inputRetryInFlightReconnect_) {
+        inputRetryPlanner_.reset();
+        inputRetryPendingAttempt_ = 0;
+        inputRetryGaveUp_ = false;
     }
 
     // Invalidate any crash-recovery timer before this accepted Connect can
@@ -6527,10 +7394,12 @@ void OrionAppController::connectRemotePlay()
     clearMeterMetrics(true);
 
     controllerUiGuardUntilMs_ = 0;
+    controllerUiPointerGuardUntilMs_ = 0;
     controllerUiSuppressionLogged_ = false;
     directPipeOwnsInput_ = false;
     shotIntentEdgeTracker_.reset();
     previousControllerUiState_ = ControllerState{};
+    squareUpAuditTracker_.reset();
     hookDownHeartbeats_ = 0;
     hookRecoveryAttempts_ = 0;
     hookFullRestartEscalated_ = false;
@@ -6555,7 +7424,7 @@ void OrionAppController::connectRemotePlay()
     // Auto-detect the console IP if it's not configured. discoverPs5() is synchronous
     // (~2 s) and persists the result back into config_ via the helperResult handler,
     // so by the time we read the IP below it will reflect whatever was found.
-    if (config_.data().remotePlayConsoleIp.trimmed().isEmpty()) {
+    if (!isXboxRemotePlay(config_.data()) && config_.data().remotePlayConsoleIp.trimmed().isEmpty()) {
         appendLog(QStringLiteral("No console IP set — discovering PS5 before connecting..."));
         remotePlay_.discoverPs5();
         remotePlay_.applyConfig(config_.data());
@@ -6652,17 +7521,35 @@ void OrionAppController::connectRemotePlay()
             return;
         }
     }
-    appendLog(QStringLiteral("Controller route: %1 -> %2 -> Chiaki")
+    appendLog(QStringLiteral("Controller route: %1 -> %2 -> %3")
                   .arg(controllerDeviceDetail_.isEmpty() ? controllerInputSource_ : controllerDeviceDetail_,
-                       controller_.backendName()));
+                       controller_.backendName(), isXboxRemotePlay(config_.data())
+                           ? QStringLiteral("Xbox app (external)") : QStringLiteral("Chiaki")));
 
     // Make sure the bandwidth preset is applied right before the stream starts so
     // chiaki's internal session reads the optimised resolution / codec / buffer sizes.
     remotePlay_.applyBandwidthMode(bandwidthModeFromString(config_.data().streamBandwidthMode));
     remotePlay_.setAudioMode(config_.data().streamAudioMode);
     setCaptureSourceHealth(QStringLiteral("waiting_for_first_frame"));
-    setChiakiEmbedVisible(true);
+    // [ORION_CONNECT_LATENCY 2026-09-19] ORDER, not content. setChiakiEmbedVisible()
+    // used to run HERE, in front of start(), and it is the single most expensive
+    // thing on the native half of the connect: measured 152 ms median (min 146,
+    // n=11, logs 09-18/09-19) between "Streaming preset: ..." and "Capture-card
+    // input window contained ...". It is Win32 window surgery on ANOTHER process's
+    // window — findChiakiWindow() sweeps up to 8 times and SetParent() blocks on
+    // the stream client's message loop — and NOTHING in it is an input to the
+    // console handshake. Meanwhile start() only has to write the promotion command
+    // to the live sidecar's stdin (measured 70 ms to "Stream promotion started"),
+    // after which the sidecar spends ~1073 ms on standby claim + handshake.
+    //
+    // Asking the console first and containing the window second overlaps that
+    // ~175 ms of local work with the ~1073 ms already in flight. Nothing regresses
+    // on containment: chiakiEmbedWatchdog_ starts immediately below and re-runs the
+    // exact same containment every tick for the whole session (35 s of fast ticks),
+    // and the deferred call still happens on this same event-loop turn, before any
+    // sidecar reply can be processed.
     remotePlay_.start();
+    setChiakiEmbedVisible(true);
 
     // Embed the Chiaki stream the instant its window appears so it never lingers
     // as a separate top-level window — and keep watching for the entire session
@@ -6694,7 +7581,240 @@ void OrionAppController::connectRemotePlay()
                   .arg(config_.data().noDipEnabled ? 1 : 0)
                   .arg(config_.data().noDipLeadMs, 0, 'f', 0)
                   .arg(config_.data().tempoRemapType));
-    chiakiEmbedWatchdog_.start();
+    if (!isXboxRemotePlay(config_.data()))
+        chiakiEmbedWatchdog_.start();
+}
+
+// ─── [ORION_INPUT_DEAD_UX 2026-08-30] input-session auto-retry + dead-input overlay ────────────
+// Closes the owner-unacceptable trap measured across 08-28..08-30: 31 of 185 Square-edge epochs
+// landed while the input session was Disconnected (worst window 2m18s, 24 presses) — the HDMI
+// video kept playing, the fail-closed write gate correctly refused every press, and NOTHING told
+// the player or retried. The write gate itself is untouched; this only retries through the same
+// user-facing Connect path and says the truth on screen. See InputSessionRetryPolicy.h for the
+// bounded state machine and the no-double-spawn / no-fake-readiness argument.
+
+namespace {
+// Kill switch for the RETRY only. The overlay is deliberately not killable: visibility of dead
+// input must never be optional.
+[[nodiscard]] bool inputSessionAutoRetryEnabled()
+{
+    static const bool enabled =
+        qgetenv("ORION_INPUT_SESSION_AUTORETRY") != QByteArrayLiteral("0");
+    return enabled;
+}
+} // namespace
+
+void OrionAppController::refreshInputDeliveryState()
+{
+    const RemotePlayState sessionState = remotePlay_.state();
+    // "Video looks alive": either the pre/post-failure capture-card preview is feeding the
+    // panel, or a session (Connecting/Running) owns it. Without live pixels there is no
+    // illusion to break — the page's ordinary Disconnected/Error surface owns that case.
+    const bool videoAlive = capturePreviewActive_ || remoteRunning_;
+    const bool pipeEnabled = orionInput_.enabled();
+    const bool pipeConnected = orionInput_.connected();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    // Running-edge debounce (OVERLAY only — the per-press log line stays instantaneous):
+    // the pipe seeds a beat after Running, so require the down state to persist for the
+    // grace, or to be proven by an actual undeliverable press inside it.
+    const bool runningPipeDown = sessionState == RemotePlayState::Running
+        && pressUndeliverable(sessionState, pipeEnabled, pipeConnected);
+    if (runningPipeDown) {
+        if (runningPipeDownSinceMs_ == 0) {
+            runningPipeDownSinceMs_ = nowMs;
+        }
+    } else {
+        runningPipeDownSinceMs_ = 0;
+    }
+    const bool suppressRunningEdgeFlash = runningPipeDown
+        && !runningPipeDownConfirmed(nowMs, runningPipeDownSinceMs_,
+                                     lastUndeliverablePressMs_);
+    const InputDeadSeverity severity = suppressRunningEdgeFlash
+        ? InputDeadSeverity::None
+        : inputDeadOverlaySeverity(
+              sessionState, pipeEnabled, pipeConnected,
+              videoAlive, inputSessionIntentActive_,
+              nowMs, lastUndeliverablePressMs_);
+
+    QString headline;
+    QString detail;
+    if (severity == InputDeadSeverity::Notice) {
+        // Connecting: deliberately-neutral routes, verdict pending. Honest, calm.
+        headline = QStringLiteral("CONNECTING — BUTTONS NOT REACHING THE CONSOLE YET");
+        detail = remoteStatus_;
+    } else if (severity == InputDeadSeverity::Critical) {
+        headline = QStringLiteral("CONTROLLER INPUT IS NOT REACHING THE CONSOLE");
+        if (sessionState == RemotePlayState::Running) {
+            // Running with the direct pipe down: the heartbeat watchdog owns this recovery
+            // (input-only repair, then one contained sidecar restart).
+            detail = QStringLiteral(
+                "The direct input link dropped — recovering it now. Presses are not landing "
+                "in the game until it reconnects.");
+        } else if (!inputSessionIntentActive_) {
+            // Press latch outside a session: the player pressed a shot button into the
+            // passive preview — they believe they are connected.
+            detail = QStringLiteral(
+                "This is the HDMI preview only — no session is connected. Press Enable "
+                "Bot + Controller to connect.");
+        } else if (inputRetryPendingAttempt_ > 0) {
+            detail = QStringLiteral("Reconnecting automatically — attempt %1 of %2.")
+                         .arg(inputRetryPendingAttempt_)
+                         .arg(InputSessionRetryPlanner::kMaxAttempts);
+        } else if (inputRetryPlanner_.identityBlocked()) {
+            detail = QStringLiteral("Reconnect blocked: %1").arg(remoteStatus_);
+        } else if (inputRetryGaveUp_) {
+            detail = QStringLiteral(
+                "Automatic reconnect did not restore the session — press Connect. (%1)")
+                         .arg(remoteStatus_);
+        } else {
+            detail = QStringLiteral("Press Connect to restore the session. (%1)")
+                         .arg(remoteStatus_);
+        }
+    }
+
+    if (severity == inputDeadSeverity_
+        && headline == inputDeadHeadline_
+        && detail == inputDeadDetail_) {
+        return;
+    }
+    const bool criticalEdge = (severity == InputDeadSeverity::Critical)
+        != (inputDeadSeverity_ == InputDeadSeverity::Critical);
+    inputDeadSeverity_ = severity;
+    inputDeadHeadline_ = headline;
+    inputDeadDetail_ = detail;
+    emit inputDeliveryStateChanged();
+    if (criticalEdge) {
+        // Out-of-app affordance for a player not looking at the app: while the dead state is
+        // terminal, the physical pad's lightbar goes warning-red through the SAME opt-in write
+        // path Defense Mode uses (see applyControllerLightbar — inert when the user's lightbar
+        // feature is off, guarded against writes mid-shot). No audio device dependency exists in
+        // this codebase and none is added.
+        applyControllerLightbar(true);
+    }
+}
+
+void OrionAppController::handleInputSessionFailure(int failureClass, bool wakeObserved)
+{
+    const auto cls = static_cast<InputSessionFailureClass>(failureClass);
+    inputRetryPendingAttempt_ = 0;
+    if (!inputSessionIntentActive_
+        || applicationShutdownActive(applicationShutdownPhase_)
+        || remotePlayTeardownActive_
+        || safeModeActive_) {
+        // No player intent (or a state that owns its own recovery/teardown): report only.
+        refreshInputDeliveryState();
+        return;
+    }
+    if (!inputSessionAutoRetryEnabled()) {
+        if (!inputRetryGaveUp_) {
+            inputRetryGaveUp_ = true;
+            appendLog(QStringLiteral(
+                "Input-session AUTO-RETRY disabled (ORION_INPUT_SESSION_AUTORETRY=0) — the "
+                "overlay will direct the player to press Connect."));
+        }
+        refreshInputDeliveryState();
+        return;
+    }
+    const InputSessionRetryDecision decision =
+        inputRetryPlanner_.onFailure(cls, wakeObserved);
+    if (!decision.retry) {
+        if (!inputRetryGaveUp_) {
+            inputRetryGaveUp_ = true;
+            appendLog(QStringLiteral(
+                "Input-session AUTO-RETRY exhausted after %1 attempts (class=%2) — giving up "
+                "cleanly; the overlay now says to press Connect.")
+                          .arg(inputRetryPlanner_.attemptsUsed())
+                          .arg(failureClass));
+            if (userLog_.enabled()) {
+                userLog_.append(QStringLiteral(
+                    "Automatic reconnect could not restore the console session — press "
+                    "Connect when you are ready."));
+            }
+        }
+        refreshInputDeliveryState();
+        return;
+    }
+    scheduleInputSessionRetry(decision, cls);
+}
+
+void OrionAppController::scheduleInputSessionRetry(
+    const InputSessionRetryDecision& decision, InputSessionFailureClass cls)
+{
+    inputRetryPendingAttempt_ = decision.attempt;
+    inputRetryGaveUp_ = false;
+    const quint64 generation = remotePlayLifecycleGeneration_;
+    const bool cold = decision.coldRestart;
+    const int attempt = decision.attempt;
+    appendLog(QStringLiteral(
+        "Input-session AUTO-RETRY scheduled: attempt=%1/%2 delay=%3ms cold=%4 class=%5 — a "
+        "failed input session must never sit silent under live video.")
+                  .arg(attempt)
+                  .arg(InputSessionRetryPlanner::kMaxAttempts)
+                  .arg(decision.delayMs)
+                  .arg(cold ? 1 : 0)
+                  .arg(static_cast<int>(cls)));
+    if (userLog_.enabled()) {
+        userLog_.append(QStringLiteral(
+            "Connection problem — reconnecting automatically (attempt %1 of %2).")
+                            .arg(attempt)
+                            .arg(InputSessionRetryPlanner::kMaxAttempts));
+    }
+    QTimer::singleShot(static_cast<int>(decision.delayMs), this,
+                       [this, generation, cold, attempt]() {
+        fireScheduledInputSessionRetry(generation, cold, attempt);
+    });
+    refreshInputDeliveryState();
+}
+
+void OrionAppController::fireScheduledInputSessionRetry(
+    quint64 generation, bool coldRestart, int attempt)
+{
+    if (inputRetryPendingAttempt_ != attempt) {
+        return;   // superseded by a manual action or a newer schedule
+    }
+    inputRetryPendingAttempt_ = 0;
+    if (generation != remotePlayLifecycleGeneration_
+        || !inputSessionIntentActive_
+        || safeModeActive_
+        || remotePlayTeardownActive_
+        || applicationShutdownActive(applicationShutdownPhase_)) {
+        // A manual Connect/Disconnect advanced the lifecycle, intent was withdrawn, or a
+        // state that owns its own recovery latched. Stand down silently.
+        refreshInputDeliveryState();
+        return;
+    }
+    const RemotePlayState liveState = remotePlay_.state();
+    if (liveState == RemotePlayState::Connecting || liveState == RemotePlayState::Running) {
+        return;   // something else already brought a session up — never race it
+    }
+    appendLog(QStringLiteral("Input-session AUTO-RETRY firing: attempt=%1/%2 cold=%3")
+                  .arg(attempt)
+                  .arg(InputSessionRetryPlanner::kMaxAttempts)
+                  .arg(coldRestart ? 1 : 0));
+    inputRetryInFlightReconnect_ = true;
+    if (coldRestart) {
+        // No-verdict failure classes only: the sidecar may be wedged inside the failed
+        // promotion, and a warm start_stream would QUEUE behind that wedge in its serialized
+        // stdin loop — executing later, it could raise an input client the native already
+        // condemned (an orphan holding the pipe). Synchronous teardown kills the sidecar
+        // process (its job object reaps children) so the reconnect starts from nothing.
+        disconnectRemotePlay(true);
+    }
+    connectRemotePlay();
+    inputRetryInFlightReconnect_ = false;
+    const RemotePlayState afterState = remotePlay_.state();
+    if (afterState != RemotePlayState::Connecting && afterState != RemotePlayState::Running) {
+        // connectRemotePlay()/start() refused locally (pad gate, security lock, missing
+        // IP/exe). Count it against the SAME bounded budget so a refusal can never spin.
+        appendLog(QStringLiteral(
+            "Input-session AUTO-RETRY attempt %1 refused before a session started (%2).")
+                      .arg(attempt)
+                      .arg(backendMessage_.isEmpty() ? remoteStatus_ : backendMessage_));
+        handleInputSessionFailure(
+            static_cast<int>(InputSessionFailureClass::LocalRefusal), false);
+        return;
+    }
+    refreshInputDeliveryState();
 }
 
 void OrionAppController::disconnectRemotePlay(bool synchronous)
@@ -6703,7 +7823,8 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     // may upgrade a user-click teardown still queued on the event loop; that
     // callback later observes the cleared flags and becomes a no-op.
     if (remotePlayTeardownActive_) {
-        if (synchronous && remotePlayTeardownDeferred_) {
+        if (synchronous) {
+            remotePlayTeardownSynchronous_ = true;
             remotePlayTeardownDeferred_ = false;
             finishRemotePlayTeardown();
         }
@@ -6712,13 +7833,29 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     // A manual or internal teardown supersedes every delayed reconnect that
     // was scheduled for the prior session generation.
     ++remotePlayLifecycleGeneration_;
+    // [ORION_INPUT_DEAD_UX] A user/system teardown withdraws session intent and cancels the
+    // retry episode; the retry machinery's own cold-restart teardown keeps both (it is about
+    // to reconnect this exact intent).
+    if (!inputRetryInFlightReconnect_) {
+        inputSessionIntentActive_ = false;
+        inputRetryPlanner_.reset();
+        inputRetryPendingAttempt_ = 0;
+        inputRetryGaveUp_ = false;
+        // The press latch exists to catch a player who believes they are connected;
+        // a deliberate Disconnect IS the player acting on the truth.
+        lastUndeliverablePressMs_ = 0;
+        refreshInputDeliveryState();
+    }
     remotePlayTeardownActive_ = true;
     remotePlayTeardownDeferred_ = !synchronous;
+    remotePlayTeardownStopRequested_ = false;
+    remotePlayTeardownSynchronous_ = synchronous;
 
     chiakiEmbedWatchdog_.stop();
     remoteRunning_ = false;
     shotIntentEdgeTracker_.reset();
     previousControllerUiState_ = ControllerState{};
+    squareUpAuditTracker_.reset();
     hookDownHeartbeats_ = 0;
     hookRecoveryAttempts_ = 0;
     hookFullRestartEscalated_ = false;
@@ -6726,6 +7863,7 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     preciseFireDeliveryFault_ = false;
     preciseFireRecoveryNeutralFrames_ = 0;
     controllerUiGuardUntilMs_ = 0;
+    controllerUiPointerGuardUntilMs_ = 0;
     controllerUiSuppressionLogged_ = false;
     directPipeOwnsInput_ = false;
     remoteState_ = QStringLiteral("Disconnecting");
@@ -6740,18 +7878,32 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     // pollPhysicalController() — which cannot run, because it is blocked behind this same
     // synchronous teardown. Without this, a release armed a few ms before the click submits into
     // a pad that finishRemotePlayTeardown() is concurrently neutraling and unplugging.
+    // [ORION_DISCONNECT_AUDIT 2026-09-19] F4: this teardown was the ONLY one that did
+    // not revoke the engine's armed gate. disarmPreciseFire() drains the worker's
+    // mailbox and cancels the armed token; it does NOT clear automation_'s armed_ bool,
+    // and there is no syncEngineArmed() anywhere below. Every sibling teardown does
+    // both -- releaseFailedRemoteInputRoute, tripWatchdog, the sidecarExited handler
+    // and prepareForApplicationExit all call automation_.setArmed(false) first.
+    //
+    // It matters on the DEFERRED path (the user's own Disconnect click, synchronous ==
+    // false): remotePlay_.stop() is one singleShot(0) away, so for one event-loop turn
+    // the 4 ms input poll still runs against state_ == Running, orionInput_ still
+    // connected and ViGEm still plugged -- directInputWriteAllowed() is satisfied and a
+    // Square held at the instant of the click can START A FRESH OWNED SHOT after the
+    // user asked to disconnect. Bounded to one tick, but it is exactly the "pad still
+    // owned after teardown began" class. Revoke the gate first, like everyone else.
+    automation_.setArmed(false);
     disarmPreciseFire();
     automation_.reset();
     // Neutral both output routes now, before graceful sidecar shutdown can
     // spend seconds draining. The virtual target is unplugged below.
     neutralizeOwnedInput();
+    unplugRemoteController(); // release local input immediately, before asynchronous process cleanup
     if (pendingSubmitSeq_ >= 0) {
         automation_.cancelPostReleaseGrade(pendingSubmitSeq_);
         const QString notice = userReleaseTracker_.fail(
             pendingSubmitSeq_, UserReleaseFailureReason::RemotePlayDisconnected);
-        if (userLog_.enabled() && !notice.isEmpty()) {
-            userLog_.append(notice);
-        }
+        appendCustomerEvent(notice);
         pendingSubmitSeq_ = -1;
     }
     releaseMarkerDeliveryGate_.reset();
@@ -6764,6 +7916,7 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     pendingSubmitFireToken_ = 0;
     pendingSubmitTransportSeq_ = 0;
     pendingSubmitSnapshot_ = {};
+    pendingSubmitFrameGrid_ = {};
     confirmedPreciseFireStage_ = PreciseFireDeliveryStage::None;
     confirmedPreciseFireToken_ = 0;
     confirmedPreciseFireTransportSeq_ = 0;
@@ -6780,6 +7933,7 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     meterConfirmed_ = false;
     meterBoxCaptureSize_ = {};
     lastRealMeterSeenMs_ = 0;
+    lastMeterOverlayVisualSeenMs_ = 0;
     userMeterVisible_ = false;
     botOwnershipArmToken_ = 0;
     botOwnershipStartedMs_ = -1.0;
@@ -6804,11 +7958,8 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
 
     setChiakiEmbedVisible(false);
 
-    // The actual teardown (sidecar shutdown + deterministic stream-client/pipe cleanup +
-    // virtual-pad unplug) blocks for up to ~1 s. Internal callers (e.g. the Vulkan→OpenGL
-    // re-embed restart) need it finished before they reconnect, so they pass synchronous=true.
-    // The user-facing button defers it one event-loop tick so "Disconnecting…" paints first —
-    // no frozen click.
+    // Local input is already released. The user path retires the owned process via
+    // exit signals and a deadline timer; only explicit internal callers may wait.
     if (synchronous) {
         finishRemotePlayTeardown();
     } else {
@@ -6822,51 +7973,8 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     }
 }
 
-void OrionAppController::finishRemotePlayTeardown()
+void OrionAppController::unplugRemoteController()
 {
-    if (!remotePlayTeardownActive_) {
-        return;
-    }
-    // [SAFE MODE] This function runs on the GUI thread and BLOCKS for seconds BY DESIGN:
-    // remotePlay_.stop() alone can spend up to kSidecarGracefulShutdownMs waiting for the sidecar
-    // to close the PS5 session cleanly, plus kill()+waitForFinished(500) and (only when that times
-    // out) the 2-pass taskkill sweep. Nothing bumped guiHeartbeatMs_ across that window, so the
-    // freeze watchdog tripped at >6000ms, disarmed automation, and onWatchdogTick escalated to
-    // enterSafeMode() — a MANUAL-recovery latch — on a perfectly normal disconnect.
-    //
-    // Two-part fix. (1) Declare the whole teardown a known bounded block so the watchdog stands
-    // down inside it — bumping the heartbeat around the calls is NOT enough, because the longest
-    // stall happens inside one synchronous call and nothing can bump from in there. The 20s bound
-    // comfortably covers the worst forced-kill chain (5s graceful + 3.5s taskkill + 0.5s kill +
-    // the 2-pass sweep) while still letting a genuine wedge trip afterwards. (2) Bump the
-    // heartbeat at each point we regain control, so the watchdog sees a live GUI the moment the
-    // suppression lifts instead of a several-second-old stamp.
-    guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
-    guiFreezeSuppressUntilMs_.store(QDateTime::currentMSecsSinceEpoch() + 20000,
-                                    std::memory_order_relaxed);
-
-    remotePlay_.stop();
-    guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
-
-    // [GRACEFUL CHIAKI DISCONNECT] Do NOT force-kill unconditionally. This sweep used to run on
-    // EVERY disconnect, which meant every chiaki termination was a TerminateProcess:
-    // chiaki_session_stop() never ran, no Takion/ctrl disconnect was sent, and the PS5 saw the
-    // transport vanish — the user-reported "LAN cable disconnected". remotePlay_.stop() now waits
-    // for the sidecar to shut the session down properly, so poll briefly for the client to exit on
-    // its own and only force-kill one that genuinely refused. A clean disconnect pays ~0ms here
-    // and spawns zero taskkills; a wedged client still gets swept exactly as before.
-#ifdef Q_OS_WIN
-    if (chiakiClientsAliveAfterGrace(kTeardownChiakiExitPollMs)) {
-        appendLog(QStringLiteral("Disconnect: stream client still alive after graceful shutdown — forcing cleanup."));
-        QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("OrionStream.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-        QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("chiaki.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-        QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("chiaki-ng.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-        QProcess::execute(QStringLiteral("taskkill.exe"), {QStringLiteral("/IM"), QStringLiteral("chiaki4deck.exe"), QStringLiteral("/F"), QStringLiteral("/T")});
-    }
-#endif
-    // Second heartbeat bump: the poll + any force-kill sweep is more blocking GUI-thread time.
-    guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
-
     // CRITICAL: tear down the virtual pad on disconnect. While it remains plugged,
     // Windows GameInput / Xbox app keeps reading its stick state — if the physical
     // pad has any drift the cursor wanders on the desktop and keyboard shortcuts
@@ -6910,6 +8018,29 @@ void OrionAppController::finishRemotePlayTeardown()
         appendLog(QStringLiteral("Virtual pad unplugged on disconnect (prevents desktop input hijack)."));
     }
 
+}
+
+void OrionAppController::finishRemotePlayTeardown()
+{
+    if (!remotePlayTeardownActive_) {
+        return;
+    }
+    if (!remotePlayTeardownStopRequested_) {
+        remotePlayTeardownStopRequested_ = true;
+        remotePlay_.stop();
+    }
+    if (remotePlayTeardownSynchronous_) {
+        // Retained only for application exit and explicit internal recovery callers.
+        guiFreezeSuppressUntilMs_.store(QDateTime::currentMSecsSinceEpoch() + 20000,
+                                        std::memory_order_relaxed);
+        remotePlay_.waitForStopped();
+        guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
+        guiFreezeSuppressUntilMs_.store(0, std::memory_order_relaxed);
+        if (!remotePlayTeardownActive_) return; // completion may have finalized us
+    }
+    if (remotePlay_.stopping()) return;
+    // The retired sidecar's job owns its children. No global process enumeration,
+    // taskkill, sleeps or process waits are permitted in the user-button path.
     remoteState_ = QStringLiteral("Disconnected");
     remoteStatus_ = QStringLiteral("Disconnected");
     backendMessage_ = QStringLiteral("Remote Play disconnected.");
@@ -6926,12 +8057,15 @@ void OrionAppController::finishRemotePlayTeardown()
         // counted against it — that wait returns as soon as the process exits, so a fast exit
         // (~300ms) would leave only ~1.8s before the reopen and the device would still be held.
         // Reopening early is exactly what produces "device IN USE / no live device".
-        QTimer::singleShot(kSidecarRestartDelayMsCaptureCard, this, [this]() { startCapturePreview(); });
+        const auto generation = remotePlayLifecycleGeneration_;
+        QTimer::singleShot(kSidecarRestartDelayMsCaptureCard, this, [this, generation]() {
+            if (generation == remotePlayLifecycleGeneration_
+                    && !remotePlayTeardownActive_ && !remoteRunning_
+                    && !applicationShutdownActive(applicationShutdownPhase_)) startCapturePreview();
+        });
     }
 
-    // [SAFE MODE] Known blocking section over. Stamp a fresh heartbeat FIRST so the watchdog never
-    // sees the (now several seconds old) pre-teardown stamp in the instant after suppression lifts.
-    // This function has no early returns, so this always runs.
+    // Normal user teardown has remained event-driven; resume with a current heartbeat.
     guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
     guiFreezeSuppressUntilMs_.store(0, std::memory_order_relaxed);
     remotePlayTeardownDeferred_ = false;
@@ -7022,7 +8156,7 @@ void OrionAppController::startLatencyCalibration()
     // exact Running state so every controlled marker has a live console/input/capture route.
     if (remotePlay_.state() != RemotePlayState::Running) {
         latencyCalibrationStatus_ = QStringLiteral(
-            "Enable Bot + Controller and wait for Remote Play to reach Running first.");
+            "Press Connect and wait for Remote Play to reach Running first.");
         appendLog(QStringLiteral(
             "Timing latency calibration not started: Remote Play is not Running."));
         emit latencyCalibrationChanged();
@@ -7116,6 +8250,134 @@ void OrionAppController::finishMeterCalibration()
                           .arg(meterCalShots_);
     appendLog(QStringLiteral("Meter calibration complete after %1 shots.").arg(meterCalShots_));
     emit statusChanged();
+}
+
+void OrionAppController::recordManualShotResult(bool made)
+{
+    if (manualShotTally_.record(made)) {
+        appendLog(QStringLiteral("Manual shot tally: action=%1 makes=%2 misses=%3 total=%4 source=user")
+                      .arg(made ? QStringLiteral("make") : QStringLiteral("miss"))
+                      .arg(manualShotMakes()).arg(manualShotMisses()).arg(manualShotTotal()));
+        emit manualShotTallyChanged();
+    }
+}
+
+void OrionAppController::undoManualShotResult()
+{
+    if (manualShotTally_.undo()) {
+        appendLog(QStringLiteral("Manual shot tally: action=undo makes=%1 misses=%2 total=%3 source=user")
+                      .arg(manualShotMakes()).arg(manualShotMisses()).arg(manualShotTotal()));
+        emit manualShotTallyChanged();
+    }
+}
+
+void OrionAppController::resetManualShotResults()
+{
+    if (manualShotTally_.reset()) {
+        appendLog(QStringLiteral("Manual shot tally: action=reset makes=0 misses=0 total=0 source=user"));
+        emit manualShotTallyChanged();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// [ORION_BANNER_VERDICT_LIVE 2026-09-14 owner] The live shot-verdict tally.
+//
+// The owner reads NBA 2K27's own shot-feedback banner while he moves ONE slider and could
+// not hold the score in his head: "can't tell if I found my value or not because sometimes
+// it's green". The sidecar now grades that banner with the SAME validated reader the
+// offline grader uses (tools/timing/panel_grade.py) and emits one verdict per banner
+// appearance; these three functions are the whole native side of the feature.
+//
+// PRESENTATION ONLY, three times over: the verdict is never handed to AutomationEngine, it
+// never enters the telemetry snapshot, and it never influences a timing decision. It is a
+// scoreboard for a human.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+void OrionAppController::observeBannerVerdict(const QString& timing, const QString& timingColor,
+                                              const QString& coverage, double ncc,
+                                              qint64 frameEpochMs, int seq, int attributed,
+                                              qint64 releaseSeq, double releaseDelayMs,
+                                              bool hasCoverage)
+{
+    // The cell COLOUR and the match score are the sidecar's own evidence for the word; the
+    // tally classifies on the WORD (see ShotVerdictTally::bucketFor - the panel paints a
+    // coverage cell green too, so a colour rule would count open misses as makes). They stay
+    // in the signal for the log line RemotePlaySession already writes.
+    Q_UNUSED(timingColor);
+    Q_UNUSED(ncc);
+    Q_UNUSED(releaseDelayMs);
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] THE ONE PLACE A BANNER REACHES THE ENGINE.
+    // Everything else about this function is unchanged and still presentation-only; this single
+    // call is the bounded closed loop (see AutomationEngine::observeBannerVerdict and
+    // BannerLeadTrim.h). Three fences, all of them here rather than downstream:
+    //   * attributed != 1        -> a panel with no BOT release behind it (a replay screen, a
+    //                               shot the owner took by hand) never moves the lead.
+    //   * releaseSeq <= 0        -> no release id to match on; the engine could not tell which
+    //                               shot TYPE graded, so the bucket would be a guess.
+    //   * the engine's own ring  -> the epoch must belong to a release THIS engine made.
+    // Coverage travels with the verdict: only explicit OPEN/WIDE OPEN panels
+    // may calibrate the open-shot correction. Every panel still reaches the tally.
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19] ...plus the panel's LAYOUT, because a panel with
+    // NO coverage cell (the 2-cell TIMING | DISTANCE layout: drills, and any no-defender
+    // context) has no defender to shrink the window and calibrates as open. The engine owns that
+    // rule and its kill switch; this is only the wire.
+    // Run BEFORE the de-dupe below on purpose: the two windows are independent (the tally
+    // de-dupes on the verdict counter, the trim on the release id), and the engine has its own
+    // one-verdict-per-release fence.
+    if (attributed == 1 && releaseSeq > 0) {
+        automation_.observeBannerVerdict(static_cast<quint64>(releaseSeq), timing, coverage,
+                                         hasCoverage);
+    }
+    if (!bannerTally_.record(timing, coverage, frameEpochMs, seq)) {
+        return;   // blank word, or a seq this window already holds
+    }
+    // The customer Activity line. Plain, one per shot, exactly what the banner said - no
+    // engineering detail, so it reads as a shot log and not as telemetry.
+    appendCustomerEvent(coverage.trimmed().isEmpty()
+                            ? QStringLiteral("Shot: %1").arg(bannerTally_.lastTiming())
+                            : QStringLiteral("Shot: %1 · %2")
+                                  .arg(bannerTally_.lastTiming(), bannerTally_.lastCoverage()));
+    emit bannerTallyChanged();
+}
+
+// [ORION_RELEASE_ORACLE_TRIM 2026-09-15 owner] The banner-free half of the closed loop.
+//
+// Unlike the tally above this is NOT presentation: the oracle exists only to move the trim, and
+// there is nothing on screen that shows it. Two fences here, matching observeBannerVerdict's:
+//   * releaseSeq <= 0 -> the sidecar could not attribute the measurement, so the engine could
+//                        not tell which shot TYPE it graded and the bucket would be a guess.
+//   * the engine's own ring -> AutomationEngine::observeReleaseOracle refuses an epoch this
+//                        engine did not release, and parks the rest behind the banner's window.
+// There is no `attributed` field to check: the sidecar emits an oracle only for a release it
+// already bound, and `release_seq` IS that binding.
+void OrionAppController::observeReleaseOracle(qint64 releaseSeq, double gapPx,
+                                              const QString& proxy)
+{
+    if (releaseSeq <= 0) {
+        return;
+    }
+    automation_.observeReleaseOracle(static_cast<quint64>(releaseSeq), gapPx, proxy);
+}
+
+void OrionAppController::observeShotRange(qint64 releaseSeq, const QString& range, double conf)
+{
+    if (releaseSeq <= 0) {
+        return;
+    }
+    automation_.noteShotRange(static_cast<quint64>(releaseSeq), range, conf);
+}
+
+void OrionAppController::resetBannerTally()
+{
+    if (bannerTally_.reset()) {
+        emit bannerTallyChanged();
+    }
+}
+
+void OrionAppController::resetBannerTallyForSession()
+{
+    if (bannerTally_.resetSession()) {
+        emit bannerTallyChanged();
+    }
 }
 
 void OrionAppController::recordSessionGrade(int releaseSeq, const QString& shotType,
@@ -7486,26 +8748,34 @@ void OrionAppController::refreshControllerDevices()
 
 void OrionAppController::refreshCaptureDevices()
 {
-    QStringList devices;
-#ifdef Q_OS_WIN
-    // PATCH B — bound the DirectShow enumeration so a contended capture card can't wedge the GUI
-    // thread. SidecarWatchdog.h documents this exact ICreateDevEnum call freezing the UI 10-15s on a
-    // contended Elgato right after a watchdog restart -> safe mode. Run the (self-contained) COM
-    // enumeration on a detached worker via runBoundedEnumeration; if it doesn't finish within
-    // kVideoEnumTimeoutMs, fall back to the last-good cached names (captureDeviceList_) so the UI
-    // thread is never blocked past the deadline. The lambda owns its own local `devices`.
-    devices = runBoundedEnumeration(kVideoEnumTimeoutMs, captureDeviceList_, []() {
-        // The picker and the sidecar share one enumerator, including its one-row-per-moniker
-        // invariant, so captureCardIndex cannot point at different devices across the boundary.
-        return enumerateVideoInputDevices().friendlyNames;
+    if (captureRefreshInFlight_) return;
+    captureRefreshInFlight_ = true;
+    struct InventoryResult {
+        VideoInputDeviceInventory inventory;
+        std::atomic<bool> ready{false};
+    };
+    auto result = std::make_shared<InventoryResult>();
+    // Worker owns only its result; it never dereferences a destroyed controller.
+    std::thread([result]() {
+        try { result->inventory = enumerateVideoInputDevices(); } catch (...) {}
+        result->ready.store(true, std::memory_order_release);
+    }).detach();
+    auto* poll = new QTimer(this);
+    poll->setInterval(25);
+    connect(poll, &QTimer::timeout, this, [this, result, poll]() {
+        if (!result->ready.load(std::memory_order_acquire)) return;
+        poll->stop();
+        poll->deleteLater();
+        captureRefreshInFlight_ = false;
+        const auto& devices = result->inventory.friendlyNames;
+        if (captureDeviceList_ != devices) {
+            captureDeviceList_ = devices;
+            emit captureDevicesChanged();
+        }
+        appendLog(QStringLiteral("Capture devices: %1")
+                      .arg(devices.isEmpty() ? QStringLiteral("none found") : devices.join(QStringLiteral(", "))));
     });
-#endif
-    if (captureDeviceList_ != devices) {
-        captureDeviceList_ = devices;
-        emit captureDevicesChanged();
-    }
-    appendLog(QStringLiteral("Capture devices: %1")
-                  .arg(devices.isEmpty() ? QStringLiteral("none found") : devices.join(QStringLiteral(", "))));
+    poll->start();
 }
 
 void OrionAppController::applyLightbarNow()
@@ -7594,14 +8864,79 @@ void OrionAppController::setRemotePlayConsole(const QString& value)
     if (data.remotePlayConsole == v) {
         return;
     }
-    data.remotePlayConsole = v;
-    saveConfigSilently(data);
+    if (remotePlay_.state() == RemotePlayState::Running
+            || remotePlay_.state() == RemotePlayState::Connecting) {
+        appendLog(QStringLiteral("Disconnect before changing the console route."));
+        emit settingsChanged();
+        return;
+    }
+    remotePlay_.stop(); // Retire any warm HDMI preview, not the launcher.
+    chiakiEmbedWatchdog_.stop();
+    switchRemotePlayConsole(data, v);
+    if (!saveConfigSilently(data)) {
+        emit settingsChanged();
+        return;
+    }
     // The X360 ViGEm pad already works for both (chiaki maps it to PS5; the Xbox app
     // reads XInput directly). PS5 = chiaki Remote Play + decoder pipe; Xbox = capture
-    // the Xbox app window via WGC (the deep capture/window wiring is the hardware phase).
+    // the explicitly selected Xbox app window via WGC.
     appendLog(v == QLatin1String("Xbox")
-        ? QStringLiteral("Console: Xbox — drive the Xbox app with the X360 virtual pad; capture via WGC (set frame_source=wgc / ORION_WGC=1 and point the window title at the Xbox app).")
+        ? QStringLiteral("Console: Xbox beta — select Microsoft's Remote Play window in Setup. WGC + X360 route; Xbox lead is separate from PS5.")
         : QStringLiteral("Console: PS5 — chiaki Remote Play + DualSense mapping (default path)."));
+}
+
+void OrionAppController::openXboxRemotePlay()
+{
+    if (!QDesktopServices::openUrl(QUrl(QStringLiteral("xbox://"))))
+        appendLog(QStringLiteral("Open the Xbox Windows app and start Remote Play, then refresh the window list in Setup."));
+}
+
+void OrionAppController::setXboxRemotePlayWindowTitle(const QString& value)
+{
+    if (remotePlay_.state() == RemotePlayState::Running
+            || remotePlay_.state() == RemotePlayState::Connecting) {
+        emit settingsChanged();
+        return;
+    }
+    auto data = config_.data();
+    data.xboxRemotePlayWindowTitle = value.trimmed().left(512);
+    if (data.xboxRemotePlayWindowTitle != config_.data().xboxRemotePlayWindowTitle)
+        saveConfigSilently(data);
+}
+
+QStringList OrionAppController::xboxRemotePlayWindows() const
+{
+    QStringList titles;
+#ifdef Q_OS_WIN
+    EnumWindows([](HWND hwnd, LPARAM context) -> BOOL {
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd))
+            return TRUE;
+        wchar_t title[1024] = {};
+        GetWindowTextW(hwnd, title, 1024);
+        const QString text = QString::fromWCharArray(title);
+        if (!text.contains(QStringLiteral("Xbox"), Qt::CaseInsensitive))
+            return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!proc)
+            return TRUE;
+        wchar_t image[32768] = {};
+        DWORD size = 32768;
+        const BOOL ok = QueryFullProcessImageNameW(proc, 0, image, &size);
+        CloseHandle(proc);
+        const QString exe = ok ? QFileInfo(QString::fromWCharArray(image, int(size))).fileName().toLower() : QString();
+        const QStringList allowed = {QStringLiteral("msedge.exe"), QStringLiteral("chrome.exe"),
+            QStringLiteral("firefox.exe"), QStringLiteral("xboxpcapp.exe"), QStringLiteral("xboxapp.exe"),
+            QStringLiteral("xboxgame streaming.exe"), QStringLiteral("applicationframehost.exe")};
+        if (allowed.contains(exe))
+            reinterpret_cast<QStringList*>(context)->append(text);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&titles));
+#endif
+    titles.sort(Qt::CaseInsensitive);
+    titles.removeDuplicates();
+    return titles;
 }
 
 void OrionAppController::setChiakiPath(const QString& value)
@@ -7684,9 +9019,8 @@ void OrionAppController::setTempoInputSource(const QString& value)
 
 void OrionAppController::setTempoRemapType(const QString& value)
 {
-    // Legacy persisted compatibility only. The shipped UI no longer exposes this
-    // selector because the automation engine's Tempo toggle is the sole remap
-    // authority and always uses the Square-triggered gather/flick output path.
+    // Legacy setter retained for older callers. The shipped Tempo control uses
+    // setTempoInputPath to update this saved preference and the active source atomically.
     const QString lower = value.trimmed().toLower();
     const QString norm = (lower == QLatin1String("stick")) ? QStringLiteral("stick")
         : (lower == QLatin1String("both")) ? QStringLiteral("both")
@@ -7836,11 +9170,17 @@ void OrionAppController::setActuationLeadMs(double value)
     }
     data.actuationLeadMs = v;
     data.actuationLeadUserSet = true;
+    // [ORION_LEAD_BY_SOURCE 2026-09-14] the value belongs to the route it was tuned on.
+    mirrorActuationLeadIntoSourceStash(data);
     if (!saveConfigSilently(data)) {
         return;
     }
     appendLog(QStringLiteral("Shot lead set to %1 ms (your value; measurement will not change it)")
                   .arg(v, 0, 'f', 0));
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14] The tally describes ONE value. The moment the
+    // owner commits a new one, the banners already counted belong to the old setting - a
+    // window that straddles the move is exactly the confusion the card exists to remove.
+    resetBannerTally();
 }
 
 double OrionAppController::meterDelayLeadOffsetMaxMs() const noexcept
@@ -7917,6 +9257,9 @@ void OrionAppController::resetActuationLead()
     }
     data.actuationLeadMs = 0.0;
     data.actuationLeadUserSet = false;
+    // [ORION_LEAD_BY_SOURCE 2026-09-14] Reset clears THIS route only: the stash entry is
+    // removed (absent == not configured), and the other route keeps the lead it was tuned to.
+    mirrorActuationLeadIntoSourceStash(data);
     if (!saveConfigSilently(data)) {
         return;
     }
@@ -8140,7 +9483,11 @@ void OrionAppController::setTipTimingLocked(bool locked)
         return;
     }
     appendLog(locked
-                  ? QStringLiteral("Tip timing locked at %1 ms for this session")
+                  // [ORION_TIP_RESTORED 2026-09-11] "for this session" was wrong and it mattered:
+                  // tip_phase_aim_frozen is persisted, so the lock survives restarts. The owner
+                  // needs the permanence stated, because a drifting aim is what it exists to stop.
+                  ? QStringLiteral("Tip timing locked at %1 ms (persists across restarts; "
+                                   "the learner keeps measuring but no longer moves the aim)")
                         .arg(tipTimingMs(), 0, 'f', 1)
                   : QStringLiteral("Tip timing unlocked — Venice's learner is adjusting it again"));
     emit tipTimingChanged();
@@ -8185,6 +9532,34 @@ void OrionAppController::setTempoWaitMs(double value)
     saveConfigSilently(data);
 }
 
+void OrionAppController::setRhythmFlickDelayMs(double value)
+{
+    // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] Mirrors setActuationLeadMs: reject non-finite,
+    // clamp into the persisted band, no-op on an unchanged value (QML re-binds this on every
+    // settingsChanged, and an unguarded write would re-sign settings.json on every repaint),
+    // then persist. saveConfigSilently() -> syncBackendConfig() -> automation_.applyConfig()
+    // is what pushes the new trim into the live engine, exactly as the Shot Lead setter does.
+    if (!std::isfinite(value)) {
+        return;
+    }
+    const double v = qBound(AppConfigData::kRhythmFlickDelayMinMs, value,
+                            AppConfigData::kRhythmFlickDelayMaxMs);
+    auto data = config_.data();
+    if (data.rhythmFlickDelayMs == v) {
+        return;
+    }
+    data.rhythmFlickDelayMs = v;
+    if (!saveConfigSilently(data)) {
+        return;
+    }
+    appendLog(QStringLiteral(
+                  "Rhythm flick timing set to %1 ms (%2; applies only while Rhythm is on)")
+                  .arg(v, 0, 'f', 0)
+                  .arg(v > 0.0 ? QStringLiteral("flick fires LATER")
+                               : (v < 0.0 ? QStringLiteral("flick fires EARLIER")
+                                          : QStringLiteral("no trim"))));
+}
+
 void OrionAppController::setTempoFallbackMs(double value)
 {
     auto data = config_.data();
@@ -8196,6 +9571,23 @@ void OrionAppController::setTempoFlickHoldMs(double value)
 {
     auto data = config_.data();
     data.tempoFlickHoldMs = qBound(16.0, value, 250.0);
+    saveConfigSilently(data);
+}
+
+// [ORION_TEMPO_RELEASE_STYLE 2026-09-15 owner] Ignore-unknown, never guess: a value that is
+// neither "flick" nor "letgo" leaves the current style in force rather than writing a style the
+// engine would have to interpret. Same rule the file loader and the env override apply.
+void OrionAppController::setTempoReleaseStyle(const QString& value)
+{
+    const QString normalized = value.trimmed().toLower();
+    if (normalized != QLatin1String("flick") && normalized != QLatin1String("letgo")) {
+        return;
+    }
+    auto data = config_.data();
+    if (data.tempoReleaseStyle == normalized) {
+        return;
+    }
+    data.tempoReleaseStyle = normalized;
     saveConfigSilently(data);
 }
 
@@ -8450,6 +9842,7 @@ void OrionAppController::setMeterOverlayStyle(const QString& value)
     QString normalized;
     if (lower == QLatin1String("brackets")) normalized = QStringLiteral("Brackets");
     else if (lower == QLatin1String("hairline")) normalized = QStringLiteral("Hairline");
+    else if (lower == QLatin1String("clean")) normalized = QStringLiteral("Clean");
     else normalized = QStringLiteral("Solid");
     auto data = config_.data();
     if (data.meterOverlayStyle == normalized) {
@@ -8570,6 +9963,25 @@ void OrionAppController::setMeterStyle(const QString& value)
     // calibration must re-converge (silent, clocks kept as warm starts).
     automation_.recalibrateAllShotTypes();
     appendLog(QStringLiteral("Calibration: all shot types -> Acquire (meter style changed)"));
+}
+
+void OrionAppController::setMeterProposer(const QString& value)
+{
+    // Normalise exactly like the settings loader so QML can hand over labels/case
+    // variants and the persisted value is always one of the two the sidecar knows.
+    const QString normalized = normalizedMeterProposer(value);
+    auto data = config_.data();
+    if (data.meterProposer == normalized) {
+        return;
+    }
+    data.meterProposer = normalized;
+    saveConfigSilently(data);
+    emit settingsChanged();
+    // The locator singleton reads ORION_METER_PROPOSER once per sidecar process, so the
+    // running sidecar keeps its current proposer; the next launch picks this one up.
+    appendLog(QStringLiteral("Meter Detection: proposer -> %1 (applies at the next sidecar launch)")
+                  .arg(normalized == QLatin1String("yolo") ? QStringLiteral("YOLO")
+                                                            : QStringLiteral("Pure CV")));
 }
 
 void OrionAppController::setActiveShotType(const QString& value)
@@ -8908,6 +10320,28 @@ QString OrionAppController::licenseKeyMasked() const
         .arg(authLicenseKey_.right(4));
 }
 
+QString OrionAppController::machineIdMasked() const
+{
+    const QString id = security_.machineId();
+    if (id.isEmpty()) {
+        return {};
+    }
+    return QStringLiteral("••••••%1").arg(id.right(6));
+}
+
+void OrionAppController::copyProfileDiscordId()
+{
+    if (profile_.discordUserId.isEmpty()) {
+        appendLog(QStringLiteral(
+            "Copy Discord ID requested but the licence server has not reported one."));
+        return;
+    }
+    if (auto* clipboard = QGuiApplication::clipboard()) {
+        clipboard->setText(profile_.discordUserId);
+        appendLog(QStringLiteral("Discord ID copied to clipboard."));
+    }
+}
+
 void OrionAppController::copyLicenseKey()
 {
     if (authLicenseKey_.isEmpty()) {
@@ -9010,15 +10444,32 @@ void OrionAppController::acceptLegalAgreement()
 
 void OrionAppController::setVideoSource(const QString& value)
 {
-    const QString v = value.trimmed().toLower();
-    const QString norm = (v == QLatin1String("capture_card") || v == QLatin1String("capture card"))
-                             ? QStringLiteral("capture_card") : QStringLiteral("decoder");
+    if (isXboxRemotePlay(config_.data()))
+        return; // Xbox always uses its explicit WGC target; preserve the PS5 source.
+    const QString norm = actuationLeadSourceKey(value);
     auto data = config_.data();
     if (data.videoSource == norm) {
         return;
     }
-    data.videoSource = norm;
-    saveConfigSilently(data);
+    // [ORION_LEAD_BY_SOURCE 2026-09-14] The route IS most of the lead (capture exposure+encode
+    // vs network+decoder), so the Shot Lead travels with it: stash the live pair under the route
+    // being left, restore the route being entered. A route that was never configured restores
+    // "not configured" (0 / false) — the pre-existing behaviour, which is what the card prompts
+    // on and what lets the measured seed run once there is authority — rather than silently
+    // inheriting a number measured on the other pipe.
+    const auto leadSwitch = switchActuationLeadVideoSource(data, norm);
+    if (!saveConfigSilently(data)) {
+        return;
+    }
+    // saveConfigSilently -> syncBackendConfig -> automation_.applyConfig, so the engine's
+    // userActuationLeadMs follows this switch immediately, exactly as it does for
+    // setActuationLeadMs. The engine's lead semantics are unchanged; only which number it gets.
+    appendLog(QStringLiteral("Shot Lead: video source %1 -> %2, lead %3 -> %4")
+                  .arg(leadSwitch.fromSource, leadSwitch.toSource,
+                       actuationLeadDescription(leadSwitch.previousLeadMs,
+                                                leadSwitch.previousUserSet),
+                       actuationLeadDescription(leadSwitch.restoredLeadMs,
+                                                leadSwitch.restoredUserSet)));
 }
 
 void OrionAppController::setCaptureCardIndex(int value)
@@ -9030,6 +10481,37 @@ void OrionAppController::setCaptureCardIndex(int value)
     }
     data.captureCardIndex = value;
     saveConfigSilently(data);
+}
+
+void OrionAppController::setCaptureCardFps(int value)
+{
+    // [ORION_CAPTURE_FPS 2026-09-14] SNAP, do not clamp — see snappedCaptureCardFps. Persisting
+    // the snapped value keeps stored == requested == what the card is actually asked for, so the
+    // health line's requested-vs-negotiated comparison is meaningful.
+    const int snapped = snappedCaptureCardFps(value);
+    auto data = config_.data();
+    if (data.captureCardFps == snapped) {
+        return;
+    }
+    data.captureCardFps = snapped;
+    if (!saveConfigSilently(data)) {
+        return;
+    }
+    appendLog(QStringLiteral(
+                  "Capture card refresh rate set to %1 fps (applies on the next sidecar launch)")
+                  .arg(snapped));
+    if (snapped > 60) {
+        // [ORION_CAPTURE_FPS_60_ONLY 2026-09-14 owner] The UI cannot reach this any more — it is
+        // a settings.json / env value only. The Elgato HD60 X ACCEPTS a 1080p120 request and
+        // delivers 60, and the sidecar then grades every shot's cadence against a frame interval
+        // the card never produced: the owner's random earlies and lates ("i turned it off and i
+        // went perfect from the field"). Say so at the moment it is set, not after a session.
+        appendLog(QStringLiteral(
+            "Capture card refresh rate %1 fps: most capture cards ACCEPT this and still deliver "
+            "60 — check the Capture health line's uniqfps before trusting it. 60 Hz is the "
+            "meter's native cadence.")
+                      .arg(snapped));
+    }
 }
 
 void OrionAppController::setHardwareDecode(bool value)
@@ -9086,21 +10568,33 @@ void OrionAppController::setDetectionConfidencePercent(int value)
     saveConfigSilently(data);
 }
 
+QString OrionAppController::tempoInputPath() const
+{
+    return selectedTempoInputPath(config_.data());
+}
+
+void OrionAppController::setTempoInputPath(const QString& value)
+{
+    auto data = config_.data();
+    if (!selectTempoInputPath(data, value) || sameTempoPathSettings(data, config_.data())) return;
+    // Revoke the old route before publishing a different trigger selection.
+    automation_.setArmed(false);
+    disarmPreciseFire();
+    neutralizeOwnedInput();
+    saveConfigSilently(data);
+    syncEngineArmed();
+}
+
 void OrionAppController::setTempoEnabled(bool value)
 {
     auto data = config_.data();
-    // Tempo Shot: a held Square is remapped to the 2K right-stick tempo motion
-    // (RS down-load through the hold, then an up-flick at the meter tip). The
-    // trigger stays Square; the engine's TempoSquare path (gated by
-    // tempoRemapEnabled) reshapes the OUTPUT and reuses the meter-timed release.
-    if (data.tempoEnabled == value && data.tempoRemapEnabled == value
-        && data.tempoFlickEnabled == value) {
-        return;
-    }
-    data.tempoEnabled = value;
-    data.tempoRemapEnabled = value;
-    data.tempoFlickEnabled = value;
+    setTempoPathEnabled(data, value);
+    if (sameTempoPathSettings(data, config_.data())) return;
+    automation_.setArmed(false);
+    disarmPreciseFire();
+    neutralizeOwnedInput();
     saveConfigSilently(data);
+    syncEngineArmed();
 }
 
 void OrionAppController::setNoDipEnabled(bool value)
@@ -9111,6 +10605,185 @@ void OrionAppController::setNoDipEnabled(bool value)
     }
     data.noDipEnabled = value;
     saveConfigSilently(data);
+}
+
+void OrionAppController::setInputTimedEnabled(bool value)
+{
+    // [ORION_NO_METER_SHELVED 2026-09-15 owner] "Shelve the no meter path, we'll beef that up for
+    // a later update." The refusal is back, and it is deliberately asymmetric: turning the mode
+    // OFF is always allowed (an install that somehow arrived on the blind path can always get
+    // back to the meter), turning it ON is refused while AppConfig::inputTimedAllowed() is false.
+    // The UI that used to call this is unmounted, so in the shipped app the only callers left are
+    // a deep link, a stale QML binding, or a test -- and the first two must not be able to put a
+    // customer on a blind release. Tests lift the fence with setInputTimedAllowedForTesting().
+    if (value && !AppConfig::inputTimedAllowed()) {
+        appendLog(QStringLiteral(
+            "NO METER: refused — the mode is shelved in this build (meter path only)."));
+        return;
+    }
+    auto data = config_.data();
+    if (data.inputTimedEnabled == value) return;
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] "switching between the two should cut off the
+    // other". This IS the disarm the switch owes the console: setArmed(false) synchronously
+    // fences the controller worker's release token and disarmPreciseFire() drops any copied
+    // deadline, BEFORE the new mode's config reaches the engine. The engine then clears both
+    // paths' transient release state on the config edge
+    // (AutomationEngine::clearTransientReleaseStateForModeSwitch) and hands the console one
+    // neutral pass-through tick, so no held virtual Square or tempo gather crosses the switch.
+    automation_.setArmed(false);
+    disarmPreciseFire();
+    data.inputTimedEnabled = value;
+    if (saveConfigSilently(data)) {
+        // [2026-09-14 owner] was `inputTimedPaused_ = !value`, which is why a saved NO METER
+        // selection "starts paused when the app launches" (the member also defaulted to true).
+        // The Pause control is gone from the card, so nothing may set this except an explicit
+        // setInputTimedPaused: selecting NO METER must mean NO METER is running.
+        inputTimedPaused_ = false;
+        emit settingsChanged();
+    }
+    syncEngineArmed();
+}
+
+void OrionAppController::setInputTimedPaused(bool value)
+{
+    if (inputTimedPaused_ == value) return;
+    inputTimedPaused_ = value;
+    // Uses the same synchronous revocation fence as route/auth disarming.
+    syncEngineArmed();
+    emit settingsChanged();
+}
+
+void OrionAppController::setInputTimedDelayMs(double value)
+{
+    if (!std::isfinite(value)) return;
+    auto data = config_.data();
+    value = std::clamp(value, 100.0, 2500.0);
+    if (data.inputTimedDelayMs == value) return;
+    if (data.inputTimedEnabled) {
+        automation_.setArmed(false);
+        disarmPreciseFire();
+    }
+    data.inputTimedDelayMs = value;
+    saveConfigSilently(data);
+    syncEngineArmed();
+}
+
+void OrionAppController::setInputTimedLeadMs(double value)
+{
+    if (!std::isfinite(value)) return;
+    auto data = config_.data();
+    value = std::clamp(value, 150.0, 400.0);
+    if (data.inputTimedLeadMs == value) return;
+    if (data.inputTimedEnabled) {
+        automation_.setArmed(false);
+        disarmPreciseFire();
+    }
+    data.inputTimedLeadMs = value;
+    saveConfigSilently(data);
+    syncEngineArmed();
+}
+
+void OrionAppController::setNoMeterHoldMs(double value)
+{
+    // [ORION_NO_METER_V2 2026-09-14 owner] THE blind-release control. Same shape as
+    // setRhythmFlickDelayMs / setActuationLeadMs: reject non-finite, clamp into the persisted
+    // band (QML re-binds on every settingsChanged, so an unguarded write would re-sign
+    // settings.json on every repaint), then persist — saveConfigSilently() ->
+    // syncBackendConfig() -> automation_.applyConfig() is what pushes it into the live engine.
+    // The clamp is also a SAFETY property here: 500 ms is the bottom of the band precisely
+    // because a shorter hold walks toward the pump-fake commit threshold.
+    if (!std::isfinite(value)) {
+        return;
+    }
+    const double v = qBound(AppConfigData::kNoMeterHoldMinMs, value,
+                            AppConfigData::kNoMeterHoldMaxMs);
+    auto data = config_.data();
+    if (data.noMeterHoldMs == v) {
+        return;
+    }
+    // A live NO METER arm must not reinterpret its copied deadline under a new hold.
+    if (data.inputTimedEnabled) {
+        automation_.setArmed(false);
+        disarmPreciseFire();
+    }
+    data.noMeterHoldMs = v;
+    if (saveConfigSilently(data)) {
+        appendLog(QStringLiteral("No Meter release timing set to %1 ms").arg(v, 0, 'f', 0));
+        // [ORION_BANNER_VERDICT_LIVE 2026-09-14] Restart the 10-shot count with the value.
+        resetBannerTally();
+    }
+    syncEngineArmed();
+}
+
+void OrionAppController::setNoMeterFadeTrimMs(double value)
+{
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14 owner] "fades need work". Same shape as
+    // setNoMeterHoldMs: reject non-finite, clamp into the persisted band (QML re-binds on every
+    // settingsChanged, so an unguarded write would re-sign settings.json on every repaint), then
+    // persist. Unlike the hold this cannot reach the pump-fake floor on its own — the floor in
+    // blindReleaseHold() still catches the sum — but the clamp keeps file, UI and env agreeing on
+    // one band.
+    if (!std::isfinite(value)) {
+        return;
+    }
+    const double v = qBound(AppConfigData::kNoMeterFadeTrimMinMs, value,
+                            AppConfigData::kNoMeterFadeTrimMaxMs);
+    auto data = config_.data();
+    if (data.noMeterFadeTrimMs == v) {
+        return;
+    }
+    // A live NO METER arm must not reinterpret its copied deadline under a new trim.
+    if (data.inputTimedEnabled) {
+        automation_.setArmed(false);
+        disarmPreciseFire();
+    }
+    data.noMeterFadeTrimMs = v;
+    if (saveConfigSilently(data)) {
+        appendLog(QStringLiteral("No Meter fade trim set to %1 ms").arg(v, 0, 'f', 0));
+        // [ORION_BANNER_VERDICT_LIVE 2026-09-14] Restart the 10-shot count with the value.
+        resetBannerTally();
+    }
+    syncEngineArmed();
+}
+
+void OrionAppController::setNoMeterVisionAssist(bool value)
+{
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] The pure-blind vs hybrid A/B switch. Same
+    // shape as setNoMeterFadeTrimMs: no-op on an unchanged write (QML re-binds on every
+    // settingsChanged, so an unguarded write would re-sign settings.json on every repaint), tear
+    // a live NO METER arm down before the rules change under it, then persist —
+    // saveConfigSilently() -> syncBackendConfig() -> automation_.applyConfig() is what pushes it
+    // into the live engine.
+    auto data = config_.data();
+    if (data.noMeterVisionAssist == value) {
+        return;
+    }
+    if (data.inputTimedEnabled) {
+        automation_.setArmed(false);
+        disarmPreciseFire();
+    }
+    data.noMeterVisionAssist = value;
+    if (saveConfigSilently(data)) {
+        appendLog(value
+                      ? QStringLiteral("No Meter: vision owns the release when it sees the meter")
+                      : QStringLiteral("No Meter: blind hold only (vision assist off)"));
+        // [ORION_BANNER_VERDICT_LIVE 2026-09-14] Restart the 10-shot count with the new rule.
+        resetBannerTally();
+    }
+    syncEngineArmed();
+}
+
+void OrionAppController::setInputTimedRhythmEnabled(bool value)
+{
+    auto data = config_.data();
+    if (data.inputTimedRhythmEnabled == value) return;
+    if (data.inputTimedEnabled) {
+        automation_.setArmed(false);
+        disarmPreciseFire();
+    }
+    data.inputTimedRhythmEnabled = value;
+    saveConfigSilently(data);
+    syncEngineArmed();
 }
 
 void OrionAppController::setNoMeterEnabled(bool value)
@@ -9646,10 +11319,79 @@ void OrionAppController::refreshLiveMeterTelemetry()
     }
 }
 
+void OrionAppController::observeDetectorHealth(const QJsonObject& health)
+{
+    // One compact line: "<proposer> · <infer> ms · <state> · locks N · <refused|drops> N".
+    // Every field is optional so an older sidecar (or a reader without the snapshot)
+    // degrades to fewer segments rather than to a blank card.
+    const QString provider = health.value(QStringLiteral("provider")).toString().trimmed();
+    QString label;
+    if (provider.isEmpty() || provider == QLatin1String("none")) {
+        label = QStringLiteral("No detector");
+    } else if (provider == QLatin1String("cv-contour")) {
+        label = QStringLiteral("Pure CV");
+    } else {
+        // ONNX Runtime provider ids: DmlExecutionProvider / CUDAExecutionProvider /
+        // CPUExecutionProvider / ... -> "YOLO · DirectML" etc.
+        QString backend = provider;
+        backend.remove(QStringLiteral("ExecutionProvider"));
+        if (backend.compare(QLatin1String("Dml"), Qt::CaseInsensitive) == 0) {
+            backend = QStringLiteral("DirectML");
+        }
+        label = backend.isEmpty() ? QStringLiteral("YOLO")
+                                  : QStringLiteral("YOLO · %1").arg(backend);
+    }
+    QStringList parts{label};
+    if (health.contains(QStringLiteral("infer_ms"))) {
+        parts.append(QStringLiteral("%1 ms")
+                         .arg(health.value(QStringLiteral("infer_ms")).toDouble(), 0, 'f', 1));
+    }
+    const QString state = health.value(QStringLiteral("state")).toString().trimmed();
+    if (!state.isEmpty() && state != QLatin1String("-")) {
+        parts.append(state);
+    }
+    if (health.contains(QStringLiteral("locks"))) {
+        parts.append(QStringLiteral("locks %1").arg(health.value(QStringLiteral("locks")).toInt()));
+    }
+    if (provider == QLatin1String("cv-contour")) {
+        // The CV locator's own gate refusals (no green tip / no white outline) are the
+        // number that says whether it is seeing THIS meter; YOLO has no equivalent, so
+        // it shows the reader's drop count instead.
+        const int refused = health.value(QStringLiteral("cv_no_tip")).toInt()
+            + health.value(QStringLiteral("cv_no_outline")).toInt();
+        parts.append(QStringLiteral("refused %1").arg(refused));
+    } else if (health.contains(QStringLiteral("drops"))) {
+        parts.append(QStringLiteral("drops %1").arg(health.value(QStringLiteral("drops")).toInt()));
+    }
+    const QString line = parts.join(QStringLiteral(" · "));
+    if (line == detectorHealthLine_ && provider == detectorProvider_) {
+        return;
+    }
+    detectorHealthLine_ = line;
+    detectorProvider_ = provider;
+    emit detectorHealthChanged();
+}
+
 void OrionAppController::observeMeterBlindness(quint64 physicalShotEpoch,
                                                bool genuineRawDetection)
 {
     const bool was = meterBlindWarning_;
+
+    // [ORION_MODE_EXCLUSIVITY 2026-09-14 owner] NO METER releases on a timer and looks at
+    // nothing. "No meter was detected for this shot" is the DESIGN there, not a fault, so the
+    // advisor is silent for the whole mode and its streak is reset — otherwise the first press
+    // back on the meter path inherits a streak earned while the detector was not being asked a
+    // question, and the customer feed shows a detector warning for a mode with no detector.
+    if (config_.data().inputTimedEnabled) {
+        meterBlindStreak_ = 0;
+        meterBlindEpoch_ = 0;
+        meterBlindEpochSawMeter_ = false;
+        meterBlindWarning_ = false;
+        if (was) {
+            emit meterBlindChanged();
+        }
+        return;
+    }
 
     // A genuine raw detection is PROOF the configured colour can be seen. Clear everything
     // immediately -- this warning must never outlive the condition it describes.
@@ -9683,8 +11425,10 @@ void OrionAppController::observeMeterBlindness(quint64 physicalShotEpoch,
 
     meterBlindWarning_ = meterBlindStreak_ >= kMeterBlindStreakTrip_;
     if (was != meterBlindWarning_) {
+        // [2026-09-14 owner] The prefix was "NO METER:", which is now the name of a whole timing
+        // MODE and the engine's own blind-release log tag — one grep, two unrelated meanings.
         appendLog(meterBlindWarning_
-                      ? QStringLiteral("NO METER: %1 shots with no detection — %2")
+                      ? QStringLiteral("METER BLIND: %1 shots with no meter detected — %2")
                             .arg(meterBlindStreak_)
                             .arg(meterBlindHint())
                       : QStringLiteral("Meter detection recovered."));
@@ -9875,8 +11619,12 @@ void OrionAppController::updateReleaseOwnershipTrace(const ControllerState& phys
     const bool stateChanged = shot_.state != ownPrevState_;
     const bool sqChanged = (physSq != ownPrevPhysSq_) || (outSq != ownPrevOutSq_);
     if (ownLogFirst_ || stateChanged || sqChanged) {
+        // [ORION_OUTPUT_DIVERGENCE 2026-09-14 owner] l2/r2 are the OUTPUT trigger values. The
+        // "it seemed like it was holding L2 for me" report could not be judged from this log at
+        // all, because no line anywhere carried a trigger value.
         appendLog(QStringLiteral("Release tick: seq=%1 state=%2 t_ms=%3 phys_sq=%4 "
-                                 "out_sq=%5 ok=%6 backend=%7 rs=(%8,%9) src=%10 kind=%11")
+                                 "out_sq=%5 ok=%6 backend=%7 rs=(%8,%9) l2=%10 r2=%11 "
+                                 "src=%12 kind=%13")
                       .arg(seq)
                       .arg(holdStateToken(shot_.state))
                       .arg(tMs)
@@ -9886,6 +11634,8 @@ void OrionAppController::updateReleaseOwnershipTrace(const ControllerState& phys
                       .arg(backend)
                       .arg(output.rightStickX)
                       .arg(output.rightStickY)
+                      .arg(static_cast<int>(output.l2))
+                      .arg(static_cast<int>(output.r2))
                       .arg(ownSrc_)
                       .arg(ownKind_));
         ownLogFirst_ = false;
@@ -9893,6 +11643,110 @@ void OrionAppController::updateReleaseOwnershipTrace(const ControllerState& phys
     ownPrevPhysSq_ = physSq;
     ownPrevOutSq_ = outSq;
     ownPrevState_ = shot_.state;
+}
+
+// [ORION_OUTPUT_DIVERGENCE 2026-09-14 owner] ---------------------------------------------------
+//
+// THE REPORT: "buttons sometimes are weird, it seemed like it was holding L2 for me". Tonight's
+// log cannot judge it — zero input-hook failures, no pad-silence lines, and not one trigger value
+// on any output line — so the only honest answer is to start recording the thing itself.
+//
+// WHAT IT WATCHES: every button the engine has no business changing, plus both analog triggers.
+// Square is EXCLUDED because the release logic legitimately suppresses and latches it (the whole
+// remap/overlap-latch design is "output Square != physical Square"), so including it would bury
+// the signal under normal operation. Everything else diverging means the output path invented or
+// swallowed an input the player did not ask for — which is exactly the claim.
+//
+// COST: a handful of integer compares per tick, one QString only on an edge. Rate-limited to one
+// START line per field per second so a stuck trigger cannot flood the ring buffer.
+//
+// BEHAVIOURAL CHANGE: none. Nothing here reads back into the output.
+void OrionAppController::observeOutputDivergence(const ControllerState& physical,
+                                                 const ControllerState& output)
+{
+    const qint64 nowMs = static_cast<qint64>(automation_.engineNowMs());
+    // Square is deliberately absent; so are the sticks (the remap owns the right stick by design).
+    struct FieldSample {
+        const char* name;
+        int out;
+        int phys;
+    };
+    const auto btn = [](const ControllerState& s, uint16_t mask) {
+        return (s.buttons & mask) != 0 ? 1 : 0;
+    };
+    const FieldSample samples[] = {
+        {"l2", static_cast<int>(output.l2), static_cast<int>(physical.l2)},
+        {"r2", static_cast<int>(output.r2), static_cast<int>(physical.r2)},
+        {"cross", btn(output, XINPUT_GAMEPAD_A), btn(physical, XINPUT_GAMEPAD_A)},
+        {"circle", btn(output, XINPUT_GAMEPAD_B), btn(physical, XINPUT_GAMEPAD_B)},
+        {"triangle", btn(output, XINPUT_GAMEPAD_Y), btn(physical, XINPUT_GAMEPAD_Y)},
+        {"l1", btn(output, XINPUT_GAMEPAD_LEFT_SHOULDER),
+         btn(physical, XINPUT_GAMEPAD_LEFT_SHOULDER)},
+        {"r1", btn(output, XINPUT_GAMEPAD_RIGHT_SHOULDER),
+         btn(physical, XINPUT_GAMEPAD_RIGHT_SHOULDER)},
+        {"l3", btn(output, XINPUT_GAMEPAD_LEFT_THUMB),
+         btn(physical, XINPUT_GAMEPAD_LEFT_THUMB)},
+        {"r3", btn(output, XINPUT_GAMEPAD_RIGHT_THUMB),
+         btn(physical, XINPUT_GAMEPAD_RIGHT_THUMB)},
+    };
+    // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] r2 is a WATCHED field, and the sprint
+    // release makes it diverge on purpose for the whole of a sprinting Square press. Attribute it
+    // rather than hide it -- this audit exists because of "it seemed like it was holding L2 for
+    // me", and a policy that silently suppressed its own evidence would be the worse bug. Live
+    // mining whitelists sprint_released=1 and every remaining r2 line IS a defect. Read once so
+    // both the OPEN and END lines of one window agree.
+    const int sprintShaped = automation_.sprintReleaseActive() ? 1 : 0;
+    constexpr int kFieldCount = static_cast<int>(std::size(samples));
+    static_assert(kFieldCount
+                      <= static_cast<int>(std::tuple_size<decltype(outDivergeSinceMs_)>::value),
+                  "outDivergeSinceMs_/outDivergeLoggedMs_ must cover every watched field");
+
+    for (int i = 0; i < kFieldCount; ++i) {
+        const FieldSample& f = samples[i];
+        if (f.out == f.phys) {
+            if (outDivergeSinceMs_[i] >= 0 && outDivergeReported_[i]) {
+                appendLog(QStringLiteral(
+                    "OUTPUT DIVERGENCE END: field=%1 held_ms=%2 state=%3 reason=%4 "
+                    "sprint_released=%5")
+                              .arg(QLatin1String(f.name))
+                              .arg(nowMs - outDivergeSinceMs_[i])
+                              .arg(holdStateToken(shot_.state))
+                              .arg(shot_.releaseReason.isEmpty() ? QStringLiteral("-")
+                                                                 : shot_.releaseReason)
+                              .arg(std::strcmp(f.name, "r2") == 0 ? sprintShaped : 0));
+            }
+            outDivergeSinceMs_[i] = -1;
+            outDivergeReported_[i] = false;
+            continue;
+        }
+        if (outDivergeSinceMs_[i] < 0) {
+            outDivergeSinceMs_[i] = nowMs;
+            continue;
+        }
+        const qint64 heldMs = nowMs - outDivergeSinceMs_[i];
+        // 40 ms = ~2-3 controller polls. Shorter than that is the ordinary one-frame skew between
+        // the packet the engine read and the packet this tick is comparing against.
+        if (heldMs < kOutDivergeMinMs_ || outDivergeReported_[i]) {
+            continue;
+        }
+        if (outDivergeLoggedMs_[i] >= 0 && nowMs - outDivergeLoggedMs_[i] < 1000) {
+            continue;   // 1/s per field
+        }
+        outDivergeLoggedMs_[i] = nowMs;
+        outDivergeReported_[i] = true;
+        ++outDivergeEvents_;
+        appendLog(QStringLiteral(
+            "OUTPUT DIVERGENCE: field=%1 out=%2 phys=%3 held_ms=%4 state=%5 reason=%6 "
+            "sprint_released=%7")
+                      .arg(QLatin1String(f.name))
+                      .arg(f.out)
+                      .arg(f.phys)
+                      .arg(heldMs)
+                      .arg(holdStateToken(shot_.state))
+                      .arg(shot_.releaseReason.isEmpty() ? QStringLiteral("-")
+                                                         : shot_.releaseReason)
+                      .arg(std::strcmp(f.name, "r2") == 0 ? sprintShaped : 0));
+    }
 }
 
 void OrionAppController::flushReleaseOwnershipTrace()
@@ -9906,7 +11760,7 @@ void OrionAppController::flushReleaseOwnershipTrace()
     // still held and the shot still didn't fire in-game, the leak is downstream (Chiaki).
     appendLog(QStringLiteral("Release ownership: seq=%1 phys_held_all=%2 out_cleared_all=%3 "
                              "max_out_sq=%4 phys_release_t_ms=%5 ticks=%6 dur_ms=%7 "
-                             "backend=%8 src=%9 kind=%10")
+                             "backend=%8 src=%9 kind=%10 out_diverge_events=%11")
                   .arg(ownSeq_)
                   .arg(ownPhysHeldAll_ ? 1 : 0)
                   .arg(ownOutClearedAll_ ? 1 : 0)
@@ -9916,7 +11770,8 @@ void OrionAppController::flushReleaseOwnershipTrace()
                   .arg(ownLastTms_)
                   .arg(ownBackend_)
                   .arg(ownSrc_)
-                  .arg(ownKind_));
+                  .arg(ownKind_)
+                  .arg(outDivergeEvents_));
     ownSeq_ = -1;
 }
 
@@ -9978,6 +11833,7 @@ void OrionAppController::clearRemotePreviewFrame()
     frameProvider_->resetFrames(nextSerial, blank);
     meterOverlayTracker_.reset();
     meterOverlayContinuityLease_.reset();
+    lastMeterOverlayVisualSeenMs_ = 0;
     meterOverlayComputedBox_ = {};
     meterOverlayComputedRejectedBox_ = {};
     remoteFrameOverlaySnapshots_.reset(RemoteFrameOverlaySnapshot{
@@ -10091,9 +11947,11 @@ void OrionAppController::handleRemoteFrame(const QImage& frame, int frameNumber)
     // preview-image px the QML overlay expects (it scales them to the displayed image via drawScale).
     {
         const qint64 nowOverlayMs = QDateTime::currentMSecsSinceEpoch();
-        // OVERLAY CONFIRMATION GATE. Draw the lock ONLY while the AUTHORITATIVE detector has a
-        // FRESH, REAL meter lock (a clean raw detection within ~120ms — echoes/stale samples
-        // excluded). This is driven purely by the detector, NOT by isShooting (which is true the
+        // OVERLAY CONFIRMATION GATE. Draw the lock only while the authoritative detector has a
+        // recent genuine lock. This display-only lease is deliberately longer than timing/metric
+        // freshness: the measured detector p90 was 167ms (max 298ms), so reusing the 120ms timing
+        // TTL made a continuously visible meter blink. Echoes/stale samples cannot renew it and
+        // AutomationEngine never reads it. This is driven by the detector, NOT by isShooting (which is true the
         // instant Square is held ~135ms, regardless of whether a meter exists). That is exactly
         // why holding Square idle used to paint a lock on a stale prior-shot bbox or a transient
         // distractor: the old gate keyed off the button + a 300ms sticky on lastMeterSeenMs_
@@ -10102,10 +11960,9 @@ void OrionAppController::handleRemoteFrame(const QImage& frame, int frameNumber)
             && captureSourceHealth_ == QLatin1String("frame_feed_active")
             && !captureAwaitingFreshFrame_
             && !guiFreezeTripped_.load(std::memory_order_relaxed);
-        const bool rawMeterRecent = overlayRuntimeHealthy
-            && lastRealMeterSeenMs_ != 0
-            && (nowOverlayMs - lastRealMeterSeenMs_)
-                < (isShooting() ? kMeterConfirmShotMs_ : kMeterConfirmFreshMs_);
+        const bool rawMeterRecent = meterOverlayVisualRecent(
+            overlayRuntimeHealthy, lastMeterOverlayVisualSeenMs_, nowOverlayMs,
+            isShooting());
         const bool continuityMeterRecent = meterOverlayContinuityLease_.maintain(
             nowOverlayMs, isShooting(), shot_.physicalShotEpoch,
             overlayRuntimeHealthy);
@@ -10156,15 +12013,17 @@ void OrionAppController::handleRemoteFrame(const QImage& frame, int frameNumber)
                 meterOverlayComputedBox_ = newBox;
                 meterOverlayComputedRejectedBox_ = {};
             }
+        } else if (boxAction == MeterOverlayBoxAction::HoldLastJoinedBox) {
+            // Metadata for this preview frame has not joined yet.  Keep the
+            // last box that *did* belong to its presented pixels; the bounded
+            // detector-freshness/continuity lease above is the only authority
+            // for this hold.  Do not update tracker state from a newer box.
         } else if (boxAction == MeterOverlayBoxAction::Clear) {
             // FOOLPROOF BOX (2026-07-22): only clear the box when the meter is GENUINELY gone
             // (no real detection within the confirm window).
-            // A single-frame join miss while the meter is still recently-real (the detector's
-            // steal/relock re-acquire blinks near the tip) previously zeroed the box for that
-            // paint -> the box "disappeared" mid-shot. Holding the last box across the blink
-            // (bounded by meterRecent's window; the meter can't move meaningfully in one
-            // frame) makes the box rock-solid like the reference tools. Display-only — does not
-            // touch fill/timing/rejection state.
+            // Freshness expired or the detector/capture authority failed.  A
+            // mere join miss is handled by HoldLastJoinedBox above; reaching
+            // this branch is therefore a genuine visibility boundary.
             meterOverlayTracker_.reset();
             if (!meterOverlayComputedBox_.isNull()) {
                 meterOverlayComputedBox_ = {};
@@ -10209,7 +12068,16 @@ void OrionAppController::handleRemoteFrame(const QImage& frame, int frameNumber)
             qmlPreviewReadyAcksWindow_ = 0;
             qmlPreviewStaleAcksWindow_ = 0;
             qmlPreviewStatsAtMs_ = nowMs;
-        } else if (nowMs - qmlPreviewStatsAtMs_ >= kQmlPreviewStatsIntervalMs_) {
+        // [ORION_ACTIVITY_FEED 2026-09-14 owner "overall polish"] Same treatment as
+        // the three RemotePlaySession gauges: 438 of the census hour's lines came
+        // from this one 5 s beat. Steady state is a minute; a window that saw a
+        // stale presentation ack (the symptom this line exists to expose) keeps the
+        // original 5 s cadence. The line stays disk-only either way — it is
+        // deny-listed out of the customer Activity ring.
+        } else if (nowMs - qmlPreviewStatsAtMs_
+                   >= (qmlPreviewStaleAcksWindow_ > 0
+                           ? kQmlPreviewStatsIntervalMs_
+                           : kQmlPreviewStatsHealthyIntervalMs_)) {
             const double seconds = std::max(
                 0.001, static_cast<double>(nowMs - qmlPreviewStatsAtMs_) / 1000.0);
             const RemoteFrameProviderStats stats = frameProvider_->takeWindowStats();
@@ -10273,6 +12141,30 @@ void OrionAppController::pollPhysicalController()
         // these directly before the read moved off-thread).
         const auto snap = rawInputWorker_->snapshot();
         if (snap.lastReportMs > 0) {
+            // [ORION_SPECIAL_BUTTON_TRACE 2026-09-11] Owner report: Options / touchpad "don't
+            // work". Log the EDGES of the non-shot buttons (once per press and release) so the
+            // next session shows whether the pad delivered them (decode) and which route
+            // carried them. Edge-only, so it stays quiet during play.
+            {
+                const auto specialMask = [](const ControllerState& st) -> unsigned {
+                    return (st.options() ? 1u : 0u) | (st.create() ? 2u : 0u)
+                        | (st.ps() ? 4u : 0u) | (st.touchpad ? 8u : 0u);
+                };
+                const unsigned before = specialMask(rawInputState_);
+                const unsigned after = specialMask(snap.state);
+                if (before != after) {
+                    appendLog(QStringLiteral(
+                                  "Special button edge: options=%1 create=%2 ps=%3 touchpad=%4 "
+                                  "route=%5 hook=%6")
+                                  .arg((after & 1u) ? 1 : 0)
+                                  .arg((after & 2u) ? 1 : 0)
+                                  .arg((after & 4u) ? 1 : 0)
+                                  .arg((after & 8u) ? 1 : 0)
+                                  .arg(directPipeOwnsInput_ ? QStringLiteral("pipe")
+                                                            : QStringLiteral("xusb"))
+                                  .arg(orionInput_.enabled() ? 1 : 0));
+                }
+            }
             rawInputState_ = snap.state;
             lastRawInputMs_ = snap.lastReportMs;
             if (!snap.label.isEmpty()) {
@@ -10414,6 +12306,8 @@ void OrionAppController::pollPhysicalController()
         constexpr qint64 kWinMmPollIntervalMs = 1000;
         constexpr qint64 kWinMmCacheTtlMs = 1500;
         const bool winmmHigherPriorityLive = rawInputLive || xinputPhysicalLive;
+        if (isXboxRemotePlay(config_.data()))
+            lastWinMmSeenMs_ = 0;
         // Once any modern controller is seen, latch WinMM off for the whole session (fixes the
         // unplug/replug c0000374: an unplug momentarily drops rawInputLive, and WinMM enumerating in
         // that churn window corrupts the heap).
@@ -10429,7 +12323,7 @@ void OrionAppController::pollPhysicalController()
             && nowMs - lastControllerDeviceChangeMs_ < kWinMmDeviceChangeCooldownMs;
         DWORD winmmFreshRawButtons = 0;
         bool winmmFreshRawValid = false;
-        if (!modernControllerEverSeen_ && !winmmHigherPriorityLive && !winmmDeviceChurnCooldown
+        if (!isXboxRemotePlay(config_.data()) && !modernControllerEverSeen_ && !winmmHigherPriorityLive && !winmmDeviceChurnCooldown
             && nowMs - lastWinMmPollMs_ >= kWinMmPollIntervalMs) {
             lastWinMmPollMs_ = nowMs;
             ControllerState winmmState;
@@ -10458,7 +12352,7 @@ void OrionAppController::pollPhysicalController()
         // discovery (incl. the modern-pad latch) so the candidate's LIFECYCLE is unchanged —
         // only its freshness improves. A failed read stops refreshing lastWinMmSeenMs_, so the
         // candidate ages out via the TTL and the 1/s discovery resumes.
-        if (!modernControllerEverSeen_ && !winmmHigherPriorityLive && !winmmDeviceChurnCooldown
+        if (!isXboxRemotePlay(config_.data()) && !modernControllerEverSeen_ && !winmmHigherPriorityLive && !winmmDeviceChurnCooldown
             && lastWinMmSeenMs_ > 0 && nowMs > lastWinMmSeenMs_
             && nowMs - lastWinMmSeenMs_ <= kWinMmCacheTtlMs) {
             ControllerState freshWinMm;
@@ -10508,7 +12402,11 @@ void OrionAppController::pollPhysicalController()
         controllerStableDevice_ = selected.active ? selected.device.detail : QStringLiteral("-");
 
         if (!selected.active) {
+            if (squareOutputWatchdogEnabled_)
+                squareOutputWatchdog_.observePhysical(false, false);
+            hookIdleNeutralSinceMs_ = -1;
             previousControllerUiState_ = ControllerState{};
+            squareUpAuditTracker_.reset();
             physicalPadLive_ = false;
             // [PRESSED OVERLAY 2026-08-08] Route lost: clear the local badge so
             // a pad unplugged mid-hold cannot leave "PRESSED" lit.
@@ -10528,8 +12426,13 @@ void OrionAppController::pollPhysicalController()
                     // ms; a minute of silent grace let users debug a "dead" bot
                     // for a full minute before the log said anything. 8 s still
                     // covers ordinary BT reconnects.
-                    physicalMissingTeardownGraceMs_ =
-                        (automation_.armed() || ownSeq_ >= 0) ? 2500 : 8000;
+                    // [ORION_PAD_SILENT_HOLD 2026-09-11] Enumerated-but-silent pads are
+                    // HELD (neutral) for 30 s and nudged once; only a pad that is gone
+                    // from the bus keeps the 2.5 s / 8 s teardown. See
+                    // silentPadTeardownGraceMs() for the live evidence.
+                    physicalMissingNudged_ = false;
+                    physicalMissingTeardownGraceMs_ = silentPadTeardownGraceMs(
+                        rawInputPresent_, automation_.armed() || ownSeq_ >= 0);
                     // Transport absence is not a physical UP/neutral sample.
                     // Fence both reader wake and controller output until the
                     // reappeared selected device proves a real neutral state.
@@ -10551,6 +12454,25 @@ void OrionAppController::pollPhysicalController()
                     // precise fire thread's release submit and can corrupt or erase the press.
                 }
                 if (nowMs - physicalMissingSinceMs_ < physicalMissingTeardownGraceMs_) {
+                    // [ORION_PAD_SILENT_HOLD 2026-09-11] Enumerated + silent: nudge the
+                    // HID collection once (open + input-report poll) and say so. The
+                    // virtual pad was already submitted neutral at onset, so nothing
+                    // is stuck while we wait for the report stream to come back.
+                    if (!physicalMissingNudged_ && rawInputPresent_
+                        && nowMs - physicalMissingSinceMs_ >= 400) {
+                        physicalMissingNudged_ = true;
+                        bool nudgeOpened = false;
+                        bool nudgeAnswered = false;
+                        nudgePhysicalPadOnce(&nudgeOpened, &nudgeAnswered);
+                        appendLog(QStringLiteral(
+                                      "Physical controller enumerated but silent for %1 ms - "
+                                      "nudged the HID collection (open=%2 report_poll=%3); "
+                                      "virtual pad held neutral for up to %4 ms.")
+                                      .arg(nowMs - physicalMissingSinceMs_)
+                                      .arg(nudgeOpened ? 1 : 0)
+                                      .arg(nudgeAnswered ? 1 : 0)
+                                      .arg(physicalMissingTeardownGraceMs_));
+                    }
                     // [ORION_PAD_TEARDOWN_GRACE 2026-08-07] Emit ONE user-visible
                     // warning once the grace has been running >3 s, so the user
                     // isn't debugging a "dead bot" in silence. Latched so the
@@ -10639,6 +12561,9 @@ void OrionAppController::pollPhysicalController()
         // native event filter can consume only those mapped UI messages while
         // leaving ordinary keyboard/mouse input untouched.
         const ControllerState& physicalState = selected.device.state;
+        const SquareUpAuditPhase squareUpAuditPhase =
+            squareUpAuditTracker_.observe(physicalState.square());
+        const bool squareUpDeliveryAudit = squareUpAuditPhase != SquareUpAuditPhase::None;
         const bool controllerPressEdge = controllerUiActivityPressEdge(
             physicalState.buttons, physicalState.dpad, physicalState.l2, physicalState.r2,
             previousControllerUiState_.buttons, previousControllerUiState_.dpad,
@@ -10646,6 +12571,17 @@ void OrionAppController::pollPhysicalController()
         previousControllerUiState_ = physicalState;
         if (controllerPressEdge) {
             controllerUiGuardUntilMs_ = nowMs + kControllerUiGuardMs;
+        }
+        // [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] Level-triggered pointer guard.
+        // A mapped pointer is driven by a HELD stick, not by an edge, so this
+        // deliberately re-arms on every poll the stick is deflected instead of
+        // only on the transition. The 4 ms poll keeps it continuously open while
+        // the owner is actually playing, and it closes on its own
+        // kControllerUiPointerGuardMs after the stick recenters.
+        if (controllerUiPointerActivity(
+                physicalState.leftStickX, physicalState.leftStickY,
+                physicalState.rightStickX, physicalState.rightStickY)) {
+            controllerUiPointerGuardUntilMs_ = nowMs + kControllerUiPointerGuardMs;
         }
 
         const bool streamActive = remoteRunning_ || chiakiEmbedStatus_ == QLatin1String("Embedded");
@@ -10677,10 +12613,10 @@ void OrionAppController::pollPhysicalController()
                 "neutral reports; a new shot press is now required."));
             syncEngineArmed();
         }
-        const QString intentSource = intent.square
-            ? QStringLiteral("square_edge")
-            : (intent.stickUp ? QStringLiteral("stick_up_edge")
-                              : QStringLiteral("stick_down_edge"));
+        // [ORION_RHYTHM_STICK_PULL 2026-09-15] One spelling, defined beside the edges themselves
+        // (orion::shotIntentSourceLabel) so the epoch line and the shot-gate arm can never
+        // disagree about what an RS pull-down is called.
+        const QString intentSource = QString::fromLatin1(shotIntentSourceLabel(intent));
         quint64 physicalShotEpoch = 0;
         if (intent.any()) {
             if (intent.stickUp || intent.stickDown) {
@@ -10696,13 +12632,20 @@ void OrionAppController::pollPhysicalController()
             physicalShotEpoch = physicalShotEpochCounter_;
             // This assignment must precede AutomationEngine::process() below. A detector
             // completion from the prior shot may arrive at any point in this GUI tick.
-            automation_.setPhysicalShotEpoch(physicalShotEpoch);
+            // intent.square certifies a debounced physical Square DOWN edge (three clean
+            // UP polls required first) and powers the engine's stale-latch canary.
+            automation_.setPhysicalShotEpoch(physicalShotEpoch, intent.square);
             // Exactly one bounded forensic record per physical edge. This proves the
             // originating control state without adding per-poll log pressure or granting
             // any timing/fire authority to diagnostics.
+            // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] APPEND-ONLY: the existing fields
+            // keep their exact spelling and order (offline tooling joins on this line's
+            // timestamp), and one fact about this press is added at the end. It is the engine's
+            // OWN predicate, asked on the same physical sample in the same tick, so the line can
+            // never claim a shaping process() did not perform -- or miss one it did.
             appendLog(QStringLiteral(
                 "Physical shot epoch: epoch=%1 intent=%2 route=%3 raw_button_mask=0x%4 "
-                "ls=(%5,%6) rs=(%7,%8) l2=%9 r2=%10")
+                "ls=(%5,%6) rs=(%7,%8) l2=%9 r2=%10 sprint_released=%11")
                           .arg(physicalShotEpoch)
                           .arg(intentSource)
                           .arg(selected.device.source)
@@ -10713,8 +12656,73 @@ void OrionAppController::pollPhysicalController()
                           .arg(physicalState.rightStickX)
                           .arg(physicalState.rightStickY)
                           .arg(static_cast<unsigned int>(physicalState.l2))
-                          .arg(static_cast<unsigned int>(physicalState.r2)));
+                          .arg(static_cast<unsigned int>(physicalState.r2))
+                          .arg(automation_.sprintReleaseWouldEngage(physicalState) ? 1 : 0));
+            if (intent.square
+                && shotIntentEdgeTracker_.lastSquareEdgeUsedDeliveredRelease()) {
+                appendLog(QStringLiteral(
+                    "RAPID SQUARE REARM: epoch=%1 proof=delivered_release_plus_two_up_polls "
+                    "action=fresh_press_forwarded")
+                              .arg(physicalShotEpoch));
+            }
+            // [ORION_PRESS_DELIVERY_AUDIT 2026-08-30] Owner invariant: a physical press must
+            // always be able to reach the console. When it structurally CANNOT — no Running
+            // input session (in capture-card mode the HDMI video keeps playing, so the game
+            // looks alive from the chair while every input is dead), or the direct pipe is
+            // down while its route is authoritative — say so AT THE PRESS. Previously this
+            // failure was only diagnosable as an absence (an epoch line followed by nothing):
+            // 31 of 185 square-edge epochs across 08-28..08-30 landed in exactly such windows
+            // (e.g. 08-28 21:48:30-21:50:48, session Disconnected, 24 undeliverable presses).
+            // One line per epoch; epochs are already debounced edges, so this cannot flood.
+            const RemotePlayState pressSessionState = remotePlay_.state();
+            const bool pipeEnabledAtPress = orionInput_.enabled();
+            const bool pipeConnectedAtPress = orionInput_.connected();
+            // pressUndeliverable() is THE shared predicate: this forensic line, the on-screen
+            // input-dead overlay (refreshInputDeliveryState), and the press latch below all
+            // evaluate the same function, so the log and the screen can never disagree.
+            if (pressUndeliverable(pressSessionState, pipeEnabledAtPress,
+                                   pipeConnectedAtPress)) {
+                appendLog(QStringLiteral(
+                    "PRESS UNDELIVERABLE: epoch=%1 intent=%2 session_state=%3 pipe_enabled=%4 "
+                    "pipe_connected=%5 vpad=%6 - no live input route; this press cannot reach "
+                    "the console")
+                              .arg(physicalShotEpoch)
+                              .arg(intentSource)
+                              .arg(static_cast<int>(pressSessionState))
+                              .arg(pipeEnabledAtPress ? 1 : 0)
+                              .arg(pipeConnectedAtPress ? 1 : 0)
+                              .arg(controller_.isConnected() ? 1 : 0));
+                // [ORION_INPUT_DEAD_UX] Same tick, same predicate: latch the overlay on (a
+                // press into dead input proves the player believes they are connected, even
+                // outside session intent), and — when the bounded retry budget is already
+                // exhausted — let the press earn ONE extra throttled reconnect attempt: a
+                // Square press is the strongest possible "I expect to be connected" signal.
+                lastUndeliverablePressMs_ = QDateTime::currentMSecsSinceEpoch();
+                if (inputSessionIntentActive_ && !safeModeActive_
+                    && !remotePlayTeardownActive_
+                    && !applicationShutdownActive(applicationShutdownPhase_)
+                    && inputSessionAutoRetryEnabled()
+                    && inputRetryPendingAttempt_ == 0) {
+                    const InputSessionRetryDecision pressDecision =
+                        inputRetryPlanner_.onUndeliverablePress(lastUndeliverablePressMs_);
+                    if (pressDecision.retry) {
+                        appendLog(QStringLiteral(
+                            "Undeliverable press with exhausted retry budget — granting one "
+                            "press-triggered reconnect attempt (throttled to one per %1 s).")
+                                      .arg(InputSessionRetryPlanner::kPressRetryThrottleMs
+                                           / 1000));
+                        scheduleInputSessionRetry(pressDecision,
+                                                  inputRetryPlanner_.lastClass());
+                    }
+                }
+                refreshInputDeliveryState();
+            }
         }
+        // Edge-only transaction identity. ShotIntentEdgeTracker emits `square`
+        // once per debounced physical DOWN, so every non-zero epoch below can
+        // produce exactly one delivery record without adding held-button log or
+        // transport pressure.
+        const bool squareDownDeliveryAudit = intent.square && physicalShotEpoch != 0;
         // Arm on ANY live detection feed, not just a live Chiaki input session:
         // in capture-card mode the meter comes from HDMI, so a failed/absent
         // Remote Play session must never bench the reader. See
@@ -10726,7 +12734,16 @@ void OrionAppController::pollPhysicalController()
             automationSecurityAllowed(),
             static_cast<unsigned int>(physicalShotEpoch));
         if (armAllowed) {
-            remotePlay_.armMeterGate(intentSource, physicalShotEpoch);
+            // [ORION_SHOT_GATE_TYPE 2026-09-15] The type travels WITH the arm. This poll is the
+            // one that carried the physical edge, and AutomationEngine::process() below latches
+            // pendingSquareShotType_ from this identical ControllerState, so asking the engine's
+            // own classifier here yields exactly the label the engine goes on to use -- one
+            // function, one config, no second implementation to drift. Without it the sidecar's
+            // meter-onset expectation is the union of every shot type (~1.05 s); with it, ~0.5 s.
+            remotePlay_.armMeterGate(
+                intentSource, physicalShotEpoch,
+                automation_.classifyPhysicalShotType(physicalState, intent.square),
+                automation_.rhythmReleaseConfigured());
         } else if (physicalShotEpoch != 0) {
             // NAME THE REFUSAL. This failure was previously diagnosable only by
             // the ABSENCE of a "shot_gate_arm send" line next to a "Physical
@@ -10852,7 +12869,7 @@ void OrionAppController::pollPhysicalController()
         // token into the precise worker.
         const LatencyControllerRoute liveRouteBeforeProcess =
             PreciseFirePolicy::liveControllerRoute(
-                remotePlay_.state() == RemotePlayState::Running,
+                directInputWriteAllowed(remotePlay_.state(), remotePlay_.inputRecoveryPending()),
                 orionInput_.enabled(), orionInput_.connected(),
                 controller_.isConnected(), controller_.isDs4Backend());
         if (latencyCacheRouteAttestation_.active()
@@ -10908,13 +12925,12 @@ void OrionAppController::pollPhysicalController()
                 pendingSubmitScheduleToken_ = 0;
                 pendingSubmitRouteGeneration_ = 0;
                 pendingSubmitRoute_ = LatencyControllerRoute::None;
-                if (userLog_.enabled() && !userNotice.isEmpty()) {
-                    userLog_.append(userNotice);
-                }
+                appendCustomerEvent(userNotice);
                 pendingSubmitDeliveryStage_ = PreciseFireDeliveryStage::None;
                 pendingSubmitFireToken_ = 0;
                 pendingSubmitTransportSeq_ = 0;
                 pendingSubmitSnapshot_ = {};
+                pendingSubmitFrameGrid_ = {};
                 confirmedPreciseFireStage_ = PreciseFireDeliveryStage::None;
                 confirmedPreciseFireToken_ = 0;
                 confirmedPreciseFireTransportSeq_ = 0;
@@ -11079,6 +13095,29 @@ void OrionAppController::pollPhysicalController()
             if (schedDeadlineMs >= 0.0 && schedToken == armedToken && schedToken != 0) {
                 fireThread_->refreshAuthority(
                     schedToken, schedAuthorityExpiryMs, automation_.engineNowMs());
+                // [ORION_BLIND_WAITER 2026-09-15] The NO METER blind token is armed at the press
+                // and can therefore wait a whole hold. Keep the packet it will press current with
+                // this tick's owned output (which also carries a mid-hold shot-type upgrade's
+                // release edge), so early arming buys tick-independence without paying for it in
+                // a stale pad snapshot. Meter/pose/vision tokens are untouched: they arm inside
+                // their own horizon and are re-armed, not refreshed, when anything changes.
+                if (automation_.scheduledFireIsBlindInputTimed()) {
+                    ControllerState refreshOutput = output;
+                    const ShotContext refreshContext = automation_.context();
+                    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15] The refreshed packet and the fence's
+                    // copy of the style are written from the same read, so they cannot diverge.
+                    const TempoReleaseStyle refreshStyle =
+                        tempoReleaseStyleFromString(automation_.config().tempoReleaseStyle);
+                    // The fade argument stays at its historical default here: these controller
+                    // call sites have never passed the arm-time fade latch, and changing that
+                    // under a "release style" patch would silently reverse every fade's flick
+                    // direction. Style only.
+                    applyShotReleaseEdge(refreshOutput, refreshContext.mode,
+                                         refreshContext.shotType, false, refreshStyle);
+                    refreshOutput.lightbarSet = false;
+                    fireThread_->refreshReleaseOutput(schedToken, refreshContext.mode,
+                                                      refreshOutput, refreshStyle);
+                }
             }
             {
                 quint64 declineToken = 0;
@@ -11097,8 +13136,12 @@ void OrionAppController::pollPhysicalController()
             if (schedDeadlineMs >= 0.0 && schedToken != armedToken) {
                 ControllerState fireOutput = output;
                 const ShotContext fireContext = automation_.context();
+                // Style only: the fade argument keeps its historical default (see the refresh
+                // site above) so "flick" is byte-identical to the pre-2026-09-15 build.
                 applyShotReleaseEdge(
-                    fireOutput, fireContext.mode, fireContext.shotType);
+                    fireOutput, fireContext.mode, fireContext.shotType, false,
+                    tempoReleaseStyleFromString(
+                        automation_.config().tempoReleaseStyle));
                 fireOutput.lightbarSet = false;
                 // [ORION_TICK_LOCK] Phase-align the absolute fire deadline so the release LANDS mid-
                 // console-tick (avoids the ±8.3ms 60Hz quantization edges), using the surfaced next-tick
@@ -11110,7 +13153,7 @@ void OrionAppController::pollPhysicalController()
                 double armDeadlineMs = schedDeadlineMs;
                 bool tickNudged = false;
                 const double verifiedTickEtaMs = tickerLatencyMs();
-                if (fireCfg.tickLockEnabled && tickPhaseVerified()
+                if (!fireCfg.inputTimedEnabled && fireCfg.tickLockEnabled && tickPhaseVerified()
                     && verifiedTickEtaMs > 0.0) {
                     const double nudged = AutomationEngine::tickAlignedFireDeadlineMs(
                         schedDeadlineMs, engineNowMs, verifiedTickEtaMs,
@@ -11125,7 +13168,8 @@ void OrionAppController::pollPhysicalController()
                     fireContext.mode,
                     fireOutput,
                     automation_.scheduledFireRouteGeneration(),
-                    automation_.scheduledFireRoute());
+                    automation_.scheduledFireRoute(),
+                    tempoReleaseStyleFromString(fireCfg.tempoReleaseStyle));
                 if (armResult == PreciseFireArmResult::EngineDisarmed) {
                     // A watchdog/defense disarm won while this GUI tick was in
                     // flight. Revoke the engine token and preserve its neutral.
@@ -11226,13 +13270,73 @@ void OrionAppController::pollPhysicalController()
         // Ownership timeline: log every shot-state transition (catches a physical press
         // that never armed = pass-through). Runs whether or not a virtual pad is present.
         logShotStateTransition(selected.device.state, output);
-        if (controller_.isConnected()) {
+        // [ORION_OUTPUT_DIVERGENCE 2026-09-14 owner] "buttons sometimes are weird, it seemed like
+        // it was holding L2 for me". Evidence only — this is the LAST point where the engine's
+        // final output and the pad's own packet are both in hand.
+        observeOutputDivergence(selected.device.state, output);
+        // Freeze the branch decision for this epoch. A connection transition
+        // between two independent isConnected() reads must not emit both the
+        // disconnected and submitted identities (or neither).
+        const bool virtualControllerConnectedAtSubmit = controller_.isConnected();
+        const qint64 idleInputNowMs = static_cast<qint64>(automation_.engineNowMs());
+        const bool hookIdleNeutral = virtualControllerConnectedAtSubmit
+            && remotePlay_.state() == RemotePlayState::Running
+            && orionInput_.enabled() && orionInput_.connected()
+            && shot_.state == HoldState::Idle
+            && pendingSubmitSeq_ < 0
+            && !routeRecoveryGateActive && !failClosedNeutralThisTick
+            && !tempoMovementCommitRequired && !forceVirtualNeutral_
+            && automation_.scheduledFireDeadlineMs() < 0.0
+            && lastArmedFireToken_.load(std::memory_order_acquire) == 0
+            && PreciseFirePolicy::controllerStateFullyNeutral(physicalState)
+            && PreciseFirePolicy::controllerStateFullyNeutral(output);
+        if (!hookIdleNeutral) {
+            hookIdleNeutralSinceMs_ = -1;
+        } else if (hookIdleNeutralSinceMs_ < 0
+                   || idleInputNowMs < hookIdleNeutralSinceMs_) {
+            hookIdleNeutralSinceMs_ = idleInputNowMs;
+        }
+        if (squareUpDeliveryAudit && !virtualControllerConnectedAtSubmit) {
+            appendLog(QStringLiteral(
+                "Square-up route audit: latest_physical_epoch=%1 phase=%2 physical_square=0 "
+                "requested_square=%3 pipe_snapshot_square=-1 pipe_snapshot_seq=0 "
+                "snapshot_local_ack=0 current_delivery_stage=not_confirmed console_ack=0 "
+                "engine_state=%4 engine_reason=%5 reason=virtual_disconnected")
+                          .arg(physicalShotEpochCounter_)
+                          .arg(squareUpAuditPhase == SquareUpAuditPhase::RawUp
+                                   ? QStringLiteral("raw_up") : QStringLiteral("debounced_up"))
+                          .arg(output.square() ? 1 : 0)
+                          .arg(holdStateToken(shot_.state))
+                          .arg(shot_.releaseReason));
+        }
+        if (squareDownDeliveryAudit && !virtualControllerConnectedAtSubmit) {
+            // No submit API was available, so neither `output` nor any stale
+            // OrionInputClient snapshot is evidence of what reached a route.
+            appendLog(QStringLiteral(
+                "Square-down delivery identity: physical_epoch=%1 shot_attempt=%2 "
+                "square_bit=-1 delivery_source_seq=0 delivery_stage=not_confirmed "
+                "local_route_ack=0 console_ack=0 packet_snapshot=unavailable "
+                "ack_wait_us=0 reason=virtual_disconnected delivered_r2=-1 "
+                "sprint_released=%3")
+                          .arg(physicalShotEpoch)
+                          .arg(shot_.armToken)
+                          .arg(automation_.sprintReleaseActive() ? 1 : 0));
+        }
+        if (virtualControllerConnectedAtSubmit) {
             QString error;
             bool submitOk = false;
             bool virtualSubmitOk = false;
             bool hookOwnsInput = false;
             InputRouteWriteResult hookWrite = InputRouteWriteResult::Failed;
             PreciseFireDeliveryDecision activeRouteDelivery;
+            OrionInputPacket squareDownPipePacket{};
+            OrionInputTransactionTiming squareDownPipeTiming{};
+            ControllerState squareDownVirtualOutput{};
+            bool squareDownPipePacketValid = false;
+            bool squareDownVirtualOutputValid = false;
+            int squareUpPipeSnapshotBit = -1;
+            uint32_t squareUpPipeSnapshotSeq = 0;
+            bool squareUpSnapshotLocalAck = false;
             bool precisionRouteRejected = false;
             bool preciseReleaseAlreadyDelivered = false;
             bool routeBoundRelease = false;
@@ -11248,7 +13352,29 @@ void OrionAppController::pollPhysicalController()
                     output.lightbarSet = false;
                 }
                 if (fireThread_ && fireThread_->firedUnconsumed()) {
-                    applyShotReleaseEdge(output, shot_.mode, shot_.shotType);
+                    applyShotReleaseEdge(
+                        output, shot_.mode, shot_.shotType, false,
+                        tempoReleaseStyleFromString(
+                            automation_.config().tempoReleaseStyle));
+                }
+                bool squareWatchdogRouteFailed = false;
+                if (squareOutputWatchdogEnabled_) {
+                    squareOutputWatchdog_.observePhysical(true, physicalState.square());
+                    const OrionInputPacket confirmed = orionInput_.lastSent();
+                    const bool confirmedSquareHeld = orionInput_.connected()
+                        && orionInput_.haveSent() && confirmed.own != 0
+                        && (confirmed.buttons & (1u << 2)) != 0;
+                    const qint64 watchdogNowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    squareOutputWatchdog_.observeOutput(confirmedSquareHeld, watchdogNowMs);
+                    if (squareOutputWatchdog_.releaseDue(
+                            watchdogNowMs, automation_.squareOutputWatchdogOwnershipActive())) {
+                        const bool attempted = releaseStaleSquareOutputLocked(
+                            QStringLiteral("unowned_output_timeout"));
+                        squareWatchdogRouteFailed = attempted && !orionInput_.connected();
+                    }
+                    if (squareOutputWatchdog_.suppressSquare())
+                        output.buttons &= ~XINPUT_GAMEPAD_X;
                 }
 
                 // The native input pipe is the authoritative PS5 route when connected. ViGEm is
@@ -11260,7 +13386,9 @@ void OrionAppController::pollPhysicalController()
                 const qint64 nowHookUs = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 const RemotePlayState liveInputState = remotePlay_.state();
-                const bool directInputReady = directInputWriteAllowed(liveInputState);
+                const bool directInputReady = directInputWriteAllowed(
+                    liveInputState, remotePlay_.inputRecoveryPending())
+                    && !squareWatchdogRouteFailed;
                 preciseReleaseAlreadyDelivered =
                     pendingSubmitSeq_ >= 0
                     && PreciseFirePolicy::hasConfirmedPreciseDelivery(
@@ -11275,7 +13403,7 @@ void OrionAppController::pollPhysicalController()
                     pendingSubmitRouteGeneration_, pendingSubmitRoute_};
                 const LatencyControllerRoute liveSubmitRoute =
                     PreciseFirePolicy::liveControllerRoute(
-                        liveInputState == RemotePlayState::Running,
+                        directInputReady,
                         orionInput_.enabled(), orionInput_.connected(),
                         controller_.isConnected(), controller_.isDs4Backend());
                 const bool precisionBindingMatches = routeBoundRelease
@@ -11298,7 +13426,13 @@ void OrionAppController::pollPhysicalController()
                     if (directInputRouteCurrentlyOwned(
                             orionInput_.connected(), orionInput_.haveSent(),
                             orionInput_.haveSent() && priorPipePacket.own != 0)) {
-                        (void)orionInput_.sendDetailed(output, true, true);
+                        releaseStaleSquareOutputLocked(QStringLiteral("controller_route_changed"));
+                        if (orionInput_.connected()) // no fresh route after an ambiguous watchdog ACK
+                            (void)orionInput_.sendDetailed(output, true, true);
+                    }
+                    if (squareDownDeliveryAudit) {
+                        squareDownVirtualOutput = output;
+                        squareDownVirtualOutputValid = true;
                     }
                     virtualSubmitOk = controller_.submit(output, &error);
                     hookOwnsInput = liveSubmitRoute == LatencyControllerRoute::Pipe;
@@ -11308,7 +13442,8 @@ void OrionAppController::pollPhysicalController()
                     PreciseFirePolicy::requiresExactDeliveryAck(
                         pendingSubmitSeq_ >= 0,
                         preciseReleaseAlreadyDelivered,
-                        routeRecoveryProbe)
+                        routeRecoveryProbe,
+                        squareDownDeliveryAudit)
                     || latencyRouteAttestationProbe
                     || tempoMovementCommitRequired;
                 const bool suppressDeliveredPreciseDuplicate =
@@ -11325,6 +13460,10 @@ void OrionAppController::pollPhysicalController()
                         hookOwnsInput = true;
                     } else {
                         virtualOutput = output;
+                    }
+                    if (squareDownDeliveryAudit) {
+                        squareDownVirtualOutput = virtualOutput;
+                        squareDownVirtualOutputValid = true;
                     }
                     virtualSubmitOk = controller_.submit(virtualOutput, &error);
                     activeRouteDelivery = PreciseFirePolicy::evaluateBoundDelivery(
@@ -11353,14 +13492,62 @@ void OrionAppController::pollPhysicalController()
                     // During Connecting neither route may forward gameplay input:
                     // Chiaki's pipe exists before its feedback sender, and exposing
                     // the ViGEm mirror can also leak controller buttons into desktop
-                    // UI. Running is the first positive console-route authority.
+                    // UI. Retained Running during recovery is not input readiness.
                     if (!directInputReady || hookOwnsInput) {
                         virtualOutput = ControllerState{};
                         virtualOutput.lightbarSet = false;
                     }
+                    if (squareDownDeliveryAudit) {
+                        squareDownVirtualOutput = virtualOutput;
+                        squareDownVirtualOutputValid = true;
+                    }
                     virtualSubmitOk = controller_.submit(virtualOutput, &error);
-                    activeRouteDelivery = PreciseFirePolicy::evaluateDelivery(
-                        hookWrite, hookOwnsInput, virtualSubmitOk);
+                    // Neutralizing the desktop pad while input is not ready is
+                    // cleanup, not proof that a replacement console route works.
+                    activeRouteDelivery = directInputReady
+                        ? PreciseFirePolicy::evaluateDelivery(
+                            hookWrite, hookOwnsInput, virtualSubmitOk)
+                        : PreciseFireDeliveryDecision{};
+                }
+                if (squareDownDeliveryAudit && activeRouteDelivery.pipeAccepted
+                    && orionInput_.haveSent()) {
+                    // Snapshot while submitMutex_ still excludes the precise-fire
+                    // worker. A later lastSent() read can observe a release from a
+                    // different transaction and must never be joined to this epoch.
+                    const OrionInputPacket accepted = orionInput_.lastSent();
+                    const uint32_t localUdpStage = static_cast<uint32_t>(
+                        static_cast<uint8_t>(OrionInputAckStage::LocalUdpAccepted));
+                    if (accepted.seq != 0
+                        && accepted.seq == orionInput_.lastAckExpectedSeq()
+                        && accepted.seq == orionInput_.lastAckSourceSeq()
+                        && orionInput_.lastAckStage() == localUdpStage
+                        && (accepted.reserved & OrionInputMustDeliver) != 0) {
+                        squareDownPipePacket = accepted;
+                        squareDownPipePacketValid = true;
+                        const OrionInputTransactionTiming acceptedTiming =
+                            orionInput_.lastTransactionTiming();
+                        if (acceptedTiming.matches(accepted.seq)) {
+                            squareDownPipeTiming = acceptedTiming;
+                        }
+                    }
+                }
+                if (squareUpDeliveryAudit && orionInput_.connected()
+                    && orionInput_.haveSent()) {
+                    // Diagnostic-only snapshot under submitMutex_: no extra write,
+                    // ACK wait, dedup bypass, epoch, or ownership decision. This may
+                    // be a previously accepted no-change state, so its provenance is
+                    // labelled separately from THIS tick's delivery stage below.
+                    const OrionInputPacket snapshot = orionInput_.lastSent();
+                    if (snapshot.own != 0 && snapshot.seq != 0) {
+                        squareUpPipeSnapshotBit = (snapshot.buttons & (1u << 2)) ? 1 : 0;
+                        squareUpPipeSnapshotSeq = snapshot.seq;
+                        squareUpSnapshotLocalAck =
+                            snapshot.seq == orionInput_.lastAckExpectedSeq()
+                            && snapshot.seq == orionInput_.lastAckSourceSeq()
+                            && orionInput_.lastAckStage() == static_cast<uint32_t>(
+                                OrionInputAckStage::LocalUdpAccepted)
+                            && (snapshot.reserved & OrionInputMustDeliver) != 0;
+                    }
                 }
                 if (tempoMovementCommitRequired) {
                     // Linearize the LS-only movement commit at the same local
@@ -11381,6 +13568,122 @@ void OrionAppController::pollPhysicalController()
                 }
             }
 
+            if (squareUpDeliveryAudit) {
+                appendLog(QStringLiteral(
+                    "Square-up route audit: latest_physical_epoch=%1 phase=%2 physical_square=0 "
+                    "requested_square=%3 pipe_snapshot_square=%4 pipe_snapshot_seq=%5 "
+                    "snapshot_local_ack=%6 current_delivery_stage=%7 console_ack=0 "
+                    "engine_state=%8 engine_reason=%9")
+                              .arg(physicalShotEpochCounter_)
+                              .arg(squareUpAuditPhase == SquareUpAuditPhase::RawUp
+                                       ? QStringLiteral("raw_up") : QStringLiteral("debounced_up"))
+                              .arg(output.square() ? 1 : 0)
+                              .arg(squareUpPipeSnapshotBit)
+                              .arg(squareUpPipeSnapshotSeq)
+                              .arg(squareUpSnapshotLocalAck ? 1 : 0)
+                              .arg(QString::fromLatin1(
+                                  preciseFireDeliveryStageField(activeRouteDelivery.stage)))
+                              .arg(holdStateToken(shot_.state))
+                              .arg(shot_.releaseReason));
+            }
+            if (squareDownDeliveryAudit) {
+                int deliveredSquareBit = -1;
+                // [ORION_SPRINT_RELEASE_ON_SQUARE 2026-09-16 owner] The DELIVERED sprint trigger,
+                // read off the very packet this line already proves the Square bit from -- so the
+                // identity line reflects the SHAPED packet, not the engine's intent. -1 keeps its
+                // existing meaning here: no packet was in hand to read.
+                int deliveredR2 = -1;
+                uint32_t deliverySourceSeq = 0;
+                QString packetSnapshot = QStringLiteral("unavailable");
+                if (activeRouteDelivery.stage
+                        == PreciseFireDeliveryStage::LocalUdpAccepted) {
+                    packetSnapshot = QStringLiteral("pipe_snapshot_mismatch");
+                    if (squareDownPipePacketValid) {
+                        constexpr uint32_t kPsSquareBit = 1u << 2;
+                        deliveredSquareBit =
+                            (squareDownPipePacket.buttons & kPsSquareBit) != 0 ? 1 : 0;
+                        deliveredR2 = static_cast<int>(squareDownPipePacket.r2_state);
+                        deliverySourceSeq = squareDownPipePacket.seq;
+                        packetSnapshot = QStringLiteral("direct_pipe_seq_join");
+                    }
+                } else if (activeRouteDelivery.stage
+                               == PreciseFireDeliveryStage::ActiveVigemSubmit) {
+                    packetSnapshot = QStringLiteral("vigem_snapshot_missing");
+                    if (squareDownVirtualOutputValid) {
+                        deliveredSquareBit = squareDownVirtualOutput.square() ? 1 : 0;
+                        deliveredR2 = static_cast<int>(squareDownVirtualOutput.r2);
+                        packetSnapshot = QStringLiteral("vigem_submit");
+                    }
+                }
+                const QString deliveryStageField = QString::fromLatin1(
+                    preciseFireDeliveryStageField(activeRouteDelivery.stage));
+                const bool pipeTimingMatches = squareDownPipePacketValid
+                    && squareDownPipeTiming.matches(squareDownPipePacket.seq);
+                const uint64_t ackWaitUs = pipeTimingMatches
+                    ? squareDownPipeTiming.ackWaitUs : 0;
+                appendLog(QStringLiteral(
+                    "Square-down delivery identity: physical_epoch=%1 shot_attempt=%2 "
+                    "square_bit=%3 delivery_source_seq=%4 delivery_stage=%5 "
+                    "local_route_ack=%6 console_ack=0 packet_snapshot=%7 "
+                    "ack_wait_us=%8 ack_wait_us_valid=%9 timing_source_seq=%10 "
+                    "delivered_r2=%11 sprint_released=%12")
+                              .arg(physicalShotEpoch)
+                              .arg(shot_.armToken)
+                              .arg(deliveredSquareBit)
+                              .arg(static_cast<qulonglong>(deliverySourceSeq))
+                              .arg(deliveryStageField)
+                              .arg(activeRouteDelivery.confirmScheduledFire ? 1 : 0)
+                              .arg(packetSnapshot)
+                              .arg(static_cast<qulonglong>(ackWaitUs))
+                              .arg(pipeTimingMatches
+                                       && squareDownPipeTiming.ackSampleValid ? 1 : 0)
+                              .arg(pipeTimingMatches
+                                       ? squareDownPipeTiming.sourceSeq : 0)
+                              .arg(deliveredR2)
+                              .arg(automation_.sprintReleaseActive() ? 1 : 0));
+            }
+
+            // [ORION_PRESS_DELIVERY_AUDIT 2026-08-30] Post-submit invariant audit: the pad's
+            // Square is physically HELD but the gameplay state this tick handed to the console
+            // route carries Square UP. Every such tick is either a deliberate policy (bot-owned
+            // Tempo representation, post-fire anti-pump-fake drain/cooldown, the
+            // waiting_for_button_release latch) or exactly the reported bug ("holding Square
+            // and the bot won't shoot"). Attribute it either way — the gate that suppressed the
+            // press is named, so live mining can whitelist the deliberate reasons and any
+            // remaining line IS the defect. Edge-deduped on the attributed reason (one line per
+            // suppression window, never per tick); nothing here touches output or timing.
+            {
+                const bool physSquareHeldNow = selected.device.state.square();
+                const bool submittedSquare = (output.buttons & XINPUT_GAMEPAD_X) != 0;
+                QString suppressReason;
+                if (physSquareHeldNow && !submittedSquare && !defenseModeActive_) {
+                    if (forceVirtualNeutral_) {
+                        suppressReason = QStringLiteral("isolation_test");
+                    } else if (precisionRouteRejected) {
+                        suppressReason = QStringLiteral("precision_route_rejected");
+                    } else if (failClosedNeutralThisTick) {
+                        suppressReason = QStringLiteral("fail_closed_neutral");
+                    } else if (!automation_.armed()) {
+                        suppressReason = QStringLiteral("engine_disarmed");
+                    } else {
+                        suppressReason = QStringLiteral("engine:%1/%2")
+                            .arg(holdStateText(shot_.state), shot_.releaseReason);
+                    }
+                }
+                if (suppressReason != lastSquareSuppressionLogged_) {
+                    lastSquareSuppressionLogged_ = suppressReason;
+                    if (!suppressReason.isEmpty()) {
+                        appendLog(QStringLiteral(
+                            "SQUARE SUPPRESSED: gate=%1 session_running=%2 pipe_connected=%3 "
+                            "(physical Square held; console being told Square-up)")
+                                      .arg(suppressReason)
+                                      .arg(remotePlay_.state() == RemotePlayState::Running
+                                               ? 1 : 0)
+                                      .arg(orionInput_.connected() ? 1 : 0));
+                    }
+                }
+            }
+
             if (precisionRouteRejected) {
                 appendLog(QStringLiteral(
                     "Precision release route rejected: token=%1 generation=%2 bound=%3; "
@@ -11396,9 +13699,11 @@ void OrionAppController::pollPhysicalController()
             // stage; the GUI's neutral catch-up must not erase that attestation.
             const bool exactRouteTransaction = pendingSubmitSeq_ >= 0
                 || latencyRouteAttestationProbe || routeRecoveryProbe
-                || tempoMovementCommitRequired;
+                || tempoMovementCommitRequired || squareDownDeliveryAudit;
             const PreciseFireDeliveryStage selectedRouteStage =
-                preciseReleaseAlreadyDelivered
+                !directInputWriteAllowed(remotePlay_.state(), remotePlay_.inputRecoveryPending())
+                ? PreciseFireDeliveryStage::None
+                : preciseReleaseAlreadyDelivered
                 ? pendingSubmitDeliveryStage_
                 : (exactRouteTransaction
                     ? activeRouteDelivery.stage
@@ -11504,16 +13809,21 @@ void OrionAppController::pollPhysicalController()
                     lastHookHeartbeatMs_ = nowHbMs;
                     const quint64 rawSnapshotLockWaitMaxUs = rawInputWorker_
                         ? rawInputWorker_->takeMaxSnapshotLockWaitUs() : 0;
+                    const OrionInputTransactionTiming hookTiming =
+                        orionInput_.lastTransactionTiming();
                     appendLog(QStringLiteral("Input hook heartbeat: connected=%1 writes=%2 failures=%3 "
                                              "ack_failures=%4 last_us=%5 max_us=%6 ack_winerr=%7 "
                                              "ack_stage=%8 ack_error=%9 ack_seq=%10 expected_seq=%11 "
                                              "ack_bytes=%12 ack_wait_us=%13 "
-                                             "raw_snapshot_lock_wait_max_us=%14")
+                                             "raw_snapshot_lock_wait_max_us=%14 clock_sample_failures=%15 "
+                                             "timing_source_seq=%16 write_attempted=%17 "
+                                             "write_sample_valid=%18 ack_attempted=%19 "
+                                             "ack_sample_valid=%20")
                                   .arg(orionInput_.connected() ? 1 : 0)
                                   .arg(orionInput_.writeCount())
                                   .arg(orionInput_.writeFailures())
                                   .arg(orionInput_.ackFailures())
-                                  .arg(orionInput_.lastWriteUs())
+                                  .arg(hookTiming.writeUs)
                                   .arg(orionInput_.maxWriteUs())
                                   .arg(orionInput_.lastAckWinError())
                                   .arg(orionInput_.lastAckStage())
@@ -11521,8 +13831,14 @@ void OrionAppController::pollPhysicalController()
                                   .arg(orionInput_.lastAckSourceSeq())
                                   .arg(orionInput_.lastAckExpectedSeq())
                                   .arg(orionInput_.lastAckReadBytes())
-                                  .arg(orionInput_.lastAckWaitUs())
-                                  .arg(rawSnapshotLockWaitMaxUs));
+                                  .arg(hookTiming.ackWaitUs)
+                                  .arg(rawSnapshotLockWaitMaxUs)
+                                  .arg(orionInput_.clockSampleFailures())
+                                  .arg(hookTiming.sourceSeq)
+                                  .arg(hookTiming.writeAttempted ? 1 : 0)
+                                  .arg(hookTiming.writeSampleValid ? 1 : 0)
+                                  .arg(hookTiming.ackAttempted ? 1 : 0)
+                                  .arg(hookTiming.ackSampleValid ? 1 : 0));
                     // The direct-input pipe and capture transport have independent lifecycles.
                     // Try the smallest repair three times (Chiaki input child only), then wait one
                     // final grace and allow ONE contained full-sidecar restart. The escalation
@@ -11533,7 +13849,7 @@ void OrionAppController::pollPhysicalController()
                         ++hookDownHeartbeats_;
                         const InputLinkRecoveryAction recoveryAction = inputLinkRecoveryAction(
                             hookDownHeartbeats_, hookRecoveryAttempts_,
-                            hookFullRestartEscalated_);
+                            hookFullRestartEscalated_, remotePlay_.inputRecoveryPending());
                         if (recoveryAction == InputLinkRecoveryAction::RecoverInputOnly
                             || recoveryAction == InputLinkRecoveryAction::RestartSidecarContained) {
                             const double frameAge = remotePlay_.frameAgeMs();
@@ -11602,6 +13918,43 @@ void OrionAppController::pollPhysicalController()
                             hookRecoveryAttempts_ = 0;
                         }
                     }
+                    // [ORION_INPUT_IDLE_REASSERT 2026-08-30] 1 Hz liveness proof of the
+                    // ESTABLISHED direct route while the pad is idle. The de-dup design means
+                    // an idle hold sends nothing, so a silently wedged pipe reader (or any
+                    // de-dup snapshot divergence that escaped the fail-closed rules) would
+                    // otherwise be discovered by the PLAYER'S NEXT PRESS — the worst possible
+                    // instant. Re-asserting the last confirmed state as a MustDeliver
+                    // transaction is console-idempotent; its ACK either proves the route
+                    // (microseconds when healthy) or closes the pipe NOW so the heartbeat
+                    // recovery machinery can re-seed before a later press. Engine Idle
+                    // alone is NOT physical idle: it includes initial Square debounce,
+                    // pass-through holds and movement preparation. Require both the
+                    // physical report and generated output to remain fully neutral for
+                    // 250 ms, with no shot/recovery work pending. This avoids adding a
+                    // second synchronous ACK on a press or its immediate release tick.
+                    // A press arriving during the bounded ACK may still wait for it;
+                    // this gate removes the observed-input overlap, not that transport
+                    // failure ceiling. An ACK already confirmed this tick needs no probe.
+                    // Kill switch: ORION_INPUT_IDLE_REASSERT=0.
+                    static const bool idleReassertEnabled =
+                        qgetenv("ORION_INPUT_IDLE_REASSERT") != QByteArrayLiteral("0");
+                    if (idleReassertEnabled && hookConnected
+                        && directInputWriteAllowed(
+                            remotePlay_.state(), remotePlay_.inputRecoveryPending())
+                        && hookIdleNeutral && hookIdleNeutralSinceMs_ >= 0
+                        && idleInputNowMs - hookIdleNeutralSinceMs_ >= 250
+                        && !activeRouteDelivery.pipeAccepted) {
+                        const InputRouteWriteResult reassertResult =
+                            orionInput_.reassertLastState();
+                        if (reassertResult == InputRouteWriteResult::WrittenUnconfirmed
+                            || reassertResult == InputRouteWriteResult::Failed) {
+                            appendLog(QStringLiteral(
+                                "Input route reassert FAILED (result=%1): direct pipe closed "
+                                "at idle; recovery will re-seed the route before the next "
+                                "press instead of discovering the wedge on it.")
+                                          .arg(static_cast<int>(reassertResult)));
+                        }
+                    }
                 }
             }
             // Pair Release issued with the exact locally accepted route; the stable delivery_stage
@@ -11612,6 +13965,8 @@ void OrionAppController::pollPhysicalController()
             // success claim; Release issued by itself remains timing intent. */
             if (pendingSubmitSeq_ >= 0) {
                 const OrionInputPacket hookPacket = orionInput_.lastSent();
+                const OrionInputTransactionTiming latestPipeTiming =
+                    orionInput_.lastTransactionTiming();
                 PreciseFireDeliveryStage deliveryStage = pendingSubmitDeliveryStage_;
                 uint32_t deliverySourceSeq = pendingSubmitTransportSeq_;
                 if (deliveryStage == PreciseFireDeliveryStage::None) {
@@ -11666,6 +14021,10 @@ void OrionAppController::pollPhysicalController()
                 const bool preciseDelivery = pendingSubmitDeliveryStage_
                         != PreciseFireDeliveryStage::None
                     && pendingSubmitFireToken_ != 0;
+                const double fireEpochMs = preciseDelivery
+                    ? pendingSubmitSnapshot_.fireEpochMs
+                    : (deliveredMarker ? deliveredMarker->wallMsEpoch : -1.0);
+                const QString fireEpochField = fireEpochLogField(fireEpochMs);
                 const OrionInputPacket* deliveredPipePacket = nullptr;
                 if (deliveryStage == PreciseFireDeliveryStage::LocalUdpAccepted) {
                     if (preciseDelivery && pendingSubmitSnapshot_.pipePacketValid
@@ -11680,6 +14039,10 @@ void OrionAppController::pollPhysicalController()
                         deliveredPacketSource = QStringLiteral("direct_pipe_seq_join");
                     }
                 }
+                const OrionInputTransactionTiming deliveredPipeTiming = preciseDelivery
+                    ? pendingSubmitSnapshot_.pipeTiming : latestPipeTiming;
+                const bool deliveredPipeTimingMatches = deliveredPipePacket
+                    && deliveredPipeTiming.matches(deliverySourceSeq);
                 if (deliveredPipePacket) {
                     constexpr uint32_t kPsSquareBit = 1u << 2;
                     constexpr int kHookAxisScale = 258;
@@ -11704,20 +14067,72 @@ void OrionAppController::pollPhysicalController()
                         deliveredRightY = deliveredVigemOutput->rightStickY;
                     }
                 }
+                // The release packet is now proven locally accepted and its
+                // Square bit is observably UP.  Arm the narrow rapid-repress
+                // recovery only for modes that owned physical Square.  A failed,
+                // unknown, or malformed delivery never relaxes the normal
+                // three-report input lifetime.
+                if (deliverySucceeded && deliveredSquareBit == 0
+                    && (shot_.mode == ShotMode::ButtonShot
+                        || shot_.mode == ShotMode::TempoSquare)) {
+                    shotIntentEdgeTracker_.noteOwnedSquareReleaseDeliveredForEpoch(
+                        shot_.physicalShotEpoch, physicalShotEpochCounter_);
+                }
+                // [ORION_TIP_FRAME_NATIVE 2026-09-17] WHERE ON THE CONSOLE'S FRAME GRID DID THIS
+                // COMMAND ACTUALLY LAND. docs/POLL_PHASE_TRACKER.md §10 asked for exactly this
+                // line: "emit the grid phase and the realised distance to the intended centre AT
+                // THE FIRE, not only at anchor dating", because the schedule could be shown to
+                // carry the frame-centre offset while the fire did not.
+                //
+                // THE LEAD IS ADDED ON PURPOSE. The grid lives on the capture-aligned clock and
+                // the command becomes VISIBLE to the console `lead` ms after it is issued, so the
+                // instant to place on the grid is command_issued + lead -- which is precisely the
+                // target the arm centred. Reading command_issued alone would measure the lead's
+                // own residue mod 16.7 ms and say nothing about centring.
+                //
+                // fire_grid_phase_ms is in [0, period) and fire_centre_delta_ms is the signed
+                // distance from the frame's centre (bounded by half a frame, negative = the
+                // release landed before the centre). Sentinels -1.000 / -99.000 mean "not
+                // measurable here": no locked grid for this shot, or no precise-fire timestamp.
+                const QString fireTargetField = pendingSubmitFrameGrid_.fireTargetMode.isEmpty()
+                    ? QStringLiteral("none")
+                    : pendingSubmitFrameGrid_.fireTargetMode;
+                const double frameGridCommandIssuedMs =
+                    preciseDelivery ? pendingSubmitSnapshot_.commandIssuedMs : -1.0;
+                // Both halves must be real or the answer is a sentinel, never a fabricated zero:
+                // no precise-fire timestamp means there is no release instant to place, and a
+                // lead of 0 would put the raw issue instant on a grid it does not live on.
+                const orion::game_frame_phase::ReleaseGridPhase releasePhase =
+                    (frameGridCommandIssuedMs > 0.0 && pendingSubmitFrameGrid_.leadMs > 0.0)
+                        ? orion::game_frame_phase::releasePhaseOnGrid(
+                              pendingSubmitFrameGrid_.grid, frameGridCommandIssuedMs,
+                              pendingSubmitFrameGrid_.leadMs)
+                        : orion::game_frame_phase::ReleaseGridPhase{};
+                const double fireGridPhaseMs = releasePhase.phaseMs;
+                const double fireCentreDeltaMs = releasePhase.centreDeltaMs;
                 appendLog(QStringLiteral("Release submit: seq=%1 ok=%2 backend=%3 "
                                          "square_bit=%4 rs=(%5,%6) hook_write_us=%7 "
                                          "hook_max_us=%8 hook_writes=%9 hook_failures=%10 "
                                          "hook_packet_seq=%11 hook_flags=0x%12 "
                                          "delivery_stage=%13 delivery_source_seq=%14 "
                                          "delivery_token=%15 packet_snapshot=%16 "
-                                         "console_ack=0 tick_submit_ok=%17%18")
+                                         "console_ack=0 tick_submit_ok=%17 "
+                                         "hook_ack_wait_us=%18 clock_sample_failures=%19 "
+                                         "hook_timing_source_seq=%20 hook_write_attempted=%21 "
+                                         "hook_write_us_valid=%22 hook_ack_attempted=%23 "
+                                         // APPEND-ONLY: every field above keeps its name and its
+                                         // order; the free-form ERR= suffix stays last because its
+                                         // value may contain spaces.
+                                         "hook_ack_wait_us_valid=%24 fire_grid_phase_ms=%25 "
+                                         "fire_centre_delta_ms=%26 fire_target=%27 %28%29")
                               .arg(pendingSubmitSeq_)
                               .arg(deliveryConfirmed ? 1 : 0)
                               .arg(deliveryBackend)
                               .arg(deliveredSquareBit)
                               .arg(deliveredRightX)
                               .arg(deliveredRightY)
-                              .arg(orionInput_.lastWriteUs())
+                              .arg(deliveredPipeTimingMatches
+                                       ? deliveredPipeTiming.writeUs : 0)
                               .arg(orionInput_.maxWriteUs())
                               .arg(orionInput_.writeCount())
                               .arg(orionInput_.writeFailures())
@@ -11730,11 +14145,61 @@ void OrionAppController::pollPhysicalController()
                               .arg(pendingSubmitFireToken_)
                               .arg(deliveredPacketSource)
                               .arg(submitOk ? 1 : 0)
+                              .arg(deliveredPipeTimingMatches
+                                       ? deliveredPipeTiming.ackWaitUs : 0)
+                              .arg(orionInput_.clockSampleFailures())
+                              .arg(deliveredPipeTimingMatches
+                                       ? deliveredPipeTiming.sourceSeq : 0)
+                              .arg(deliveredPipeTimingMatches
+                                       && deliveredPipeTiming.writeAttempted ? 1 : 0)
+                              .arg(deliveredPipeTimingMatches
+                                       && deliveredPipeTiming.writeSampleValid ? 1 : 0)
+                              .arg(deliveredPipeTimingMatches
+                                       && deliveredPipeTiming.ackAttempted ? 1 : 0)
+                              .arg(deliveredPipeTimingMatches
+                                       && deliveredPipeTiming.ackSampleValid ? 1 : 0)
+                              // [ORION_TIP_FRAME_NATIVE 2026-09-17] Numbered BELOW the ERR suffix
+                              // on purpose: QString::arg fills the lowest remaining marker, so a
+                              // new marker placed after a free-form value would be exposed to
+                              // whatever that value happens to contain.
+                              .arg(fireGridPhaseMs, 0, 'f', 3)
+                              .arg(fireCentreDeltaMs, 0, 'f', 3)
+                              .arg(fireTargetField)
+                              .arg(fireEpochField)
                               .arg(deliverySucceeded ? QString()
                                     : QStringLiteral(" ERR=%1").arg(
                                           deliveryConfirmed
                                               ? error.left(80)
                                               : QStringLiteral("local_delivery_not_confirmed"))));
+                if (preciseDelivery) {
+                    // Add-only parser-safe transaction telemetry. The command
+                    // timestamp is the scheduler/marker authority; completion
+                    // and the pipe ACK wait are diagnostic-only and can vary
+                    // without moving scheduledFireDeltaMs or learned lead.
+                    const double pipeAckCompleteMs =
+                        pendingSubmitSnapshot_.route == LatencyControllerRoute::Pipe
+                            ? pendingSubmitSnapshot_.activeRouteCompleteMs : -1.0;
+                    appendLog(QStringLiteral(
+                        "Precise dispatch timing: seq=%1 token=%2 delivery_stage=%3 "
+                        "command_issued_ms=%4 active_route_complete_ms=%5 "
+                        "active_route_wait_ms=%6 pipe_ack_complete_ms=%7 "
+                        "pipe_timing_source_seq=%8 pipe_write_us=%9 "
+                        "pipe_write_us_valid=%10 pipe_ack_attempted=%11 "
+                        "pipe_ack_wait_us=%12 pipe_ack_wait_us_valid=%13")
+                                  .arg(pendingSubmitSeq_)
+                                  .arg(pendingSubmitFireToken_)
+                                  .arg(deliveryStageField)
+                                  .arg(pendingSubmitSnapshot_.commandIssuedMs, 0, 'f', 3)
+                                  .arg(pendingSubmitSnapshot_.activeRouteCompleteMs, 0, 'f', 3)
+                                  .arg(pendingSubmitSnapshot_.activeRouteDurationMs, 0, 'f', 3)
+                                  .arg(pipeAckCompleteMs, 0, 'f', 3)
+                                  .arg(pendingSubmitSnapshot_.pipeTiming.sourceSeq)
+                                  .arg(pendingSubmitSnapshot_.pipeTiming.writeUs)
+                                  .arg(pendingSubmitSnapshot_.pipeTiming.writeSampleValid ? 1 : 0)
+                                  .arg(pendingSubmitSnapshot_.pipeTiming.ackAttempted ? 1 : 0)
+                                  .arg(pendingSubmitSnapshot_.pipeTiming.ackWaitUs)
+                                  .arg(pendingSubmitSnapshot_.pipeTiming.ackSampleValid ? 1 : 0));
+                }
                 appendLog(QStringLiteral(
                     "Release delivery identity: physical_epoch=%1 shot_attempt=%2 "
                     "release_seq=%3 schedule_token=%4 delivery_token=%5 "
@@ -11750,9 +14215,7 @@ void OrionAppController::pollPhysicalController()
                     ? userReleaseTracker_.confirm(pendingSubmitSeq_)
                     : userReleaseTracker_.fail(
                         pendingSubmitSeq_, UserReleaseFailureReason::TransportNotConfirmed);
-                if (userLog_.enabled() && !userNotice.isEmpty()) {
-                    userLog_.append(userNotice);
-                }
+                appendCustomerEvent(userNotice);
                 if (!deliverySucceeded) {
                     automation_.cancelPostReleaseGrade(pendingSubmitSeq_);
                     preciseFireDeliveryFault_ = true;
@@ -11772,6 +14235,7 @@ void OrionAppController::pollPhysicalController()
                 pendingSubmitFireToken_ = 0;
                 pendingSubmitTransportSeq_ = 0;
                 pendingSubmitSnapshot_ = {};
+                pendingSubmitFrameGrid_ = {};
             }
             // Per-tick ownership trace through Releasing/Cooldown + the summary flush.
             updateReleaseOwnershipTrace(selected.device.state, output, submitOk, nowMs);
@@ -11785,7 +14249,7 @@ void OrionAppController::pollPhysicalController()
             appendLog(QStringLiteral("Release submit: seq=%1 ok=0 backend=NONE "
                                      "delivery_stage=not_confirmed delivery_source_seq=0 "
                                      "delivery_token=%2 console_ack=0 tick_submit_ok=0 "
-                                     "reason=virtual_disconnected")
+                                     "fire_epoch_ms=-1.000 reason=virtual_disconnected")
                           .arg(pendingSubmitSeq_)
                           .arg(pendingSubmitFireToken_));
             appendLog(QStringLiteral(
@@ -11800,9 +14264,7 @@ void OrionAppController::pollPhysicalController()
             automation_.cancelPostReleaseGrade(pendingSubmitSeq_);
             const QString notice = userReleaseTracker_.fail(
                 pendingSubmitSeq_, UserReleaseFailureReason::VirtualControllerDisconnected);
-            if (userLog_.enabled() && !notice.isEmpty()) {
-                userLog_.append(notice);
-            }
+            appendCustomerEvent(notice);
             setControllerLifecycle(ControllerLifecycleState::ControllerFault,
                                    QStringLiteral("Release NOT submitted — virtual pad disconnected; the shot "
                                                   "did not reach the console"));
@@ -11817,6 +14279,7 @@ void OrionAppController::pollPhysicalController()
             pendingSubmitFireToken_ = 0;
             pendingSubmitTransportSeq_ = 0;
             pendingSubmitSnapshot_ = {};
+            pendingSubmitFrameGrid_ = {};
         }
         // Lost the virtual pad mid-release — don't lose the ownership summary (can't keep
         // tracing without a submit, so flush whatever we accumulated).
@@ -11857,6 +14320,7 @@ void OrionAppController::setCaptureSourceHealth(const QString& value)
         // lock before any held position can be presented.
         meterOverlayContinuityLease_.reset();
         lastRealMeterSeenMs_ = 0;
+        lastMeterOverlayVisualSeenMs_ = 0;
     }
     emit statusChanged();
 }
@@ -11953,9 +14417,18 @@ void OrionAppController::applyControllerLightbar(bool force)
         return;
     }
 
+    // [ORION_INPUT_DEAD_UX] Terminal dead-input override outranks everything: a session the
+    // player asked for is down while video plays, so the pad in their hands is the one surface
+    // guaranteed to be seen. Same opt-in write path as every other lightbar update (inert when
+    // the user's lightbar feature is off — the enabled gate above already returned).
+    const bool inputDeadWarning = inputDeadSeverity_ == InputDeadSeverity::Critical
+        && inputSessionIntentActive_;
     // Defense Mode overrides the base color (mode pill + pad agree at a glance).
-    QColor color(defenseModeActive_ ? config_.data().defenseLightbarColor
-                                    : config_.data().controllerLightbarPrimaryColor);
+    QColor color(inputDeadWarning
+                     ? QColor(QStringLiteral("#EF4444"))
+                     : QColor(defenseModeActive_
+                                  ? config_.data().defenseLightbarColor
+                                  : config_.data().controllerLightbarPrimaryColor));
     const QColor secondary(config_.data().controllerLightbarSecondaryColor);
     if (!color.isValid()) {
         lightbarRefreshPending_ = false;
@@ -12049,12 +14522,13 @@ bool OrionAppController::hasRecentRawInput() const noexcept
     // [ORION_PAD_LIVE_INPUT_GATE 2026-08-07] lastRawInputMs_ is set only when the
     // rawInputWorker snapshot carries a real HID report (OrionAppController.cpp
     // :9381) and is cleared to 0 on device removal (:4183 / :6913). Enumeration
-    // (findRawInputController -> rawInputPresent_ = true at :9419) does NOT touch
-    // lastRawInputMs_, so this predicate cleanly distinguishes "reports flowing"
-    // from "device visible to Windows but silent".
-    if (lastRawInputMs_ <= 0) return false;
+    // (findRawInputController -> rawInputPresent_ = true at :9419) sets rawInputPresent_.
+    // Fall back to rawInputPresent_ when the controller is enumerated so that an
+    // idle pad resting on the desk satisfies the gate without forcing the user
+    // to wiggle the sticks.
+    if (lastRawInputMs_ <= 0) return rawInputPresent_;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    return (nowMs - lastRawInputMs_) < 3000;
+    return (nowMs - lastRawInputMs_) < 3000 || rawInputPresent_;
 }
 
 #ifdef Q_OS_WIN
@@ -12217,26 +14691,12 @@ void OrionAppController::applyControllerUsbPowerFix()
 #endif
 }
 
-bool OrionAppController::wakePhysicalPadAndConfirmReport()
+bool OrionAppController::nudgePhysicalPadOnce(bool* opened, bool* answered)
 {
-#ifdef Q_OS_WIN
-    // [ORION_PAD_LIVE_INPUT_GATE 2026-08-08] Enumerated-but-silent recovery.
-    // A healthy Sony pad streams input reports continuously while enumerated
-    // (IMU noise makes every report unique; Raw Input posts WM_INPUT per
-    // report, with no state-change de-duplication), so "enumerated + silent"
-    // is not an idle pad — it is a pad whose transport went quiet, most
-    // commonly USB selective suspend after system idle. Opening the HID
-    // collection forces a D0 resume; the synchronous input-report poll nudges
-    // firmware that idles its stream while suspended. Both are best-effort
-    // DIAGNOSTICS ONLY: admission below still requires the dedicated input
-    // thread to decode a REAL report (the exact predicate the 2026-08-07 gate
-    // introduced), so a genuinely dead pad is refused exactly as before.
-    if (!rawInputWorker_) {
-        return false;
-    }
-    const QString path = rawInputDevicePath_;
     bool probeOpened = false;
     bool probeAnswered = false;
+#ifdef Q_OS_WIN
+    const QString path = rawInputDevicePath_;
     if (!path.isEmpty()) {
         HANDLE handle = CreateFileW(
             reinterpret_cast<LPCWSTR>(path.utf16()),
@@ -12265,6 +14725,37 @@ bool OrionAppController::wakePhysicalPadAndConfirmReport()
             CloseHandle(handle);
         }
     }
+#endif
+    if (opened) {
+        *opened = probeOpened;
+    }
+    if (answered) {
+        *answered = probeAnswered;
+    }
+    return probeOpened;
+}
+
+bool OrionAppController::wakePhysicalPadAndConfirmReport()
+{
+#ifdef Q_OS_WIN
+    // [ORION_PAD_LIVE_INPUT_GATE 2026-08-08] Enumerated-but-silent recovery.
+    // A healthy Sony pad streams input reports continuously while enumerated
+    // (IMU noise makes every report unique; Raw Input posts WM_INPUT per
+    // report, with no state-change de-duplication), so "enumerated + silent"
+    // is not an idle pad — it is a pad whose transport went quiet, most
+    // commonly USB selective suspend after system idle. Opening the HID
+    // collection forces a D0 resume; the synchronous input-report poll nudges
+    // firmware that idles its stream while suspended. Both are best-effort
+    // DIAGNOSTICS ONLY: admission below still requires the dedicated input
+    // thread to decode a REAL report (the exact predicate the 2026-08-07 gate
+    // introduced), so a genuinely dead pad is refused exactly as before.
+    if (!rawInputWorker_) {
+        return false;
+    }
+    const QString path = rawInputDevicePath_;
+    bool probeOpened = false;
+    bool probeAnswered = false;
+    nudgePhysicalPadOnce(&probeOpened, &probeAnswered);
     // Confirm: re-run the standard poll/mirror until a real report lands. This
     // reuses the production predicates (selector liveness + hasRecentRawInput),
     // so on success every downstream consumer (physicalPadLive_, route logs,
@@ -12311,12 +14802,26 @@ void OrionAppController::appendLog(const QString& message)
     // machine lines. Keep the human ring human-sized (kActivityRingMaxLines,
     // 1000 as of 2026-08-08 so a whole batch stays skimmable in-app); the
     // complete diagnostic stream is still queued to disk below.
+    const QString stamped = QStringLiteral("%1  %2")
+                                .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")),
+                                     simplified);
     if (!periodicDiagnostic) {
-        logs_.append(QStringLiteral("%1  %2")
-                         .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")),
-                              simplified));
+        logs_.append(stamped);
         while (logs_.size() > ui_notifications::kActivityRingMaxLines) {
             logs_.removeFirst();
+        }
+        logsDirty_ = true;
+    }
+    // [ORION_ACTIVITY_FEED 2026-09-14 owner] THE customer/engineering split, in
+    // one place: ui_notifications::shouldEnterActivityRing(). Engineering
+    // telemetry keeps its disk line below and its place in the raw `logs_` ring
+    // the Debug page reads — it simply never reaches the Activity feed, which is
+    // why 1000 entries there is now hours of real events instead of the twelve
+    // minutes of counter lines the 2026-09-14 census measured.
+    if (ui_notifications::shouldEnterActivityRing(simplified)) {
+        customerLogs_.append(stamped);
+        while (customerLogs_.size() > ui_notifications::kActivityRingMaxLines) {
+            customerLogs_.removeFirst();
         }
         logsDirty_ = true;
     }
@@ -12392,7 +14897,53 @@ void OrionAppController::persistConfig(const AppConfigData& data, const QString&
 
 void OrionAppController::syncBackendConfig()
 {
-    automation_.applyConfig(config_.data(), config_.learning());
+    const bool enableInputPipe = !isXboxRemotePlay(config_.data())
+        && qEnvironmentVariable("ORION_INPUT_HOOK") == QLatin1String("1");
+    if (orionInput_.enabled() != enableInputPipe) {
+        disarmPreciseFire();
+        QMutexLocker submitLock(&submitMutex_);
+        orionInput_.resetConnection();
+        orionInput_.setEnabled(enableInputPipe);
+        directPipeOwnsInput_ = false;
+    }
+    auto engineConfig = config_.data();
+    if (isXboxRemotePlay(engineConfig))
+        engineConfig.meterBlindBackstop = false; // External windows require real meter evidence.
+    automation_.applyConfig(engineConfig, config_.learning());
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] Re-read the loop's published state from the ENGINE
+    // rather than from the settings object: applyConfig above is also where the trim is RESET on
+    // a committed Shot Lead change and where it is restored (at half strength) at app start, so
+    // this is the one place that can keep the caption honest on every one of those paths.
+    {
+        const bool armed = automation_.bannerLeadTrimEnabled();
+        const double shown =
+            automation_.bannerLeadTrimMsForType(QStringLiteral("Standstill"));
+        if (armed != bannerLeadTrimEnabled_
+            || !qFuzzyCompare(1.0 + shown, 1.0 + bannerLeadTrimMs_)) {
+            bannerLeadTrimEnabled_ = armed;
+            bannerLeadTrimMs_ = shown;
+            emit bannerLeadTrimChanged();
+        }
+    }
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] Same reason, same place: applyConfig above is where the
+    // seed is re-evaluated against the freshly committed Shot Lead pair, so this is the one
+    // handler that can keep the caption honest on the reset-to-Auto and the first-run paths
+    // (both of which change the seed without any shot having been fired).
+    {
+        const bool active = automation_.leadAutoSeedActive();
+        const double seedMs = automation_.leadAutoSeedMs();
+        const double measuredMs = automation_.leadAutoSeedMeasuredMs();
+        const QString kind = automation_.leadAutoSeedKind();
+        if (active != leadAutoSeedActive_ || kind != leadAutoSeedKind_
+            || !qFuzzyCompare(1.0 + seedMs, 1.0 + leadAutoSeedMs_)
+            || !qFuzzyCompare(1.0 + measuredMs, 1.0 + leadAutoSeedMeasuredMs_)) {
+            leadAutoSeedActive_ = active;
+            leadAutoSeedKind_ = kind;
+            leadAutoSeedMs_ = seedMs;
+            leadAutoSeedMeasuredMs_ = measuredMs;
+            emit leadAutoSeedChanged();
+        }
+    }
     detector_.applyConfig(config_.data());
     remotePlay_.applyConfig(config_.data());
     // [ORION_METER_DELAY 2026-08-08] Every non-QML save path funnels through here
@@ -12405,6 +14956,17 @@ void OrionAppController::syncBackendConfig()
     // silently overriding a hold_start setting). key=value, add-only.
     {
         const auto& timingConfig = config_.data();
+        // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] APPEND-ONLY: rhythm_delay_ms is the flick trim
+        // (positive = flick fires later), carried here so a batch log says what the trim was for
+        // the whole session without having to read settings.json back.
+        // [ORION_NO_METER_V2 2026-09-14] hold_ms is H_ref, the blind law's whole user input;
+        // delay_ms / lead_ms are retired from the math and are no longer carried here.
+        appendLog(QStringLiteral(
+            "Input timer: enabled=%1 hold_ms=%2 rhythm=%3 rhythm_delay_ms=%4")
+            .arg(timingConfig.inputTimedEnabled ? 1 : 0)
+            .arg(timingConfig.noMeterHoldMs, 0, 'f', 1)
+            .arg(timingConfig.inputTimedRhythmEnabled ? 1 : 0)
+            .arg(timingConfig.rhythmFlickDelayMs, 0, 'f', 1));
         appendLog(QStringLiteral("Timing mode: autonomous=%1 shadow=%2 anchor=%3 tipGate=%4")
                       .arg(timingConfig.autonomousVision ? 1 : 0)
                       .arg(timingConfig.autonomousVisionShadow ? 1 : 0)
@@ -12596,8 +15158,28 @@ void OrionAppController::updateRuntimeStatus()
                         : QStringLiteral("Waiting for live capture heartbeat");
 
     licenseDetail_ = licenseState_ == QLatin1String("Local Dev") ? QStringLiteral("Local source mode") : QStringLiteral("Current launcher entitlement");
-    timeLeft_ = licenseState_ == QLatin1String("Local Dev") ? QStringLiteral("Dev") : QStringLiteral("-");
-    timeLeftDetail_ = licenseState_ == QLatin1String("Local Dev") ? QStringLiteral("No entitlement granted") : QStringLiteral("No expiry loaded");
+    if (licenseState_ == QLatin1String("Local Dev")) {
+        timeLeft_ = QStringLiteral("Dev");
+        timeLeftDetail_ = QStringLiteral("No entitlement granted");
+    } else {
+        // Single source of truth with the Profile page's hero number: both derive
+        // from licenseDaysLeft(), so "Time left" can never contradict "Days left".
+        const int days = profileDaysLeft();
+        if (days == -2) {
+            timeLeft_ = QStringLiteral("Lifetime");
+            timeLeftDetail_ = QStringLiteral("No expiry");
+        } else if (days < 0) {
+            timeLeft_ = QStringLiteral("-");
+            timeLeftDetail_ = QStringLiteral("No expiry loaded");
+        } else {
+            timeLeft_ = days == 1 ? QStringLiteral("1 day")
+                                  : QStringLiteral("%1 days").arg(days);
+            timeLeftDetail_ = QStringLiteral("Expires %1").arg(
+                QDateTime::fromSecsSinceEpoch(profile_.expiryEpochS)
+                    .toLocalTime()
+                    .toString(QStringLiteral("d MMM yyyy")));
+        }
+    }
 
     const bool meterSeen = data.value(QStringLiteral("meter_detected")).toBool(false)
         || data.value(QStringLiteral("hold_meter_detected")).toBool(false)

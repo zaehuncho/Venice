@@ -1,178 +1,228 @@
 # Orion Admin Tools
 
-Orion ships two hardened Qt admin tools beside the launcher:
+Three client surfaces operate the licence backend, all speaking the same
+contract — `docs/ADMIN_PANEL_V2_CONTRACT.md` (§2-§6 endpoints, §7 clients):
 
-- `OrionOwner.exe` - owner-only console for staff registration, staff disable,
-  staff machine reset, enrollment reissue, license lookup, HWID reset, and
-  license deactivation.
-- `OrionStaff.exe` - staff console for Discord-ID-bound enrollment/login and
-  role-limited license operations.
+- **`OrionOwner.exe`** — the owner console: Dashboard, Licenses, Staff, Audit, Config.
+- **`OrionStaff.exe`** — the staff console: Licenses (role-limited), My audit, My access.
+- **`tools/admin/orion_admin.py`** — the scriptable twin of both.
 
-Both tools use the same production build, updater handoff, release manifest, and
-security policy path as `OrionNative.exe`. They do not embed owner/admin secrets,
-Discord bot tokens, Sellhub secrets, update private keys, or license authority.
-The owner secret is prompted and kept in memory only. Staff sessions are issued
-by the backend as short-lived machine-bound bearer tokens.
+Neither EXE embeds an owner secret, bot token, update key or licence authority.
+The owner secret is typed at login and held in memory only; staff sessions are
+machine-bound bearer tokens issued by the backend.
 
-The shipped release package must contain the EXEs, but not loose admin QML
-source. `verify_orion.ps1 -StrictSecurity` builds `OrionOwner.exe` and
-`OrionStaff.exe` in the production tree, packages them, and runs the release
-security audit.
+Sources: `native_orion/src/AdminToolController.{h,cpp}` (one controller for both
+tools, `ORION_OWNER_TOOL` / `ORION_STAFF_TOOL` picks the mode),
+`native_orion/src/admin_tool_main.cpp`, `native_orion/qml/admin/**`.
 
-Both EXEs also expose a non-interactive startup integrity check used by the
-strict gate:
+## Roles and capabilities
+
+Server-enforced by `require_capability`. The clients only *display* the matrix —
+`AdminToolController::can()` and the CLI's `ROLE_CAPABILITIES` hide what a role
+cannot do so the UI is honest; they never stand in for the server's gate.
+
+| capability | owner | admin | support |
+|---|---|---|---|
+| license.lookup | ✓ | ✓ | ✓ |
+| license.create | ✓ | ✓ (≤ caps.keys_per_day) | ✗ |
+| license.reset_machine | ✓ | ✓ (≤ caps.resets_per_day) | ✓ |
+| license.reset_machine **force** | ✓ | ✗ | ✗ |
+| license.extend | ✓ | ✓ (≤ caps.extend_max_days) | ✗ |
+| license.revoke / unrevoke / freeze / unfreeze | ✓ | ✓ | ✗ |
+| license.set_plan / transfer | ✓ | ✓ | ✗ |
+| license.set_reset_policy, blacklist | ✓ | ✗ | ✗ |
+| staff.* , config.* , metrics, audit.read_all | ✓ | ✗ | ✗ |
+| audit.read_own | ✓ | ✓ | ✓ |
+
+An owner has two ways in: the break-glass admin secret, or a staff row with
+`role=owner` (a machine-bound token like any other). Both reach `/api/admin/*`;
+the tools call that state **owner routes**, and fall back to `/api/staff/*`
+otherwise.
+
+**Every mutation requires a reason (≤200 characters).** In the panels the action
+button stays disabled until the reason field is valid; in the CLI `--reason` is
+mandatory and destructive commands additionally prompt for confirmation.
+
+## OrionOwner.exe
+
+Login: admin secret + TOTP code (§5 — the code is required once
+`owner_totp_required` is on, and is cached for the session).
+
+| screen | what it does | endpoint |
+|---|---|---|
+| Dashboard | licence/trial/activation/reset/staff/version counters, online now, fraud flags, service state | `GET /api/admin/metrics`, `GET /api/admin/config` |
+| Licenses | lookup by key / email / Discord ID / machine ID; create (plan, days, count ≤25, Discord, email, note); revoke, unrevoke, freeze, unfreeze, extend, set plan, transfer; reset machine with the policy view (free left, used, paid credits, locked, reset history) and an owner **force** switch; per-key reset policy; blacklist / unblacklist | `POST /api/admin/license {action, reason, ...}` |
+| Staff | create (role + caps) → the one-time enroll key with a copy button; roster with role, enabled state, caps and usage today; disable/enable, set role, set caps, reset machine, reissue enrollment | `GET/POST /api/admin/staff` |
+| Audit | since / until / actor / action / target filters, cursor paging, per-row expander with `details{}` | `GET /api/admin/audit` |
+| Config | kill switch, version gate, MOTD, reset-policy defaults, fraud thresholds, alert routing, owner TOTP enrol/confirm, admin-secret rotation, IP allowlist | `GET/POST /api/admin/config` |
+
+## OrionStaff.exe
+
+Login: **enrol once** on this machine with the staff id + one-time enroll key,
+then sign in with the staff id alone. Every staff request carries
+`Authorization: Bearer …`, `X-Machine-Id` (the Lambda's `require_staff` refuses a
+bound token without it) and `X-Orion-Discord-Id`.
+
+- **Licenses** — the same screen, with anything the role cannot do hidden.
+- **My audit** — `GET /api/staff/audit` (own rows, cursor-paged).
+- **My access** — staff id, role, machine, caps and usage today, and a read-out
+  of the capability matrix for the current role.
+
+## One-time secrets
+
+Four things are shown exactly once and never again; each gets a copy button and
+a Dismiss that wipes it from the controller:
+
+| secret | where | note |
+|---|---|---|
+| staff enroll key | Staff → create / reissue enrollment | only a salted per-staff hash is stored; lost ⇒ reissue |
+| new licence keys | Licenses → create | the panel shows full keys only at creation |
+| TOTP otpauth URI + secret | Config → Enrol TOTP | add to the authenticator, then confirm a code |
+| rotated admin secret | Config → Rotate admin secret | the session switches to it immediately; the old secret is dead |
+
+### Owner TOTP procedure (§5)
+
+1. Config → **Enrol TOTP** (reason required) → `POST /api/admin/config {action: totp_enroll}`
+   returns the otpauth URI once. Add it to the authenticator.
+2. Enter the current 6-digit code → **Confirm code** → `{action: totp_confirm, code}`.
+   Confirming turns `owner_totp_required` on.
+3. From then on the login pane's TOTP field is mandatory; the controller sends
+   `X-Orion-Admin-TOTP` with every owner-secret request and caches the code for
+   the session. Server codes `totp_required` / `invalid_totp` re-arm the prompt.
+
+### Secret rotation
+
+Config → **Rotate admin secret** (reason + confirmation) →
+`{action: rotate_admin_secret}` writes a new secret to SSM and returns it once.
+The panel keeps the session alive by switching to the new secret in memory —
+store it before closing the window.
+
+## CLI — `tools/admin/orion_admin.py`
+
+Stdlib only, HTTPS only, no secrets on disk beyond the ignored
+`~/.orion/admin_config.json` (written `0600`). Credentials resolve from the
+environment first: `ORION_ADMIN_SECRET`, `ORION_ADMIN_TOTP`, `ORION_ADMIN_TOKEN`,
+`ORION_ADMIN_STAFF_ID`, `ORION_ADMIN_DISCORD_ID`, `ORION_ADMIN_ROLE`,
+`ORION_API_BASE`. The TOTP code is never written to disk — interactive runs
+prompt for it, scripts pass `ORION_ADMIN_TOTP`.
+
+```bash
+# identity / session
+orion-admin version
+orion-admin whoami                       # role, staff id, caps, usage today
+orion-admin caps                         # the matrix above (display only)
+orion-admin config                       # redacted local config
+orion-admin login --mode owner           # prompts for the secret, never echoes
+orion-admin login --mode staff --staff-id staff_abc
+orion-admin logout
+orion-admin staff-enroll --staff-id staff_abc --enroll-key ENROLL-...
+orion-admin staff-login  --staff-id staff_abc
+
+# licences  (POST /api/admin/license | /api/staff/license {action, reason, ...})
+orion-admin license lookup --key ORION-XXXX-XXXX-XXXX [--reveal]
+orion-admin license lookup --email u@e.com | --discord ID | --machine MACHINE
+orion-admin license create --plan pro --days 90 --count 5 [--discord ID] [--email ..] [--note ..] --reason "launch batch"
+orion-admin license revoke|unrevoke|freeze|unfreeze --key ORION-... --reason "..."
+orion-admin license reset-machine --key ORION-... [--force] --reason "..."
+orion-admin license extend   --key ORION-... --days 30 --reason "..."
+orion-admin license set-plan --key ORION-... --plan pro --reason "..."
+orion-admin license transfer --key ORION-... --discord ID|--email .. --reason "..."
+orion-admin license set-reset-policy --key ORION-... [--free-resets N] [--penalty-days N] [--locked true|false] --reason "..."
+orion-admin license blacklist|unblacklist --machine ID|--discord ID --reason "..."
+
+# staff (owner)
+orion-admin staff list
+orion-admin staff create --discord ID --role admin [--keys-per-day N] [--resets-per-day N] [--extend-max-days N] --reason "..."
+orion-admin staff disable|enable|reset-machine|reissue-enrollment --staff-id staff_abc --reason "..."
+orion-admin staff set-role --staff-id staff_abc --role support --reason "..."
+orion-admin staff set-caps --staff-id staff_abc --resets-per-day 3 --reason "..."
+
+# audit (owner: everything; staff: own rows)
+orion-admin audit [--since UNIX] [--until UNIX] [--actor ..] [--action ..] [--target ..] [--cursor ..] [--limit ≤200]
+
+# owner config (§5)
+orion-admin server-config show
+orion-admin server-config set --min-client-version 1.5.0 --blocked-versions "1.3.0,1.3.1" \
+                              --motd-text "Maintenance 02:00 UTC" --motd-level maint --motd-until 1800000000 \
+                              --free-resets 3 --penalty-days 3 --cooldown-s 86400 --self-service true \
+                              --machines-30d 3 --resets-30d 4 \
+                              --alert-owner ID --alert-events "staff.create,license.revoke" \
+                              --owner-totp-required true --ip-allowlist "203.0.113.0/24" \
+                              --reason "hardening pass"
+orion-admin server-config totp-enroll  --reason "..."      # URI shown once
+orion-admin server-config totp-confirm --code 123456 --reason "..."
+orion-admin server-config rotate-secret --reason "..."     # new secret shown once
+
+# global kill switch (config.global_kill; the bot route is read-only)
+orion-admin killswitch status|engage|release --reason "..."
+
+# owner dashboard numbers
+orion-admin metrics
+```
+
+`--yes` skips the confirmation prompt for scripted use; `--reason` is still
+mandatory. `--base-url` overrides the endpoint (HTTPS only).
+
+## Safety rules
+
+- Every mutation carries a reason (≤200 chars) and lands in the audit row.
+- Destructive actions (revoke, freeze, reset-machine, transfer, blacklist, staff
+  disable / reset-machine / reissue, killswitch engage, secret rotation) also
+  require a typed confirmation unless `--yes`.
+- Full licence keys appear only at creation or with an explicit `--reveal`;
+  everywhere else they are masked to the last four characters.
+- Admin secrets, TOTP codes and staff tokens are never printed or logged.
+- Non-HTTPS endpoints are refused by the transport; the Qt tools additionally
+  pin the server certificate and abort on a mismatch.
+
+## Packaging and startup integrity
+
+Both EXEs build from `native_orion/CMakeLists.txt`
+(`orion_add_admin_tool(OrionOwner ORION_OWNER_TOOL OrionOwner)` / `OrionStaff`);
+the admin QML lives in `ORION_ADMIN_QML_FILES` and is compiled into the
+executable's QML module, so no loose admin QML ships.
 
 ```powershell
+cmake --build native_orion\build --config Release --target OrionOwner OrionStaff
 .\OrionOwner.exe --check-startup-security
 .\OrionStaff.exe --check-startup-security
 ```
 
-In production builds this returns `0` only if `release_manifest.json` verifies
-the package. A missing or modified manifest-covered file returns non-zero before
-the QML UI loads. `verify_orion.ps1 -StrictSecurity` runs this against the real
-package and against a copied package with `release_manifest.json` removed.
+In production builds the startup check returns `0` only if
+`release_manifest.json` verifies the package; a missing or modified
+manifest-covered file returns non-zero before the QML loads.
+`verify_orion.ps1 -StrictSecurity` runs this against the real package and against
+a copy with the manifest removed.
 
-Owner/Staff tools do not consume gameplay `settings.json`, so the admin runtime
-does not block on the launcher's gameplay settings-signature check when running
-from a packaged admin install. Release-manifest integrity, debugger/analysis
-locks, server authentication, role checks, and machine-bound staff tokens still
-fail closed.
+The admin tools do not consume the gameplay `settings.json`, so the runtime does
+not block on the launcher's settings-signature check. Release-manifest
+integrity, debugger/analysis locks, server authentication, role checks and
+machine-bound staff tokens still fail closed, and a security lock refuses
+privileged auth outright (reported to `/api/{admin,staff}/tamper-report`, which
+never unlocks the client).
 
-## CLI (`tools/admin/orion_admin.py`)
+## Error codes surfaced to the operator
 
-A local, stdlib-only command-line tool for owner/staff operations against the
-Orion license backend. It is intentionally kept out of the customer gameplay UI.
-
-## Auth & Config
-
-Credentials resolve from, in order:
-
-1. Environment: `ORION_ADMIN_SECRET` for owner, `ORION_ADMIN_TOKEN` for staff,
-   plus optional `ORION_ADMIN_DISCORD_ID`, `ORION_ADMIN_ROLE`,
-   `ORION_API_BASE`.
-2. Ignored local file `~/.orion/admin_config.json`, written `0600` by login or
-   enrollment commands. It lives outside the repo and is never committed.
-
-```bash
-# Owner auth. Prompts silently and never echoes the secret.
-python tools/admin/orion_admin.py login --mode owner
-
-# Staff first-time enrollment. The owner creates this one-time key.
-python tools/admin/orion_admin.py staff-enroll --discord 123456789012345678 --enrollment-key ORION-STAFF-...
-
-# Staff session refresh on the same machine.
-python tools/admin/orion_admin.py staff-login --discord 123456789012345678
-```
-
-`orion_admin.py config` prints a redacted config: secrets are shown only as
-`set` or `unset`.
-
-## Roles
-
-Roles are server-enforced. CLI checks are advisory only.
-
-| Role | Capabilities |
-| --- | --- |
-| `owner` | Everything, including staff create, disable, role changes, and enrollment reissue. |
-| `admin` | License create, revoke, unrevoke, reset, deactivate, extend, plan change, lookup, audit. |
-| `support` | License lookup, limited HWID reset, and deactivate. |
-
-Staff identity is bound by Discord ID and machine ID. The backend rejects
-disabled staff, wrong-machine tokens, expired sessions, and role-ineligible
-operations.
-
-## Commands
-
-```bash
-# Backend / identity
-orion-admin version
-orion-admin whoami
-
-# License lifecycle
-orion-admin license create --email user@example.com --plan pro --days 365 [--discord ID] [--key ORION-...]
-orion-admin license lookup --key ORION-XXXX-XXXX-XXXX
-orion-admin license lookup --email user@example.com
-orion-admin license lookup --key ORION-XXXX-XXXX-XXXX --reveal
-orion-admin license revoke      --key ORION-... --reason "chargeback"
-orion-admin license unrevoke    --key ORION-...
-orion-admin license reset-hwid  --key ORION-... --reason "user reinstalled"
-orion-admin license deactivate  --key ORION-... --reason "transfer"
-orion-admin license extend      --key ORION-... --days 90
-orion-admin license set-plan    --key ORION-... --plan pro
-
-# Staff management (owner)
-orion-admin staff list
-orion-admin staff create --discord ID --name "Display Name" --role admin
-orion-admin staff disable --discord ID --reason "left team"
-orion-admin staff reset-machine --discord ID --reason "new PC"
-orion-admin staff reissue-enrollment --discord ID --reason "lost enrollment key"
-
-# Audit
-orion-admin audit --limit 50
-```
-
-## Safety Rules
-
-- Destructive actions require a non-empty `--reason` and an interactive
-  confirmation. `--yes` skips the prompt for scripts, but the reason is still
-  mandatory.
-- Full license keys are shown only by `license create` once, or by explicit
-  `--reveal`. Everywhere else uses suffix-only masking.
-- Staff enrollment keys are shown once by `staff create` or
-  `staff reissue-enrollment`; only salted hashes are stored server-side.
-- HTTPS-only transport. Non-HTTPS endpoints are refused.
-- Admin secrets and staff tokens are never printed or logged.
-
-## Endpoint Contract
-
-Owner endpoints:
-
-- `POST /api/provision` - create a license with owner secret.
-- `GET /api/admin/license?key=` - look up a license.
-- `POST /api/admin/license` - `revoke`, `unrevoke`, `reset_machine`,
-  `deactivate`, `extend_expiry`, and `change_plan`.
-- `GET /api/admin/search?email=` / `?discord=` - suffix-only license search.
-- `GET /api/admin/whoami` - owner identity check.
-- `GET/POST /api/admin/staff` - list/create/enable/disable/update-role/reset
-  staff machine/reissue enrollment.
-- `GET /api/admin/staff/audit?limit=` - staff/admin audit stream.
-- `POST /api/admin/tamper-report` - owner-authenticated security-lock/tamper
-  audit report from the privileged tool. This never unlocks the client.
-- `GET /api/version`.
-
-Staff endpoints:
-
-- `POST /api/staff/enroll` - Discord ID + one-time key + machine ID returns a
-  short-lived staff token.
-- `POST /api/staff/login` - Discord ID + same machine ID returns a fresh staff
-  token.
-- `GET /api/staff/whoami` - staff identity check.
-- `GET/POST /api/staff/license` - role-limited license lookup and mutations.
-- `POST /api/staff/tamper-report` - staff-token-authenticated
-  security-lock/tamper audit report from the privileged tool. Disabled or
-  wrong-machine staff tokens still fail closed.
-
-Audit rows are rendered with suffix-only targets plus actor, action, target
-type, and reason.
+`totp_required` / `invalid_totp` (re-prompts for a code), `ip_not_allowed`,
+`rate_limited`, `version_blocked`, `token_expired` / `machine_mismatch` /
+`staff_disabled` / `invalid_token` (the staff session is dropped and login is
+required again), plus the licence states `frozen` and `blacklisted`.
 
 ## Tests
 
-`tests/test_orion_admin.py` runs fully offline with a fake transport: key
-masking, expiry math, config redaction, auth-header construction, HTTPS refusal,
-reason/confirmation gates, key-once creation, masked lookups, and staff command
-flows.
+- `tests/test_orion_admin.py` — fully offline (fake transport). Asserts each
+  subcommand's method, path and body against the contract, plus reason and
+  confirmation gating, key masking, auth headers (owner secret + TOTP; staff
+  bearer + `X-Machine-Id`), route selection (owner vs staff), enrol/login body
+  shape, audit paging, config patch construction, and error surfacing.
 
-`tests/test_backend_staff_auth.py` runs fully offline with fake tables: staff
-token verification, disabled-staff rejection, one-time enrollment-key handling,
-route exposure, role matrix, and structured JSON failures.
+  ```powershell
+  .\.venv\Scripts\python.exe -m pytest tests\test_orion_admin.py -q
+  ```
 
-`tools/admin/check_backend_contract.py` is the live, non-secret deployment smoke:
-
-```powershell
-python tools\admin\check_backend_contract.py --base-url https://api.zaeorion.com
-```
-
-It must pass before Owner/Staff tools are considered production-ready. Expected
-live behavior is not "200 everywhere"; unauthenticated staff/admin/tamper probes
-should fail closed with JSON auth or missing-field errors. A `404` means the
-deployed API Gateway/Lambda revision is missing the staff route contract.
+- `tests/backend` — the server-side capability matrix, reset-policy state
+  machine, audit rows, version gate, MOTD, TOTP, IP allowlist, blacklist, fraud
+  flags and metrics shape.
+- `tools/admin/check_backend_contract.py` — live, non-secret deployment smoke.
+  Unauthenticated probes must fail closed with JSON auth errors; a `404` means
+  the deployed Lambda revision predates the route.

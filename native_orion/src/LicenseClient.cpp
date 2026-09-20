@@ -52,6 +52,9 @@ VersionResult parseVersionResponse(const QByteArray& payload)
     }
 
     const auto obj = doc.object();
+    // Contract §5: /api/version carries `motd` when one is set and unexpired. Read it
+    // before the identity checks so a notice survives even a failed health verdict.
+    result.motd = parseMotd(obj.value(QStringLiteral("motd")));
     result.api = obj.value(QStringLiteral("api")).toString();
     if (result.api.isEmpty()) {
         // Backend >= 0.4.0 identifies via "service" (Lambda function name) instead
@@ -88,6 +91,7 @@ LicenseResult parseActivateResponse(const QByteArray& payload)
     result.user = obj.value(QStringLiteral("user")).toString(obj.value(QStringLiteral("username")).toString());
     result.plan = obj.value(QStringLiteral("plan")).toString();
     result.token = obj.value(QStringLiteral("token")).toString(obj.value(QStringLiteral("access_token")).toString());
+    result.canonicalLicenseKey = obj.value(QStringLiteral("canonical_license_key")).toString().trimmed().toUpper();
     // CRIT-1: keep the signed session token's identity CLIENT-SIDE (it used to
     // be discarded). The backend returns "tid" (handle_activate); accept the
     // documented "token_id" spelling too.
@@ -97,6 +101,12 @@ LicenseResult parseActivateResponse(const QByteArray& payload)
     result.error = obj.value(QStringLiteral("error")).toString();
     result.message = obj.value(QStringLiteral("message")).toString(
         obj.value(QStringLiteral("error")).toString(result.ok ? QStringLiteral("License activated.") : QStringLiteral("Activation failed.")));
+    // Contract §5: `version_blocked` names the oldest accepted client; `motd` is
+    // read here too in case the server attaches it to the activation verdict.
+    result.minClientVersion = obj.value(QStringLiteral("min_client_version")).toString();
+    result.motd = parseMotd(obj.value(QStringLiteral("motd")));
+    // Customer Profile page data. Absent on the current live Lambda -> known=false.
+    result.profile = parseLicenseProfile(obj.value(QStringLiteral("profile")));
     return result;
 }
 
@@ -115,6 +125,11 @@ LicenseResult parseLicenseCheckResponse(const QByteArray& payload)
     // now + LEASE_TTL_S server-side; lease_sig is the 07-15 signed-lease field.
     result.leaseExpiresAtEpochS = static_cast<qint64>(obj.value(QStringLiteral("lease_expires_at")).toDouble(0.0));
     result.leaseSig = obj.value(QStringLiteral("lease_sig")).toString().toUtf8();
+    // Contract §5: version gate + MOTD ride the heartbeat.
+    result.minClientVersion = obj.value(QStringLiteral("min_client_version")).toString();
+    result.motd = parseMotd(obj.value(QStringLiteral("motd")));
+    // The heartbeat is what keeps the Profile page's days-left fresh.
+    result.profile = parseLicenseProfile(obj.value(QStringLiteral("profile")));
     return result;
 }
 
@@ -130,6 +145,170 @@ int compareSemanticVersions(const QString& lhs, const QString& rhs)
         if (a > b) return 1;
     }
     return 0;
+}
+
+LicenseProfile parseLicenseProfile(const QJsonValue& value)
+{
+    LicenseProfile profile;
+    if (!value.isObject()) {
+        return profile;   // absent == unknown; the caller keeps what it had
+    }
+    const QJsonObject obj = value.toObject();
+
+    // DynamoDB numbers arrive as JSON numbers through json.dumps(default=
+    // decimal_default), but a legacy row can stringify one. Accept both rather
+    // than silently reporting 0 days left to a paying customer.
+    const auto number = [](const QJsonValue& v) -> qint64 {
+        if (v.isDouble()) {
+            return static_cast<qint64>(v.toDouble(0.0));
+        }
+        if (v.isString()) {
+            bool ok = false;
+            const qint64 parsed = v.toString().trimmed().toLongLong(&ok);
+            return ok ? parsed : 0;
+        }
+        return 0;
+    };
+    const auto count = [&number](const QJsonValue& v) {
+        const qint64 raw = number(v);
+        if (raw <= 0) {
+            return 0;
+        }
+        return static_cast<int>(raw < 1'000'000 ? raw : 1'000'000);
+    };
+
+    profile.known = true;
+    profile.discordUserId = obj.value(QStringLiteral("discord_user_id")).toString().trimmed();
+    profile.discordUsername = obj.value(QStringLiteral("discord_username")).toString().trimmed();
+    profile.plan = obj.value(QStringLiteral("plan")).toString().trimmed();
+    const qint64 expiry = number(obj.value(QStringLiteral("expiry")));
+    profile.expiryEpochS = expiry > 0 ? expiry : 0;
+    const qint64 activatedAt = number(obj.value(QStringLiteral("activated_at")));
+    profile.activatedAtEpochS = activatedAt > 0 ? activatedAt : 0;
+
+    const QJsonObject resets = obj.value(QStringLiteral("hwid_resets")).toObject();
+    profile.hwidResetsUsed = count(resets.value(QStringLiteral("used")));
+    profile.hwidResetsFreeTotal = count(resets.value(QStringLiteral("free_total")));
+    profile.hwidPaidCredits = count(resets.value(QStringLiteral("paid_credits")));
+    // Trust the server's free_remaining, but never let a stale/garbled pair
+    // render "4 of 3 free remaining": the derived value is the ceiling.
+    const int derivedRemaining =
+        profile.hwidResetsFreeTotal > profile.hwidResetsUsed
+            ? profile.hwidResetsFreeTotal - profile.hwidResetsUsed
+            : 0;
+    const int reportedRemaining = count(resets.value(QStringLiteral("free_remaining")));
+    profile.hwidResetsFreeRemaining =
+        reportedRemaining < derivedRemaining ? reportedRemaining : derivedRemaining;
+    return profile;
+}
+
+LicenseMotd parseMotd(const QJsonValue& value)
+{
+    LicenseMotd motd;
+    if (!value.isObject()) {
+        return motd;
+    }
+    const QJsonObject obj = value.toObject();
+    motd.text = obj.value(QStringLiteral("text")).toString().trimmed();
+    if (motd.text.isEmpty()) {
+        return motd;   // no text == no notice, whatever else is set
+    }
+
+    const QString level = obj.value(QStringLiteral("level")).toString().trimmed().toLower();
+    if (level == QLatin1String("warn") || level == QLatin1String("warning")) {
+        motd.level = QStringLiteral("warn");
+    } else if (level == QLatin1String("maint") || level == QLatin1String("maintenance")) {
+        motd.level = QStringLiteral("maint");
+    } else {
+        motd.level = QStringLiteral("info");
+    }
+
+    // `until`: Unix seconds per the contract ("Timestamps are Unix seconds"); a
+    // numeric string or an ISO-8601 stamp is tolerated so an owner-tool typo cannot
+    // pin a notice forever. Unparseable -> 0 (no expiry).
+    const QJsonValue until = obj.value(QStringLiteral("until"));
+    if (until.isDouble()) {
+        motd.untilEpochS = static_cast<qint64>(until.toDouble(0.0));
+    } else if (until.isString()) {
+        const QString raw = until.toString().trimmed();
+        bool numeric = false;
+        const qint64 asNumber = raw.toLongLong(&numeric);
+        if (numeric) {
+            motd.untilEpochS = asNumber;
+        } else {
+            const QDateTime stamp = QDateTime::fromString(raw, Qt::ISODate);
+            motd.untilEpochS = stamp.isValid() ? stamp.toSecsSinceEpoch() : 0;
+        }
+    }
+    if (motd.untilEpochS < 0) {
+        motd.untilEpochS = 0;
+    }
+    return motd;
+}
+
+bool isLicenseKillCode(const QString& code)
+{
+    return code == QLatin1String("service_disabled") || code == QLatin1String("revoked")
+        || code == QLatin1String("expired") || code == QLatin1String("device_mismatch")
+        || code == QLatin1String("invalid_key") || code == QLatin1String("inactive")
+        || code == QLatin1String("frozen") || code == QLatin1String("blacklisted")
+        || code == QLatin1String("version_blocked")
+        || code == QLatin1String("subscription_required");
+}
+
+QString licenseErrorUserText(const LicenseResult& result, const QString& fallback)
+{
+    const QString& code = result.error;
+    if (code == QLatin1String("frozen")) {
+        return QStringLiteral("Your subscription is paused — contact support.");
+    }
+    if (code == QLatin1String("blacklisted")) {
+        return QStringLiteral("This device is blocked.");
+    }
+    if (code == QLatin1String("subscription_required")) {
+        return QStringLiteral("An active Venice subscription tied to your Discord account is required. Run /purchase or open a ticket.");
+    }
+    if (code == QLatin1String("version_blocked")) {
+        const QString minimum = result.minClientVersion.trimmed();
+        return minimum.isEmpty()
+            ? QStringLiteral("Update required — this version is no longer allowed.")
+            : QStringLiteral("Update required — this version is no longer allowed (minimum version %1).")
+                  .arg(minimum);
+    }
+    // Every other code: the server's prose. The parsers fall back to the bare code
+    // when the server sent no `message`, which is still better than silence.
+    if (!result.message.trimmed().isEmpty()) {
+        return result.message;
+    }
+    return fallback;
+}
+
+QJsonObject licenseActivateRequestBody(const QString& licenseKey,
+                                       const QString& machineId,
+                                       const QString& requestNonce,
+                                       qint64 requestTimestamp)
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("license_key"), licenseKey.trimmed());
+    body.insert(QStringLiteral("key"), licenseKey.trimmed());
+    body.insert(QStringLiteral("machine_id"), machineId);
+    body.insert(QStringLiteral("client_version"), QStringLiteral(ORION_NATIVE_VERSION));
+    body.insert(QStringLiteral("fingerprint_version"), 2);
+    body.insert(QStringLiteral("request_nonce"), requestNonce);
+    body.insert(QStringLiteral("request_timestamp"), requestTimestamp);
+    return body;
+}
+
+QJsonObject licenseCheckRequestBody(const QString& licenseKey, const QString& machineId)
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("license_key"), licenseKey.trimmed());
+    body.insert(QStringLiteral("key"), licenseKey.trimmed());
+    body.insert(QStringLiteral("machine_id"), machineId);
+    // Version gate (contract §5): the heartbeat carries client_version exactly as
+    // activation does so the server can answer version_blocked mid-session.
+    body.insert(QStringLiteral("client_version"), QStringLiteral(ORION_NATIVE_VERSION));
+    return body;
 }
 
 LicenseClient::LicenseClient(QObject* parent)
@@ -234,14 +413,7 @@ void LicenseClient::postActivate(QString licenseKey, QString machineId)
     request.setRawHeader("X-Orion-Request-Timestamp", QByteArray::number(requestTimestamp));
     request.setRawHeader("X-Orion-Request-Id", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
 
-    QJsonObject body;
-    body.insert(QStringLiteral("license_key"), licenseKey.trimmed());
-    body.insert(QStringLiteral("key"), licenseKey.trimmed());
-    body.insert(QStringLiteral("machine_id"), machineId);
-    body.insert(QStringLiteral("client_version"), QStringLiteral(ORION_NATIVE_VERSION));
-    body.insert(QStringLiteral("fingerprint_version"), 2);
-    body.insert(QStringLiteral("request_nonce"), requestNonce);
-    body.insert(QStringLiteral("request_timestamp"), requestTimestamp);
+    const QJsonObject body = licenseActivateRequestBody(licenseKey, machineId, requestNonce, requestTimestamp);
 
     auto* reply = network_.post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::encrypted, this, [this, reply]() {
@@ -273,9 +445,24 @@ void LicenseClient::postActivate(QString licenseKey, QString machineId)
             if (reply->property("orion_pin_failed").toBool()) {
                 result.message = QStringLiteral("Pinned server certificate did not match.");
             } else if (reply->error() == QNetworkReply::OperationCanceledError || reply->error() == QNetworkReply::TimeoutError) {
+#ifdef ORION_PRODUCTION_BUILD
+                // Production must not carry instructions or marker strings for
+                // a developer-only offline key path. The local hook is compiled
+                // out in OrionAppController; keep its customer error copy out too.
+                result.message = QStringLiteral("License request timed out. Check your connection and try again.");
+#else
                 result.message = QStringLiteral("License request timed out. Use an NVDEV local key in the dev checkout or check server connectivity.");
+#endif
             } else if (obj.contains(QStringLiteral("message")) || obj.contains(QStringLiteral("error"))) {
-                result.message = obj.value(QStringLiteral("message")).toString(obj.value(QStringLiteral("error")).toString(reply->errorString()));
+                // A structured verdict behind an HTTP 4xx (the backend's err() helper
+                // answers 403/426 with a JSON body): keep the error CODE and
+                // min_client_version so the controller can map version_blocked /
+                // frozen / blacklisted to their own copy instead of raw prose.
+                const LicenseResult verdict = parseActivateResponse(body);
+                result.error = verdict.error;
+                result.minClientVersion = verdict.minClientVersion;
+                result.motd = verdict.motd;
+                result.message = verdict.message.isEmpty() ? reply->errorString() : verdict.message;
             } else {
                 result.message = reply->errorString();
             }
@@ -311,11 +498,7 @@ void LicenseClient::postValidate(QString licenseKey, QString machineId)
     request.setTransferTimeout(15'000);
     applyStrictTls(request);
 
-    QJsonObject body;
-    body.insert(QStringLiteral("license_key"), licenseKey.trimmed());
-    body.insert(QStringLiteral("key"), licenseKey.trimmed());
-    body.insert(QStringLiteral("machine_id"), machineId);
-    body.insert(QStringLiteral("client_version"), QStringLiteral(ORION_NATIVE_VERSION));
+    const QJsonObject body = licenseCheckRequestBody(licenseKey, machineId);
 
     auto* reply = network_.post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::encrypted, this, [this, reply]() {

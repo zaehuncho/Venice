@@ -30,7 +30,7 @@ Read-only = only staff/bots can send. ✅Verified / 💎Customer mean "that role
 - `#how-to-buy` — how-to-buy embed → links to store
 
 ### 🛒 STORE  *(everyone can view)*
-- `#pricing` — the 4 product embeds (Day/Week/Month/Lifetime) with buy buttons → `{{STORE_URL}}`
+- `#pricing` — ONE pricing embed (free 3-day trial + $25/month) with a Subscribe button → `{{STORE_URL}}`. Owner rule 2026-09-15: no tiers, no Lifetime.
 - `#purchase` — the SellHub `/purchase` bot lives here
 - `#reviews` — vouches (read-only; customers post via a vouch command or staff repost)
 - `#vouch-format` — how to leave a vouch

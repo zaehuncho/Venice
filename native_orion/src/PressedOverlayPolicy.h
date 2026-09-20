@@ -43,4 +43,36 @@ private:
     bool held_ = false;
 };
 
+
+// Passive release-side forensic observer.  Raw UP and the third consecutive
+// selected-device UP are separately observable because ownership can deliberately
+// hold output through the first two polls.  This never changes input or grants
+// a shot epoch.  Route loss resets it rather than pretending a missing report is UP.
+enum class SquareUpAuditPhase { None, RawUp, DebouncedUp };
+
+class SquareUpAuditTracker final {
+public:
+    [[nodiscard]] SquareUpAuditPhase observe(bool held) noexcept
+    {
+        if (held) {
+            heldSeen_ = true;
+            upPolls_ = 0;
+            return SquareUpAuditPhase::None;
+        }
+        if (!heldSeen_ || upPolls_ >= 3) {
+            return SquareUpAuditPhase::None;
+        }
+        ++upPolls_;
+        return upPolls_ == 1 ? SquareUpAuditPhase::RawUp
+            : (upPolls_ == 3 ? SquareUpAuditPhase::DebouncedUp
+                            : SquareUpAuditPhase::None);
+    }
+
+    void reset() noexcept { heldSeen_ = false; upPolls_ = 0; }
+
+private:
+    bool heldSeen_ = false;
+    int upPolls_ = 0;
+};
+
 } // namespace orion

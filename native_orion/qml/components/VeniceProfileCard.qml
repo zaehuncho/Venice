@@ -1,7 +1,7 @@
 import QtCore
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
+import OrionNative
 import QtQuick.Dialogs
 
 // [VENICE_PROFILE 2026-08-08] Backup / restore of the customer timing surface as a
@@ -56,9 +56,9 @@ Card {
             text: "Saves Shot Lead, Tip Timing, Meter Delay and the learned per-shot press "
                   + "constants to a file you can restore after a reinstall or on a second PC. "
                   + "No license or account data is included; imported values are range-checked."
-            color: "#8A96A8"
-            font.family: "Segoe UI Variable"
-            font.pixelSize: 11
+            color: Theme.textMuted
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontCaption
             wrapMode: Text.Wrap
         }
 
@@ -70,13 +70,13 @@ Card {
             PrimaryButton {
                 text: "Export Profile"
                 Layout.fillWidth: true
-                Layout.preferredHeight: 34
+                Layout.preferredHeight: Theme.controlHeight
                 onClicked: exportDialog.open()
             }
             PrimaryButton {
                 text: "Import Profile"
                 Layout.fillWidth: true
-                Layout.preferredHeight: 34
+                Layout.preferredHeight: Theme.controlHeight
                 onClicked: importDialog.open()
             }
         }
@@ -85,9 +85,9 @@ Card {
             Layout.fillWidth: true
             visible: root.lastResult.length > 0
             text: root.lastResult
-            color: root.lastOk ? "#4ADE80" : "#F87171"
-            font.family: "Cascadia Mono"
-            font.pixelSize: 11
+            color: root.lastOk ? Theme.success : Theme.danger
+            font.family: Theme.fontMono
+            font.pixelSize: Theme.fontCaption
             wrapMode: Text.Wrap
             elide: Text.ElideNone
         }

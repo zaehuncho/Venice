@@ -194,6 +194,23 @@ def test_package_audit_requires_owner_and_staff_tools(tmp_path):
     assert {"OrionOwner.exe", "OrionStaff.exe"} <= missing
 
 
+def test_customer_package_audit_does_not_require_internal_tools(tmp_path):
+    package = tmp_path / "package"
+    package.mkdir()
+    for name in security_audit.ESSENTIAL_PACKAGE_FILES - {"OrionOwner.exe", "OrionStaff.exe"}:
+        target = package / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"placeholder")
+    (package / "release_manifest.json").write_text(
+        json.dumps({"schema": "orion.release_manifest.v1", "audience": "customer", "files": {"OrionNative.exe": {"sha256": "0" * 64}}}),
+        encoding="utf-8",
+    )
+
+    findings = security_audit.audit_package_structure(package)
+
+    assert not any(f.code == "PACKAGE_ESSENTIAL_MISSING" for f in findings)
+
+
 def test_package_audit_requires_custom_chiaki_runtime(tmp_path):
     package = tmp_path / "package"
     package.mkdir()
@@ -272,7 +289,7 @@ def test_package_audit_rejects_crown_jewel_python_and_unapproved_models(tmp_path
     crown_dir = package / "native_orion" / "backend"
     crown_dir.mkdir(parents=True)
     (crown_dir / "simple_meter_reader.py").write_text("# embedded only\n", encoding="utf-8")
-    # Thin entry wrappers remain an intentional part of today's package.
+    # The compiled sidecar entry point is source-bound and must never ship loose.
     (crown_dir / "autogreen_sidecar.py").write_text("# launcher\n", encoding="utf-8")
     model_dir = package / "models" / "experimental"
     model_dir.mkdir(parents=True)
@@ -284,7 +301,7 @@ def test_package_audit_rejects_crown_jewel_python_and_unapproved_models(tmp_path
     model_paths = {f.path for f in findings if f.code == "UNAPPROVED_MODEL_PACKAGED"}
 
     assert any(path.endswith("native_orion/backend/simple_meter_reader.py") for path in crown_paths)
-    assert not any(path.endswith("native_orion/backend/autogreen_sidecar.py") for path in crown_paths)
+    assert any(path.endswith("native_orion/backend/autogreen_sidecar.py") for path in crown_paths)
     assert any(path.endswith("models/experimental/meter-v99.pt") for path in model_paths)
     assert any(path.endswith("models/experimental/meter-v99.json") for path in model_paths)
 

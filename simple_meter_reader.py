@@ -44,6 +44,7 @@ import json as _json
 import collections as _collections
 import logging as _logging
 import os as _os
+import sys as _sys
 import time as _time
 from collections import deque
 from dataclasses import dataclass
@@ -53,6 +54,11 @@ import numpy as np
 import cv2
 
 import meter_bar_colors as _mbc
+
+try:                                    # [ORION_PLAYER_ANCHOR] optional; inert when absent
+    import player_anchor as _player_anchor
+except Exception:                       # pragma: no cover - never break the shipped reader
+    _player_anchor = None
 
 _cal_logger = _logging.getLogger("meter_color_cal")
 _gz_logger = _logging.getLogger("green_zone")
@@ -1224,6 +1230,26 @@ class SimpleMeterReader:
         self._gameplay_structure_verified = False
         self._gameplay_structure_proof_epoch = 0
         self._physical_shot_epoch = 0
+        # [ORION_PLAYER_ANCHOR 2026-09-15] The press window, republished on the FRAME clock.
+        # The locator runs on the detector worker thread and never sees an epoch, a press or
+        # a release; this reader is the only object that holds a press epoch and a frame
+        # timestamp at the same instant, so it is the publisher. See player_anchor.ArmState.
+        self._pa_epoch = 0
+        # [ORION_SHOT_GATE_TYPE 2026-09-15] The engine's own classification of the live press
+        # ("Standstill" / "Left Fade" / ...) and whether this configuration releases with the
+        # Rhythm flick, both delivered by the shot_gate_arm command and republished with the
+        # press below. Empty type = unknown, which is what an old engine, a stick/probe edge
+        # or a local self-arm produces; the locator then keeps the UNION onset window.
+        self._pa_shot_type = ""
+        self._pa_rhythm = False
+        self._pa_shot_type_epoch = 0
+        # [ORION_SHOT_GATE_RELEASE 2026-09-15] The epoch whose press window has already been
+        # closed by an engine release/disarm marker. Without it the per-frame republish below
+        # would simply re-arm the press it just closed, one frame later.
+        self._pa_released_epoch = 0
+        # Last frame timestamp the republish saw: the press window lives on the FRAME clock,
+        # but a release marker arrives on the control thread with no frame in hand.
+        self._pa_last_ts = None
         self._gameplay_verify_frames = 0
         # STRUCTURE NECROPSY (2026-08-30, diagnostics only -- zero behaviour change).
         # Live 20260830_112306: the engine aborted 18 presses with
@@ -1412,6 +1438,7 @@ class SimpleMeterReader:
         # that artefact to vertical extrapolation manufactured ~5-10px tracking errors -- nearly
         # the measured 12px fill-dropout threshold.  Tuple = (source_ts, cx, bottom, w, h).
         self._det_box_hist = _collections.deque(maxlen=6)
+        self._det_hist_velocity_cache = None
         # Per-frame NCC tracker (see _track_box_ncc): template + search window + accept floor.
         self._det_tmpl = None
         self._det_tmpl_size = None      # detector dimensions at the appearance seed
@@ -1546,6 +1573,23 @@ class SimpleMeterReader:
         # measurement crop. Pixel geometry requires BOTH a local green cap and a
         # narrow neutral ribbon; brightness alone previously selected jerseys.
         self._det_measure_raw = _flag('ORION_METER_MEASUREMENT_BOX', '0')
+        # [ORION_READER_LOCK_BOX_DIMS 2026-09-11] The fill ruler is the MEASUREMENT box's height
+        # (denom = bh-1, the notch zone, the box-relative base hold). That box is the tracked box
+        # after the emit EMA, and its dims drift away from the detector's: live 2026-09-11
+        # (session 11:28, detframes.csv) the CV proposer served 107-110 px boxes while the reader
+        # measured in 118-121 px boxes on 33 of 36 practice shots and 130-145 px x 30-44 px
+        # boxes on the game shots -- a 9-30 % ruler change that moves every anchor and differs
+        # per shot. With the landmark proposer the box IS the ruler (tip-to-notch is a constant
+        # 100 px), so the measurement/display dims are pinned to the detector's while a fresh
+        # detector box exists; the tracker keeps ownership of x/y (bottom-aligned). Applies to
+        # the cv-contour proposer only unless forced; "0" disables.
+        self._det_lock_dims = _flag('ORION_READER_LOCK_BOX_DIMS', '1')
+        self._det_lock_dims_force = _flag('ORION_READER_LOCK_BOX_DIMS_FORCE', '0')
+        self._det_lock_dims_max_age_s = max(0.05, _fnum('ORION_READER_LOCK_BOX_DIMS_MAX_AGE_S', 0.35))
+        # [ORION_READER_DETECTOR_ONLY_SEAT] see _det_only_seat_veto. cv-contour only unless forced.
+        self._det_only_seat = _flag('ORION_READER_DETECTOR_ONLY_SEAT', '1')
+        self._det_only_seat_force = _flag('ORION_READER_DETECTOR_ONLY_SEAT_FORCE', '0')
+        self._det_only_seat_max_age_s = max(0.02, _fnum('ORION_READER_DETECTOR_ONLY_SEAT_MAX_AGE_S', 0.12))
         self._det_pixel_ruler = _flag('ORION_METER_PIXEL_RULER', '0')
         self._det_kalman_search = _flag('ORION_METER_KALMAN_SEARCH', '0')
         self._det_pixel_geometry = None
@@ -2030,6 +2074,146 @@ class SimpleMeterReader:
         self._press_ghost_evict_total = 0     # lifecycle resets this press
         self._press_ghost_suppress_total = 0  # zero-read holds this press
         self._press_ghost_summary_epoch = 0   # epoch the totals belong to
+        # ------------------------------------------------------------------ 2026-09-15
+        # [ORION_READER_GHOST_FORGET_LOCATOR] THE RE-SEED LOOP (live 2026-09-15 22:37Z, rapid
+        # drill, one press every 2.5-3s; epochs 9-15 all graded LATE). Measured: every one of
+        # those presses dropped a leftover at 83-94%% (STALE LOCK DROPPED AT PRESS), evicted it
+        # again post-press, retired its identity after full absence -- and then did it 2-11 MORE
+        # times in the same press window (GHOST PRESS SUMMARY evictions=2..11), with DETECTOR
+        # HEALTH showing locks +5/+7/+8/+12/+10 between 2s samples while drops stayed flat at
+        # 26-27 and seeded climbed in lockstep (23->65). Locks WITHOUT drops are eviction
+        # re-locks: the evict path resets the lifecycle to idle directly (no _det_drop_lock, so
+        # no drop is counted) and the very next proposal re-locks through _det_on_found's
+        # strong-and-armed shortcut. WHY the proposal keeps being the ghost: meter_locator_cv
+        # keeps its OWN positional memory (_last_box/_last_ts) and three of its acceptance
+        # paths -- the roaming ROI, the gate-9 bridge, and the tip-corroborate / outline-support
+        # escapes -- accept a candidate with NO confirmed green tip or NO outline support purely
+        # because something was accepted at that spot moments ago. The reader's eviction and its
+        # ghost retirement clear every reader-side seed (_det_warm_pos, _det_active_box, box)
+        # but never touched that locator memory, so the retired ghost seeded its own successor.
+        # Each cycle also re-derives the per-lock ruler (_det_reset_lock_state clears _subpx_D,
+        # _coarse_denom_ref, _det_scale_reference), which is the project's "fill denominator is
+        # the detector box -- latch it" invariant being thrown away 5-11 times per press.
+        # FIX: whenever the reader drops/evicts/retires a leftover, it also tells the locator to
+        # forget WHERE it last saw a meter. A real meter loses at most one confirmation frame
+        # (it still has its own tip and outline); the ghost loses its free pass.
+        self._ghost_forget_locator = _flag('ORION_READER_GHOST_FORGET_LOCATOR', '1')
+        self._loc_forget_n = 0
+        # ------------------------------------------------------------------ 2026-09-16
+        # [ORION_READER_FORGET_RATE_LIMIT] ...AND THE FIX ABOVE, UNRATED, CAUSED THE BLIND RUN.
+        #
+        # Live 2026-09-16 14:20:46-14:21:11, epochs 22-27: SIX consecutive presses with no
+        # vision sample at all (all six backstopped blind). DETECTOR HEALTH over the window:
+        # `loc_forget` 0 -> 148 climbing in lockstep with `locks` while `drops` stayed flat
+        # (39 locks / 42 seeds / 39 forgets in 4 s) -- i.e. ~10 evictions per SECOND while the
+        # previous shot's meter sat on screen through a rapid-fire re-press, against 0.76
+        # evictions per press offline on the 8.8 fps framedump (which is exactly why the
+        # replay could not reproduce it).
+        #
+        # Each of those evictions called forget_position(), and the first version of that
+        # method wiped the locator's TWO-FRAME PROMOTION PAIRS along with the ghost's box:
+        # `_pending` (the outline-less first sight), `_expect` (the sub-floor first sight the
+        # relaxation trio needs to accept a 12-14% onset) and `_tipless` (the tip-less rise
+        # pair). A pair needs TWO CONSECUTIVE FRAMES to promote; at 10 wipes a second the real
+        # meter's pair never survived to its second frame, so its first publication landed
+        # 100-170 ms late (BOX LATCHED 810-912 ms after the press vs the 750 ms deadline).
+        #
+        # TWO bounds, both of them about the same thing -- a forget must cost the ghost, never
+        # the shot:
+        #   (a) ONE forget per press epoch per ZONE. The second eviction of the same ghost in
+        #       the same press is a no-op: the locator already forgot that box, and calling
+        #       again can only destroy memory formed SINCE, which by definition is not the
+        #       ghost's.
+        #   (b) NEVER while a first-sight pair is still inside its promotion window. The pair
+        #       is one frame from deciding; let it decide. If the ghost is still there next
+        #       frame the eviction fires again and the forget happens then (bounded by
+        #       ORION_READER_FORGET_DEFER_MAX frames so a pathologically self-renewing pair
+        #       can never hold the forget off for good).
+        self._forget_rate_limit = _flag('ORION_READER_FORGET_RATE_LIMIT', '1')
+        # 64 px: the same "a different object" radius the ghost eviction log already uses.
+        self._forget_zone_px = max(8.0, _fnum('ORION_READER_FORGET_ZONE_PX', 64.0))
+        self._forget_defer_max = max(0, int(_fnum('ORION_READER_FORGET_DEFER_MAX', 12.0)))
+        self._loc_forget_epoch = -1          # press the zone list below belongs to
+        self._loc_forget_zones = []          # zones already forgotten in that press
+        self._loc_forget_unzoned = False     # a caller with no box got its one forget
+        self._loc_forget_logged = False      # the one ERROR line of this press is out
+        self._loc_forget_defer_n = 0         # consecutive deferrals in this press
+        self._frame_ts_last = None           # last frame ts seen by detect() (frame clock)
+        self._loc_forget_suppressed = 0      # rate-limited calls (lifetime)
+        self._loc_forget_deferred = 0        # pair-deferred calls (lifetime)
+        # ------------------------------------------------------------------ 2026-09-16
+        # [ORION_READER_PRESS_WITHHOLD_SUMMARY] EVERY LAYER GETS A LIVE COUNTER.
+        #
+        # The 09-16 blind run took a day to attribute because three of the six publication
+        # layers had no number that survived to the log: `idle_unpublished=` and `idle_reuse=`
+        # sit past the 300-char trim the native relay applies to every sidecar WARNING/ERROR
+        # line (RemotePlaySession.cpp: `trimmed.left(300)`), and STATIC ZONE WITHHELD /
+        # RESEED REFUSED (repeat) / COLD FIRST-READ VETOED are DEBUG lines that never leave
+        # the sidecar at all. So: the health line carries the layer counters FIRST (below),
+        # and every press closes with ONE ERROR summary naming what each layer withheld.
+        self._pw_epoch = 0                   # press these counters belong to
+        self._pw_flushed_epoch = 0           # press whose summary is already out
+        self._pw_ghost_static = 0            # ghost breaker: evictions + zero-read holds
+        self._pw_cold_first = 0              # COLD FIRST-READ VETOED
+        self._pw_idle_gate = 0               # ORION_READER_IDLE_PUBLISH_GATE refusals
+        self._pw_fresh_zone = 0              # RESEED REFUSED (retired ghost's zone)
+        self._pw_static_zone = 0             # STATIC ZONE WITHHELD
+        self._pw_reseed = 0                  # RESEED REFUSED (box latch)
+        # [ORION_READER_FRESH_AFTER_GHOST] ...and the zone the ghost occupied keeps a WEAK
+        # requirement after its identity is retired: GHOST IDENTITY RETIRED AFTER FULL ABSENCE
+        # used to clear the quarantine outright, after which ANY next lock there published
+        # freely -- including a re-rendered leftover, which is exactly what the 3-frame static
+        # window then had to re-identify from scratch while publishing its first reads. While
+        # this press still has not seen its own meter low, a lock inside the retired ghost's
+        # zone must prove a LOW (< the engine's 40%% ownership bound) RISING pair before its
+        # reads are handed to the engine. Sub-40 reads publish exactly as before (a single low
+        # frame is harmless and the engine can own it); only unproven >=40 reads are withheld,
+        # which the engine would refuse to anchor on anyway. Inert once the press has seen its
+        # onset (_press_low_seen) and outside a press window.
+        # [SHIP CONFIG 2026-09-17] DEFAULT OFF. GHOST_FORGET_LOCATOR (rate-limited) is what
+        # the graded ship sessions actually ran to close the leftover-meter class; this
+        # second, overlapping layer was in the OFF half of the 09-16 launch line and has no
+        # graded live hours of its own. The code and its tests are KEPT --
+        # ORION_READER_FRESH_AFTER_GHOST=1 restores it byte-for-byte.
+        self._fresh_after_ghost = _flag('ORION_READER_FRESH_AFTER_GHOST', '0')
+        self._press_fresh_zone = None        # (cx, cy) the retired/dropped ghost occupied
+        self._press_fresh_zone_logged = False
+        self._press_fresh_withheld = 0
+        # [ORION_READER_BOX_LATCH] Once this press's own meter has been sighted and published,
+        # the lock's BOX IDENTITY is latched for the rest of the press: the teleport re-seed
+        # (three consistent far proposals adopted as a brand-new lock, _det_on_found) may not
+        # silently replace the geometry the engine is measuring against mid-shot. A genuine
+        # break still goes through _det_drop_lock, which the engine sees. Same invariant as
+        # "fill denominator is the detector box -- latch it".
+        self._box_latch = _flag('ORION_READER_BOX_LATCH', '1')
+        self._box_latch_epoch = 0            # physical epoch owning the latch (0 = none)
+        self._box_latch_generation = 0       # lock generation the latch belongs to
+        self._box_latch_box = None
+        self._box_latch_refused = 0
+        # [ORION_READER_STATIC_ZONE_QUARANTINE] The owner's "false locks onto the court white
+        # lines": live 2026-09-15 22:36:26-22:36:58Z, with NO press anywhere in the window, a
+        # static column at box=[777,342,26,110] was locked and dropped ~20 times in 40s
+        # (DETECTOR HEALTH locks 1->26 tracking drops 1->25 one-for-one). _det_drop_lock ARMS
+        # the warm re-acquire memory at the spot the lock died, and _det_on_found's `warm`
+        # shortcut re-locks there instantly -- a lock that never proved a rise is re-seeded from
+        # its own corpse. So: a drop whose lock NEVER rose arms no warm memory and scores a
+        # strike against that position; once a position has _static_zone_strikes strikes its
+        # reads are WITHHELD (never published) until a lock there proves _static_zone_rise_pp of
+        # rise, and the warm shortcut stays refused. A real meter rises on its second read, so
+        # it pays one frame; a court line never rises at all. Sustained full-frame absence
+        # decays the strikes (the object is gone), and records expire after the TTL.
+        self._static_zone_q = _flag('ORION_READER_STATIC_ZONE_QUARANTINE', '1')
+        self._static_zone_px = max(8.0, _fnum('ORION_READER_STATIC_ZONE_PX', 48.0))
+        self._static_zone_strikes = max(1, _inum('ORION_READER_STATIC_ZONE_STRIKES', 2))
+        self._static_zone_min_reads = max(1, _inum('ORION_READER_STATIC_ZONE_MIN_READS', 3))
+        self._static_zone_rise_pp = max(0.0, _fnum('ORION_READER_STATIC_ZONE_RISE_PP', 2.0))
+        self._static_zone_ttl_s = max(1.0, _fnum('ORION_READER_STATIC_ZONE_TTL_S', 20.0))
+        self._static_zone_absence_results = max(
+            1, _inum('ORION_READER_STATIC_ZONE_ABSENCE_RESULTS', 30))
+        self._static_zone_max = max(1, _inum('ORION_READER_STATIC_ZONE_MAX', 8))
+        self._static_zones = []              # [{'cx','cy','n','ts','logged'}]
+        self._static_zone_nofind_n = 0
+        self._static_zone_withheld = 0
         # [ORION_READER_COLD_FIRST_READ_VETO] COLD-LOCK FIRST-READ SANITY (2026-08-30,
         # session_20260830_191051). A COLD lock's first 1-2 fill reads on a raw proposal
         # box can measure garbage-HIGH before the box/denominator settles: measured live,
@@ -2228,8 +2412,23 @@ class SimpleMeterReader:
                           "scan_right": 0, "scan_right_hit": 0,
                           "scan_partial_miss": 0, "occlusion_fill": 0,
                           "occlusion_top": 0, "occlusion_negative": 0,
-                          "occlusion_reject": 0}
+                          "occlusion_reject": 0, "idle_unpublished": 0}
         self._det_diag_last = 0.0
+        # [ORION_READER_IDLE_PUBLISH_GATE 2026-09-15] see _idle_publish_ok for the whole
+        # argument.
+        # [SHIP CONFIG 2026-09-17] DEFAULT OFF. It was in the OFF half of the 09-16 launch
+        # line: withholding idle publications is a cosmetic/eviction win, but it is one more
+        # layer that can refuse a real first read, and the 09-16 blind run (six consecutive
+        # backstopped presses) was traced to exactly that kind of unrated publication layer.
+        # STATIC_ZONE_QUARANTINE + BOX_LATCH + the rate-limited GHOST_FORGET are the layers
+        # that are graded. ORION_READER_IDLE_PUBLISH_GATE=1 restores the gate unchanged.
+        self._idle_pub_gate = _flag('ORION_READER_IDLE_PUBLISH_GATE', '0')
+        self._idle_pub_rise_pp = max(0.0, _fnum('ORION_READER_IDLE_PUBLISH_RISE_PP', 3.0))
+        self._idle_pub_cont_s = max(0.0, _fnum('ORION_READER_IDLE_PUBLISH_CONT_S', 0.5))
+        self._idle_pub_tol_px = max(0.0, _fnum('ORION_READER_IDLE_PUBLISH_TOL_PX', 24.0))
+        self._idle_pub_fills = deque(maxlen=3)   # last 3 reads of the CURRENT column
+        self._idle_pub_seen = None               # (cx, cy, ts) of the last read column
+        self._idle_pub_box = None                # (cx, cy, ts) of the last PUBLISHED column
         if _flag('ORION_METER_DETECTOR', '0'):
             try:
                 import meter_detector_yolo as _mdy
@@ -2796,6 +2995,36 @@ class SimpleMeterReader:
         self._pr_frozen_n = 0              # consecutive static >=fill_min emissions while pending
         self._pr_prev_fill = None          # previous emitted fill for the static test (P1 only)
         self._pr_yield_n = 0               # observability: force-unlocks fired this session
+        # ------------------------------------------------------------------ #
+        #  RELEASE ORACLE (ORION_RELEASE_ORACLE, default ON) -- DIAGNOSTIC ONLY.
+        #
+        #  [2026-09-15] Measured on session_20260915_185359 (29 releases, 27 gradable):
+        #  ~35-50 ms after the bar tops out 2K27 RETRACTS the white fill by a few pixels
+        #  and HOLDS it there, and that settled gap between the white fill's top and the
+        #  green band's BOTTOM separates the game's own banner verdict perfectly --
+        #  EXCELLENT <= 3 px, LATE/EARLY >= 4 px (settled_fill EXCELLENT 90.06 +- 0.32
+        #  vs LATE 85.47 +- 2.79). It is the only per-shot signal the reader can measure
+        #  that agrees with the banner without reading the banner, so it is worth logging
+        #  on every shot.
+        #
+        #  IT IS NOT A TIMING INPUT AND MUST NEVER BECOME ONE. It is measured 300-500 ms
+        #  AFTER the release command, i.e. long after every decision this reader feeds;
+        #  nothing here touches a fill, a box, a window or a gate. The whole feature is
+        #  one measurement taken from numbers _read_fill already computed, plus one ERROR
+        #  line per release and one append-only key on the release diagnostic record.
+        # ------------------------------------------------------------------ #
+        self._ro_on = _flag('ORION_RELEASE_ORACLE', '1')
+        self._ro_lo_s = max(0.0, _fnum('ORION_RELEASE_ORACLE_LO_MS', 300.0)) / 1000.0
+        self._ro_hi_s = max(self._ro_lo_s, _fnum(
+            'ORION_RELEASE_ORACLE_HI_MS', 500.0) / 1000.0)
+        self._ro_thr_px = max(0.0, _fnum('ORION_RELEASE_ORACLE_GAP_PX', 3.5))
+        self._ro_pending = False       # a release is open and its settle window is filling
+        self._ro_seq = 0               # the native release id the window belongs to
+        self._ro_epoch = 0             # the SHOT-GATE epoch (machine line's release_seq)
+        self._ro_t0 = None             # ts of the first frame seen after the command
+        self._ro_samples = []          # (dt_s, gap_px|None, gap_pct|None, fill, g_bot_pct|None)
+        self._ro_frame = None          # per-frame handoff out of _read_fill
+        self.last_release_oracle = None  # the last emitted record (tests + the sidecar read it)
         # B6 sub-flag: also end the fast per-shot CALIBRATION (width baseline / vertical-zoom
         # reference / dim rebase) at the arm edge, via reset_session_scale(). Separately
         # switchable because it is the one part of the epoch the offline gates cannot exercise
@@ -4254,10 +4483,21 @@ class SimpleMeterReader:
                 self._clear_gameplay_structure_proof()
                 self._physical_shot_epoch = 0
                 self._clear_micro_candidate()
+                # [ORION_PICKUP_PER_PRESS 2026-09-15] THE DISARM EDGE IS THE LAST PRESS'S
+                # CLOSE. The engine DOES send shot_gate_release on the live path (the native
+                # logs "shot_gate_release send: ... sent=1" per release and autogreen_sidecar
+                # dispatches it to release_shot_gate); its receipt line is a WARNING and is
+                # routinely eaten by the native relay's 1 s WARNING throttle, which is why it
+                # is absent from session logs. notify_physical_shot_release therefore runs and
+                # flushes first; this edge -- the hw arm window falling -- is the fallback
+                # close for a press whose release edge was lost, taps and aborts. Forensics
+                # only: it runs once per disarm, reads one dict and logs.
+                self._flush_pickup_line()
             self._shot_armed_hw = next_hw
         elif not armed:
             if self._shot_armed_hw:
                 self._close_epoch_census("full_disarm")
+                self._flush_pickup_line()     # same close, the 2-arg legacy hook's path
             self._shot_armed_hw = False   # a full disarm always closes the hw window too
             self._clear_gameplay_structure_proof()
             self._physical_shot_epoch = 0
@@ -4406,6 +4646,307 @@ class SimpleMeterReader:
                 and self._ep_census.get("epoch") == self._gameplay_structure_proof_epoch):
             self._ep_census["latched"] = True
 
+    # ------------------------------------------------------------------ #
+    #  [ORION_PLAYER_ANCHOR] the press window, on the FRAME clock
+    # ------------------------------------------------------------------ #
+    def _publish_press_window(self, ts) -> None:
+        """Hand the locator the press it cannot see.
+
+        The orchestrator arms this reader (``notify_physical_shot_start`` /
+        ``set_shot_state``) on the control thread, with no frame timestamp; the locator
+        judges everything on the FRAME clock. Republishing the arm here -- at the
+        production boundary, with this frame's ts -- puts the press in the locator's own
+        time base at a cost of at most one frame of quantisation, and needs no new engine
+        message and no change to the async locator wrapper.
+
+        Inert unless ORION_PLAYER_ANCHOR is on. Never raises: a broken anchor must cost the
+        reader nothing.
+        """
+        if _player_anchor is None:
+            return
+        try:
+            now = float(ts) if ts is not None else _time.monotonic()
+            self._pa_last_ts = now
+            # [ORION_CV_TIPLESS_ARMED 2026-09-15] The ARM is not the anchor. The anchor needs
+            # WHERE (a nameplate search, real per-frame cost, default OFF); the tipless
+            # acceptance path needs only WHEN -- "a press is open and the meter is due" -- and
+            # ships ON. Publishing the press window is one tuple swap per press edge, so the
+            # two switches are separated here rather than making the tipless path depend on a
+            # feature nobody has turned on.
+            if not (_player_anchor.enabled() or self._pa_arm_only()):
+                if self._pa_epoch:
+                    self._pa_epoch = 0
+                    _player_anchor.ARM.reset()
+                return
+            epoch = int(self._physical_shot_epoch or 0)
+            # [ORION_SHOT_GATE_RELEASE 2026-09-15] A press the engine has already answered
+            # (release edge issued, or the player cancelled) is OVER, even while the reader's
+            # hardware arm window stays open for the post-release tail. Without this term the
+            # marker's close would be undone by the very next frame's republish.
+            armed = (bool(self._shot_armed_hw) and epoch != 0
+                     and epoch != int(self._pa_released_epoch or 0))
+            if armed and epoch != self._pa_epoch:
+                self._pa_epoch = epoch
+                # [ORION_SHOT_GATE_TYPE 2026-09-15] The engine ships its classification with
+                # the arm, so the expectation window is this shot type's own. An empty type
+                # (old engine, stick/probe edge, local self-arm) keeps the union -- see
+                # player_anchor.onset_window_ms.
+                _player_anchor.ARM.note_press(
+                    epoch, now, self._pa_shot_type_for(epoch), self._pa_rhythm)
+                # a new press is a new player position: drop the plate TRACK, keep identity
+                _player_anchor.ANCHOR.reset(keep_identity=True)
+                # [ORION_PICKUP_PER_PRESS 2026-09-15] LAST, for the same reason the release
+                # path notes the release first: arming the anchor is BEHAVIOUR, the PICKUP
+                # record is only forensics. This press's record is opened HERE, by the press
+                # itself, so that every press gets a line at its close -- including the ones
+                # the locator never found a meter for, which are precisely the misses the
+                # owner is complaining about. Any predecessor that never reached a close (a
+                # dropped release marker, an arm that fell with no frame to notice it) is
+                # flushed first, so no record is overwritten unlogged. One operation: the
+                # control thread's notify_physical_shot_start may already have rolled this
+                # same press, and a bare flush here would log THIS press's empty record.
+                # [ORION_CV_TIPLESS_ARMED] behind the ANCHOR's switch: with arm-only
+                # publication there is no plate search, so every field of the record but the
+                # epoch would be blank and the census would be a wall of empty lines.
+                if _player_anchor.enabled():
+                    self._roll_pickup_record(epoch)
+            elif not armed and self._pa_epoch:
+                # release FIRST: the anchor stopping is behaviour, the PICKUP line is only
+                # forensics, and a broken log line must never leave the anchor armed.
+                closing = self._pa_epoch
+                self._pa_epoch = 0
+                _player_anchor.ARM.note_release(closing, now)
+                if _player_anchor.enabled():
+                    self._flush_pickup_line()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _pa_arm_only() -> bool:
+        """[ORION_CV_TIPLESS_ARMED] Publish the press window even with the anchor switched off?
+
+        True whenever a consumer needs WHEN but not WHERE. Today that is exactly the locator's
+        tipless acceptance path, which is on by default; read per call so a live toggle takes
+        effect without a restart, like ``player_anchor.enabled()`` itself.
+        """
+        try:
+            v = _os.environ.get("ORION_CV_TIPLESS_ARMED", "").strip()
+            return float(v) > 0.0 if v else True
+        except Exception:
+            return True
+
+    def _flush_tipless_line(self) -> None:
+        """One `TIPLESS LOCK:` ERROR line per press whose lock the tipless path produced.
+
+        [ORION_CV_TIPLESS_ARMED 2026-09-15] Emitted from the reader, not from the locator: the
+        locator runs on the detector worker thread, where a logging call takes the handler lock
+        on the same thread the frame budget belongs to. The locator writes a small record and
+        this drains it on the reader's own thread, at most once per press.
+
+        ERROR, not WARNING, for the same reason the PICKUP: line is ERROR -- every sidecar
+        WARNING shares one 1 s throttle slot that the press's own arm receipt has already
+        taken, so a WARNING here would be dropped on exactly the presses it describes.
+        """
+        try:
+            base = getattr(getattr(self, "_meter_detector", None), "_base", None)
+            rec = getattr(base, "tipless", None)
+            if not isinstance(rec, dict) or rec.get("logged"):
+                return
+            if int(rec.get("epoch", 0) or 0) <= 0 or float(rec.get("fill", -1.0)) < 0.0:
+                return              # no press, or the tipless path never produced this lock
+            rec["logged"] = 1
+            _acq_logger.error(
+                "TIPLESS LOCK: epoch=%d fill=%.1f rise_frames=%d conf=%.2f",
+                int(rec.get("epoch", 0)), float(rec.get("fill", -1.0)),
+                int(rec.get("rise_frames", 0)), float(rec.get("conf", 0.0)))
+        except Exception:
+            pass
+
+    def _pa_shot_type_for(self, epoch: int) -> str:
+        """The engine's classification for `epoch`, or "" when none was delivered for it.
+
+        Epoch-keyed on purpose: the type arrives on the control thread and the press is
+        republished on the frame clock, so a type left over from the PREVIOUS shot must never
+        narrow this one's onset window -- an unknown type costs a wider window, a wrong type
+        costs a refused meter.
+        """
+        return (self._pa_shot_type
+                if int(self._pa_shot_type_epoch or 0) == int(epoch or 0) else "")
+
+    def notify_physical_shot_type(self, shot_epoch=0, shot_type="", rhythm=False) -> None:
+        """The engine's shot type for a press (from the native shot_gate_arm command).
+
+        [ORION_SHOT_GATE_TYPE 2026-09-15] Called twice at most per shot: once with the arm
+        (the type the press edge classified) and, when the engine's blind 200 ms grace
+        re-types a Standstill into a fade, once more on the SAME epoch. The second call must
+        NOT move the press, so an already-armed epoch is updated in place.
+
+        Additive and fail-open: an old engine never calls it and the union window stands.
+        """
+        try:
+            epoch = int(shot_epoch)
+        except (TypeError, ValueError, OverflowError):
+            epoch = 0
+        if not (0 < epoch <= 0xFFFFFFFFFFFFFFFF):
+            return
+        self._pa_shot_type = str(shot_type or "")[:24].strip()
+        self._pa_rhythm = bool(rhythm)
+        self._pa_shot_type_epoch = epoch
+        if _player_anchor is None:
+            return
+        try:
+            if _player_anchor.enabled() and self._pa_epoch == epoch:
+                _player_anchor.ARM.note_shot_type(
+                    epoch, self._pa_shot_type, self._pa_rhythm)
+        except Exception:
+            pass
+
+    def notify_physical_shot_release(self, shot_epoch=0, release_ms=None,
+                                     reason="release") -> bool:
+        """The engine issued this press's release edge (or cancelled the press). -> closed?
+
+        [ORION_SHOT_GATE_RELEASE 2026-09-15] The press window used to end only when the
+        reader's hardware arm fell, i.e. up to ORION_ANCHOR_ARM_S (2.5 s) after a meter whose
+        whole life is under 1.5 s. That left the nameplate anchor running through the post-
+        release tail and left a RETIRED press able to license a sub-floor candidate on the
+        next screen. The engine knows the instant exactly, on every release path, so it says
+        so.
+
+        A marker for an epoch other than the live one is ignored: a late message for a
+        retired press must never close the press that replaced it.
+        """
+        try:
+            epoch = int(shot_epoch)
+        except (TypeError, ValueError, OverflowError):
+            epoch = 0
+        current = int(self._physical_shot_epoch or 0)
+        if epoch and current and epoch != current:
+            return False
+        epoch = epoch or current
+        if epoch <= 0:
+            return False
+        self._pa_released_epoch = epoch
+        # [ORION_READER_PRESS_WITHHOLD_SUMMARY] the press is CLOSED: one ERROR line naming what
+        # each publication layer kept from the engine on this shot. Before the anchor early-out
+        # below -- the census is about the reader, not about the anchor being installed. Guarded
+        # because this method is also borrowed unbound by press-window harnesses that carry no
+        # publication state at all: a forensics census may never break the release hook.
+        try:
+            self._flush_press_withhold_summary(str(reason or "release"))
+        except AttributeError:
+            pass
+        if _player_anchor is None:
+            return True
+        try:
+            if _player_anchor.enabled() and self._pa_epoch == epoch:
+                self._pa_epoch = 0
+                _player_anchor.ARM.note_release(epoch, self._pa_last_ts)
+                self._flush_pickup_line()
+        except Exception:
+            pass
+        return True
+
+    def _open_pickup_record(self, epoch) -> None:
+        """A new press is live: open its pickup record on the locator.
+
+        [ORION_PICKUP_PER_PRESS 2026-09-15] The record carries `logged`, so opening it is
+        what re-arms the next flush. Never raises and never touches detection -- the locator
+        method writes one dict and nothing else.
+
+        `self._meter_detector` is the process-wide ``AsyncMeterLocator`` (see __init__) and
+        `_base` is the proposer inside it -- ``MeterContourLocator`` under
+        ORION_METER_PROPOSER=cv, which is the only proposer that keeps a pickup record.
+        Under the shipped ONNX proposer `_base` has no ``open_pickup_record`` and this is a
+        no-op, exactly as intended.
+        """
+        try:
+            base = getattr(getattr(self, "_meter_detector", None), "_base", None)
+            opener = getattr(base, "open_pickup_record", None)
+            if callable(opener):
+                opener(int(epoch))
+        except Exception:
+            pass
+
+    def _roll_pickup_record(self, epoch) -> None:
+        """Close whatever record is open and open `epoch`'s -- in that order, once.
+
+        [ORION_PICKUP_PER_PRESS 2026-09-15] Both press edges call this: the control thread's
+        notify_physical_shot_start and the frame clock's _publish_press_window. Rolling has
+        to be one operation because the flush is unconditional: whichever edge arrives second
+        would otherwise flush the record the FIRST edge just opened for this very press, and
+        emit its line before a single frame had been looked at (first_sight_fill=-1.0 on a
+        press whose meter was found 40 ms later). Guarding the flush on "the open record
+        belongs to a different press" makes the second call a no-op, so the two edges cannot
+        produce two lines -- or one wrong one -- for one press.
+        """
+        try:
+            ep = int(epoch or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if ep <= 0:
+            return
+        try:
+            base = getattr(getattr(self, "_meter_detector", None), "_base", None)
+            open_rec = getattr(base, "pickup", None)
+            open_ep = int(open_rec.get("epoch", 0) or 0) if isinstance(open_rec, dict) else 0
+        except Exception:
+            open_ep = 0
+        if open_ep != ep:
+            self._flush_pickup_line()
+        self._open_pickup_record(ep)
+
+    def _flush_pickup_line(self) -> None:
+        """One PICKUP: line per press -- where and when the meter was first seen, and
+        whether the anchor is what found it. This is the number the owner's complaint is
+        about ("late reads"), so it is logged unconditionally, not sampled.
+
+        [ORION_PICKUP_PER_PRESS 2026-09-15] A press whose meter was NEVER picked up is the
+        most valuable line here, not a line to skip: it flushes with first_sight_fill=-1.0
+        and anchor_used=0, which is what makes `grep PICKUP:` a complete census of presses
+        rather than a list of the hits.
+
+        [ORION_PICKUP_LEVEL 2026-09-15] ERROR, NOT WARNING -- THIS is why the line was
+        silent live, not the record bookkeeping. RemotePlaySession.cpp:2884 relays the
+        sidecar's stderr, and EVERY sidecar WARNING line shares ONE global slot of
+        kSidecarWarnThrottleMs = 1000 ms (RemotePlaySession.h:530); ERROR/CRITICAL bypass it
+        (`isError`). A press emits the orchestrator's own `SHOT-GATE ARM RECEIPT` WARNING on
+        the control thread and this flush one frame (<=17 ms) later on the processing
+        thread, so the receipt took the slot on EVERY press and the PICKUP line lost it on
+        EVERY press: 30 presses, 0 lines. Before the flush moved to the press it fired at
+        the hw-disarm edge instead -- ORION_SHOT_GATE arm windows are 20 s
+        (`_shot_gate_max_seconds`), i.e. once per RALLY, far from any other warning -- which
+        is exactly why the same code logged 2 lines for 37 presses. Same remedy, same
+        reason, as the "METER DETECTOR load" line above and the probe diagnostics' explicit
+        bypass. The line still stays out of the customer Activity ring: it carries nine
+        key=value pairs, so UiNotificationPolicy's counter-line heuristic classifies it as
+        engineering.
+        """
+        try:
+            base = getattr(getattr(self, "_meter_detector", None), "_base", None)
+            p = getattr(base, "pickup", None)
+            if not isinstance(p, dict) or p.get("logged"):
+                return
+            # A record that no press ever opened (epoch 0, the locator's blank) describes
+            # nothing; only a real press epoch is a line.
+            try:
+                if int(p.get("epoch", 0) or 0) <= 0:
+                    return
+            except (TypeError, ValueError, OverflowError):
+                return
+            p["logged"] = 1
+            st = getattr(base, "stats", {}) or {}
+            _acq_logger.error(
+                "PICKUP: epoch=%d first_sight_fill=%.1f first_sight_ms_after_press=%.1f "
+                "anchor_used=%d anchor_conf=%.2f refused_outside_patch=%d "
+                "expect_accept=%d anchor_ms=%.2f patch_hits=%d",
+                int(p.get("epoch", 0)), float(p.get("first_sight_fill", -1.0)),
+                float(p.get("first_sight_ms_after_press", -1.0)),
+                int(p.get("anchor_used", 0)), float(p.get("anchor_conf", 0.0)),
+                int(p.get("refused_outside_patch", 0)), int(p.get("expect_accept", 0)),
+                float(p.get("anchor_ms", 0.0)), int(st.get("anchor_patch_hit", 0)))
+        except Exception:
+            pass
+
     def notify_physical_shot_start(self, shot_epoch=0) -> None:
         """Start a new hardware-owned shot even if the prior arm window is still open.
 
@@ -4429,6 +4970,9 @@ class SimpleMeterReader:
         self._pr_release_pending = False
         self._pr_frozen_n = 0
         self._pr_prev_fill = None
+        # RELEASE ORACLE (diagnostic): a new press ends the previous release's settle window
+        # whether or not it ever filled, so no record is carried across a shot boundary.
+        self._ro_flush("next_press")
         try:
             parsed_epoch = int(shot_epoch)
         except (TypeError, ValueError, OverflowError):
@@ -4437,6 +4981,29 @@ class SimpleMeterReader:
         self._physical_shot_epoch = (
             parsed_epoch if 0 < parsed_epoch <= 0xFFFFFFFFFFFFFFFF else 0)
         self._ep_census["epoch"] = int(self._physical_shot_epoch)
+        # [ORION_PICKUP_PER_PRESS 2026-09-15] OPEN THE FORENSICS RECORD ON THE CONTROL
+        # THREAD, WHERE THE PRESS IDENTITY IS BORN.
+        #
+        # _publish_press_window opens it too, from the frame clock, and that is still the
+        # only place the ANCHOR is armed -- behaviour is untouched here. But the frame-clock
+        # open can lose a press outright: the processing loop pushes
+        # set_shot_state(..., armed_hw) every frame from its own snapshot of the gate
+        # deadlines, and a snapshot taken just before _arm_shot_gate extended them lands
+        # AFTER this method with armed_hw=False, whose `hw disarm` branch zeroes
+        # _physical_shot_epoch. The next detect() then sees epoch 0, never publishes this
+        # press, and the press disappears from the census with no line at all. The record is
+        # pure forensics, so opening it from the authoritative press edge costs nothing and
+        # makes `grep PICKUP:` a complete census whatever the gate does afterwards.
+        #
+        # Flush FIRST (the predecessor's line) and only then open, exactly as the frame-clock
+        # path does; open_pickup_record is idempotent per epoch so the two paths cannot
+        # produce two records for one press.
+        if _player_anchor is not None and self._physical_shot_epoch:
+            try:
+                if _player_anchor.enabled():
+                    self._roll_pickup_record(self._physical_shot_epoch)
+            except Exception:
+                pass
         # STALE-LOCK DROP AT THE PRESS.
         #
         # This method deliberately leaves pixel/tracker state intact (see the
@@ -4467,6 +5034,10 @@ class SimpleMeterReader:
             # (window expired with the leftover still on screen) -- exactly one summary
             # line per press either way.
             self._ghost_press_flush_summary("window_end")
+            # [ORION_READER_PRESS_WITHHOLD_SUMMARY] and the withhold census for the press that
+            # just ended, if its own release never closed it (abort / cancelled / tap).
+            self._flush_press_withhold_summary("next_press")
+            self._pw_epoch = int(self._physical_shot_epoch or 0)
             self._press_low_seen = False
             self._press_ghost_reads.clear()
             self._press_ghost_zone = None
@@ -4484,6 +5055,10 @@ class SimpleMeterReader:
             self._press_implausible_n = 0
             self._press_implausible_logged = False
             self._press_rise_run = 0
+            # [ORION_READER_FRESH_AFTER_GHOST / _BOX_LATCH] both are per-press artefacts.
+            self._press_fresh_zone = None
+            self._press_fresh_zone_logged = False
+            self._clear_box_latch('new_press')
         # ROBUST held fill: the ghost's read flickers to 0.0 on pan-blurred frames (measured
         # epochs 41/45: 0.00 at the press instant, 88.9/45.1 one frame later), so judge the
         # recent nonzero detector-fill history alongside the instantaneous value. The history
@@ -4551,6 +5126,14 @@ class SimpleMeterReader:
                 self._det_active_box = None
             except Exception:
                 pass
+            # [ORION_READER_GHOST_FORGET_LOCATOR / _FRESH_AFTER_GHOST] The proposer's own
+            # positional memory is a seed too: without this the very next proposal is the
+            # dropped leftover's own column, bridged on co-location alone (no green tip, no
+            # outline support needed), and the evict/re-lock loop starts. The zone also keeps
+            # a fresh-onset requirement for the rest of this press.
+            self._det_forget_locator_position('stale_press_drop', box=_zb,
+                                              ts=self._frame_ts_last)
+            self._arm_press_fresh_zone(_zb, 'stale_press_drop')
             # Name it in the log. Offline replay could NOT reproduce the stale
             # state this fixes (the harness's synthetic presses do not align with
             # real shot cycles), so the live log is the only arbiter of whether
@@ -4590,6 +5173,9 @@ class SimpleMeterReader:
                     "(fresh rising continuity proved; the continuing meter keeps serving)",
                     self._physical_shot_epoch, max(_held_now, _held_recent))
             else:
+                # Name the object being refused BEFORE the seeds are cleared: the surgical
+                # forget needs the ghost's column to know which first-sight pairs are its own.
+                _ub = self.box or getattr(self, "_det_active_box", None)
                 self.conf = 0.0
                 self.box = None
                 self.tmpl = None
@@ -4600,6 +5186,8 @@ class SimpleMeterReader:
                     self._det_active_box = None
                 except Exception:
                     pass
+                self._det_forget_locator_position('unproven_low_press_drop', box=_ub,
+                                                  ts=self._frame_ts_last)
                 _acq_logger.error(
                     "UNPROVEN LOW LOCK DROPPED AT PRESS: epoch=%d held_fill=%.1f%% "
                     "(no fresh rising continuity; new press must reacquire)",
@@ -4648,6 +5236,9 @@ class SimpleMeterReader:
             except Exception:
                 pass
         self._shot_release_seen = True
+        # RELEASE ORACLE (diagnostic, see __init__): open this release's settle window. It
+        # only starts a measurement buffer -- no reader state below it can see the call.
+        self._ro_open(seq, physical_epoch)
         # [ORION_READER_POST_RELEASE_YIELD] OUR OWN release for the current hw window was
         # relayed: from here (until the next physical arm edge) a static >=90 lock is a spent
         # meter, and P1 may yield it. Latched unconditionally; consumption is flag-gated.
@@ -4678,6 +5269,327 @@ class SimpleMeterReader:
                 self._gz_fill_at_release = float(self.last_fill)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------ #
+    #  RELEASE ORACLE (ORION_RELEASE_ORACLE) -- see __init__. Diagnostic only.
+    # ------------------------------------------------------------------ #
+    def _ro_measure(self, hsv, ph, pw, track_top, fillable_h, sy):
+        """RELEASE ORACLE: (gap_px, gap_pct, green_bottom_pct) for this frame, or (None,)*3.
+
+        Deliberately its OWN landmark pair rather than the emitted `red_top`/`cap_bot`, because
+        the emitted pair cannot see the case the finding is about. A shot that lands AT the tip
+        buries the green cap under the fill; the reader's cap anchor only looks for green ABOVE
+        the fill and its row gate wants 15 % of the strip width lit, so on
+        session_20260915_185359 seq 4/11/14/22/23 it read "no cap at all" while 3-6 green pixels
+        of the arrow head were still on screen -- exactly the frames whose gap is <= 0, i.e. the
+        best shots in the batch. This is the rule the finding was measured with (the forensics in
+        _analysis/pixmeasure.py): the meter's own interior columns, a row counts as fill at >= 3
+        white pixels and as band at >= 2 green pixels, and the fill's top is the top of the
+        BOTTOM-ANCHORED run with <= 2-row gaps bridged.
+
+        Vectorized end to end (one 3x1 morphological close, no per-row Python) and only ever
+        called while a release window is open, so the detect thread pays for it for at most
+        half a second per shot.
+        """
+        try:
+            c0, c1 = (3, pw - 3) if pw > 6 else (0, pw)
+            y0 = max(0, int(track_top) - int(round(34.0 * float(sy))))
+            sub = hsv[y0:ph, c0:c1]
+            if sub.size == 0 or fillable_h <= 0:
+                return (None, None, None)
+            hh = sub[:, :, 0].astype(np.int16)
+            ss = sub[:, :, 1].astype(np.int16)
+            vv = sub[:, :, 2].astype(np.int16)
+            wrow = ((vv >= 235) & (ss <= 40)).sum(axis=1)
+            grow = ((ss >= 90) & (hh >= 35) & (hh <= 95) & (vv >= 120)).sum(axis=1)
+            grows = np.flatnonzero(grow >= 2)
+            if grows.size == 0:
+                return (None, None, None)
+            wcol = np.where(wrow >= 3, 255, 0).astype(np.uint8).reshape(-1, 1)
+            # odd kernel -> centred anchor -> the run does not walk a row (see meter_locator_cv)
+            wcol = cv2.morphologyEx(wcol, cv2.MORPH_CLOSE, np.ones((3, 1), np.uint8))
+            widx = np.flatnonzero(wcol.ravel() > 0)
+            if widx.size == 0:
+                return (None, None, None)
+            brk = np.flatnonzero(np.diff(widx) > 1)
+            top = int(widx[brk[-1] + 1]) if brk.size else int(widx[0])
+            gbot = int(grows.max())
+            gap = float(top - gbot)
+            return (gap, gap / fillable_h * 100.0,
+                    (ph - float(y0 + gbot)) / fillable_h * 100.0)
+        except Exception:
+            return (None, None, None)
+
+    def _ro_open(self, seq, physical_epoch: int = 0) -> None:
+        """A release command was issued: flush the predecessor, open this one's window.
+
+        `physical_epoch` is the SHOT-GATE epoch (the pose arm token) this release belongs to.
+        It is latched HERE, at the command, because it is the id the machine line has to
+        carry: the banner verdict is attributed on the same token, so the native can join the
+        two instruments per shot. `seq` (the release-marker counter) stays the human line's id.
+        """
+        if not self._ro_on:
+            return
+        self._ro_flush("superseded")
+        try:
+            self._ro_seq = max(0, int(seq))
+        except (TypeError, ValueError, OverflowError):
+            self._ro_seq = 0
+        try:
+            self._ro_epoch = max(0, int(physical_epoch))
+        except (TypeError, ValueError, OverflowError):
+            self._ro_epoch = 0
+        self._ro_pending = True
+        self._ro_t0 = None
+        self._ro_samples = []
+        self._ro_frame = None
+
+    def _ro_tick(self, ts) -> None:
+        """Per-frame clock for the open window: start it, and close it when it has run out.
+
+        Separate from _ro_note because a release whose meter vanished immediately produces no
+        samples at all -- _read_fill never runs -- and such a release still has to emit its
+        (unknown) line rather than sit open until the next press.
+        """
+        if not (self._ro_on and self._ro_pending):
+            return
+        try:
+            now = float(ts)
+        except (TypeError, ValueError):
+            return
+        if self._ro_t0 is None:
+            self._ro_t0 = now
+        elif now - self._ro_t0 >= self._ro_hi_s:
+            self._ro_flush("settled")
+
+    def _ro_note(self, ts, fill) -> None:
+        """Fold one frame into the open window; emit once it has run past the settle window.
+
+        `t0` is the first frame the reader processed after the command, not the command
+        itself (the marker arrives on the control thread with no frame clock), so every
+        offset here is late by at most one frame -- irrelevant to a 300-500 ms window and
+        honest about what was actually measured.
+        """
+        try:
+            now = float(ts)
+        except (TypeError, ValueError):
+            return
+        if self._ro_t0 is None:
+            self._ro_t0 = now
+        dt = now - self._ro_t0
+        if dt < 0.0:
+            return                          # an out-of-order frame is not a settle sample
+        f = self._ro_frame
+        if f is not None:
+            self._ro_samples.append((dt, f[0], f[1], float(fill), f[2]))
+            if len(self._ro_samples) > 240:
+                self._ro_samples = self._ro_samples[-240:]
+
+    def _ro_flush(self, reason: str) -> None:
+        """Emit ONE `RELEASE ORACLE:` ERROR line for the open release, then close it.
+
+        The window is the samples between LO and HI ms after the command; the reported
+        numbers are their MEDIANS, so one occluded or mid-retraction frame cannot move the
+        verdict. A window with no green band anywhere in it is `verdict_proxy=unknown` --
+        the measurement was not available, which is not the same as a miss.
+        """
+        if not (self._ro_on and self._ro_pending):
+            return
+        self._ro_pending = False
+        samples, seq = self._ro_samples, int(self._ro_seq)
+        epoch = int(self._ro_epoch)
+        self._ro_samples = []
+        self._ro_t0 = None
+        self._ro_frame = None
+        try:
+            win = [s for s in samples if self._ro_lo_s <= s[0] <= self._ro_hi_s]
+            if not win:
+                win = list(samples)         # sparse feed: judge on what actually arrived
+            gaps = [s[1] for s in win if s[1] is not None]
+            if gaps:
+                gap_px = float(np.median(gaps))
+                gap_pct = float(np.median([s[2] for s in win if s[2] is not None]))
+                g_bot = float(np.median([s[4] for s in win if s[4] is not None]))
+                verdict = "green" if gap_px <= self._ro_thr_px else "miss"
+            else:
+                gap_px = gap_pct = g_bot = -1.0
+                verdict = "unknown"
+            fills = [s[3] for s in win]
+            settled = float(np.median(fills)) if fills else -1.0
+            rec = {"seq": seq, "gap_px": round(gap_px, 2), "gap_pct": round(gap_pct, 2),
+                   "settled_fill": round(settled, 2), "green_bottom_pct": round(g_bot, 2),
+                   "verdict_proxy": verdict, "n": len(win), "end_reason": str(reason)}
+            self.last_release_oracle = rec
+            _acq_logger.error(
+                "RELEASE ORACLE: seq=%d gap_px=%.2f gap_pct=%.2f settled_fill=%.2f "
+                "green_bottom_pct=%.2f verdict_proxy=%s",
+                seq, gap_px, gap_pct, settled, g_bot, verdict)
+            self._ro_emit_machine(epoch or seq, rec)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  RELEASE ORACLE -> native, on the banner verdict's own stdout channel.
+    #
+    #  [ORION_RELEASE_ORACLE_TRIM 2026-09-15 owner] RemotePlaySession.cpp already parses this
+    #  line (`event == "release_oracle"`): gap_px + verdict_proxy reach the engine's Shot Lead
+    #  trim, the rest is forensics for the native log. The ERROR line above stays exactly as it
+    #  was -- it is the human/greppable half and several diagnostics read it.
+    #
+    #  FRAMING is the banner verdict's, byte for byte: ONE compact-separator JSON object plus
+    #  '\n', written through remote_play_orchestrator.emit_stdout_jsonl, which holds
+    #  STDOUT_EMIT_LOCK so the orchestrator's, the sidecar's and this writer's lines can never
+    #  interleave mid-object on the pipe the native reads. The module is looked up in
+    #  sys.modules rather than imported: the orchestrator imports THIS module, so importing it
+    #  back would be a cycle, and a reader running outside the sidecar (tests, replay) must not
+    #  drag the whole orchestrator in just to log a diagnostic.
+    #
+    #  IDENTITY: `release_seq` is the SHOT-GATE EPOCH (the pose arm token), which is what the
+    #  banner verdict is attributed on -- so the native joins the two instruments per shot. A
+    #  release relayed without an epoch (legacy 1-arg notify_release, tests) falls back to the
+    #  release-marker counter; that will simply never join a banner, which is the honest
+    #  outcome for a release whose identity was never published.
+    #
+    #  `event` is FIRST and authoritative: it is the key every other message on this stdout
+    #  channel uses and the one RemotePlaySession::handleSidecarMessage dispatches on. The
+    #  native also accepts `type` as a fallback when `event` is absent, and `type` is the key
+    #  the agreed schema was written with, so both are emitted: the line matches the written
+    #  schema and takes the channel's own convention. The native ignores `type` whenever
+    #  `event` is present, so the duplicate can never route a line twice.
+    #
+    #  UNGATED by ORION_GREEN_SELF_GRADE on purpose: the self-grade flag owns the green-zone
+    #  window's own experiment, and the owner asked for this measurement on every release.
+    #  ORION_RELEASE_ORACLE=0 turns the whole feature off (window, line and this emit together).
+    # ------------------------------------------------------------------ #
+    _ro_sink = None          # set_release_oracle_sink() -- tests/sidecar override
+
+    def set_release_oracle_sink(self, fn) -> None:
+        """Route the machine line somewhere other than stdout (tests, a sidecar relay)."""
+        self._ro_sink = fn
+
+    def _ro_emit_machine(self, release_seq, rec) -> None:
+        payload = {
+            "event": "release_oracle",
+            "type": "release_oracle",
+            "release_seq": int(release_seq),
+            "gap_px": float(rec["gap_px"]),
+            "gap_pct": float(rec["gap_pct"]),
+            "settled_fill": float(rec["settled_fill"]),
+            "green_bottom_pct": float(rec["green_bottom_pct"]),
+            "verdict_proxy": str(rec["verdict_proxy"]),
+            "t_ms": round(_time.time() * 1000.0, 1),
+        }
+        line = _json.dumps(payload, separators=(",", ":")) + "\n"
+        sink = self._ro_sink
+        if sink is None:
+            _orch = _sys.modules.get("remote_play_orchestrator")
+            sink = getattr(_orch, "emit_stdout_jsonl", None) if _orch is not None else None
+        try:
+            if callable(sink):
+                sink(line)
+            else:
+                _sys.stdout.write(line)
+                _sys.stdout.flush()
+        except Exception:
+            # A lost oracle line is cosmetic; it must never take the reader down.
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  IDLE PUBLICATION GATE (ORION_READER_IDLE_PUBLISH_GATE, default ON)
+    #
+    #  THE COMPLAINT. Between shots the locator locks white columns that are not meters --
+    #  court lines, the scoreboard, the shot chart, the owner's own jersey. Measured on the
+    #  2026-09-15 session: `DETECTOR HEALTH found=2745` against ~600 frames that carried a
+    #  real meter, and one static column at [777,342,26,110] locked and dropped TWENTY times
+    #  in 40 s. The engine already ignores them (no arm, no fire), so this was filed as
+    #  cosmetic. It is not: the overlay draws every one of those boxes on the owner's screen,
+    #  and each one is a lock the next press has to EVICT -- `STALE LOCK DROPPED AT PRESS`,
+    #  followed by a re-acquire that costs the first frames of the real meter.
+    #
+    #  THE GATE. A lock is tracked internally exactly as before (its memory, its ruler, its
+    #  eviction rules all still run); it is PUBLISHED -- handed to the engine and the overlay
+    #  -- only when one of three things is true:
+    #    (a) A PRESS IS ARMED. A shot always publishes, from its first accepted frame, with
+    #        no history required and no delay: this is the rule that makes the gate free.
+    #    (b) THE FILL ROSE >= ORION_READER_IDLE_PUBLISH_RISE_PP (3) over the last 3 reads of
+    #        THE SAME column. That is the owner shooting without the bot -- the meter is real
+    #        and has to stay visible. A real meter climbs ~0.16-0.25 pp/ms, i.e. 3-4 pp per
+    #        60 fps frame, so it qualifies on its second read; a static false lock's fill
+    #        jitters by well under a point and never does.
+    #    (c) IT IS THE CONTINUATION OF AN ALREADY-PUBLISHED LOCK: the same column, within
+    #        ORION_READER_IDLE_PUBLISH_CONT_S (0.5) of the last published frame. This is what
+    #        keeps a shot on screen through the post-release settle, after the gate disarms,
+    #        and across the brief found=False blinks the async locator produces mid-shot.
+    #  Nothing else is published, and every refusal is counted as `idle_unpublished=` on the
+    #  DETECTOR HEALTH line, so the gate's cost is visible in the same place its benefit is.
+    #
+    #  A lock that has never been published cannot BE a continuation, so an idle false lock
+    #  gets no free pass from (c): (a) and (b) are the only two doors, and both of them are
+    #  the presence of a real shot.
+    # ------------------------------------------------------------------ #
+    def _idle_publish_ok(self, detected: bool, bbox, fill: float, ts) -> bool:
+        """Return whether this frame's detection may be published. Never raises."""
+        try:
+            if not detected:
+                return False
+            # A hardware press grants permission to measure, not permission to
+            # publish malformed fill/geometry as current meter evidence.
+            fill = float(fill)
+            if not np.isfinite(fill) or not 0.0 <= fill <= 100.0:
+                return False
+            if ts is not None and not np.isfinite(float(ts)):
+                return False
+            now = float(ts) if (ts is not None and ts == ts) else _time.monotonic()
+            cx = cy = None
+            try:
+                if bbox and len(bbox) >= 4 and int(bbox[2]) > 0 and int(bbox[3]) > 0:
+                    cx = float(bbox[0]) + float(bbox[2]) * 0.5
+                    cy = float(bbox[1]) + float(bbox[3]) * 0.5
+            except (TypeError, ValueError, IndexError):
+                cx = cy = None
+            if cx is None or cy is None or not np.isfinite(cx) or not np.isfinite(cy):
+                return False
+            scale = max(0.5, float(self.H or 720) / 720.0)
+
+            def _near(prev):
+                # A meter on a fade slides up to ~0.6 px/ms, so the tolerance grows with the
+                # gap exactly as the locator's own co-location tolerance does -- and is cut
+                # off at the continuation window, because "the same column a second later" is
+                # a claim about a meter's life, not about a coordinate.
+                if prev is None or cx is None:
+                    return False
+                dt = max(0.0, now - prev[2])
+                if dt > self._idle_pub_cont_s:
+                    return False
+                tol = (self._idle_pub_tol_px + min(90.0, 600.0 * dt)) * scale
+                return abs(cx - prev[0]) <= tol and abs(cy - prev[1]) <= tol
+
+            # (b) the RISE, measured on the last reads of THIS column only: a fill history
+            # carried across a re-seat onto a different column would read as growth.
+            if not _near(self._idle_pub_seen):
+                self._idle_pub_fills.clear()
+            hist = self._idle_pub_fills
+            rose = bool(hist) and (fill - min(hist)) >= self._idle_pub_rise_pp
+            hist.append(float(fill))
+            if cx is not None:
+                self._idle_pub_seen = (cx, cy, now)
+
+            ok = bool(self._shot_armed or self._shot_armed_hw)          # (a)
+            if not ok and rose:                                         # (b)
+                ok = True
+            if not ok and self._idle_pub_box is not None:               # (c)
+                ok = ((now - self._idle_pub_box[2]) <= self._idle_pub_cont_s
+                      and _near(self._idle_pub_box))
+            if ok:
+                if cx is not None:
+                    self._idle_pub_box = (cx, cy, now)
+                return True
+            self._det_diag["idle_unpublished"] = int(
+                self._det_diag.get("idle_unpublished", 0)) + 1
+            self._pw_idle_gate += 1
+            return False
+        except Exception:
+            return False         # a broken gate cannot create actionable meter evidence
 
     @staticmethod
     def _no_meter_sample(reason: str, stage: str) -> dict:
@@ -5050,7 +5962,9 @@ class SimpleMeterReader:
         sx = float(width) / max(1., float(size[0]))
         sy = float(height) / max(1., float(size[1]))
         delta = max(abs(sx - 1.), abs(sy - 1.))
-        if not (0.0 < delta <= min(.35, float(self._scale_step_max))):
+        # Inclusive geometric limits need roundoff tolerance: 1.35 - 1.0
+        # exceeds 0.35 in binary floating point. This is far below a pixel.
+        if not (0.0 < delta <= min(.35, float(self._scale_step_max)) + 1e-12):
             return candidates
         th, tw = tmpl.shape[:2]
         nw, nh = int(round(tw * sx)), int(round(th * sy))
@@ -5159,7 +6073,7 @@ class SimpleMeterReader:
         sy = float(h) / max(1.0, float(reference['size'][1]))
         delta = max(abs(sx - 1.0), abs(sy - 1.0))
         nw, nh = int(round(tw * sx)), int(round(th * sy))
-        if (not (0.0 < delta <= min(.35, float(self._scale_step_max)))
+        if (not (0.0 < delta <= min(.35, float(self._scale_step_max)) + 1e-12)
                 or nw < 8 or nh < 4 or (nw, nh) == (tw, th)):
             self._det_scale_pending = None
             return False
@@ -5425,7 +6339,15 @@ class SimpleMeterReader:
         try:
             if len(self._det_box_hist) < 3:
                 return 0.0, 0.0, 0.0, False
-            h = list(self._det_box_hist)
+            h = tuple(tuple(row) for row in self._det_box_hist)
+            # Extrapolation, reconciliation and the deviation bound ask for the
+            # same robust velocity within one frame (and between async results).
+            # Cache only by the entire immutable history plus both policy knobs:
+            # repeated source slots save work, while any mutation/retune misses.
+            key = (h, float(self._det_vel_min_span_s), float(self._det_early_v_max))
+            cached = getattr(self, '_det_hist_velocity_cache', None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
             span = float(h[-1][0]) - float(h[0][0])
             if span < 0.05:
                 return 0.0, 0.0, 0.0, False
@@ -5445,7 +6367,9 @@ class SimpleMeterReader:
             if not trusted and spd > float(self._det_early_v_max):
                 sc = float(self._det_early_v_max) / max(1e-6, spd)
                 vx *= sc; vy *= sc; spd = float(self._det_early_v_max)
-            return float(vx), float(vy), float(spd), trusted
+            result = (float(vx), float(vy), float(spd), trusted)
+            self._det_hist_velocity_cache = (key, result)
+            return result
         except Exception:
             return 0.0, 0.0, 0.0, False
 
@@ -6015,6 +6939,8 @@ class SimpleMeterReader:
         """Clear every per-lock artefact so nothing stale can steer the next lock (the retired
         reset() + the existing veto-clear discipline: 'stale motion must not extrapolate a new
         lock')."""
+        if getattr(self, '_box_latch_epoch', 0):
+            self._clear_box_latch('lock_state_reset')
         self._det_state = 'idle'
         self._det_streak = 0
         self._det_pend_box = None
@@ -6038,6 +6964,7 @@ class SimpleMeterReader:
         self._det_fill_hist.clear()
         self._det_coarse_fill_hist.clear()
         self._det_box_hist.clear()
+        self._det_hist_velocity_cache = None
         self._det_tmpl = None
         self._det_tmpl_size = None
         self._det_tmpl_cx_offset = 0.0
@@ -6195,6 +7122,304 @@ class SimpleMeterReader:
         return (-1e-6 <= _locator_age
                 <= max(0.0, float(self._det_ttl_s)) + 1e-6)
 
+    # ------------------------------------------------------------------ box identity latch
+    def _box_latch_live(self) -> bool:
+        """True while this press's published lock owns the box geometry."""
+        if not self._box_latch or self._box_latch_epoch == 0:
+            return False
+        if int(self._box_latch_epoch) != int(self._physical_shot_epoch or 0):
+            return False
+        if int(self._box_latch_generation) != int(getattr(self, '_det_lock_generation', 0) or 0):
+            return False
+        return self._det_state == 'locked'
+
+    def _arm_box_latch(self, box, ts) -> None:
+        """[ORION_READER_BOX_LATCH] Latch the box identity once this press's own meter has
+        been sighted and published. From here the geometry may only change through an
+        explicit drop, which the engine sees; a silent mid-shot re-seed may not replace it."""
+        if not self._box_latch or box is None:
+            return
+        _ep = int(self._physical_shot_epoch or 0)
+        if _ep == 0 or not self._shot_armed_hw:
+            return
+        _gen = int(getattr(self, '_det_lock_generation', 0) or 0)
+        if self._box_latch_epoch == _ep and self._box_latch_generation == _gen:
+            return
+        try:
+            self._box_latch_box = tuple(int(v) for v in box)
+        except (TypeError, ValueError, OverflowError):
+            return
+        self._box_latch_epoch = _ep
+        self._box_latch_generation = _gen
+        _acq_logger.error(
+            "BOX LATCHED: epoch=%d generation=%d box=[%d,%d,%d,%d] "
+            "reader_geometry_latched=1 native_ownership=unconfirmed",
+            _ep, _gen, *self._box_latch_box)
+
+    def _clear_box_latch(self, why: str) -> None:
+        if self._box_latch_epoch == 0:
+            return
+        _acq_logger.debug("BOX LATCH CLEARED: epoch=%d why=%s",
+                          int(self._box_latch_epoch), why)
+        self._box_latch_epoch = 0
+        self._box_latch_generation = 0
+        self._box_latch_box = None
+
+    def _locator_pending_pairs(self, ts=None):
+        """[ORION_READER_FORGET_RATE_LIMIT] The proposer's live first-sight pairs, or ()."""
+        fn = getattr(getattr(self, "_meter_detector", None), "pending_pairs", None)
+        if not callable(fn):
+            return ()
+        try:
+            return tuple(fn(ts) or ())
+        except Exception:
+            return ()
+
+    def _det_forget_locator_position(self, why: str, box=None, ts=None) -> bool:
+        """[ORION_READER_GHOST_FORGET_LOCATOR] Tell the proposer to forget WHERE it last saw
+        a meter, so the object this reader just refused cannot bridge the proposer's own
+        acceptance gates into the next proposal. Inert for a proposer without the API.
+
+        `box` is the GHOST: a 4-tuple (x, y, w, h) or a 2-tuple centre. It is what makes the
+        forget surgical -- the proposer keeps the first-sight pairs that belong to a DIFFERENT
+        column (this press's real meter) and drops only the ghost's own. Passing None keeps the
+        original total amnesia, so a caller that genuinely does not know stays fail-closed.
+
+        [ORION_READER_FORGET_RATE_LIMIT 2026-09-16] Rate-limited: one forget per press per
+        zone, and never while a pair is mid-promotion (see the __init__ knob block -- unrated,
+        this call at ~10 Hz is what blinded six consecutive presses on 09-16). -> did it fire?
+        """
+        if not self._ghost_forget_locator:
+            return False
+        fn = getattr(getattr(self, "_meter_detector", None), "forget_position", None)
+        if not callable(fn):
+            return False
+        epoch = int(getattr(self, "_physical_shot_epoch", 0) or 0)
+        if epoch != self._loc_forget_epoch:
+            self._loc_forget_epoch = epoch
+            self._loc_forget_zones = []
+            self._loc_forget_unzoned = False
+            self._loc_forget_logged = False
+            self._loc_forget_defer_n = 0
+        zone = None
+        if box is not None:
+            try:
+                if len(box) >= 4 and float(box[2]) > 0.0:
+                    zone = (float(box[0]) + float(box[2]) * 0.5,
+                            float(box[1]) + float(box[3]) * 0.5)
+                elif len(box) >= 2:
+                    zone = (float(box[0]), float(box[1]))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                zone = None
+        if self._forget_rate_limit:
+            # (a) the same ghost, again, in the same press: the proposer already forgot it.
+            if zone is not None:
+                for _z in self._loc_forget_zones:
+                    if (abs(_z[0] - zone[0]) <= self._forget_zone_px
+                            and abs(_z[1] - zone[1]) <= self._forget_zone_px):
+                        self._loc_forget_suppressed += 1
+                        return False
+            elif self._loc_forget_unzoned:
+                self._loc_forget_suppressed += 1
+                return False
+            # (b) a pair is one frame from deciding -- let it decide.
+            _live = self._locator_pending_pairs(ts)
+            if _live and self._loc_forget_defer_n < self._forget_defer_max:
+                self._loc_forget_defer_n += 1
+                self._loc_forget_deferred += 1
+                _acq_logger.debug(
+                    "LOCATOR FORGET DEFERRED: epoch=%d why=%s pairs=%s n=%d",
+                    epoch, why, ",".join(_live), self._loc_forget_defer_n)
+                return False
+        try:
+            kept = fn(box) if box is not None else fn()
+        except TypeError:
+            try:      # a proposer that predates `box=`: total amnesia, as it always did
+                kept = fn()
+            except Exception:
+                return False
+        except Exception:
+            return False
+        try:
+            kept = tuple(kept or ())
+        except TypeError:
+            kept = ()
+        self._loc_forget_defer_n = 0
+        if zone is not None:
+            self._loc_forget_zones.append(zone)
+        else:
+            self._loc_forget_unzoned = True
+        self._loc_forget_n += 1
+        self._det_diag['loc_forget'] = self._det_diag.get('loc_forget', 0) + 1
+        _msg = ("LOCATOR POSITION FORGOTTEN: epoch=%d zone=%s kept_pairs=%s why=%s")
+        _args = (epoch,
+                 ("(%d,%d)" % (int(zone[0]), int(zone[1]))) if zone is not None else "-",
+                 (",".join(kept) if kept else "-"), why)
+        if not self._loc_forget_logged:
+            self._loc_forget_logged = True
+            _acq_logger.error(_msg, *_args)     # ERROR: the native relay throttles WARNINGs
+        else:
+            _acq_logger.debug(_msg, *_args)
+        return True
+
+    # ------------------------------------------------------------ press withhold summary
+    def _flush_press_withhold_summary(self, reason: str) -> None:
+        """[ORION_READER_PRESS_WITHHOLD_SUMMARY] One ERROR line per press naming, per layer,
+        how many reads it kept from the engine. Idempotent per epoch; silent when nothing was
+        withheld. See the __init__ counter block for why this exists at ERROR."""
+        _ep = int(self._pw_epoch or 0)
+        _tot = (self._pw_ghost_static + self._pw_cold_first + self._pw_idle_gate
+                + self._pw_fresh_zone + self._pw_static_zone + self._pw_reseed)
+        if _ep and _tot > 0 and _ep != self._pw_flushed_epoch:
+            self._pw_flushed_epoch = _ep
+            try:
+                _acq_logger.error(
+                    "PRESS WITHHOLD SUMMARY: epoch=%d ghost_static=%d cold_first=%d "
+                    "idle_gate=%d fresh_zone=%d static_zone=%d reseed=%d end=%s",
+                    _ep, self._pw_ghost_static, self._pw_cold_first, self._pw_idle_gate,
+                    self._pw_fresh_zone, self._pw_static_zone, self._pw_reseed, reason)
+            except Exception:
+                pass
+        self._pw_ghost_static = 0
+        self._pw_cold_first = 0
+        self._pw_idle_gate = 0
+        self._pw_fresh_zone = 0
+        self._pw_static_zone = 0
+        self._pw_reseed = 0
+
+    def _arm_press_fresh_zone(self, box, why: str) -> None:
+        """[ORION_READER_FRESH_AFTER_GHOST] Remember where a leftover was refused at/after this
+        press. Until this press sights its own meter low AND rising, an unproven >=40% read
+        from a lock in that zone is withheld (the engine could not own it anyway)."""
+        # Part of the ghost-press guard family: ORION_READER_GHOST_PRESS_BREAK=0 pins every
+        # leftover-meter layer off, this one included.
+        if not (self._fresh_after_ghost and self._ghost_press_break) or box is None:
+            return
+        try:
+            self._press_fresh_zone = (float(box[0]) + float(box[2]) * 0.5,
+                                      float(box[1]) + float(box[3]) * 0.5)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return
+        self._press_fresh_zone_logged = False
+        _acq_logger.debug("FRESH-ONSET REQUIRED IN ZONE: why=%s zone=(%d,%d)",
+                          why, int(self._press_fresh_zone[0]), int(self._press_fresh_zone[1]))
+
+    # ------------------------------------------------------------ static-zone quarantine
+    def _static_zone_find(self, cx: float, cy: float, now: float):
+        """The remembered static-drop record covering (cx, cy), pruning expired ones."""
+        if not self._static_zone_q:
+            return None
+        keep = []
+        hit = None
+        for z in self._static_zones:
+            if (now - float(z['ts'])) > self._static_zone_ttl_s:
+                continue
+            keep.append(z)
+            if (abs(cx - float(z['cx'])) <= self._static_zone_px
+                    and abs(cy - float(z['cy'])) <= self._static_zone_px * 2.0):
+                hit = z
+        self._static_zones = keep
+        return hit
+
+    def _note_static_zone_drop(self, now: float, reason: str, box) -> bool:
+        """Score a strike when a lock dies WITHOUT ever having proved a rise.
+
+        Returns True when the caller must NOT arm the warm re-acquire memory: re-seeding a
+        never-risen lock from the spot it died is exactly the idle lock/drop churn measured
+        live (~20 cycles in 40s on one court line, with no press anywhere near)."""
+        if not self._static_zone_q or box is None:
+            return False
+        if int(getattr(self, '_det_lock_read_n', 0) or 0) < self._static_zone_min_reads:
+            return False
+        _f0 = getattr(self, '_det_lock_fill0', None)
+        _fmax = float(getattr(self, '_det_lock_fill_max', -1.0) or -1.0)
+        if _f0 is not None and (_fmax - float(_f0)) >= self._static_zone_rise_pp:
+            return False                     # it rose: a real meter lived here
+        try:
+            cx = float(box[0]) + float(box[2]) * 0.5
+            cy = float(box[1]) + float(box[3]) * 0.5
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False
+        z = self._static_zone_find(cx, cy, now)
+        if z is None:
+            z = {'cx': cx, 'cy': cy, 'n': 0, 'ts': now, 'logged': False}
+            self._static_zones.append(z)
+            if len(self._static_zones) > self._static_zone_max:
+                self._static_zones.pop(0)
+        # Follow the object (a court line drifts with the camera) and score the strike.
+        z['cx'] = cx * 0.5 + float(z['cx']) * 0.5
+        z['cy'] = cy * 0.5 + float(z['cy']) * 0.5
+        z['n'] = int(z['n']) + 1
+        z['ts'] = float(now)
+        if int(z['n']) >= self._static_zone_strikes and not z['logged']:
+            z['logged'] = True
+            _acq_logger.error(
+                "STATIC ZONE QUARANTINED: zone=(%d,%d) strikes=%d reason=%s reads=%d "
+                "rise=%.1fpp (< %.1f) - no warm re-seed and no publish there until it rises "
+                "or goes absent",
+                int(z['cx']), int(z['cy']), int(z['n']), reason,
+                int(getattr(self, '_det_lock_read_n', 0) or 0),
+                (_fmax - float(_f0)) if _f0 is not None else -1.0,
+                self._static_zone_rise_pp)
+        # The FIRST never-risen drop at a position still arms the warm memory: a genuine
+        # mid-shot dropout must re-latch on one proposal (pinned by
+        # test_simple_reader_lock_lifecycle::test_warm_reacquire_relatches_on_one_proposal,
+        # and a meter can legitimately die before it is measured rising). Only a REPEAT
+        # offender -- the same position producing _static_zone_strikes never-risen locks -- is
+        # refused the seed and quarantined, which is exactly the live idle churn's signature.
+        return int(z['n']) >= self._static_zone_strikes
+
+    def _static_zone_quarantined(self, box, now: float):
+        """The armed record covering this box, or None."""
+        if not self._static_zone_q or box is None:
+            return None
+        try:
+            cx = float(box[0]) + float(box[2]) * 0.5
+            cy = float(box[1]) + float(box[3]) * 0.5
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        z = self._static_zone_find(cx, cy, now)
+        if z is None or int(z['n']) < self._static_zone_strikes:
+            return None
+        return z
+
+    def _static_zone_release(self, z, why: str) -> None:
+        """A meter proved itself here: retire the record outright."""
+        if z is None:
+            return
+        try:
+            self._static_zones.remove(z)
+        except ValueError:
+            return
+        _acq_logger.error(
+            "STATIC ZONE RELEASED: zone=(%d,%d) why=%s (a real meter proved a rise here)",
+            int(z['cx']), int(z['cy']), why)
+
+    def _note_static_zone_absence(self, *, found: bool, fresh: bool, scope: str,
+                                  new_result: bool) -> None:
+        """Sustained full-frame absence decays the strikes: the object is gone, so the
+        evidence that this position is a persistent false lock decays with it. A find, a
+        partial scan or a live lock all reset the run (only a full scan can prove absence)."""
+        if not self._static_zone_q or not self._static_zones:
+            return
+        if not fresh or not new_result or scope != 'full':
+            return
+        if found or self._det_state == 'locked':
+            self._static_zone_nofind_n = 0
+            return
+        self._static_zone_nofind_n += 1
+        if self._static_zone_nofind_n < self._static_zone_absence_results:
+            return
+        self._static_zone_nofind_n = 0
+        keep = []
+        for z in self._static_zones:
+            z['n'] = int(z['n']) - 1
+            if int(z['n']) < self._static_zone_strikes:
+                z['logged'] = False
+            if int(z['n']) > 0:
+                keep.append(z)
+        self._static_zones = keep
+
     def _note_press_ghost_full_result(self, *, found: bool, fresh: bool,
                                       scope: str, new_result: bool) -> None:
         """Retire one quarantined meter identity after proven full-frame absence.
@@ -6216,6 +7441,7 @@ class SimpleMeterReader:
             return
 
         _count = self._press_ghost_full_nofind_n
+        _retired_zone = self._press_ghost_zone
         self._press_ghost_zone = None
         self._press_ghost_level = None
         self._press_ghost_zone_low_n = 0
@@ -6231,6 +7457,18 @@ class SimpleMeterReader:
             self._det_active_box = None
         except Exception:
             pass
+        # [ORION_READER_GHOST_FORGET_LOCATOR] The reader-side seeds are cleared above; the
+        # PROPOSER's own positional memory is the one that survived and re-proposed the
+        # retired ghost's column on co-location alone (see the __init__ knob block).
+        self._det_forget_locator_position('ghost_identity_retired', box=_retired_zone,
+                                          ts=self._frame_ts_last)
+        # [ORION_READER_FRESH_AFTER_GHOST] The identity is retired, not the requirement: until
+        # this press sights its own meter low AND rising, an unproven >=40% read from a lock
+        # in that zone stays withheld.
+        if (_retired_zone is not None and self._fresh_after_ghost
+                and self._ghost_press_break):
+            self._press_fresh_zone = (float(_retired_zone[0]), float(_retired_zone[1]))
+            self._press_fresh_zone_logged = False
         _acq_logger.error(
             "GHOST IDENTITY RETIRED AFTER FULL ABSENCE: epoch=%d full_nofinds=%d "
             "(same-zone next meter may acquire fresh)",
@@ -6268,20 +7506,42 @@ class SimpleMeterReader:
     def _det_drop_lock(self, now: float, reason: str) -> None:
         """Drop the lock and arm the WARM re-acquire memory at the spot it died (retired
         _note_lock_loss -> _warm_pos: 'a candidate near where a corroborated lock was lost
-        moments ago is the same meter continuing its rise')."""
-        if self._det_emit is not None:
-            self._det_warm_pos = (float(self._det_emit[0]),
-                                  float(self._det_emit[1]) - float(self._det_emit[3]) * 0.5)
-        elif self._det_last_box is not None:
-            lb = self._det_last_box
-            self._det_warm_pos = (lb[0] + lb[2] * 0.5, lb[1] + lb[3] * 0.5)
-        self._det_warm_ts = float(now)
+        moments ago is the same meter continuing its rise').
+
+        [ORION_READER_STATIC_ZONE_QUARANTINE] That sentence is only true of a lock that was
+        RISING. A lock that never rose is decor, and warm-seeding the next acquisition from
+        the spot it died is what produced ~20 lock/drop cycles in 40s on one court line with
+        no press anywhere near (live 2026-09-15 22:36:26-58Z). Such a drop scores a strike
+        against the position and arms NO warm memory."""
+        _static_hit = False
+        if self._static_zone_q:
+            _sb = self._det_last_box
+            if _sb is None and self._det_emit is not None:
+                _e = self._det_emit
+                _sb = (float(_e[0]) - float(_e[2]) * 0.5, float(_e[1]) - float(_e[3]),
+                       float(_e[2]), float(_e[3]))
+            try:
+                _static_hit = self._note_static_zone_drop(now, reason, _sb)
+            except Exception:
+                _static_hit = False
+        if not _static_hit:
+            if self._det_emit is not None:
+                self._det_warm_pos = (float(self._det_emit[0]),
+                                      float(self._det_emit[1]) - float(self._det_emit[3]) * 0.5)
+            elif self._det_last_box is not None:
+                lb = self._det_last_box
+                self._det_warm_pos = (lb[0] + lb[2] * 0.5, lb[1] + lb[3] * 0.5)
+            self._det_warm_ts = float(now)
+        else:
+            self._det_warm_pos = None
+            self._det_warm_ts = -1.0e9
         self._det_diag['drop'] += 1
         try:
             self.last_debug = dict(self.last_debug or {})
             self.last_debug['det_drop'] = reason
         except Exception:
             pass
+        self._clear_box_latch('lock_dropped:' + str(reason))
         self._det_reset_lock_state()
 
     def _det_on_found(self, box, conf: float, now: float, new_result: bool,
@@ -6290,6 +7550,28 @@ class SimpleMeterReader:
         ACCEPTED into the lock (the caller then updates _det_last_box / history / template);
         False = the proposal must not move anything this frame (pending warm-up, or a
         teleport outlier accruing re-seed strikes)."""
+        # After this press ends, keep measuring only its existing meter for the
+        # landing/oracle tail. A warm memory, lingering hardware arm, or repeated
+        # strong court proposal must not acquire/reseed a different object.
+        epoch = int(getattr(self, '_physical_shot_epoch', 0) or 0)
+        closed = epoch > 0 and epoch == int(getattr(self, '_pa_released_epoch', 0) or 0)
+        if closed:
+            reference = None
+            if self._det_state == 'locked':
+                if self._det_emit is not None:
+                    reference = (float(self._det_emit[0]),
+                                 float(self._det_emit[1]) - float(self._det_emit[3]) * 0.5)
+                elif self._det_last_box is not None:
+                    x, y, w, h = self._det_last_box
+                    reference = (x + w * 0.5, y + h * 0.5)
+            x, y, w, h = (float(v) for v in box)
+            jump = (float(np.hypot(x + w * 0.5 - reference[0],
+                                   y + h * 0.5 - reference[1]))
+                    if reference is not None else float('inf'))
+            if not np.isfinite(jump) or jump > self._det_jump_gate() * max(1.0, float(self._det_track_scale)):
+                self._det_diag['post_release_acquire_refused'] = (
+                    self._det_diag.get('post_release_acquire_refused', 0) + 1)
+                return False
         if not self._det_lifecycle:
             return True                      # pre-port behaviour: every fresh box is adopted
         bx, by, bw, bh = (float(v) for v in box)
@@ -6331,6 +7613,24 @@ class SimpleMeterReader:
                 self._det_strike_box = (cx, cy)
                 self._det_strike_n = 1
             if self._det_strike_n >= int(self._det_reseed_n):
+                # [ORION_READER_BOX_LATCH] ...but not while the engine owns this shot on this
+                # lock. Adopting a far proposal as a FRESH lock swaps the box the fill
+                # denominator is measured against, mid-shot, with no drop for the engine to
+                # see. A genuine break must go through _det_drop_lock instead.
+                if self._box_latch_live():
+                    self._box_latch_refused += 1
+                    self._pw_reseed += 1
+                    self._det_diag['reseed_refused'] = (
+                        self._det_diag.get('reseed_refused', 0) + 1)
+                    self._det_strike_n = 0
+                    self._det_strike_box = None
+                    _acq_logger.error(
+                        "RESEED REFUSED: epoch=%d generation=%d latched=[%d,%d,%d,%d] "
+                        "proposal=(%d,%d) - the engine owns this shot; a break must drop the "
+                        "lock, not re-seat it",
+                        int(self._box_latch_epoch), int(self._box_latch_generation),
+                        *(self._box_latch_box or (0, 0, 0, 0)), int(cx), int(cy))
+                    return False
                 # Genuine relocation (three consistent far proposals ~ a new shot elsewhere):
                 # adopt it as a FRESH lock -- full state reset so the old lock's motion/fill
                 # cannot bleed into the new one.
@@ -6368,6 +7668,13 @@ class SimpleMeterReader:
                 and (now - self._det_warm_ts) <= float(self._det_warm_s)
                 and float(np.hypot(cx - self._det_warm_pos[0],
                                    cy - self._det_warm_pos[1])) <= gate * 2.0)
+        if warm and self._static_zone_quarantined(box, now) is not None:
+            # [ORION_READER_STATIC_ZONE_QUARANTINE] A quarantined position may still be
+            # acquired -- the real meter can render there, and only a lock can watch it rise
+            # -- but never through the WARM shortcut, which exists to continue a rising meter
+            # and here would just re-seed the decor from its own corpse. The ordinary
+            # two-result acquire streak still applies.
+            warm = False
         # STRONG proposal paired with the PHYSICAL arm: the press is the behavioural evidence
         # (retired T-a4 refused loc_strong standalone). This is what keeps first-detected fill
         # at 0-10% -- the armed onset frame may latch immediately.
@@ -6648,6 +7955,52 @@ class SimpleMeterReader:
             return None
         return None
 
+    def _proposer_stats(self):
+        """Compact counters of the box PROPOSER (the CV locator keeps gate counters; the ONNX
+        locator has none). Read-only; '-' when there is nothing to report."""
+        try:
+            base = getattr(self._meter_detector, "_base", None)
+            st_ = getattr(base, "stats", None)
+            if not isinstance(st_, dict):
+                return "-"
+            # [ORION_LOCATOR_IDLE_REUSE 2026-09-15] `idle_reuse` rides here so the scans the
+            # locator did NOT run on frozen menu/loading frames are visible next to the ones
+            # it did; a live run that shows idle_reuse=0 across a menu means the signature is
+            # not seeing the feed as static (noise, a moving screensaver, or the knob is off).
+            keys = ("hit", "no_tip", "outline_weak", "no_outline", "outline_bridged", "roi",
+                    "full", "idle_reuse")
+            return "{" + ",".join("%s=%s" % (k, st_.get(k, 0)) for k in keys if k in st_) + "}"
+        except Exception:
+            return "-"
+
+    def detector_health_snapshot(self):
+        """One dict for the UI's Meter Detection card (sidecar -> native telemetry):
+        provider, inference ms, lifecycle counters and the proposer's own gate counters.
+        Presentation-only: nothing here feeds the engine."""
+        try:
+            det = self._meter_detector
+            _dg = getattr(self, "_det_diag", None) or {}
+            base = getattr(det, "_base", None)
+            st_ = getattr(base, "stats", None)
+            out = {
+                "provider": str(getattr(det, "provider", "none")) if det is not None else "none",
+                "infer_ms": round(float(getattr(det, "infer_ms", 0.0) or 0.0), 2) if det is not None else 0.0,
+                "state": str(getattr(self, "_det_state", "-")),
+                "calls": int(_dg.get("calls", 0)), "found": int(_dg.get("found", 0)),
+                "locks": int(_dg.get("lock", 0)), "drops": int(_dg.get("drop", 0)),
+                "hot_submit": int(_dg.get("hot_submit", 0)), "reseat_x": int(_dg.get("reseat_x", 0)),
+                "dims_locked": int(_dg.get("dims_locked", 0)),
+                "det_only_veto": int(_dg.get("det_only_veto", 0)),
+            }
+            if isinstance(st_, dict):
+                for k in ("hit", "no_tip", "outline_weak", "no_outline", "outline_bridged",
+                          "shape_irregular", "tip_spill", "shape_error", "shape_bridge_tip_refused",
+                          "shape_full_body_bridged"):
+                    out["cv_" + k] = int(st_.get(k, 0))
+            return out
+        except Exception:
+            return None
+
     def _reseat_x_dx(self, frame, box):
         """[ORION_READER_RESEAT_X] Horizontal offset (px) that puts `box` on the white ribbon
         visible in this frame, or None. Whiteness = min(B,G,R) >= 200 counted per column over
@@ -6693,11 +8046,61 @@ class SimpleMeterReader:
         except Exception:
             return None
 
+    def _det_only_seat_veto(self, col, ts):
+        """True when a colour-tier candidate must NOT seat: the proposer is the landmark CV
+        locator and no fresh detector box overlaps the candidate (IoU < 0.3)."""
+        try:
+            if not self._det_only_seat:
+                return False
+            if str(getattr(self._meter_detector, "provider", "")) != "cv-contour" and not self._det_only_seat_force:
+                return False
+            box = self._det_last_box
+            fresh = (box is not None and ts is not None and self._det_last_found_ts is not None
+                     and 0.0 <= float(ts) - float(self._det_last_found_ts) <= self._det_only_seat_max_age_s)
+            if fresh:
+                ax, ay, aw, ah = (int(v) for v in box); bx, by, bw, bh = (int(v) for v in col)
+                ix0, iy0 = max(ax, bx), max(ay, by); ix1, iy1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+                inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+                union = aw * ah + bw * bh - inter
+                if union > 0 and inter / float(union) >= 0.3:
+                    return False
+            self._det_diag["det_only_veto"] = self._det_diag.get("det_only_veto", 0) + 1
+            return True
+        except Exception:
+            return False
+
+    def _det_lock_dims_active(self):
+        if not self._det_lock_dims:
+            return False
+        if self._det_lock_dims_force:
+            return True
+        return str(getattr(self._meter_detector, "provider", "")) == "cv-contour"
+
+    def _det_pin_dims(self, box, ts):
+        """[ORION_READER_LOCK_BOX_DIMS] the detector's (w, h) on the tracker's bottom-centre."""
+        try:
+            if not self._det_lock_dims_active() or self._det_last_box is None:
+                return box
+            if ts is not None and self._det_last_found_ts is not None:
+                if not (0.0 <= float(ts) - float(self._det_last_found_ts) <= self._det_lock_dims_max_age_s):
+                    return box
+            dw, dh = int(self._det_last_box[2]), int(self._det_last_box[3])
+            x, y, w, h = (int(v) for v in box)
+            if dw <= 0 or dh <= 0 or (w == dw and h == dh):
+                return box
+            cx = x + w * 0.5
+            bottom = y + h
+            self._det_diag["dims_locked"] = self._det_diag.get("dims_locked", 0) + 1
+            return (int(round(cx - dw * 0.5)), int(bottom - dh), dw, dh)
+        except Exception:
+            return box
+
     def _det_measurement_boxes(self, frame, tracked, ts=None):
         """Keep the old display contract; an opt-in pixel crop never sees its EMA."""
-        tracked = tuple(int(v) for v in tracked)
+        tracked = self._det_pin_dims(tuple(int(v) for v in tracked), ts)
         display = (tuple(int(v) for v in self._det_smooth_emit(tracked))
                    if self._det_lifecycle else tracked)
+        display = self._det_pin_dims(display, ts)      # the emit EMA must not re-inflate the ruler
         self._det_display_box = display
         self._det_pixel_geometry = None
         measured = display
@@ -6982,7 +8385,7 @@ class SimpleMeterReader:
         resized, _w, height, _when = evidence
         proposed = float(height) / ref[2]
         if (not np.isfinite(proposed) or proposed <= 0.0
-                or abs(proposed / scale - 1.0) > min(.35, float(self._scale_step_max))
+                or abs(proposed / scale - 1.0) > min(.35, float(self._scale_step_max)) + 1e-12
                 or abs(span - ref[1] * proposed) > 2.0):
             return scale
         pending = self._det_scale_pending
@@ -7481,6 +8884,18 @@ class SimpleMeterReader:
     def _measure_fill_in_box(self, frame, box, ts=None):
         self._det_pixel_ruler_reject = False
         result = self._measure_fill_in_box_legacy(frame, box, ts)
+        if self._tracking_meter_style == "pill":
+            # [ORION_PILL_RULER 2026-09-19] The Pill proposer box carries ~16px of
+            # pedestal+cap padding around the capsule, so its box-relative ruler reads
+            # 7.5 + 0.88*true and fires the 20% phase anchor ~30ms early. Re-express the
+            # same measured edge against the capsule's OWN base/apex landmarks (see
+            # pill_fill_ruler.py). Fail-open: a missing landmark returns `result`
+            # unchanged, and no other style can reach this branch.
+            try:
+                import pill_fill_ruler as _pfr
+                result = _pfr.measure(self, frame, box, ts, result)
+            except Exception:
+                pass
         if not self._det_pixel_ruler:
             return result
         # Physical geometry can only tighten the existing direct-read verdict.
@@ -7559,6 +8974,8 @@ class SimpleMeterReader:
             # largest contiguous run of white rows = the fill block (ignores the meter's
             # non-white rounded base at the very bottom, which broke a naive bottom-anchor).
             best_top = None; best_len = 0; run_top = None
+            base_top = None; base_len = 0
+            base_region = bh - max(8, int(round(0.20 * bh)))
             for r in range(bh):
                 if wfrac[r] >= 0.28:
                     if run_top is None:
@@ -7567,9 +8984,30 @@ class SimpleMeterReader:
                     if run_top is not None:
                         if (r - run_top) > best_len:
                             best_len = r - run_top; best_top = run_top
+                        if r - 1 >= base_region and r - run_top >= 3:
+                            if r - run_top > base_len:
+                                base_top, base_len = run_top, r - run_top
                         run_top = None
-            if run_top is not None and (bh - run_top) > best_len:
-                best_len = bh - run_top; best_top = run_top
+            if run_top is not None:
+                if (bh - run_top) > best_len:
+                    best_len = bh - run_top; best_top = run_top
+                if bh - run_top >= 3 and bh - run_top > base_len:
+                    base_top, base_len = run_top, bh - run_top
+            # A floating jersey/court stripe can be longer than the real low fill.
+            # Prefer an independently observed base-reaching solid run over that
+            # detached stripe; the rung rescue below still handles divided Pill fill.
+            if (base_top is not None and best_top is not None
+                    and best_top + best_len - 1 < base_region):
+                base_support = white[base_top:base_top + base_len].sum(axis=0)
+                coherent = np.count_nonzero(base_support >= .8 * base_len)
+                if coherent < int(np.ceil(.28 * (x1 - x0))):
+                    # Socks over nameplate text can imitate two stacked runs.
+                    # Refuse that ambiguity rather than turning a false 45% lock
+                    # into an ownable false 18% onset by selecting the lower text.
+                    self._last_fill_coarse = 0.0
+                    self._dbg_subpx = dict(ok=0, gate='floating_without_base_ribbon')
+                    return 0.0, None, -1
+                best_top, best_len = base_top, base_len
             # ---- RUNG-TOLERANT LADDER RESCUE (see __init__ doc; ORION_METER_RUNG_FILL).
             # On the Pill capsule the walk above finds nothing (wfrac ceiling 0.20-0.26
             # vs the 0.28 floor) or an occasional 2-3-row scrap; the ladder block is the
@@ -7583,6 +9021,7 @@ class SimpleMeterReader:
             # A solid-ribbon (Arrow2) walk result that touches the base region is NEVER
             # overridden -- the ladder block barely exists there (narrow-band gate).
             self._dbg_rung = None
+            _rb = None
             if self._rung_fill:
                 _bw = x1 - x0
                 _blim = bh - max(8, int(round(0.20 * bh)))
@@ -7619,6 +9058,19 @@ class SimpleMeterReader:
                         best_top, best_len = _r_top, _r_len
                         self._dbg_rung = {"why": _pick, "nseg": _r_nseg,
                                           "top": _r_top, "len": _r_len}
+            # A cap/jersey fragment is not a measured fill edge merely because
+            # a locator supplied this box. The solid/rung selection above must
+            # reach the existing meter-base region, or its exact selected top
+            # must agree with a gated base-reaching rung block. An unrelated
+            # unselected base rung cannot validate a floating stripe above it.
+            # This retains the Pill tick that shares the real ladder's top.
+            # Keep trusted ruler and width history: rejected pixels do not erase them.
+            if (best_top is not None
+                    and (_rb is None or _rb[0] != best_top)
+                    and best_top + best_len - 1 < base_region):
+                self._last_fill_coarse = 0.0
+                self._dbg_subpx = dict(ok=0, gate='floating_without_base_ribbon')
+                return 0.0, None, -1
             # A slight side-on occlusion can leave several exact meter columns
             # visible while reducing every row below the ordinary 28%-of-box
             # consensus.  Recover only from those bottom-connected columns and
@@ -7680,9 +9132,16 @@ class SimpleMeterReader:
             # green make-window (the ~96-98% cap): topmost green run, on THE SAME RULER as
             # the fill emitted THIS frame (see [ORION_GREEN_SCALE_UNIFY] below).
             green = None
+            # A make window is one compact, aligned component at the capsule tip.
+            # Never union its rows/pixel confidence with detached court/player paint.
+            gmask = self._connected_meter_cap(gmask, white)
+            gfrac = gmask.mean(axis=1)
             gpx = int(gmask.sum())
-            if gpx >= 8:      # measured: >=8 green px in the box = a real make-window cap
-                grows = np.flatnonzero(gfrac >= 0.20)
+            if gpx >= 4:      # tiny caps reach here only with independent ribbon support
+                # Narrow windows can contain only 2-4 pixels per row in a 26px
+                # detector box. Their connected geometry, not box-wide occupancy,
+                # proves the cap; retain the two-pixel apex convention below.
+                grows = np.flatnonzero(gmask.sum(axis=1) >= 2)
                 if grows.size:
                     g_top_row = int(grows[0])
                     g_bot_row = int(grows[-1])
@@ -7747,6 +9206,64 @@ class SimpleMeterReader:
             return round(fill, 2), green, (int(best_top) if best_top is not None else -1)
         except Exception:
             return 0.0, None, -1
+
+    @staticmethod
+    def _connected_meter_cap(gmask, white):
+        """Return one observed tip component, never a bounding union of green decor."""
+        bh, bw = gmask.shape
+        selected = np.zeros_like(gmask, dtype=bool)
+        # Estimate the actual ribbon centre from its base region, independent of
+        # any floating white stripe higher in the box. Cold/no-fill reads use the
+        # box centre but still need the same compact tip geometry.
+        base_cols = white[bh - max(8, int(round(.20 * bh))):].sum(axis=0)
+        peak = int(base_cols.max()) if base_cols.size else 0
+        core = np.flatnonzero(base_cols >= max(2, .5 * peak)) if peak >= 2 else []
+        core_left = int(core[0]) if len(core) else max(0, bw // 2 - 2)
+        core_right = int(core[-1]) + 1 if len(core) else min(bw, bw // 2 + 3)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            gmask.astype(np.uint8), connectivity=8)
+        chosen, mass = 0, 0
+        for label in range(1, n):
+            x, y, w, h, area = (int(v) for v in stats[label])
+            if area < 8:
+                # Downscaled, strict-colour apex pixels can form a real 2x2 cap.
+                # This branch measures GREEN ONLY: it never supplies white fill,
+                # acquisition authority, or a fallback box-centre identity.
+                # Refuse fragments/decor ambiguity and demand a coherent current
+                # bottom ribbon plus a compact, centred apex component.
+                if (area < 4 or not (2 <= w <= 4 and 2 <= h <= 4)
+                        or area < .5 * w * h or n != 2
+                        or y + h > max(10, int(np.ceil(.15 * bh)))
+                        or peak < 6):
+                    continue
+                tiny_core = np.flatnonzero(base_cols >= max(6, .5 * peak))
+                if (len(tiny_core) < 5 or len(tiny_core) > .65 * bw
+                        or int(tiny_core[-1]) - int(tiny_core[0]) + 1 != len(tiny_core)
+                        or abs(x + .5 * w - .5 * (tiny_core[0] + tiny_core[-1] + 1)) > 1.5
+                        or min(x + w, int(tiny_core[-1]) + 1)
+                           - max(x, int(tiny_core[0])) < 2):
+                    continue
+                ribbon = white[bh - max(8, int(round(.20 * bh))):, tiny_core]
+                solid_rows = np.mean(ribbon, axis=1) >= .8
+                run = longest = 0
+                for solid in solid_rows:
+                    run = run + 1 if solid else 0
+                    longest = max(longest, run)
+                if longest < 6:
+                    continue
+            if (w < 2 or h < 2
+                    or y > max(8, int(np.ceil(.25 * bh)))
+                    or y + h > max(10, int(np.ceil(.30 * bh)))
+                    # Filled white can split a real cap into two side fragments.
+                    # A fragment still has to overlap the observed ribbon, not
+                    # merely touch its edge or sit elsewhere in the crop.
+                    or min(x + w, core_right) - max(x, core_left) < 2):
+                continue
+            if area > mass:
+                chosen, mass = label, area
+        if chosen:
+            selected = labels == chosen
+        return selected
 
     def _rung_fill_block(self, white, bh, bw):
         """Gap-tolerant fill block for LADDER-divided meters (2K27 Pill capsule).
@@ -9208,6 +10725,9 @@ class SimpleMeterReader:
         a real fill latch and a positive native release id is explicitly a proxy and downstream
         production telemetry rejects it.
         """
+        # RELEASE ORACLE (diagnostic): settle the open window BEFORE the record below reads
+        # its gap, so `oracle_gap_px` describes THIS release and never the previous one.
+        self._ro_flush("shot_end")
         try:
             if self._gz_grade and not self._gz_graded:
                 est = self._gz_estimate()
@@ -9235,7 +10755,13 @@ class SimpleMeterReader:
                            "shot_attempt": int(self._gz_release_shot_attempt),
                            "release_proxy": bool(proxy), "label": label,
                            "window_conf": round(g_conf, 3),
-                           "n_exposed_green": len(self._gz_starts), "end_reason": str(reason)}
+                           "n_exposed_green": len(self._gz_starts), "end_reason": str(reason),
+                           # RELEASE ORACLE (see __init__) -- APPEND-ONLY. The settled
+                           # white-top-to-green-bottom gap for this release, or -1.0 when the
+                           # window never produced a measurable frame. Diagnostic; no consumer
+                           # of this record may time anything on it.
+                           "oracle_gap_px": round(float(
+                               (self.last_release_oracle or {}).get("gap_px", -1.0)), 2)}
                     self._gz_graded = True
                     self.last_green_grade = rec
                     self._gz_emit(rec)
@@ -9363,6 +10889,7 @@ class SimpleMeterReader:
         probe = bool(probe) or bool(self._probe_read)
         if not probe:
             self._read_bail = None       # EPOCH-3/5: per-frame "do not emit this number" flag
+            self._ro_frame = None        # RELEASE ORACLE: per-frame settle measurement
         self._pre_hug_tbox = None        # BOX-HUG: per-call, set only on the full geometry path
         self._hug_stroke = None          # BOX-TIGHT mode 2: per-call twin of the above
         strip, x0, top_search = self._fill_strip(frame, col)
@@ -9694,6 +11221,9 @@ class SimpleMeterReader:
             # GREEN-ZONE: harvest the neon band's lower edge (un-occluded frames only) and,
             # when the window flag is on, emit the colour-derived [g_lo, 100] window.
             green = self._gz_process(hsv, int(red_top_coarse), ph, fillable_h, green)
+        # RELEASE ORACLE (diagnostic; see __init__): this frame's settled landmark pair.
+        if self._ro_on and not probe and self._ro_pending:
+            self._ro_frame = self._ro_measure(hsv, ph, pw, track_top, fillable_h, _sy)
         coarse = (ph - red_top_coarse) / fillable_h * 100.0
         # SUB-PIXEL fill = smoothed threshold crossing of the red profile (Orion's genuine add)
         sm = np.convolve(red_row, np.array([0.25, 0.5, 0.25]), mode="same")
@@ -10618,6 +12148,18 @@ class SimpleMeterReader:
                                        "box": [int(v) for v in col],
                                        "n": int(self._arm_edge_vetoes)}
                     col = None
+                if col is not None and self._det_only_seat_veto(col, ts):
+                    # [ORION_READER_DETECTOR_ONLY_SEAT 2026-09-11] Under the landmark proposer
+                    # the reader's own colour tiers seated wide false locks at the press (w 31-50
+                    # px boxes on 14/98 shots in session 120503: jersey numbers, nameplates, a
+                    # leftover meter) -- the ownership proof then restarted on those samples and
+                    # 4 wide-open shots aborted. The CV proposer searches the whole band every
+                    # frame in ~1 ms, so a real meter always has a fresh detector box: a colour
+                    # candidate that no fresh detector box overlaps is not a meter.
+                    self.last_debug = {"stage": "det_only_veto", "tier": acq_tier or "-",
+                                       "box": [int(v) for v in col],
+                                       "n": int(self._det_diag.get("det_only_veto", 0))}
+                    col = None
                 if col is not None:
                     evidence = "red"
                     self._courtwide_lock = bool(courtwide_acq)
@@ -10834,6 +12376,11 @@ class SimpleMeterReader:
         # this one.
         self._read_bail = None
         coarse, subpix, tbox, top_row, green = self._read_fill(frame, col)
+        # RELEASE ORACLE (diagnostic, see __init__): fold THIS frame's settle measurement into
+        # the open release window. Reads only what _read_fill already measured and writes only
+        # its own buffer; no branch below it can see a different number because of this call.
+        if self._ro_on and self._ro_pending:
+            self._ro_note(ts, float(coarse))
         # GREEN-ONLY HOLD (cap/deflate): the green tip anchors the box but the red column has
         # momentarily vanished -> DON'T report a 0% glitch; hold the last good fill while the box
         # stays glued to the meter. A receding red (real deflation) still reads through naturally.
@@ -11225,6 +12772,11 @@ class SimpleMeterReader:
         # interleaves later, this result remains stamped OLD (and native rejects it) instead of
         # laundering old pixels into the new epoch through the mutable reader global.
         _detect_shot_epoch = int(self._physical_shot_epoch) if self._shot_armed_hw else 0
+        # [ORION_READER_FORGET_RATE_LIMIT] the FRAME clock, kept for the control-thread paths
+        # (notify_physical_shot_start) that have no ts of their own: the locator's first-sight
+        # pairs are stamped in frame time, so asking whether one is still live needs it.
+        if ts is not None and ts == ts:
+            self._frame_ts_last = float(ts)
         self._prepare_frame_geometry(frame_bgr)
         # BOX-TIGHT: the per-frame fresh-column source must be cleared at the PRODUCTION
         # boundary, not only inside read() -- a subclass read() can return before the base
@@ -11234,6 +12786,14 @@ class SimpleMeterReader:
         # B6: latch/clear the physical arm edge BEFORE read(), so the breaker's bounded hw grace
         # is measured from the press that opened this window (see _hw_arm_grace_live).
         self._note_hw_arm_edge(ts)
+        # [ORION_PLAYER_ANCHOR] publish this press window to the anchor, BEFORE the frame is
+        # submitted to the locator: the locator decides where to look from it.
+        self._publish_press_window(ts)
+        # [ORION_CV_TIPLESS_ARMED] drain the locator's tipless record (a dict read and, at most
+        # once per press, one ERROR line) on the reader thread, never on the detector worker.
+        self._flush_tipless_line()
+        # RELEASE ORACLE (diagnostic, see __init__): run the open window's clock.
+        self._ro_tick(ts)
         # B7: capture this shot's arm-edge red reference (once per hardware epoch, at the press).
         self._note_arm_edge_reference(frame_bgr)
         # DETECTOR-DRIVEN LOCATION (see __init__): submit this frame to the async YOLO locator
@@ -11393,6 +12953,9 @@ class SimpleMeterReader:
                           and _dts_f + 1.0e-6 >= _rrts):
                         _rescue_source_ready = True
                 self._note_press_ghost_full_result(
+                    found=bool(_dfound), fresh=bool(_dfresh), scope=str(_dscope),
+                    new_result=bool(_new_res))
+                self._note_static_zone_absence(
                     found=bool(_dfound), fresh=bool(_dfresh), scope=str(_dscope),
                     new_result=bool(_new_res))
                 if _dfresh and _dfound and _dbox is not None:
@@ -11583,8 +13146,32 @@ class SimpleMeterReader:
                 # whether results are fresh (not stale/CPU-starved), and whether it is seeding.
                 if ts is not None and (ts - self._det_diag_last) >= 2.0:
                     self._det_diag_last = ts
+                    # [ORION_READER_HEALTH_FIELD_ORDER 2026-09-16] THE LAYER COUNTERS COME
+                    # FIRST. The native relay forwards `trimmed.left(300)` of every sidecar
+                    # WARNING/ERROR (RemotePlaySession.cpp), and with a ~45-char log prefix
+                    # that cut landed in the middle of `lifecycle(...)`: on the 09-16 blind
+                    # run `idle_unpublished=` and `idle_reuse=` were never once visible in the
+                    # native log, so two of the six publication layers had NO live counter and
+                    # could be neither accused nor cleared. Everything that can WITHHOLD a read
+                    # now sits inside the first ~150 chars; the descriptive scan/lifecycle
+                    # census stays behind it, where a trim costs nothing.
+                    _lst = getattr(getattr(self._meter_detector, "_base", None),
+                                   "stats", None) or {}
                     _acq_logger.error(
-                        "DETECTOR HEALTH provider=%s infer=%.0fms calls=%d found=%d fresh=%d "
+                        "DETECTOR HEALTH provider=%s"
+                        + " loc_forget=" + str(_dg.get("loc_forget", 0))
+                        + "/" + str(getattr(self, "_loc_forget_suppressed", 0))
+                        + "/" + str(getattr(self, "_loc_forget_deferred", 0))
+                        + " reseed_refused=" + str(_dg.get("reseed_refused", 0))
+                        + " staticq=" + str(len(self._static_zones))
+                        + "/" + str(self._static_zone_withheld)
+                        + " idle_unpublished=" + str(_dg.get("idle_unpublished", 0))
+                        + " idle_reuse=" + str(_lst.get("idle_reuse", 0))
+                        + " press_fresh_withheld=" + str(
+                            getattr(self, "_press_fresh_withheld", 0))
+                        + " tipless=" + str(_lst.get("tipless_accept", 0))
+                        + "/" + str(_lst.get("tipless_pending", 0))
+                        + " infer=%.0fms calls=%d found=%d fresh=%d "
                         "stale=%d seeded=%d nofound_veto=%d last=(found=%s fresh=%s box=%s age=%.2fs)"
                         " lifecycle(state=" + str(self._det_state)
                         + " locks=" + str(_dg["lock"]) + " drops=" + str(_dg["drop"])
@@ -11598,6 +13185,12 @@ class SimpleMeterReader:
                         + " reject=" + str(_dg.get("occlusion_reject", 0)) + ")"
                         + " hot_submit=" + str(_dg.get("hot_submit", 0))
                         + " reseat_x=" + str(_dg.get("reseat_x", 0))
+                        + " dims_locked=" + str(_dg.get("dims_locked", 0))
+                        + " det_only_veto=" + str(_dg.get("det_only_veto", 0))
+                        # [ORION_READER_IDLE_PUBLISH_GATE] locks the reader tracked but did NOT
+                        # hand to the engine/overlay (no arm, no rise, no continuation) --
+                        # moved to the FRONT of this line, where the relay's trim cannot eat it.
+                        + " cv=" + str(self._proposer_stats())
                         + " scan(enabled=%s scope=%s last_side=%s"
                         + " full=%d/%d left=%d/%d right=%d/%d partial_miss=%d)",
                         getattr(self._meter_detector, "provider", "?"),
@@ -11753,16 +13346,36 @@ class SimpleMeterReader:
                 # fill_coarse/raw_fill_pct always carries the COARSE row-walk value, so live
                 # telemetry keeps a permanent sub-pixel-vs-coarse A/B breadcrumb per frame.
                 _sp = float(_sp); _co = float(getattr(self, "_last_fill_coarse", _sp) or 0.0)
+                # A retained box is not a measured white edge. In particular a
+                # vanished/occluded ribbon's sentinel zero must not enter a timing
+                # slope or create a rollback followed by a fictitious rapid rise.
+                _white_read_valid = bool(
+                    _tr is not None and int(_tr) >= 0
+                    and np.isfinite(_sp) and np.isfinite(_co)
+                    and 0.0 <= _sp <= 100.0 and 0.0 <= _co <= 100.0)
+                _measurement_rejected = bool(
+                    not _white_read_valid or self._det_occ_censored_reject
+                    or self._det_pixel_ruler_reject)
                 if self._det_lifecycle:
                     # Per-lock fill bookkeeping: the PROVEN-rise latch that earns the extended
                     # coast (retired peak-hold demanded a real rise) + the white-ribbon presence
                     # that stands in for the retired red-presence survival corroboration.
-                    self._det_last_presence = bool(_tr is not None and int(_tr) >= 0)
+                    self._det_last_presence = not _measurement_rejected
                     self._det_lock_read_n = int(getattr(self, "_det_lock_read_n", 0)) + 1
-                    if self._det_lock_fill0 is None:
-                        self._det_lock_fill0 = _sp
-                    if _sp > self._det_lock_fill_max:
-                        self._det_lock_fill_max = _sp
+                    if self._det_last_presence and np.isfinite(_sp) and _sp > 0.0:
+                        # A failed read's zero is absence, not the start of a rise.
+                        # Before a rise has been proved, a material downward re-seat
+                        # starts a new ordered episode. Do not retain its old peak:
+                        # a falling leftover is not an upward-growing meter.
+                        unproved = (self._det_lock_fill0 is None
+                            or self._det_lock_fill_max - self._det_lock_fill0
+                            < float(self._static_zone_rise_pp))
+                        if (self._det_lock_fill0 is None or (unproved
+                                and _sp < self._det_lock_fill0 - 2.5)):
+                            self._det_lock_fill0 = _sp
+                            self._det_lock_fill_max = _sp
+                        elif _sp > self._det_lock_fill_max:
+                            self._det_lock_fill_max = _sp
                     # A lifecycle-approved box becomes a side-priority hint only
                     # after its measured meter fill proves a real rise. A static
                     # one-frame proposal can therefore never steer the next scan;
@@ -11779,7 +13392,7 @@ class SimpleMeterReader:
                 self.last_fill = _sp
                 self.last_coarse = _co
                 # Independent detector-fill velocity (read()'s _vel_hist is décor-polluted).
-                if ts is not None:
+                if ts is not None and not _measurement_rejected:
                     self._det_fill_hist.append((float(ts), _sp))
                     self._det_coarse_fill_hist.append((float(ts), _co))
                     _cut = float(ts) - 0.5
@@ -11811,25 +13424,16 @@ class SimpleMeterReader:
                      "confidence": _occ_conf, "velocity_pct_s": _dvel,
                      "top_row": int(_tr) if _tr is not None else -1, "green": _grn,
                      "rejection_reason": "", "rise_state": self._rise_state(_sp),
-                     "stage": "detector_fill"}
+                     "stage": "detector_fill",
+                     "measurement_missing": not _white_read_valid}
                 if self._det_occ_censored_reject or self._det_pixel_ruler_reject:
                     _pixel_reject_reason = ("detector_pixel_geometry_missing"
-                        if self._det_pixel_ruler_reject else "detector_fill_top_occluded")
-                    # The normal row walk saw only a trajectory-truncated lower
-                    # remainder and the locator was negative/stale (or the bridge
-                    # deadline elapsed).  Preserve the held box for lifecycle
-                    # hysteresis, but publish no fill: a false low value would turn
-                    # an occlusion into a late shot.  Remove this frame's zero from
-                    # the velocity histories so the censor cannot create a false
-                    # falling edge either.
-                    if (ts is not None and self._det_fill_hist
-                            and abs(float(self._det_fill_hist[-1][0])
-                                    - float(ts)) <= 1.0e-9):
-                        self._det_fill_hist.pop()
-                    if (ts is not None and self._det_coarse_fill_hist
-                            and abs(float(self._det_coarse_fill_hist[-1][0])
-                                    - float(ts)) <= 1.0e-9):
-                        self._det_coarse_fill_hist.pop()
+                        if self._det_pixel_ruler_reject else
+                        "detector_fill_top_occluded" if self._det_occ_censored_reject
+                        else "detector_white_ribbon_missing")
+                    # Keep lifecycle/tracker state available for reacquisition,
+                    # but publish absence and no velocity/green target. No zero
+                    # or rejected edge was appended to either timing history.
                     self.last_fill = 0.0
                     self.last_coarse = 0.0
                     s = {"detected": False, "meter_present": False,
@@ -11858,7 +13462,8 @@ class SimpleMeterReader:
                     _detect_shot_epoch > 0 and self._shot_armed_hw
                     and self._physical_shot_epoch == _detect_shot_epoch)
                 _df_has_structure = (
-                    _grn is not None and _tr is not None and int(_tr) >= 0)
+                    not _measurement_rejected and _grn is not None
+                    and _tr is not None and int(_tr) >= 0)
                 _df_low_rise = (
                     np.isfinite(_co) and 0.0 < float(_co) <= self._ghost_press_low_pct)
                 _df_locked = not self._det_lifecycle or self._det_state == 'locked'
@@ -11895,7 +13500,8 @@ class SimpleMeterReader:
                             sample_ts=ts,
                             coarse_fill=_co,
                             locator_box=_df_nogreen_locator_box,
-                            white_ribbon=bool(_tr is not None and int(_tr) >= 0),
+                            white_ribbon=bool(not _measurement_rejected
+                                              and _tr is not None and int(_tr) >= 0),
                             locator_fresh=True)
                     else:
                         self._reset_detfill_nogreen_evidence()
@@ -12097,6 +13703,7 @@ class SimpleMeterReader:
                     self._press_ghost_reads.clear()
                     _evict = True
             if _evict or _suppress_hold:
+                self._pw_ghost_static += 1
                 if _evict:
                     # LOG IDEMPOTENCE (see __init__): the eviction itself stays per-frame
                     # (it is what frees the single locker), but the ERROR line is emitted
@@ -12147,6 +13754,16 @@ class SimpleMeterReader:
                         self._det_active_box = None
                     except Exception:
                         pass
+                    # [ORION_READER_GHOST_FORGET_LOCATOR] Without this the proposer re-proposes
+                    # the very box just evicted -- on co-location alone -- and the reader
+                    # re-locks it next frame: the measured 2-11 evictions / +5..+12 locks per
+                    # press with drops flat. The quarantine zone already knows WHERE the ghost
+                    # is; the proposer must not.
+                    self._det_forget_locator_position(
+                        'ghost_press_evict',
+                        box=(_gbb[0], _gbb[1], _gbb[2], _gbb[3]), ts=ts)
+                    self._arm_press_fresh_zone(
+                        (_gbb[0], _gbb[1], _gbb[2], _gbb[3]), 'ghost_press_evict')
                 _bk_det = False; _bk_fill = 0.0
         # [ORION_READER_COLD_FIRST_READ_VETO] (see the __init__ knob block for the measured
         # live failure). Runs AFTER the ghost breaker on purpose: the breaker must see every
@@ -12175,6 +13792,7 @@ class SimpleMeterReader:
                 and int(getattr(self, "_det_lock_read_n", 0)) <= self._cold_first_read_n
                 and _bk_fill >= self._cold_first_read_pct):
             _vf = _bk_fill
+            self._pw_cold_first += 1
             _acq_logger.debug(
                 "COLD FIRST-READ VETOED: read#%d fill=%.1f%% >= %.1f%% (unproven cold-lock "
                 "read withheld; the engine could never anchor on it)",
@@ -12336,6 +13954,97 @@ class SimpleMeterReader:
                         self._press_ghost_full_nofind_n = 0
                         self._press_ghost_reads.clear()
                         self._ghost_press_flush_summary("real_onset_rise")
+        # [ORION_READER_FRESH_AFTER_GHOST] A ghost that was dropped at the press, evicted
+        # post-press or retired after full absence leaves its ZONE under a fresh-onset
+        # requirement for the rest of the press. Deliberately AFTER the plausibility block so
+        # the mid-rise escape (_press_rise_run, three consecutive plausible rising serves) is
+        # still fed and can stand the requirement down for an onset that never reads low --
+        # only the publication is withheld, and only for reads at/above the engine's own 40%
+        # first-sight bound, which it could not anchor on anyway.
+        if (self._fresh_after_ghost and self._ghost_press_break and _bk_det
+                and s.get("stage") == "detector_fill"
+                and self._press_fresh_zone is not None
+                and not self._press_low_seen
+                and self._shot_armed_hw and ts is not None
+                and self._hw_arm_ts is not None
+                and int(getattr(self, "_hw_arm_grace_epoch", 0) or 0)
+                == int(self._physical_shot_epoch or 0)
+                and (float(ts) - float(self._hw_arm_ts)) <= self._ghost_press_window_s
+                and _bk_fill >= self._stale_press_drop_pct):
+            _fbb = s.get("bbox") or [0, 0, 0, 0]
+            _fcx = float(_fbb[0]) + float(_fbb[2]) * 0.5
+            _fcy = float(_fbb[1]) + float(_fbb[3]) * 0.5
+            _fr = max(32.0, self._ghost_zone_radius_scale * max(8.0, float(_fbb[2])))
+            if (abs(_fcx - self._press_fresh_zone[0]) <= _fr
+                    and abs(_fcy - self._press_fresh_zone[1]) <= _fr * 2.0):
+                self._press_fresh_withheld += 1
+                self._pw_fresh_zone += 1
+                if not self._press_fresh_zone_logged:
+                    self._press_fresh_zone_logged = True
+                    _acq_logger.error(
+                        "RESEED REFUSED: epoch=%d fill=%.1f%% zone=(%d,%d) - a retired ghost "
+                        "held this zone; a lock here is withheld until this press sights its "
+                        "own meter low and rising",
+                        int(self._physical_shot_epoch or 0), _bk_fill,
+                        int(self._press_fresh_zone[0]), int(self._press_fresh_zone[1]))
+                else:
+                    _acq_logger.debug(
+                        "RESEED REFUSED (repeat): epoch=%d fill=%.1f%%",
+                        int(self._physical_shot_epoch or 0), _bk_fill)
+                s = {"detected": False, "meter_present": False, "fill": 0.0,
+                     "fill_coarse": 0.0, "bbox": [0, 0, 0, 0],
+                     "stage": "ghost_zone_unproven", "confidence": 0.0,
+                     "velocity_pct_s": 0.0,
+                     "rejection_reason": "ghost_zone_unproven", "rise_state": ""}
+                try:
+                    self.last_debug = {"stage": "ghost_zone_unproven",
+                                       "zone_fill": round(_bk_fill, 2)}
+                except Exception:
+                    pass
+                _bk_det = False; _bk_fill = 0.0
+        if self._press_low_seen and self._press_fresh_zone is not None:
+            self._press_fresh_zone = None        # this press proved its own onset
+            self._press_fresh_zone_logged = False
+        # [ORION_READER_STATIC_ZONE_QUARANTINE] Press-INDEPENDENT (the owner's court-line false
+        # locks happened with no press within 40s). A position that has produced
+        # _static_zone_strikes locks that never rose publishes nothing until a lock there
+        # proves a rise; the moment one does, the record is retired and the zone is normal
+        # again. A real meter pays at most the frame it takes to gain _static_zone_rise_pp.
+        if (self._static_zone_q and _bk_det and ts is not None
+                and s.get("stage") == "detector_fill"):
+            _zb = s.get("bbox") or [0, 0, 0, 0]
+            _zq = self._static_zone_quarantined(_zb, float(ts))
+            if _zq is not None:
+                _zf0 = getattr(self, "_det_lock_fill0", None)
+                _zrise = ((float(getattr(self, "_det_lock_fill_max", -1.0) or -1.0)
+                           - float(_zf0)) if _zf0 is not None else -1.0)
+                if _zrise >= self._static_zone_rise_pp:
+                    self._static_zone_release(_zq, 'lock_proved_rise')
+                else:
+                    self._static_zone_withheld += 1
+                    self._pw_static_zone += 1
+                    _acq_logger.debug(
+                        "STATIC ZONE WITHHELD: zone=(%d,%d) strikes=%d fill=%.1f%% rise=%.1fpp",
+                        int(_zq['cx']), int(_zq['cy']), int(_zq['n']), _bk_fill, _zrise)
+                    s = {"detected": False, "meter_present": False, "fill": 0.0,
+                         "fill_coarse": 0.0, "bbox": [0, 0, 0, 0],
+                         "stage": "static_zone_quarantined", "confidence": 0.0,
+                         "velocity_pct_s": 0.0,
+                         "rejection_reason": "static_zone_quarantined", "rise_state": ""}
+                    try:
+                        self.last_debug = {"stage": "static_zone_quarantined",
+                                           "zone_fill": round(_bk_fill, 2)}
+                    except Exception:
+                        pass
+                    _bk_det = False; _bk_fill = 0.0
+        # [ORION_READER_BOX_LATCH] Everything above has had its say: what survives here is a
+        # detector-fill read this press OWNS (its own onset was sighted). Latch the geometry.
+        if (self._box_latch and _bk_det and self._press_low_seen
+                and s.get("stage") == "detector_fill"
+                and self._shot_armed_hw
+                and int(self._physical_shot_epoch or 0) != 0
+                and self._det_state == 'locked'):
+            self._arm_box_latch(s.get("bbox"), ts)
         if self._meter_color == "White":
             # MEASURE THE CAP DIRECTLY, do not trust `s["green"]`.
             #
@@ -12570,6 +14279,30 @@ class SimpleMeterReader:
                     # kept (the gradual two-sided gate heals them in place -- see _read_fill).
                     self._low_cand_hist = []
                     self._high_cand_hist = []
+        if s.get("measurement_missing", False):
+            # Run zero-read/ghost retirement bookkeeping first. Suppressing at
+            # the detector-fill construction would starve the ghost's consecutive
+            # zero counter and leave a dead candidate monopolizing acquisition.
+            s = {"detected": False, "meter_present": False, "fill": 0.0,
+                 "fill_coarse": 0.0, "bbox": [0, 0, 0, 0], "confidence": 0.0,
+                 "velocity_pct_s": 0.0, "top_row": -1, "green": None,
+                 "stage": "detector_white_ribbon_missing",
+                 "rejection_reason": "detector_white_ribbon_missing",
+                 "rise_state": ""}
+        # [ORION_PROOF_DETECTOR_BOX 2026-09-19] Stamp the PRE-transform rectangle on EVERY
+        # published frame, not only when BOX-TIGHT reshapes one. The orchestrator forwards it
+        # to native as `det_bbox`, where the ownership proof's shape gate judges detection
+        # geometry on it instead of on the overlay hug (the hug reaches up to
+        # ORION_READER_BOX_TIGHT_SIDE/TOP/BOT_REACH = 18 px past each edge and is re-derived
+        # from this frame's colour pixels, so a still 26x110 meter draws 26..44 px wide).
+        # Unconditional so the field can never be one frame stale: with the flag off it simply
+        # equals the published bbox, and the native side then sees no change at all.
+        if not isinstance(self.last_debug, dict):
+            self.last_debug = {}
+        _pre_tight_bbox = s.get("bbox")
+        self.last_debug["det_box"] = (
+            [int(v) for v in _pre_tight_bbox] if _pre_tight_bbox and len(_pre_tight_bbox) >= 4
+            else [0, 0, 0, 0])
         if self._box_tight:
             # BOX-TIGHT: re-shape ONLY the outgoing rectangle (after the breaker, so a
             # suppressed frame's zero box stays zero). fill/velocity/green/top_row and every
@@ -12605,6 +14338,13 @@ class SimpleMeterReader:
         detected = bool(s["detected"])
         fill = float(s.get("fill", 0.0) or 0.0)
         vel = float(s.get("velocity_pct_s", 0.0) or 0.0)
+        # [ORION_READER_IDLE_PUBLISH_GATE 2026-09-15] see _idle_publish_ok. The ONLY thing it
+        # changes is what leaves this adapter; every piece of reader/locator state above it has
+        # already been updated, so the next press still inherits the full memory.
+        bbox_out = tuple(int(v) for v in s.get("bbox", (0, 0, 0, 0)))
+        if self._idle_pub_gate and not self._idle_publish_ok(detected, bbox_out, fill, ts):
+            detected = False
+            bbox_out = (0, 0, 0, 0)
         green = s.get("green")            # (start,end,center,width,conf,px) or None
         # Green release target (the make-window centre) when present; else the tip (100%).
         g_start = g_end = g_center = -1.0
@@ -12635,7 +14375,7 @@ class SimpleMeterReader:
             detected=detected,
             style=style,
             color_name=color,
-            bbox=tuple(int(v) for v in s.get("bbox", (0, 0, 0, 0))),
+            bbox=bbox_out,
             fill_pct=fill,
             confidence=float(s.get("confidence", 0.0) or 0.0),
             consecutive_frames=int(self._consec),

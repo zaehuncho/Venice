@@ -6,12 +6,16 @@ consumed by the dependency-free ``tip_registration_infer.RegistrationPredictor``
 """
 from __future__ import annotations
 
+import argparse
+import glob
 import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +23,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "models" / "tip_registration.json"
+DEFAULT_CSV_GLOB = str(ROOT / "logs" / "diagnostics" / "detframes*.csv")
 
 SCHEMA = "orion.tip_registration.v2"
 MODEL_ID = "tip-registration-global"
@@ -29,8 +34,9 @@ UNCERTAINTY = {
     "maximum_ms": 250.0,
     "basis": "conservative structural floor from leave-one-session-out horizon error",
 }
-NOTE = "learn_template on full corpus; see tools/timing/tip_registration_eval.py for LOSO accuracy"
+NOTE = "learn_template on selected corpus; see tools/timing/tip_registration_eval.py for LOSO accuracy"
 _VERSION_FIELDS = ("u_grid", "g_vals", "u_tip", "priors", "q33", "q66", "uncertainty")
+_RECORDING_TIMESTAMP_RE = re.compile(r"(?<!\d)(20\d{6})(?:_(\d{6}))?(?!\d)")
 
 
 def _load_training_module():
@@ -44,6 +50,113 @@ def _load_training_module():
             sys.path.insert(0, path)
     import tip_registration_eval as training
     return training
+
+
+def parse_since(value: str) -> datetime:
+    """Parse an ISO-8601 corpus cutoff and normalize it to UTC."""
+
+    candidate = value.strip()
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --since value {value!r}; use YYYY-MM-DD or an ISO-8601 timestamp"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recording_timestamp(path: Path) -> datetime:
+    """Use the capture timestamp in the filename, falling back to file mtime."""
+
+    match = _RECORDING_TIMESTAMP_RE.search(path.name)
+    if match:
+        date_text, time_text = match.groups()
+        stamp = date_text + (time_text or "000000")
+        return datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+
+
+def _resolve_pattern(pattern: str) -> str:
+    expanded = Path(os.path.expandvars(os.path.expanduser(pattern)))
+    if not expanded.is_absolute():
+        expanded = ROOT / expanded
+    return str(expanded)
+
+
+def resolve_csv_paths(
+    csv_globs: Sequence[str] | None = None,
+    since: datetime | None = None,
+) -> list[Path]:
+    """Resolve repeatable globs, de-duplicate them, and apply the recording cutoff."""
+
+    patterns = list(csv_globs) if csv_globs else [DEFAULT_CSV_GLOB]
+    by_key: dict[str, Path] = {}
+    for pattern in patterns:
+        for match in glob.glob(_resolve_pattern(pattern), recursive=True):
+            path = Path(match).resolve()
+            if path.is_file() and path.suffix.lower() == ".csv":
+                by_key.setdefault(os.path.normcase(str(path)), path)
+    paths = sorted(by_key.values(), key=lambda path: str(path).casefold())
+    if since is not None:
+        paths = [path for path in paths if _recording_timestamp(path) >= since]
+    return paths
+
+
+def _source_label(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def build_training_manifest(
+    csv_paths: Sequence[Path],
+    csv_globs: Sequence[str] | None,
+    since: datetime | None,
+) -> dict[str, Any]:
+    """Bind the model to the exact source files used for training."""
+
+    return {
+        "csv_globs": list(csv_globs) if csv_globs else ["logs/diagnostics/detframes*.csv"],
+        "since_utc": since.strftime("%Y-%m-%dT%H:%M:%SZ") if since else None,
+        "sources": [
+            {
+                "path": _source_label(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+            for path in csv_paths
+        ],
+    }
+
+
+def load_shots_by_session(training, csv_paths: Sequence[Path]):
+    """Load exactly the resolved corpus while preserving one session per source CSV."""
+
+    sessions = {}
+    dropped = 0
+    for path in csv_paths:
+        shots, _ = training.ff.load_csv_shots(str(path))
+        keep = [
+            shot for shot in shots
+            if training.shot_rise_dur(shot) <= training.MAX_REAL_RISE_MS
+        ]
+        dropped += len(shots) - len(keep)
+        if keep:
+            sessions[_source_label(path)] = keep
+    return sessions, dropped
 
 
 def _priors(pool: Sequence[dict], training) -> tuple[float, float, float]:
@@ -78,6 +191,7 @@ def assemble_payload(
     n_shots: int,
     n_sessions: int,
     built_utc: str,
+    training_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create, version, and validate one serializable v2 model document."""
 
@@ -99,6 +213,8 @@ def assemble_payload(
         "uncertainty": dict(UNCERTAINTY),
         "note": NOTE,
     }
+    if training_manifest is not None:
+        payload["training"] = training_manifest
     payload["model_version"] = model_content_version(payload)
     validate_payload(payload)
     return payload
@@ -160,6 +276,18 @@ def validate_payload(payload: dict[str, Any]) -> None:
             or not 0.0 <= calibration[1] <= 2.0 or not 25.0 <= calibration[2] <= 1000.0):
         raise ValueError("invalid tip-registration uncertainty calibration")
 
+    manifest = payload.get("training")
+    if manifest is not None:
+        sources = manifest.get("sources") if isinstance(manifest, dict) else None
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("tip-registration training manifest has no sources")
+        for source in sources:
+            if (not isinstance(source, dict)
+                    or not isinstance(source.get("path"), str)
+                    or int(source.get("size_bytes", 0)) <= 0
+                    or not re.fullmatch(r"[0-9A-F]{64}", str(source.get("sha256", "")))):
+                raise ValueError("invalid tip-registration training source")
+
 
 def write_validated_payload(payload: dict[str, Any], destination: Path = OUT) -> None:
     """Known-answer test a temporary file, then atomically replace the production model."""
@@ -184,9 +312,44 @@ def write_validated_payload(payload: dict[str, Any], destination: Path = OUT) ->
             temporary.unlink()
 
 
-def main() -> int:
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--csv-glob",
+        action="append",
+        dest="csv_globs",
+        metavar="PATTERN",
+        help=(
+            "training CSV glob, relative to the repository root unless absolute; "
+            "repeat to combine patterns"
+        ),
+    )
+    parser.add_argument(
+        "--since",
+        type=parse_since,
+        help=(
+            "include captures at or after this ISO-8601 time; dated filenames are authoritative "
+            "and undated files use mtime"
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=OUT,
+        help=f"model destination (default: {OUT})",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _argument_parser().parse_args(argv)
+    csv_paths = resolve_csv_paths(args.csv_globs, args.since)
+    if not csv_paths:
+        print("ERROR: corpus filters matched no CSV files.")
+        return 1
+
     training = _load_training_module()
-    sessions, dropped = training.load_shots_by_session()
+    sessions, dropped = load_shots_by_session(training, csv_paths)
     all_shots = [shot for session in sessions.values() for shot in session]
     if len(all_shots) < 8:
         print(f"ERROR: only {len(all_shots)} usable shots in the corpus -- need >= 8 to learn a template.")
@@ -219,9 +382,11 @@ def main() -> int:
         n_shots=len(all_shots),
         n_sessions=len(sessions),
         built_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        training_manifest=build_training_manifest(csv_paths, args.csv_globs, args.since),
     )
-    write_validated_payload(payload)
-    print(f"wrote {OUT} ({payload['model_version']})")
+    destination = args.output if args.output.is_absolute() else ROOT / args.output
+    write_validated_payload(payload, destination)
+    print(f"wrote {destination} ({payload['model_version']})")
     print(
         f"  u_tip={u_tip:.3f}  priors(T,A,fmin): "
         + "  ".join(f"{key}={tuple(round(x, 1) for x in value)}" for key, value in priors.items())

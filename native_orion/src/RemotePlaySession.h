@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AppConfig.h"
+#include "AsyncProcessRetirer.h"
 #include "FrameDecoder.h"
 #include "OrionExports.h"
 #include "OrionTypes.h"
@@ -45,6 +46,17 @@ public:
 
     void start();
     void stop();
+    void waitForStopped(); // application exit / explicitly synchronous internal recovery only
+    [[nodiscard]] bool stopping() const noexcept { return !retiringSidecar_.isNull(); }
+    // [ORION_CONNECT_LATENCY 2026-09-19] Start the connect stage clock at the USER's
+    // click, not at start(). Everything before start() -- settings save, virtual-pad
+    // creation, bandwidth preset, window containment -- was completely dark in the
+    // logs (the 09-19 forensics could measure stages a1..a4 only by differencing
+    // unrelated lines, and "click -> handler entry" not at all). One call from
+    // OrionAppController::connectRemotePlay() makes every later stamp relative to the
+    // press. Safe to call more than once; a call with no following start() just
+    // leaves a stale timer that the next start() re-reads or ignores.
+    void beginConnectStopwatch();
     // Live capture-card preview BEFORE Connect: open the HDMI card + stream preview frames to the
     // QML panel WITHOUT launching Chiaki, the input hook, or the virtual pad. Only meaningful for
     // the capture-card source; a no-op otherwise or when a session is already up. start() then hands
@@ -68,7 +80,22 @@ public:
     // Wake the meter reader on the first physical Square/vertical-stick edge,
     // before the automation hold-to-own debounce completes.  This carries no
     // release authority; beginShot's tokenized pose_arm remains authoritative.
-    void armMeterGate(const QString& source, quint64 physicalShotEpoch);
+    // [ORION_SHOT_GATE_TYPE 2026-09-15] `shotType` is the engine classifier's own label for
+    // this press ("Standstill" / "Left Fade" / ... , empty when the edge carried none) and
+    // narrows the sidecar's meter-onset expectation window from the union to one type;
+    // `rhythm` says whether this configuration releases with the Rhythm flick offset. Both
+    // are additive: an empty type keeps the sidecar on the union window, exactly as before.
+    // A re-send with the SAME epoch and source="type_upgrade" refreshes the type mid-press
+    // (the blind 200 ms grace can re-type a Standstill into a fade) WITHOUT moving the press.
+    void armMeterGate(const QString& source, quint64 physicalShotEpoch,
+                      const QString& shotType = QString(), bool rhythm = false);
+    // [ORION_SHOT_GATE_RELEASE 2026-09-15] Close the press window the arm opened. `releaseMs`
+    // is EPOCH ms (the sidecar's own fill-sample clock), matching sendReleaseMarker's wall_ms
+    // contract. Sent on EVERY release path (vision, blind NO METER, METER BACKSTOP).
+    void sendShotGateRelease(quint64 physicalShotEpoch, double releaseWallMsEpoch);
+    // Close the press window for a press that ended WITHOUT a bot release: the player let go
+    // (tap / pump fake) or the engine aborted. `reason` is one snake_case token.
+    void sendShotGateDisarm(quint64 physicalShotEpoch, const QString& reason);
     // Recover only the Chiaki input process/pipe while preserving a healthy
     // capture-card + detector sidecar.
     bool recoverInputLink();
@@ -112,6 +139,9 @@ public:
     void observePacket(const QString& srcIp, const QString& dstIp, int srcPort, int dstPort, int size, double ts);
 
     [[nodiscard]] RemotePlayState state() const noexcept { return state_; }
+    // Input-only recovery is an authority gate inside an otherwise-live stream
+    // generation. It must not masquerade as a cold Connecting transition.
+    [[nodiscard]] bool inputRecoveryPending() const noexcept { return inputRecoveryPending_; }
     [[nodiscard]] QString statusText() const noexcept { return statusText_; }
     [[nodiscard]] TelemetrySnapshot telemetry() const noexcept { return telemetry_; }
     [[nodiscard]] int sidecarFps() const noexcept { return sidecarFps_; }
@@ -189,6 +219,7 @@ signals:
     // started. Consumers may use this edge to reset process-local provenance
     // namespaces; an attempted/failed launch never emits it.
     void sidecarProcessGenerationStarted();
+    void sidecarStopFinished();
     void sidecarDetectionReady(orion::DetectionResult result);
     // Direct receipt for the neutral controller-route command. This closes only the local
     // native-to-sidecar command handshake; latency telemetry must still echo the same generation
@@ -217,6 +248,72 @@ signals:
     // the MeterConfigPanel state badge. calibrating = a user calibrate_meter window is open.
     void meterCalibrationStatusReady(int shotsDone, int shotsNeeded, QString state,
                                      QString learnedDate, bool calibrating);
+    // Reader detector health from the sidecar ({"event":"detector_health",...}, ~every 2 s
+    // while a reader exists): provider ("cv-contour" or an ONNX provider name), infer_ms,
+    // state (idle|pending|locked), calls/found/locks/drops/hot_submit/reseat_x and the
+    // cv_* gate counters when the pure-CV proposer is active. Feeds ONLY the Meter
+    // Detection card's status line (detectorHealthLine / detectorProvider) — never the
+    // engine or any timing path.
+    void detectorHealthReady(QJsonObject health);
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14] One graded shot from the GAME'S OWN feedback
+    // panel ({"event":"banner_verdict",...} from banner_verdict_live.py). Exactly one signal
+    // per banner APPEARANCE, ~0.5-1.5 s after the release; a banner that stays up does not
+    // re-fire. PRESENTATION ONLY - the owner's live tuning tally, never an engine input.
+    //   timing       one of the grader's template words, uppercase, never empty and never
+    //                "UNKNOWN": EXCELLENT | LATE | EARLY (the library holds exactly these
+    //                three timing words today; treat any other word as "not green" rather
+    //                than assuming a closed set).
+    //   timingColor  "green" | "red" | "yellow" | "white" — the panel's own cell colour.
+    //                GREEN (i.e. a made-by-timing shot) is the WORD, not the colour: the
+    //                grader's green words are EXCELLENT and PERFECT.
+    //   coverage     WIDE OPEN | OPEN | SEMI-OPEN | BOTHERED | LIGHT CONTEST | SOLID CONTEST
+    //                | HEAVY CONTEST | SMOTHERED, or EMPTY when the panel showed no coverage
+    //                cell (a 2-cell TIMING|DISTANCE panel).
+    //   ncc          template match score for the timing word, always >= 0.90 by construction.
+    //   frameEpochMs wall-clock ms of the frame the verdict was read from.
+    //   seq          1-based verdict counter for this session (gap-free; use it to de-dupe).
+    //   attributed   1 when the sidecar bound this panel to a BOT release, 0 otherwise (a replay
+    //                screen, or a shot the owner took by hand). [ORION_BANNER_LEAD_TRIM
+    //                2026-09-15] Only an attributed verdict may move the Shot Lead trim; an
+    //                older sidecar that omits the field reads back as 0, which is fail-closed.
+    //   releaseSeq   the SHOT-GATE EPOCH of that release -- the physical shot epoch this engine
+    //                sent on shot_gate_release, which is the id the reader's release feed is
+    //                keyed on. NOT ShotContext::releaseSeq, and -1 when unattributed.
+    //   releaseDelayMs  panel-appearance minus release, in ms (-1 when unattributed). Diagnostic.
+    //   hasCoverage  [ORION_BANNER_COVERAGE_ABSENT 2026-09-19] whether the panel HAD a coverage
+    //                cell at all -- LAYOUT, not content. The game's 2-cell TIMING | DISTANCE
+    //                panel has none (a drill, or any no-defender context), and it was 98 of the
+    //                281 graded releases across the 2026-09-18 sessions. `coverage` alone cannot
+    //                say which of two opposite things an empty word means:
+    //                  hasCoverage=true,  coverage="" -> the cell exists and was unreadable
+    //                  hasCoverage=false, coverage="" -> there is no cell and never will be
+    //                An older sidecar that omits the field reads back TRUE, which keeps the
+    //                2026-09-18 strict coverage gate byte-for-byte.
+    void bannerVerdict(QString timing, QString timingColor, QString coverage,
+                       double ncc, qint64 frameEpochMs, int seq,
+                       int attributed, qint64 releaseSeq, double releaseDelayMs,
+                       bool hasCoverage);
+    // [ORION_RELEASE_ORACLE_TRIM 2026-09-15 owner] The reader's post-release RETRACTION oracle,
+    // ~300-500 ms after each release -- the banner-free input to the same Shot Lead trim.
+    //   releaseSeq  the SHOT-GATE EPOCH (identical keying to bannerVerdict's), -1 when the
+    //               sidecar could not attribute the measurement.
+    //   gapPx       white-top -> green-bottom retraction gap in pixels. UNSIGNED: it is the
+    //               DISTANCE from the green window and says nothing about which side. <= 3 px
+    //               was EXCELLENT and >= 4 px a miss on 27/27 of the 09-15 framedump shots.
+    //               NaN when the reader could not measure it.
+    //   proxy       the reader's own word: "green" | "miss" | "unknown". Anything else, and
+    //               "unknown" itself, is dropped by the engine rather than guessed at.
+    void releaseOracle(qint64 releaseSeq, double gapPx, QString proxy);
+    // [ORION_SHOT_RANGE 2026-09-17 owner] THREE or MID for one press, read off the ball
+    // handler's nameplate "3" cell 40-120 ms after the Square edge (sidecar shot_range.py).
+    //   releaseSeq  the SHOT-GATE EPOCH, the same key the banner and the oracle are attributed
+    //               on -- NOT ShotContext::releaseSeq. -1 when the sidecar had no press.
+    //   range       "three" | "mid" | "unknown". Anything else, and "unknown" itself, leaves the
+    //               engine's reading where it was: the sidecar declining to answer must never
+    //               CLEAR a range it already delivered for this press.
+    //   conf        0..1, the agreement of the 2-3 sampled frames. Diagnostic: the engine keys
+    //               on the word, never on the number.
+    void shotRange(qint64 releaseSeq, QString range, double conf);
     void audioToggleBusyChanged(bool busy);
     // The detection sidecar exited. Emitted after the terminal stateChanged
     // notification; whileStreaming is the immutable process-generation verdict
@@ -227,6 +324,20 @@ signals:
     // controller's capturePreviewActive property so the QML panel shows the card feed while
     // the session is still Disconnected. Not emitted for the full streaming session.
     void previewActiveChanged(bool active);
+    // [ORION_INPUT_DEAD_UX 2026-08-30] Terminal input-session failure, classified. Emitted AFTER
+    // the terminal stateChanged(Error/…) and any warm-preview restore, exactly once per failed
+    // promotion / input-recovery attempt, so OrionAppController can drive the bounded auto-retry
+    // and the input-dead overlay from a settled state. failureClass carries
+    // orion::InputSessionFailureClass (int on the wire; see InputSessionRetryPolicy.h for the
+    // per-class retry safety argument). wakeObserved = a rest-mode console wake was in progress
+    // for this attempt (the retry planner then waits out the boot instead of fighting it).
+    // This signal classifies EXISTING failures only — it never adjudicates readiness and cannot
+    // move the session state.
+    void inputSessionFailure(int failureClass, bool wakeObserved);
+    // Synchronous edge emitted after the in-place recovery command is accepted by
+    // the existing sidecar. Consumers must revoke input/fire authority while
+    // retaining the current capture, detector, and learned-timing generation.
+    void inputRecoveryStarted();
     // FIX 2: the sidecar reported what this install can actually do ({"event":"capabilities"}).
     // `noMeterAvailable` is false when the pose/skele dependencies (ultralytics/torch) or the
     // three models/*.pt weights are not present — i.e. selecting "No Meter" would produce a bot
@@ -249,6 +360,8 @@ private:
 
     void startSidecar();
     void stopSidecar();
+    void scheduleSidecarStart(int delayMs);
+    void prepareSidecarCaptureInventory();
     // Connect fast-path: promote the already-running warm PREVIEW sidecar (capture card + detector
     // live) straight into a full streaming session by COMMANDING it to launch Chiaki/input over
     // stdin, instead of tearing it down and cold-rebuilding a new process. Only valid when the warm
@@ -329,11 +442,33 @@ private:
     int frameCounter_ = 0;
     QProcess* helperProcess_ = nullptr;
     QProcess* sidecarProcess_ = nullptr;
+    QPointer<AsyncProcessRetirer> retiringSidecar_;
+    bool captureInventoryPending_ = false;
+    bool captureInventoryPrepared_ = false;
+    bool captureInventoryStartRequested_ = false;
+    quint64 captureInventoryStartGeneration_ = 0;
+    bool sidecarStartAfterStop_ = false;
+    quint64 sidecarStartAfterStopGeneration_ = 0;
+    int sidecarStartAfterStopDelayMs_ = 0;
     // Off-GUI-thread preview JPEG decoder. Owns a dedicated worker thread with a 1-deep drop-oldest
     // mailbox; its decoded(QImage) signal is relayed to frameReady on the GUI thread so the render
     // thread never blocks on base64/JPEG decode. Child QObject: destroyed (and its thread joined) with
     // this session. See handleSidecarMessage's "frame" branch.
     FrameDecoder* frameDecoder_ = nullptr;
+    // [ORION_DISCONNECT_AUDIT 2026-09-19] F7: bumped by start() and stop() ONLY -- the
+    // two places where the user changes what this session is supposed to be doing. It
+    // exists so a deferred lifecycle timer can tell "the intent that armed me" from
+    // "a later intent that happens to leave the same state_". Deliberately separate
+    // from streamPromoteGeneration_/inputRecoveryGeneration_, which are also bumped by
+    // process-level events (QProcess::finished, startSidecar) and would therefore
+    // cancel a handoff that is legitimately waiting for exactly that process to die.
+    quint64 sessionIntentGeneration_ = 0;
+    // [ORION_CONNECT_LATENCY 2026-09-19] Connect stage clock. Started at the user's
+    // click (beginConnectStopwatch) and read at each stage boundary so the native
+    // half of the connect is measurable straight from orion_native.log instead of by
+    // differencing unrelated lines. Diagnostic only: nothing branches on it.
+    QElapsedTimer connectStopwatch_;
+    bool connectStopwatchArmed_ = false;
     QChronoTimer previewPresentationTimer_;
     QElapsedTimer previewPresentationClock_;
     PreviewPresentationBuffer previewPresentationBuffer_;
@@ -421,6 +556,11 @@ private:
     // because sidecarStartedHasInputAuthority() requires an explicit input_ready on `started`.
     bool streamPromotePending_ = false;
     bool streamPromoteAcked_ = false;
+    // >0 once the sidecar reported a rest-mode wake in progress: the original 20s deadline
+    // timer stands down and a second timer of this length (sidecar budget + headroom) fires
+    // instead. Reset with streamPromoteAcked_.
+    int streamPromoteDeadlineExtendMs_ = 0;
+    void fireStreamPromoteDeadline(quint64 generation, int deadlineMs);
     // True only while Connect is upgrading an already-live capture-card preview. A failed verdict
     // may restore that exact sidecar to preview ownership instead of tearing down/reopening Elgato.
     bool streamPromoteFromWarmPreview_ = false;
@@ -438,8 +578,9 @@ private:
     static constexpr int kStreamPromoteFallbackMs = 2500;
     static constexpr int kStreamPromoteDeadlineMs = 20000;
     // Input-only recovery has its own generation and native deadline. Without this, a blocked
-    // Python/Chiaki retry could leave Connecting indefinitely, and a late ready event could revive
-    // a session after timeout/disconnect.
+    // Python/Chiaki retry could leave route authority pending indefinitely, and a late ready event
+    // could revive a session after timeout/disconnect. The outer stream remains Running so the
+    // capture/detector/timing generation is retained; input authority is gated independently.
     bool inputRecoveryPending_ = false;
     bool rejectLateInputRecoveryReady_ = false;
     quint64 inputRecoveryGeneration_ = 0;
@@ -480,6 +621,10 @@ private:
     // names only for webcam-safe probing and strips every cached ID; a swapped
     // card at the same index therefore cannot inherit timing authority.
     VideoInputDeviceInventory cachedVideoDeviceInventory_;
+    // Memoized result of pythonExecutable() — the cv2-import probe spawns a python process with
+    // waitForFinished(8000) per candidate on the GUI thread, and it was recomputed on every
+    // sidecar (re)start. Resolve once. mutable so the const getter can populate it.
+    mutable QString cachedPythonExe_;
     QString rootDir_;
     int sidecarFps_ = 0;
     int requestedFps_ = 60;

@@ -40,8 +40,8 @@ Item {
             z: -1
             anchors.fill: parent
             anchors.topMargin: 3
-            radius: parent.radius
-            color: "#06090E"
+            radius: cardWrap.radius
+            color: Theme.shadowHalo
             opacity: 0.5
         }
 
@@ -69,7 +69,7 @@ Item {
                     text: "Stream setup"
                     color: Theme.textPrimary
                     font.family: Theme.fontUi
-                    font.pixelSize: 20
+                    font.pixelSize: Theme.fontHeading
                     font.weight: Font.DemiBold
                 }
                 Text {
@@ -77,7 +77,7 @@ Item {
                     text: "Set up your console connection once. You can change this later on the Dashboard."
                     color: Theme.textMuted
                     font.family: Theme.fontUi
-                    font.pixelSize: 12
+                    font.pixelSize: Theme.fontSmall
                     wrapMode: Text.WordWrap
                 }
             }
@@ -91,9 +91,10 @@ Item {
                 clip: true
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                 ScrollBar.vertical: ScrollBar {
+                    id: formScrollBar
                     policy: ScrollBar.AsNeeded
                     width: 6
-                    contentItem: Rectangle { radius: 3; color: parent.pressed ? Theme.scrollbarThumbActive : Theme.scrollbarThumb }
+                    contentItem: Rectangle { radius: 3; color: formScrollBar.pressed ? Theme.scrollbarThumbActive : Theme.scrollbarThumb }
                     background: Rectangle { color: "transparent" }
                 }
 

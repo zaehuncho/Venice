@@ -13,6 +13,18 @@ import pytest
 from simple_meter_reader import SimpleMeterReader
 
 
+# [ORION_READER_IDLE_PUBLISH_GATE 2026-09-15] The fixtures below feed a meter with NO press
+# armed and (mostly) a constant fill -- byte for byte the shape the reader's idle publication
+# gate now withholds from the engine and the overlay (see SimpleMeterReader._idle_publish_ok).
+# The gate is a PUBLICATION policy with its own suite (tests/test_idle_publish_gate.py); these
+# tests are about what the reader MEASURES, so the gate is switched off here and they keep
+# measuring it.
+@pytest.fixture(autouse=True)
+def _idle_publish_gate_off(monkeypatch):
+    monkeypatch.setenv("ORION_READER_IDLE_PUBLISH_GATE", "0")
+
+
+
 def _meter_frame(fill_frac=1.0):
     H, W = 1080, 1920
     f = np.full((H, W, 3), 40, np.uint8)
@@ -360,3 +372,79 @@ def test_sidecar_payload_contract_intact_over_simple_reader():
     assert payload["meter_present"] is False
     assert payload["raw_fed"] is False
     assert payload["shot"]["fill_pct"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+#  [ORION_SHOT_GATE_TYPE / _RELEASE 2026-09-15] native command -> reader -> locator
+# --------------------------------------------------------------------------- #
+
+def test_native_arm_type_reaches_the_locator_and_the_release_closes_the_press(monkeypatch):
+    """End to end on the REAL orchestrator + REAL SimpleMeterReader: the shot type the engine
+    put on shot_gate_arm ends up bounding the locator's meter-onset window, and the engine's
+    release marker closes that window instead of it timing out on ORION_ANCHOR_ARM_S."""
+    import player_anchor as pa
+
+    monkeypatch.setenv("ORION_PLAYER_ANCHOR", "1")
+    pa.reset_all(keep_identity=False)
+    orch = _build_orch(monkeypatch, "1")
+    reader = orch._meter_detector
+
+    assert orch.arm_shot_gate("square_edge", "31", "Left Fade", True) is True
+    reader.detect(_meter_frame(1.0), ts=100.0)          # the frame-clock republish
+    assert pa.ARM.armed and pa.ARM.epoch == 31
+    assert pa.ARM.shot_type == "Left Fade" and pa.ARM.rhythm is True
+    assert pa.onset_window_ms(pa.ARM.shot_type) == pytest.approx((575.0, 1075.0))
+
+    # the blind 200 ms grace re-types the press: same epoch, no new press timestamp
+    assert orch.arm_shot_gate("type_upgrade", "31", "Right Fade", False) is True
+    assert pa.ARM.shot_type == "Right Fade" and pa.ARM.press_ts == pytest.approx(100.0)
+
+    assert orch.release_shot_gate("31", 1757913600123.4) is True
+    assert not pa.ARM.armed
+    reader.detect(_meter_frame(1.0), ts=100.02)         # must NOT re-arm the answered press
+    assert not pa.ARM.armed
+    pa.reset_all(keep_identity=False)
+
+
+def test_native_arm_without_a_type_keeps_the_union_window(monkeypatch):
+    """BACKWARD COMPATIBILITY: an old native's two-argument arm still works end to end."""
+    import player_anchor as pa
+
+    monkeypatch.setenv("ORION_PLAYER_ANCHOR", "1")
+    pa.reset_all(keep_identity=False)
+    orch = _build_orch(monkeypatch, "1")
+    assert orch.arm_shot_gate("square_edge", "32") is True
+    orch._meter_detector.detect(_meter_frame(1.0), ts=200.0)
+    assert pa.ARM.armed and pa.ARM.shot_type == ""
+    assert pa.onset_window_ms(pa.ARM.shot_type) == pytest.approx((50.0, 1100.0))
+    pa.reset_all(keep_identity=False)
+
+
+def test_sidecar_stdin_contract_for_the_three_shot_gate_commands():
+    """The sidecar's stdin dispatch reads exactly these keys; pin the names so a rename on
+    either side of the boundary fails here rather than silently in production."""
+    import inspect
+    import remote_play_orchestrator as rpo
+
+    src = _sidecar_source()
+    for needle in ('elif cmd == "shot_gate_arm"', 'elif cmd == "shot_gate_release"',
+                   'elif cmd == "shot_gate_disarm"', 'msg.get("shot_type"',
+                   'msg.get("rhythm"', 'msg.get("release_ms"', 'msg.get("reason"'):
+        assert needle in src, needle
+
+    arm = inspect.signature(rpo.RemotePlayOrchestrator.arm_shot_gate).parameters
+    assert list(arm) == ["self", "source", "shot_epoch", "shot_type", "rhythm"]
+    # every new argument is optional: an old sidecar calling the two-argument form still works
+    assert arm["shot_type"].default == ""
+    assert arm["rhythm"].default is False
+    rel = inspect.signature(rpo.RemotePlayOrchestrator.release_shot_gate).parameters
+    assert list(rel) == ["self", "shot_epoch", "release_ms"]
+    dis = inspect.signature(rpo.RemotePlayOrchestrator.disarm_shot_gate).parameters
+    assert list(dis) == ["self", "shot_epoch", "reason"]
+
+
+def _sidecar_source():
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "native_orion", "backend", "autogreen_sidecar.py")
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()

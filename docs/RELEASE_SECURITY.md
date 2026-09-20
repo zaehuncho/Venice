@@ -137,7 +137,7 @@ timing bugs, and support substantially harder. Ship-time checklist:
    encryption + symbol stripping. Leave `OrionNative.exe` / Qt UI lightly
    processed so crash dumps stay triageable.
 3. **Pack the shipping executables** (VMProtect/Themida-class or an in-house
-   packer) with `tools/security/pack_orion_release.py` AFTER the strict package
+   packer) with `tools/security/pack_lethe_release.py` AFTER the strict package
    is green. The wrapper copies the strict package, runs the external packer,
    regenerates `release_manifest.json`, runs `tools/security_audit.py
    --package-only`, runs Owner/Staff startup-integrity checks, and proves

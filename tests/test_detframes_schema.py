@@ -88,3 +88,21 @@ def test_quality_diag_columns_present():
                  "roi_sad", "stale", "valid", "R_used", "is_iframe"):
         assert name in cols, f"{name} column missing from detframes schema"
     assert cols.index("q_frame") > cols.index("mtr_phase")
+
+
+def test_fill_ruler_provenance_columns_present_and_appended():
+    """A phase crossing is valid only within one estimator/source generation.
+
+    Keep those identities in the diagnostic record so a live batch can verify the
+    same contract the native engine enforced instead of inferring it from fill.
+    """
+    cols = _DETCSV_HEADER.split(",")
+    names = (
+        "coarse_fill_pct",
+        "fill_estimator_mode",
+        "fill_estimator_generation",
+        "frame_integrity_generation",
+    )
+    for name in names:
+        assert name in cols, f"{name} column missing from detframes schema"
+    assert cols.index("coarse_fill_pct") > cols.index("det_h")

@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import re
 import socket
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -154,6 +155,85 @@ def probe_console_state(host: str, timeout_s: float = 2.5) -> ConsoleProbe:
             sock.close()
         except OSError:
             pass
+
+
+@dataclass(frozen=True)
+class DiscoveredConsole:
+    host: str           # answering address
+    state: str          # "ready" | "standby"
+    port: int           # discovery port that answered
+
+
+def discover_consoles(broadcast: str, timeout_s: float = 1.2) -> List[DiscoveredConsole]:
+    """Broadcast SRCH on the given address and collect every answering console.
+
+    Exists for CONSOLE ADDRESS DRIFT: the PS5 sits on the PC's ICS network and its
+    DHCP lease moves (.100 -> .138 -> .126 within two days of live testing). Each time,
+    the configured ip stopped answering and the input session died before it became
+    ready ("the current Chiaki session ended before becoming ready"), while the console
+    was answering discovery one address over. Never raises; an empty list covers every
+    failure (no socket, no broadcast permission, no answer). One entry per address.
+    """
+    broadcast = str(broadcast or "").strip()
+    if not broadcast:
+        return []
+    ports = (
+        (DISCOVERY_PORT_PS5, PROTOCOL_VERSION_PS5),
+        (DISCOVERY_PORT_PS4, PROTOCOL_VERSION_PS4),
+    )
+    found: dict = {}
+    deadline = time.monotonic() + max(0.3, float(timeout_s))
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return []
+    try:
+        sock.setblocking(False)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass
+        for port, version in ports:
+            payload = (
+                f"{_SRCH_HEAD}device-discovery-protocol-version:{version}\n"
+            ).encode("utf-8") + b"\x00"
+            try:
+                sock.sendto(payload, (broadcast, port))
+            except OSError:
+                continue
+        while time.monotonic() < deadline:
+            try:
+                data, addr = sock.recvfrom(2048)
+            except (BlockingIOError, InterruptedError, ConnectionResetError):
+                time.sleep(0.02)
+                continue
+            except OSError:
+                break
+            state = _parse_probe_response(data)
+            if state and addr[0] not in found:
+                found[addr[0]] = DiscoveredConsole(str(addr[0]), state, int(addr[1]))
+        return list(found.values())
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def subnet_broadcast(host: str) -> str:
+    """The /24 directed broadcast for an IPv4 literal ('192.168.137.126' -> '192.168.137.255').
+
+    ICS hands out a /24 (255.255.255.0) and that is the only topology this rig runs on;
+    a non-IPv4 input yields '' so the caller skips discovery rather than guessing."""
+    text = str(host or "").strip()
+    try:
+        socket.inet_pton(socket.AF_INET, text)
+    except (OSError, ValueError):
+        return ""
+    parts = text.split(".")
+    if len(parts) != 4:
+        return ""
+    return ".".join(parts[:3] + ["255"])
 
 
 def _decode_qsettings_bytearray(value) -> bytes:
@@ -340,12 +420,31 @@ def session_port_open(host: str, timeout_s: float = 0.6) -> bool:
             pass
 
 
-def wait_for_session_port(host: str, budget_s: float) -> bool:
-    """Poll the session port until it opens or the budget runs out."""
+def wait_for_session_port(host: str, budget_s: float,
+                          poll_s: Optional[float] = None,
+                          connect_timeout_s: Optional[float] = None) -> bool:
+    """Poll the session port until it opens or the budget runs out.
+
+    Granularity matters here: the old 0.7s sleep + 0.6s connect timeout meant a console
+    whose port had just opened was noticed up to ~1.3s late, on EVERY wake. A refused
+    connect on the LAN returns instantly and a dropped SYN (stack still booting) only
+    costs the connect timeout, so 0.25s/0.4s keeps the cost of a miss small while
+    noticing readiness ~4x sooner. Both are env-tunable (ORION_PS5_WAKE_POLL_S /
+    ORION_PS5_WAKE_CONNECT_TIMEOUT_S) for slow networks."""
+    def _env_f(name: str, default: float, lo: float, hi: float) -> float:
+        try:
+            v = float(os.environ.get(name, "") or default)
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+    poll = _env_f("ORION_PS5_WAKE_POLL_S", 0.25 if poll_s is None else float(poll_s), 0.05, 2.0)
+    cto = _env_f("ORION_PS5_WAKE_CONNECT_TIMEOUT_S",
+                 0.4 if connect_timeout_s is None else float(connect_timeout_s), 0.1, 2.0)
     deadline = time.monotonic() + max(0.0, float(budget_s))
     while True:
-        if session_port_open(host, timeout_s=0.6):
+        if session_port_open(host, timeout_s=cto):
             return True
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
             return False
-        time.sleep(0.7)
+        time.sleep(min(poll, remaining))

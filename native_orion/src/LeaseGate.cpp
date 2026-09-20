@@ -162,7 +162,15 @@ QByteArray LeaseGate::leaseVerifyPublicKey()
     // with lease-signing first (see docs/SERVER_DEPLOY_CHECKLIST.md), else valid leases would be
     // rejected. To rotate: regenerate the keypair, set the private half in SSM
     // /orion/lease_signing_key, and replace the base64 below.
-    return QByteArray::fromBase64("nKx5ximQYHX1/eMB9m7tzcPtO/gtSBIaCDd4BiT4itw=");
+    // ROTATED 2026-09-19: the 07-17 private half was never in SSM and could not be found
+    // anywhere on this machine or in git history, so the server could not sign a single lease
+    // (`[LEASE] signing unavailable: No module named 'cryptography'` + ParameterNotFound), and a
+    // production client stopped firing exactly 900 s after unlock. A fresh keypair was generated
+    // with tools/signing/new_lease_keypair.py; the private half lives only in SSM
+    // /orion/lease_signing_key. Safe to rotate because no production build had shipped yet.
+    // To rotate again: regenerate, put the PEM in that SSM parameter, replace the base64 below,
+    // and REBUILD (docs/SIGNING_FIX_2026-09-19.md).
+    return QByteArray::fromBase64("KKBzDoL7+FrwNmBg86z+Vk84oEdRQFLqfD1ahFb/XhY=");
 }
 
 } // namespace orion

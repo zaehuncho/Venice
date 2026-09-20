@@ -143,13 +143,15 @@ ESSENTIAL_FILES = {
                             # without it). Listed here so packaging fails loud, not silent.
 }
 
-# Files that are staged into the package (so internal/staff builds still work) but
-# MUST be excluded from a customer-facing release_manifest.json. Any name added here
-# MUST also appear in the Excludes= list of installer/orion.iss:109 — the two sets
-# are the same source of truth: what the customer installer strips. If the manifest
-# still listed these, SecurityManager::verifyReleaseIntegrity() would fail closed on
-# a customer machine (manifest entry with no on-disk file) and lock the app.
+# Internal-only executables must be absent from customer packages and manifests.
+# The installer exclusion remains defence in depth for older package archives.
 CUSTOMER_EXCLUDED_FILES = {"OrionOwner.exe", "OrionStaff.exe"}
+
+
+def strip_customer_excluded_files(package_dir: Path) -> None:
+    """Keep privileged tools out of the customer ZIP, not merely its manifest."""
+    for name in CUSTOMER_EXCLUDED_FILES:
+        (package_dir / name).unlink(missing_ok=True)
 
 # Crown-jewel and model policy is canonical in release_filter_policy.py and is
 # shared with the independent security audit. Never redeclare it here.
@@ -523,9 +525,13 @@ def copy_runtime(sidecar_dist: Path | None = None,
 
     copy_chiaki_runtime(package_dir)
 
-    backend_dst = package_dir / "native_orion" / "backend"
+    # Production always launches the source-bound OrionSidecar.exe. Do not ship
+    # its 160KB Python entry point as dead, readable source. The standalone PS5
+    # setup helper remains loose and lands at the exact app-relative path used by
+    # RemotePlaySession::helperPath().
+    backend_dst = package_dir / "backend"
     backend_dst.mkdir(parents=True, exist_ok=True)
-    for script in ("autogreen_sidecar.py", "ps5_remoteplay_helper.py"):
+    for script in ("ps5_remoteplay_helper.py",):
         src = ROOT / "native_orion" / "backend" / script
         if src.exists():
             shutil.copy2(src, backend_dst / script)
@@ -731,6 +737,7 @@ def write_release_manifest(package_dir: Path, version: str | None = None,
 
     manifest = {
         "schema": "orion.release_manifest.v1",
+        "audience": "customer" if customer else "internal",
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "file_count": len(files),
         "files": files,
@@ -1045,6 +1052,8 @@ def main() -> int:
     staging_dir = create_package_staging_dir(PACKAGE_DIR)
     try:
         copy_runtime(selected_sidecar_dist, package_dir=staging_dir)
+        if args.customer:
+            strip_customer_excluded_files(staging_dir)
         write_release_manifest(
             staging_dir,
             version,

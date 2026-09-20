@@ -331,7 +331,17 @@ def audit_package_structure(package_dir: Path) -> list[Finding]:
         ]
 
     present = {path.relative_to(package_dir).as_posix() for path in package_dir.rglob("*") if path.is_file()}
-    for essential in sorted(ESSENTIAL_PACKAGE_FILES):
+    audience = "internal"
+    manifest_path = package_dir / "release_manifest.json"
+    if manifest_path.is_file():
+        try:
+            audience = json.loads(manifest_path.read_text(encoding="utf-8")).get("audience", "internal")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass  # The independent manifest audit reports malformed content.
+    essentials = ESSENTIAL_PACKAGE_FILES
+    if audience == "customer":
+        essentials = essentials - {"OrionOwner.exe", "OrionStaff.exe"}
+    for essential in sorted(essentials):
         if essential not in present:
             findings.append(
                 Finding(

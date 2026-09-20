@@ -451,6 +451,8 @@ class RemotePlayCV:
                     consecutive_frames=result.consecutive_frames,
                     raw_fill_pct=result.raw_fill_pct,
                     smoothed_fill_pct=result.smoothed_fill_pct,
+                    fill_estimator_mode=result.fill_estimator_mode,
+                    fill_estimator_generation=result.fill_estimator_generation,
                     velocity=result.velocity,
                     fill_velocity_pct_s=result.fill_velocity_pct_s,
                     green_window_start_pct=result.green_window_start_pct,

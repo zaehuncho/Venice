@@ -1,0 +1,52 @@
+{
+  "_meta": {
+    "channel": "#downloads",
+    "channel_id": "1549499799861067876",
+    "replaces_message_id": null,
+    "replaces_note": "#downloads is empty — nothing to replace. This is the first post.",
+    "post_as": "Triton",
+    "method": "POST /channels/1549499799861067876/messages",
+    "blocked_by": "Launch blocker B5: no signed installer is published yet. Replace INSTALLER_URL and INSTALLER_SHA256 with the real values, and delete this note, before posting. Do not post a link to an unsigned build."
+  },
+  "message": {
+    "embeds": [
+      {
+        "title": "Download Venice",
+        "color": 2450411,
+        "description": "The installer below is the only official download. Venice is never distributed through DMs, file-sharing links or another server.",
+        "fields": [
+          {
+            "name": "1 • Installer",
+            "value": "[Download Venice Setup](INSTALLER_URL)\nSHA-256: `INSTALLER_SHA256`\nWindows will show the publisher on the signed installer — if it does not, stop and open a ticket.",
+            "inline": false
+          },
+          {
+            "name": "2 • Unlock it",
+            "value": "Launch Venice, then open [zaeorion.com/connect](https://zaeorion.com/connect), sign in with the **same Discord account** you use here, and enter the one-time code. No licence key is involved, and your Discord ID alone is not a code.",
+            "inline": false
+          },
+          {
+            "name": "3 • First run",
+            "value": "Connect your 60 Hz capture card or PS5 Remote Play, confirm the game frame is visible, then follow <#1549499802738499705>.",
+            "inline": false
+          },
+          {
+            "name": "Moving PCs",
+            "value": "Access is locked to one PC. `/hwid_reset` gives you 3 free moves; after that each reset takes one day off your subscription.",
+            "inline": false
+          }
+        ],
+        "footer": { "text": "Venice • Official" }
+      }
+    ],
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          { "type": 2, "style": 5, "label": "Download installer", "url": "INSTALLER_URL" },
+          { "type": 2, "style": 5, "label": "Connect your PC", "url": "https://zaeorion.com/connect" }
+        ]
+      }
+    ]
+  }
+}

@@ -67,6 +67,42 @@ def _mk_reader(monkeypatch, lifecycle="1", **env):
 STEP = 1.0 / 60.0
 
 
+def test_released_epoch_cannot_acquire_court_candidate(monkeypatch):
+    r = _mk_reader(monkeypatch)
+    r._physical_shot_epoch = 41
+    r._shot_armed_hw = True  # the diagnostic tail outlives the physical release
+    assert r.notify_physical_shot_release(41)
+    monkeypatch.setattr(r, '_det_result_this_arm', lambda _: True)
+    for i in range(5):
+        assert not r._det_on_found((600, 300, 24, 107), 0.99, 10.0 + i * STEP, True)
+    assert r._det_state != 'locked'
+    r.notify_physical_shot_start(42)
+    assert r._det_on_found((600, 300, 24, 107), 0.99, 11.0, True)
+
+
+def test_release_keeps_same_meter_but_never_reseeds_to_court(monkeypatch):
+    r = _mk_reader(monkeypatch)
+    r._physical_shot_epoch = 41
+    r._det_state = 'locked'
+    r._det_last_box = (600, 300, 24, 107)
+    assert r.notify_physical_shot_release(41)
+    # Continued measurement of this shot remains available to the landing oracle.
+    assert r._det_on_found((605, 300, 24, 107), 0.99, 10.0, True)
+    for i in range(8):
+        assert not r._det_on_found((100, 300, 24, 107), 0.99, 10.1 + i * STEP, True)
+    assert r._det_diag['reseed'] == 0
+    assert r._det_last_box == (600, 300, 24, 107)
+
+
+def test_old_release_never_closes_new_press_acquisition(monkeypatch):
+    r = _mk_reader(monkeypatch)
+    r._physical_shot_epoch = 42
+    r._shot_armed_hw = True
+    assert not r.notify_physical_shot_release(41)
+    monkeypatch.setattr(r, '_det_result_this_arm', lambda _: True)
+    assert r._det_on_found((600, 300, 24, 107), 0.99, 10.0, True)
+
+
 def _feed(r, t, box=None, conf=0.9, fill=0.5, x=None, armed_hw=False):
     """Script one detector result at t and run one detect()."""
     fd = r._meter_detector
@@ -155,8 +191,9 @@ def test_teleport_outlier_does_not_move_the_lock(monkeypatch):
     r = _mk_reader(monkeypatch)
     t = _lock(r)
     res = _feed(r, t + STEP, box=(100, 300, 24, 107), conf=0.95)
-    assert res.detected
-    assert abs((res.bbox[0] + res.bbox[2] * 0.5) - 612) < 40   # still near x=600
+    assert not res.detected  # pixels exist only at the rejected teleport, not the held box
+    box = r._det_active_box
+    assert abs((box[0] + box[2] * 0.5) - 612) < 40   # lock remains near x=600
     assert r._det_strike_n == 1
 
 
@@ -682,11 +719,13 @@ def test_pan_with_stale_detector_keeps_genuine_fill(monkeypatch):
 
 def test_pan_dropout_reproduces_with_continuity_off(monkeypatch):
     """The same pan with ORION_METER_TRACK_CONTINUITY=0 must reproduce the measured
-    defect (zero-fill frames while detected) -- proving the ON-arm test has teeth."""
+    defect (missing white-edge frames) -- proving the ON-arm test has teeth."""
     out = _pan_run(monkeypatch, cont="0")
-    late = [(i, xt, res) for i, xt, res in out if i >= 24 and res.detected]
-    zeros = [i for i, _, res in late if res.fill_pct <= 0.5]
-    assert len(zeros) >= 3
+    late = [(i, xt, res) for i, xt, res in out if i >= 24]
+    missing = [i for i, _, res in late
+               if not res.detected and res.rejection_reason == "detector_white_ribbon_missing"]
+    assert len(missing) >= 3
+    assert all(not res.detected or res.fill_pct > 0.5 for _, _, res in late)
 
 
 def test_no_fabricated_fill_when_ribbon_vanishes(monkeypatch):

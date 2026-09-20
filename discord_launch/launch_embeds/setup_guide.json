@@ -1,0 +1,68 @@
+{
+  "_meta": {
+    "channel": "#setup-guide",
+    "channel_id": "1549499802738499705",
+    "replaces_message_id": "1549501209650536460",
+    "replaces_note": "Triton embed 'Venice Setup Guide' posted 2026-09-15; verified 2026-09-19 as still present and still saying 'activate with the key delivered by DM', which no longer matches the paired-account flow.",
+    "post_as": "Triton (only the author bot can PATCH it; Triton still holds Send here after the read-only pass, while Customer and Trial no longer do)",
+    "method": "PATCH /channels/1549499802738499705/messages/1549501209650536460",
+    "merged_from": "faq.json — the support and troubleshooting answers, the HWID reset facts and the 'open a ticket, never post a code' rule were folded in on 2026-09-19 because the owner keeps a lean server and #faq, #support-info and #hwid-reset do not exist. The long-form answers stay in the /setup and /faq commands."
+  },
+  "message": {
+    "embeds": [
+      {
+        "title": "Venice Setup Guide",
+        "color": 2450411,
+        "description": "Install, connect, tune — then the three problems people actually hit. Long answers live in `/setup` and `/faq`.",
+        "fields": [
+          {
+            "name": "1 • Install and unlock",
+            "value": "Download the signed installer from <#1549499799861067876> and launch Venice. Open [zaeorion.com/connect](https://zaeorion.com/connect), sign in with the **same Discord account** you use here, and enter the one-time code in the launcher. There is no licence key, and your Discord ID alone is not a code.",
+            "inline": false
+          },
+          {
+            "name": "2 • Connect video",
+            "value": "Use a **60 Hz capture card**, or **PS5 Remote Play**. Confirm the full game frame is visible in the Live Capture panel before you shoot. PS5 only — Xbox is not supported yet.",
+            "inline": false
+          },
+          {
+            "name": "3 • Tune Shot Lead",
+            "value": "Tune Shot Lead against NBA 2K27's **TIMING** banner. One small step at a time, and keep the setup consistent between sessions.",
+            "inline": false
+          },
+          {
+            "name": "4 • No Meter (optional)",
+            "value": "Turn No Meter mode on only once the capture is stable; it follows the shot animation rather than the meter.",
+            "inline": false
+          },
+          {
+            "name": "🎥 Capture card not detected",
+            "value": "Close every other app using the card (OBS, browser tabs, the card's own viewer) — cards allow **one** at a time. Use a **USB 3.0+** port and check HDMI goes console → card **IN**. **Turn HDCP off** on the PS5: Settings → System → HDMI. That is the most common cause of a black or missing feed. Then check the driver in Device Manager, and try 1080p output.",
+            "inline": false
+          },
+          {
+            "name": "🎮 Remote Play won't pair, or lags",
+            "value": "PS5: Settings → System → **Remote Play on**, and enable the rest-mode network options. Take a fresh PIN from Link Device — they expire quickly — and pair on the same network. For lag: **wire both ends**. Wi-Fi jitter cannot be timed through, and dropping the stream one quality notch beats a stuttering 1080p.",
+            "inline": false
+          },
+          {
+            "name": "🟩 No greens / the overlay isn't reading",
+            "value": "Check the Live Capture panel actually shows gameplay — if it is black, fix that first. **Hold** the shot input and let Venice release it; releasing manually fights the tool. The controller must be plugged into the **PC**. Shot meter **on** in 2K's settings. Give it 10–15 practice shots to calibrate before judging it.",
+            "inline": false
+          },
+          {
+            "name": "💻 Moving to another PC",
+            "value": "Access is locked to one PC. Run `/hwid_reset`: the first **3 resets are free**, after that each reset takes one day off your subscription. Then connect again on the new machine.",
+            "inline": false
+          },
+          {
+            "name": "Still stuck?",
+            "value": "`/status` shows what is linked to your account; `/setup` and `/faq` have the long answers. Anything else, open a ticket in <#1549499767321534464> — never post a one-time code, password or payment details in a public channel.",
+            "inline": false
+          }
+        ],
+        "footer": { "text": "Venice • Official" }
+      }
+    ]
+  }
+}

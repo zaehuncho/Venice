@@ -23,6 +23,7 @@ the orchestrator's existing black-frame guard.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -178,7 +179,56 @@ def _frame_contract_reason(
     return ""
 
 
-def _isolate_immutable_frame(frame, verify_copy: bool = True):
+# [ORION_CAPTURE_VERIFY_STRIDE 2026-09-15] THE FULL-FRAME COMPARE WAS THE IDLE STALL.
+# The stall attributor named `CaptureCardReader` inside `_isolate_immutable_frame` ->
+# `numpy.array_equal` on 58 consumer gaps in one session (p50 50 ms, max 497 ms), every one
+# of them while the game sat in a menu or a loading screen. Measured on this machine, per
+# 1080p BGR frame:
+#     np.array_equal(frame, owned)        2.81 ms   (and a 6.2 MB temporary bool array)
+#     np.array_equal(frame[::4],  owned)  0.58 ms
+#     np.array_equal(frame[::8],  owned)  0.29 ms
+#     np.array_equal(frame[::4, ::4], ..) 1.14 ms   <- 1/16 of the BYTES, 4x the time of [::4]
+# The allocation is what actually hurts: 6.2 MB of bool per frame at 60 fps is ~370 MB/s of
+# churn straight into the generational GC, which is exactly the textbook gen-2 sweep the
+# attributor's own GC: line was written to catch. A ROW stride is used rather than a 2-D
+# stride because the strided-column gather costs more than the bytes it saves (the table
+# above), and because the tear this check exists to catch -- a driver writing a NEW frame
+# over the buffer we just copied -- rewrites whole scanline bands, never a lone pixel.
+# Default 8 => any tear touching 8 consecutive rows (0.7 % of a 1080p frame) is caught.
+#   ORION_CAPTURE_VERIFY_STRIDE=1  full compare, byte-identical to the shipped behaviour
+#   ORION_CAPTURE_VERIFY_FULL=1    strict: when the strided sample MATCHES, confirm with the
+#                                  full compare (the sample can only prove a tear, never
+#                                  prove its absence -- this buys that proof back)
+_VERIFY_STRIDE = max(1, int(_env_float("ORION_CAPTURE_VERIFY_STRIDE", 8.0)))
+_VERIFY_FULL = _env_flag("ORION_CAPTURE_VERIFY_FULL", False)
+# [ORION_CAPTURE_ISOLATE_COPY 2026-09-15] WHO MUTATES THE PUBLISHED FRAME: nobody, and
+# nobody can -- the published array is `setflags(write=False)`, so any in-place write
+# downstream would raise instead of corrupting a neighbour (the one annotation path,
+# _framedump_write, takes `ann = frame.copy()` first; no other module writes into a
+# capture frame). The copy is therefore NOT a mutation guard, it is a BUFFER-LIFETIME
+# guard, and that hazard is live-proven in this repo: AsyncMeterLocator._submit snapshots
+# every frame it is handed because "the live capture backend reuses its frame buffer" --
+# the 2K27 failure where the reader locked decor at ~0 % fill while the offline replay hit
+# 96 %. So the copy stays ON by default; this knob exists for a rig whose driver has been
+# proven to hand back a fresh allocation per read, and it is the only way to get the
+# remaining ~2.3 ms/frame back.
+_ISOLATE_COPY = _env_flag("ORION_CAPTURE_ISOLATE_COPY", True)
+
+
+def _frame_sample_matches(a, b, stride: int) -> bool:
+    """Row-strided equality -- the cheap signature the torn-copy check runs on.
+
+    ``stride <= 1`` is the full compare. Any larger stride compares every ``stride``-th
+    ROW (contiguous rows, one numpy call); a mismatch PROVES the source changed, a match
+    only says no sampled row changed.
+    """
+    if stride <= 1:
+        return bool(np.array_equal(a, b))
+    return bool(np.array_equal(a[::stride], b[::stride]))
+
+
+def _isolate_immutable_frame(frame, verify_copy: bool = True, *, stride=None,
+                             full=None, copy=None):
     """Copy a driver-owned buffer and return an immutable, contiguous ndarray.
 
     ``cv2.VideoCapture.read`` normally allocates a fresh ndarray, but that is a backend
@@ -186,18 +236,61 @@ def _isolate_immutable_frame(frame, verify_copy: bool = True):
     directly lets a backend that recycles it overwrite pixels while detection/preview still
     read the previous frame (a genuine torn-frame race).  The explicit owned copy is the
     capture/detector ownership boundary.  When ``verify_copy`` is enabled, compare the source
-    once after the copy; a buffer that changed during the copy is rejected as torn.
+    once after the copy; a buffer that changed during the copy is rejected as torn -- on a
+    ROW-STRIDED sample by default, see ORION_CAPTURE_VERIFY_STRIDE above.
 
     Returns ``(owned_frame, reason)``.  ``owned_frame`` is read-only on success.
     """
     try:
+        if not (_ISOLATE_COPY if copy is None else bool(copy)):
+            # Opt-in only (ORION_CAPTURE_ISOLATE_COPY=0). No copy => nothing to verify.
+            owned = np.ascontiguousarray(frame, dtype=np.uint8)
+            owned.setflags(write=False)
+            return owned, ""
         owned = np.array(frame, dtype=np.uint8, order="C", copy=True)
-        if verify_copy and not np.array_equal(frame, owned):
-            return None, "torn_copy"
+        if verify_copy:
+            _s = _VERIFY_STRIDE if stride is None else max(1, int(stride))
+            if not _frame_sample_matches(frame, owned, _s):
+                return None, "torn_copy"
+            if _s > 1 and (_VERIFY_FULL if full is None else bool(full)):
+                if not np.array_equal(frame, owned):
+                    return None, "torn_copy"
         owned.setflags(write=False)
         return owned, ""
     except Exception:
         return None, "isolation"
+
+
+# [ORION_CAPTURE_CADENCE_RELOCK 2026-09-14] Some drivers ACCEPT a frame-rate request the device
+# cannot deliver (Elgato HD60 X: 1080p120 YUY2 accepted, 60 fps delivered; measured on the
+# owner's rig: raw_fps=60.0 with raw_late~300 per health window at a 120 request). A cadence
+# lock built for the requested rate then flags every frame late and its snapping grid is wrong.
+# After a short warm-up the DELIVERED median interval decides; if it disagrees with the
+# requested rate by more than the tolerance the lock is rebuilt at the delivered rate.
+_CADENCE_RELOCK_WARMUP = 90          # frames of delivered intervals before judging (1.5 s @60)
+_CADENCE_RELOCK_TOL = 0.20           # |delivered/requested - 1| above this => re-lock
+_CADENCE_COMMON_FPS = (24.0, 25.0, 30.0, 50.0, 59.94, 60.0, 100.0, 119.88, 120.0, 144.0, 240.0)
+
+
+def delivered_cadence_fps(intervals_ns, requested_fps: float, tol: float = _CADENCE_RELOCK_TOL):
+    """Return the delivered fps to re-lock to, or None when the device honours ``requested_fps``.
+
+    ``intervals_ns``: recent inter-arrival intervals (ns). The median is robust to the occasional
+    dropped/duplicated frame; the result snaps to the nearest common rate when within 3 %.
+    """
+    vals = sorted(int(v) for v in intervals_ns if v and v > 0)
+    if len(vals) < 8 or not requested_fps or requested_fps <= 0:
+        return None
+    med = vals[len(vals) // 2]
+    if med <= 0:
+        return None
+    fps = 1e9 / float(med)
+    if abs(fps / float(requested_fps) - 1.0) <= tol:
+        return None
+    nearest = min(_CADENCE_COMMON_FPS, key=lambda c: abs(fps / c - 1.0))
+    if abs(fps / nearest - 1.0) <= 0.03:
+        return float(nearest)
+    return float(round(fps, 1))
 
 
 class CadenceLock:
@@ -248,6 +341,14 @@ class CadenceLock:
         self._outlier_run = 0
         self._skip_run = 0                      # consecutive multi-period (k>1) gaps
         self.relocks = 0                        # diagnostics: how many hard re-locks happened
+        # [2026-09-11] A k>=2 "drop" is PROVISIONAL for one frame. A single read that returns
+        # 12.5-20.8 ms late lands within drop_snap of the k=2 grid point too, and the old rule
+        # advanced the grid a whole period: that frame and the next ~5 were stamped +16.6 ms
+        # (0.5/min live, poisoning ~1-2 shots per 50). If the very next read lands (k-1) periods
+        # BEHIND the advanced grid, the device never dropped anything: step the grid back at
+        # once instead of coasting relock_after frames.
+        self._pending_skip = 0                  # k of the last provisional drop acceptance
+        self.skip_reverts = 0                   # diagnostics: provisional drops taken back
 
     def reset(self, t_meas_ns: float) -> None:
         self.t_locked = float(t_meas_ns)
@@ -255,6 +356,7 @@ class CadenceLock:
         self.dt_est = self.dt_nom
         self._outlier_run = 0
         self._skip_run = 0
+        self._pending_skip = 0
 
     def update(self, t_meas_ns: float) -> int:
         """Feed the raw read-return timestamp (ns); return the cadence-locked timestamp (ns)."""
@@ -276,6 +378,17 @@ class CadenceLock:
         predicted = self.t_locked + self.dt_est
         error = t_meas - predicted              # phase error vs the one-period grid
 
+        if self._pending_skip >= 2:
+            k_prev = self._pending_skip
+            self._pending_skip = 0
+            back = (k_prev - 1) * self.dt_est
+            # the read after a FALSE drop sits (k-1) periods behind the advanced grid
+            if abs(error + back) <= self.drop_snap_ns:
+                self.skip_reverts += 1
+                self._skip_run = 0
+                self._outlier_run = 0
+                self.t_locked = (predicted - back) + self.alpha * (error + back)
+                return int(self.t_locked)
         if abs(error) > self.outlier_ns:
             # Bughunt #5: before treating an off-grid read as an outlier, test the multi-period
             # DROP hypothesis. When the driver drops 1-3 frames, the next read lands ON the grid
@@ -297,8 +410,10 @@ class CadenceLock:
                         self.relocks += 1
                         self.reset(t_meas)
                         return int(self.t_locked)
-                    # Genuine drop: advance k periods (on-grid stamp), normal in-lock tracking.
+                    # Drop accepted PROVISIONALLY: advance k periods (on-grid stamp), normal
+                    # in-lock tracking; the next read may take it back (see _pending_skip).
                     self._outlier_run = 0
+                    self._pending_skip = k
                     self.t_locked = pred_k + self.alpha * err_k
                     self.dt_est += self.beta * err_k
                     if self.dt_est < self._freq_lo:
@@ -382,6 +497,9 @@ class CaptureCardBackend:
         self._use_mjpg = bool(use_mjpg)
 
         self._ring = FrameRingBuffer(capacity=2)
+        # Serialize only publication and invalidation, never a driver read/copy.
+        # stop() may abandon a reader; its late pixels must not reenter the ring.
+        self._publication_lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._cap = None
@@ -498,10 +616,12 @@ class CaptureCardBackend:
         self._aspect_ratio = 16.0 / 9.0
         self._aspect_tolerance = max(
             0.001, min(0.25, _env_float("ORION_CAPTURE_ASPECT_TOLERANCE", 0.035)))
-        # A second full-frame comparison after copying is intentional: it proves the
-        # driver buffer did not change while ownership crossed into Orion.  The copy is
-        # always made; this flag only exists as a diagnostic escape hatch for unusually
-        # slow hardware and defaults fail-safe/on.
+        # A second comparison after copying is intentional: it proves the driver buffer did
+        # not change while ownership crossed into Orion.  The copy is always made; this flag
+        # only exists as a diagnostic escape hatch for unusually slow hardware and defaults
+        # fail-safe/on.  The comparison itself is ROW-STRIDED (ORION_CAPTURE_VERIFY_STRIDE,
+        # see _isolate_immutable_frame): the full-frame compare was the measured cause of the
+        # idle-menu capture stalls.
         self._verify_copy = _env_flag("ORION_CAPTURE_VERIFY_COPY", True)
         self._integrity_rejects = {}
         self._last_integrity_error = ""
@@ -525,14 +645,31 @@ class CaptureCardBackend:
         # Prefer a real device timeline when the bounded cadence probe validates it;
         # invalid/absent hardware PTS automatically falls back to read-return QPC.
         self._hw_pts_enabled = _env_flag("ORION_CAPTURE_USE_HW_PTS", True)
+        self._reset_source_timing()
+
+    def _reset_source_timing(self) -> None:
+        """Drop clock proof when a new capture handle starts a source epoch.
+
+        CAP_PROP_POS_MSEC commonly restarts at zero on reopen. Neither its
+        old anchor/probe decision nor the old cadence/epoch mapping belongs
+        to new pixels. Frame numbering and configured latency stay unchanged.
+        """
         self._cadence = CadenceLock(self._fps)
+        # [ORION_CAPTURE_CADENCE_RELOCK] delivered-interval warm-up (see delivered_cadence_fps).
+        self._relock_intervals = deque(maxlen=_CADENCE_RELOCK_WARMUP)
+        self._relock_prev_ns = 0
+        self._relock_done = False
+        self._cadence_delivered_fps = 0.0
+        self._fps_requested = int(self._fps)
         self._perf_to_epoch_off_ns = 0          # perf_counter_ns -> time_ns offset (slow EMA)
         # hardware-PTS probe state
         self._hw_pts_prev_ms = None
         self._hw_pts_good = 0
+        self._hw_pts_probe_frames = 0
         self._hw_pts_anchor = None              # (pos_ms0, perf_ns0) once monotonic
         self._hw_pts_decided = False
         self._hw_pts_ok = False
+        self._hw_pts_fault_reason = ""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -652,6 +789,7 @@ class CaptureCardBackend:
         )
         if len(arrivals) < 2:
             return {
+                "stage_kind": "capture",
                 "samples": len(arrivals),
                 "fps": 0.0,
                 "max_gap_ms": 0.0,
@@ -698,6 +836,7 @@ class CaptureCardBackend:
                 worst_post_ms = post_ns / 1e6
 
         return {
+            "stage_kind": "capture",
             "samples": len(arrivals),
             "fps": (len(arrivals) - 1) / covered_s,
             "max_gap_ms": max(gaps) / 1e6,
@@ -955,15 +1094,24 @@ class CaptureCardBackend:
                            (names[self._device_index]
                             if names is not None and self._device_index < len(names) else ""))
 
-        self._cap = cap
-        self._api_name = api_name
-        self._source_generation += 1
-        self._stop_evt.clear()
+        with self._publication_lock:
+            self._cap = cap
+            self._api_name = api_name
+            self._source_generation += 1
+            self._reset_source_timing()
+            self._ring.clear()
+            self._stop_evt.clear()
         self._last_put_ns = 0
         self._started_ns = time.perf_counter_ns()
         self._stall_logged = False
         with self._arrival_lock:
             self._arrival_ns.clear()
+            # [ORION_CAPTURE_CADENCE_RELOCK] a reopened source gets a fresh verdict.
+            self._relock_intervals.clear()
+            self._relock_prev_ns = 0
+            self._relock_done = False
+            self._cadence_delivered_fps = 0.0
+            self._cadence = CadenceLock(self._fps)
             self._cadence_samples.clear()
         self._cadence_logged = False
         self._last_integrity_error = ""
@@ -988,6 +1136,7 @@ class CaptureCardBackend:
     def _run(self) -> None:
         import cv2  # noqa: F401
         cap = self._cap
+        source_generation = self._source_generation
         bad = 0
         try:
             while not self._stop_evt.is_set() and cap is not None and self._cap is cap:
@@ -998,6 +1147,11 @@ class CaptureCardBackend:
                     ok, frame = False, None
                 read_return_ns = time.perf_counter_ns()
                 read_return_epoch_ns = time.time_ns()
+                # A stopped/abandoned read can return after a replacement has
+                # cleared the shared event. Handle + generation fence it too.
+                if (self._stop_evt.is_set() or self._cap is not cap
+                        or self._source_generation != source_generation):
+                    break
                 if not ok or frame is None or getattr(frame, "size", 0) == 0:
                     bad += 1
                     if bad >= self._BAD_READ_LIMIT:
@@ -1013,6 +1167,26 @@ class CaptureCardBackend:
                     # device PTS may replace only this measurement.
                     ts_perf_ns, ts_epoch_ns = self._stamp_frame(
                         read_return_ns, read_return_epoch_ns)
+                    if self._hw_pts_fault_reason:
+                        # A once-proven device clock can reset/freeze without
+                        # reopening its handle. Do not splice read-return QPC
+                        # into that clock's timing evidence. Discard this one
+                        # transition frame and invalidate the old timing epoch;
+                        # the next frame uses QPC without a device reopen stall.
+                        with self._publication_lock:
+                            if (self._stop_evt.is_set() or self._cap is not cap
+                                    or self._source_generation != source_generation):
+                                break
+                            fault = self._hw_pts_fault_reason
+                            self._hw_pts_fault_reason = ""
+                            self._source_generation += 1
+                            source_generation = self._source_generation
+                            self._ring.clear()
+                        logger.warning(
+                            "Capture-card hardware PTS proof revoked: reason=%s; "
+                            "QPC measurement active; timing generation=%d",
+                            fault, source_generation)
+                        continue
                     reason = self._contract_reason(frame)
                     if reason:
                         self._note_integrity_reject(reason)
@@ -1039,46 +1213,52 @@ class CaptureCardBackend:
                     if geom != self._last_geom:
                         logger.info("Capture-card frame geometry %dx%d", geom[0], geom[1])
                         self._last_geom = geom
-                    self._frame_number += 1
-                    publication_perf_ns = time.perf_counter_ns()
-                    publication_epoch_ns = time.time_ns()
-                    fd = FrameData(
-                        frame=frame,
-                        timestamp_ns=ts_perf_ns,
-                        epoch_ns=ts_epoch_ns,
-                        capture_timestamp_ns=ts_perf_ns,
-                        capture_epoch_ns=ts_epoch_ns,
-                        publication_timestamp_ns=publication_perf_ns,
-                        publication_epoch_ns=publication_epoch_ns,
-                        frame_number=self._frame_number,
-                        feed_frozen=self._feed_frozen,
-                        capture_api=str(self._api_name or "").strip().upper(),
-                        capture_device_index=int(self._device_index),
-                        capture_width=int(self._negotiated_width),
-                        capture_height=int(self._negotiated_height),
-                        capture_fps=float(self._negotiated_fps),
-                        capture_fourcc=str(self._negotiated_fourcc),
-                        capture_buffer_size=float(self._negotiated_buffer_size),
-                        source_generation=int(self._source_generation),
-                        integrity_isolated=True,
-                    )
-                    self._ring.put(fd)
-                    publish_perf_ns = time.perf_counter_ns()
-                    publish_epoch_ns = time.time_ns()
-                    # Liveness/stall detection uses the verified ring-publication time, never the
-                    # smoothed frame stamp: a coasted cadence-lock value must not mask a genuine
-                    # feed freeze, and a frame is not live until consumers can actually acquire it.
-                    self._last_put_ns = publish_perf_ns
-                    with self._arrival_lock:
-                        self._arrival_ns.append(publish_perf_ns)
-                        self._cadence_samples.append((
-                            publish_perf_ns,
-                            publish_epoch_ns,
-                            int(self._frame_number),
-                            int(read_start_ns),
-                            int(read_return_ns),
-                            int(isolate_done_ns),
-                        ))
+                    with self._publication_lock:
+                        # Copy/validation may outlive stop() or a source swap.
+                        # The check and ring put are atomic with invalidation.
+                        if (self._stop_evt.is_set() or self._cap is not cap
+                                or self._source_generation != source_generation):
+                            break
+                        self._frame_number += 1
+                        publication_perf_ns = time.perf_counter_ns()
+                        publication_epoch_ns = time.time_ns()
+                        fd = FrameData(
+                            frame=frame,
+                            timestamp_ns=ts_perf_ns,
+                            epoch_ns=ts_epoch_ns,
+                            capture_timestamp_ns=ts_perf_ns,
+                            capture_epoch_ns=ts_epoch_ns,
+                            publication_timestamp_ns=publication_perf_ns,
+                            publication_epoch_ns=publication_epoch_ns,
+                            frame_number=self._frame_number,
+                            feed_frozen=self._feed_frozen,
+                            capture_api=str(self._api_name or "").strip().upper(),
+                            capture_device_index=int(self._device_index),
+                            capture_width=int(self._negotiated_width),
+                            capture_height=int(self._negotiated_height),
+                            capture_fps=float(self._negotiated_fps),
+                            capture_fourcc=str(self._negotiated_fourcc),
+                            capture_buffer_size=float(self._negotiated_buffer_size),
+                            source_generation=int(self._source_generation),
+                            integrity_isolated=True,
+                        )
+                        self._ring.put(fd)
+                        publish_perf_ns = time.perf_counter_ns()
+                        publish_epoch_ns = time.time_ns()
+                        # Liveness/stall detection uses the verified ring-publication time, never the
+                        # smoothed frame stamp: a coasted cadence-lock value must not mask a genuine
+                        # feed freeze, and a frame is not live until consumers can actually acquire it.
+                        self._last_put_ns = publish_perf_ns
+                        with self._arrival_lock:
+                            self._arrival_ns.append(publish_perf_ns)
+                            self._cadence_samples.append((
+                                publish_perf_ns,
+                                publish_epoch_ns,
+                                int(self._frame_number),
+                                int(read_start_ns),
+                                int(read_return_ns),
+                                int(isolate_done_ns),
+                            ))
                     self._stall_logged = False
                     if self._reopen_grace_ns:
                         # A fresh frame landed => the in-place re-open completed; drop the
@@ -1115,9 +1295,14 @@ class CaptureCardBackend:
                             # no-op that just burned its 5-attempt budget and latched feed_frozen.
                             # The native side asserts the same invariant ("The Elgato can only be
                             # opened once, so tear the preview down FIRST", RemotePlaySession.cpp).
-                            self._reopen_grace_ns = time.perf_counter_ns() + int(
-                                (self._reopen_settle_s + self._REOPEN_OPEN_BUDGET_S) * 1e9)
-                            self._cap = None
+                            with self._publication_lock:
+                                if (self._stop_evt.is_set() or self._cap is not cap
+                                        or self._source_generation != source_generation):
+                                    break
+                                self._reopen_grace_ns = time.perf_counter_ns() + int(
+                                    (self._reopen_settle_s + self._REOPEN_OPEN_BUDGET_S) * 1e9)
+                                self._cap = None
+                                self._ring.clear()
                             try:
                                 cap.release()
                             except Exception as exc:
@@ -1127,40 +1312,58 @@ class CaptureCardBackend:
                             # observed live); re-opening inside it just fails again. Wait it out —
                             # and abort instantly if stop() arrives (wait() returns True when set).
                             if self._stop_evt.wait(self._reopen_settle_s):
-                                self._reopen_grace_ns = 0
+                                with self._publication_lock:
+                                    if self._source_generation == source_generation:
+                                        self._reopen_grace_ns = 0
                                 break
+                            with self._publication_lock:
+                                if (self._stop_evt.is_set() or self._cap is not None
+                                        or self._source_generation != source_generation):
+                                    break
                             newcap, newapi = self._open()
                             if newcap is None:
                                 # No handle left to read from: end the reader. is_healthy() then
                                 # reports dead (thread gone) and the orchestrator detaches + re-opens
                                 # the backend in-process on its ~2s retry cadence.
-                                self._reopen_grace_ns = 0
-                                self._feed_frozen = True
+                                with self._publication_lock:
+                                    if (self._source_generation == source_generation
+                                            and self._cap is None):
+                                        self._reopen_grace_ns = 0
+                                        self._feed_frozen = True
                                 logger.warning("Capture-card stall re-open FAILED (device did not come "
                                                "back %.1fs after release) — reader exiting so the "
                                                "orchestrator re-opens the backend", self._reopen_settle_s)
                                 break
-                            if self._stop_evt.is_set():
-                                # stop() ran during the settle/open and already nulled self._cap.
-                                # Publishing the fresh handle here would RESURRECT a device nobody
-                                # owns (and nobody would ever release). Release it on this — the
-                                # reader — thread, which is the only thread allowed to, and exit.
+                            with self._publication_lock:
+                                accept_reopen = (
+                                    not self._stop_evt.is_set() and self._cap is None
+                                    and self._source_generation == source_generation)
+                                if accept_reopen:
+                                    cap = newcap
+                                    self._cap = cap
+                                    self._api_name = newapi
+                                    self._source_generation += 1
+                                    self._reset_source_timing()
+                                    source_generation = self._source_generation
+                                    # Keep _sig across reopen so static content cannot
+                                    # restart the bounded recovery budget forever.
+                                    self._sig_change_ns = time.perf_counter_ns()
+                                    self._feed_frozen = False
+                                elif self._source_generation == source_generation:
+                                    self._reopen_grace_ns = 0
+                            if not accept_reopen:
+                                # A stop/restart can clear the event while this open
+                                # is still blocked. Generation-check the installation
+                                # atomically; never replace the new owner's handle,
+                                # clock, queue or recovery state. Teardown stays here
+                                # on the reader thread that opened the rejected handle.
                                 try:
-                                    newcap.release()
+                                    with _DEVICE_GRAPH_LOCK:
+                                        newcap.release()
                                 except Exception as exc:
                                     logger.debug("Capture-card re-open release-on-stop failed: %s", exc)
-                                self._reopen_grace_ns = 0
-                                logger.info("Capture-card re-open discarded: stop() arrived mid-recovery")
+                                logger.info("Capture-card re-open discarded: source stopped or replaced")
                                 break
-                            cap = newcap
-                            self._cap = cap
-                            self._api_name = newapi
-                            self._source_generation += 1
-                            # NB: _sig is deliberately NOT reset — an unchanged signature after the
-                            # re-open is what lets the 5-attempt budget expire on a legitimately
-                            # static screen instead of re-opening forever.
-                            self._sig_change_ns = time.perf_counter_ns()   # grace for the fresh device
-                            self._feed_frozen = False
                             # _reopen_grace_ns stays ARMED until the first fresh frame lands (cleared
                             # in the put path above) so is_healthy() covers the whole recovery.
                             logger.info("Capture-card re-opened via %s after stall (settle %.1fs)",
@@ -1210,6 +1413,8 @@ class CaptureCardBackend:
         # Track the near-constant perf->epoch offset once, drift-corrected with a slow EMA, so we
         # can derive a jitter-free epoch stamp from the locked perf stamp (both were sampled at the
         # same read instant, so their difference is the offset).
+        cap = self._cap
+        source_generation = self._source_generation
         off = read_epoch_ns - read_perf_ns
         if self._perf_to_epoch_off_ns == 0:
             self._perf_to_epoch_off_ns = off
@@ -1217,7 +1422,40 @@ class CaptureCardBackend:
             self._perf_to_epoch_off_ns = int(self._perf_to_epoch_off_ns * 0.99 + off * 0.01)
 
         meas_ns = self._measure_ns(read_perf_ns)
-        locked_perf = self._cadence.update(meas_ns) if self._pts_lock else meas_ns
+        if self._cap is not cap or self._source_generation != source_generation:
+            # The read's lifecycle guard will discard this result. In particular
+            # a late cap.get() must not advance a replacement source's PLL.
+            return int(read_perf_ns), int(read_epoch_ns)
+        # [ORION_CAPTURE_CADENCE_RELOCK] judge the delivered rate once per source generation.
+        if not self._relock_done:
+            if self._relock_prev_ns:
+                self._relock_intervals.append(int(meas_ns) - int(self._relock_prev_ns))
+            self._relock_prev_ns = int(meas_ns)
+            if len(self._relock_intervals) >= _CADENCE_RELOCK_WARMUP:
+                self._relock_done = True
+                delivered = delivered_cadence_fps(self._relock_intervals, float(self._fps))
+                if delivered:
+                    self._cadence_delivered_fps = float(delivered)
+                    self._cadence = CadenceLock(float(delivered))
+                    self._cadence.reset(int(meas_ns))
+                    # Adopt the delivered rate EVERYWHERE the requested one was assumed: the
+                    # late-gap statistic (gap > 1.5 x nominal flagged every 16.7 ms frame as late
+                    # at a 120 request: raw_late ~300/window), the hw-PTS probe's nominal period,
+                    # the health floor and a later reopen's CAP_PROP_FPS request.
+                    self._fps_requested = int(self._fps)
+                    self._fps = int(round(float(delivered)))
+                    self._min_health_fps = max(
+                        1.0, min(float(self._fps),
+                                 _env_float("ORION_CAPTURE_MIN_HEALTH_FPS",
+                                            max(12.0, float(self._fps) * 0.35))))
+                    _med_ms = sorted(self._relock_intervals)[len(self._relock_intervals) // 2] / 1e6
+                    logger.warning(
+                        "Capture cadence re-locked: requested %.0f fps but the device delivers "
+                        "%.2f fps (median interval %.2f ms); the timing grid now follows the "
+                        "delivered rate. Pick the delivered rate in Setup > Refresh rate.",
+                        float(self._fps), float(delivered), _med_ms)
+        locked_perf = (self._cadence.update(meas_ns)
+                       if self._pts_lock and not self._hw_pts_fault_reason else meas_ns)
         # Device latency: the glass event happened BEFORE read() returned, so date the frame
         # earlier => frame_age_ms reflects true glass->detector time. Default 0 (no mean change).
         locked_perf -= self._latency_ns
@@ -1231,6 +1469,7 @@ class CaptureCardBackend:
         Also probes CAP_PROP_POS_MSEC once and logs whether the card exposes a usable per-frame
         hardware timestamp (many USB cards report 0/garbage; some report a monotonic device clock)."""
         cap = self._cap
+        source_generation = self._source_generation
         if cap is None:
             return read_perf_ns
         # HOT PATH: cap.get(CAP_PROP_POS_MSEC) is a DirectShow filter-graph round-trip, and it was
@@ -1249,8 +1488,43 @@ class CaptureCardBackend:
             logger.debug("Capture-card CAP_PROP_POS_MSEC read failed: %s", exc)
             pos_ms = 0.0
 
+        if self._cap is not cap or self._source_generation != source_generation:
+            return read_perf_ns
+
+        was_proven = self._hw_pts_decided and self._hw_pts_ok
         if not self._hw_pts_decided:
             self._probe_hw_pts(pos_ms, read_perf_ns)
+
+        if self._hw_pts_enabled and was_proven:
+            reason = ""
+            if not math.isfinite(pos_ms) or pos_ms <= 0.0:
+                reason = "missing_or_nonfinite"
+            elif self._hw_pts_prev_ms is not None and pos_ms <= self._hw_pts_prev_ms:
+                reason = "nonadvancing"
+            elif self._hw_pts_anchor is None:
+                reason = "missing_anchor"
+            else:
+                pos_ms0, perf0 = self._hw_pts_anchor
+                mapped_ns = perf0 + (pos_ms - pos_ms0) * 1e6
+                # Allow ordinary read-return/anchor jitter using the existing
+                # cadence discontinuity budget, but never accept a device clock
+                # jump that dates pixels far into the future. Do not invalidate
+                # an OLD monotonic stamp: its age can represent real queued data.
+                if not math.isfinite(mapped_ns) or mapped_ns > (
+                        read_perf_ns + self._cadence.relock_gap_ns):
+                    reason = "future_mapping"
+            if reason:
+                # Latch fallback for this handle. Re-probing only on a real
+                # source reopen prevents a flaky device clock from oscillating
+                # between timing domains every twenty frames.
+                self._hw_pts_ok = False
+                self._hw_pts_decided = True
+                self._hw_pts_anchor = None
+                self._hw_pts_prev_ms = None
+                self._hw_pts_fault_reason = reason
+                self._cadence.reset(read_perf_ns)
+                return read_perf_ns
+            self._hw_pts_prev_ms = pos_ms
 
         if self._hw_pts_enabled and self._hw_pts_ok and self._hw_pts_anchor is not None and pos_ms > 0.0:
             pos_ms0, perf0 = self._hw_pts_anchor
@@ -1260,7 +1534,8 @@ class CaptureCardBackend:
         return read_perf_ns
 
     def _probe_hw_pts(self, pos_ms: float, read_perf_ns: int) -> None:
-        """Decide (once) whether CAP_PROP_POS_MSEC advances monotonically at ~frame cadence."""
+        """Decide per source epoch whether PTS advances at frame cadence."""
+        self._hw_pts_probe_frames += 1
         dt_nom_ms = 1000.0 / (self._fps if self._fps > 0 else 60.0)
         if pos_ms and pos_ms > 0.0 and self._hw_pts_prev_ms is not None:
             delta = pos_ms - self._hw_pts_prev_ms
@@ -1280,7 +1555,7 @@ class CaptureCardBackend:
             self._hw_pts_decided = True
             logger.info("Capture-card hardware PTS (CAP_PROP_POS_MSEC): monotonic at cadence — "
                         "%s as lock measurement", "USING" if self._hw_pts_enabled else "available (disabled)")
-        elif self._frame_number >= 45:
+        elif self._hw_pts_probe_frames >= 45:
             self._hw_pts_ok = False
             self._hw_pts_decided = True
             logger.info("Capture-card hardware PTS (CAP_PROP_POS_MSEC): not usable "
@@ -1367,7 +1642,9 @@ class CaptureCardBackend:
         thread owns release (see _run's finally). A wedged reader is ABANDONED: detach the
         handle so a re-open never touches it, keep a reference so the GC finalizer can't release
         it on an arbitrary thread, and let the reader's teardown / process exit reclaim it."""
-        self._stop_evt.set()
+        with self._publication_lock:
+            self._stop_evt.set()
+            self._ring.clear()
         t = self._thread
         if t is not None and t.is_alive():
             t.join(timeout=self._STOP_JOIN_S)

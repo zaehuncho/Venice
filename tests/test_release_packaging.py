@@ -57,6 +57,19 @@ def _write_signed_release_manifest(package_dir: Path, version: str | None = None
 # --------------------------------------------------------------------------- #
 # 1. manifest <-> SecurityManager schema contract
 # --------------------------------------------------------------------------- #
+def test_customer_package_strips_privileged_executables_before_manifest(tmp_path):
+    (tmp_path / "OrionNative.exe").write_bytes(b"customer")
+    for name in pkg.CUSTOMER_EXCLUDED_FILES:
+        (tmp_path / name).write_bytes(b"staff-only")
+
+    pkg.strip_customer_excluded_files(tmp_path)
+    manifest, _public = _write_signed_release_manifest(tmp_path)
+
+    assert manifest["audience"] == "customer"
+    assert not (pkg.CUSTOMER_EXCLUDED_FILES & set(manifest["files"]))
+    assert all(not (tmp_path / name).exists() for name in pkg.CUSTOMER_EXCLUDED_FILES)
+
+
 def test_manifest_matches_securitymanager_schema(tmp_path):
     (tmp_path / "OrionNative.exe").write_bytes(b"the-exe")
     (tmp_path / "sub").mkdir()
@@ -660,6 +673,7 @@ def _write_fake_sidecar_bundle(dist: Path, model_payload: bytes = b"verified-mod
     bundled_files = {
         "OrionSidecar.exe": b"compiled-sidecar",
         "models/latency_factory_prior.json": model_payload + b"-latency",
+        "models/orion_meter_detector.onnx": model_payload + b"-detector",
         "models/tip_registration.json": model_payload + b"-tip",
     }
     file_map = {}
@@ -697,9 +711,21 @@ def test_copy_runtime_gets_timing_models_only_from_verified_sidecar(
     monkeypatch, tmp_path
 ):
     root, _build = _configure_minimal_runtime(monkeypatch, tmp_path)
+    backend = root / "native_orion" / "backend"
+    backend.mkdir(parents=True)
+    (backend / "autogreen_sidecar.py").write_text(
+        "# compiled into OrionSidecar.exe\n", encoding="utf-8"
+    )
+    (backend / "ps5_remoteplay_helper.py").write_text(
+        "# standalone setup helper\n", encoding="utf-8"
+    )
     source_models = root / "models"
     source_models.mkdir()
-    for name in ("latency_factory_prior.json", "tip_registration.json"):
+    for name in (
+        "latency_factory_prior.json",
+        "orion_meter_detector.onnx",
+        "tip_registration.json",
+    ):
         (source_models / name).write_bytes(b"unverified-repository-copy")
 
     dist = tmp_path / "sidecar.dist"
@@ -721,6 +747,13 @@ def test_copy_runtime_gets_timing_models_only_from_verified_sidecar(
     assert (package / "models" / "tip_registration.json").read_bytes() == (
         b"verified-model-tip"
     )
+    assert (package / "models" / "orion_meter_detector.onnx").read_bytes() == (
+        b"verified-model-detector"
+    )
+    assert (package / "backend" / "ps5_remoteplay_helper.py").is_file()
+    assert not any(
+        path.name == "autogreen_sidecar.py" for path in package.rglob("*")
+    )
     assert pkg.scan_forbidden(package) == []
 
 
@@ -730,7 +763,11 @@ def test_stale_sidecar_cannot_seed_release_with_repository_timing_models(
     root, _build = _configure_minimal_runtime(monkeypatch, tmp_path)
     source_models = root / "models"
     source_models.mkdir()
-    for name in ("latency_factory_prior.json", "tip_registration.json"):
+    for name in (
+        "latency_factory_prior.json",
+        "orion_meter_detector.onnx",
+        "tip_registration.json",
+    ):
         (source_models / name).write_bytes(b"repository-model")
 
     dist = tmp_path / "sidecar.dist"

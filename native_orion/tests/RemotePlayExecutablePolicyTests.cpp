@@ -1,6 +1,7 @@
 #include "AppConfig.h"
 #include "PacketBridgeAuthority.h"
 #include "RemotePlayExecutablePolicy.h"
+#include "SidecarReaderProfile.h"
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
@@ -31,6 +32,16 @@ bool createExecutableFixture(const QString& path, const QByteArray& contents)
 QString canonical(const QString& path)
 {
     return QDir::toNativeSeparators(QFileInfo(path).canonicalFilePath());
+}
+
+// [ORION_PILL_YOLO_ROUTE 2026-09-17] Put the proposer setting into a child environment
+// exactly the way RemotePlaySession::startSidecar does, so the style route below is always
+// tested against the environment the launch really hands it. Wrapped because
+// applyMeterProposerSetting() is [[nodiscard]]: its return value IS the launch log line.
+void seedProposerEnv(QProcessEnvironment& env, const QString& proposerSetting)
+{
+    const QString resolved = applyMeterProposerSetting(env, proposerSetting, true);
+    QVERIFY(resolved.startsWith(QStringLiteral("ORION_METER_PROPOSER=")));
 }
 
 } // namespace
@@ -251,6 +262,299 @@ private slots:
         QCOMPARE(first.size, second.size);
         QVERIFY(first.sha256 != second.sha256);
     }
+
+    // [METER DETECTION CARD 2026-09-10] The sidecar env carries ORION_METER_PROPOSER from
+    // the user's setting under the SidecarReaderProfile contract: the setting is the
+    // source of truth, an explicit process value wins only in development, production
+    // pins the setting, and nothing but "cv" | "yolo" ever reaches the child.
+    void sidecarEnvCarriesMeterProposerFromSetting()
+    {
+        const QString key = QString::fromLatin1(kMeterProposerEnvKey);
+        QCOMPARE(key, QStringLiteral("ORION_METER_PROPOSER"));
+
+        // Silent environment: the setting is exported verbatim (normalised).
+        {
+            QProcessEnvironment env;
+            const QString resolved = applyMeterProposerSetting(env, QStringLiteral("yolo"), true);
+            QCOMPARE(env.value(key), QStringLiteral("yolo"));
+            QCOMPARE(resolved, QStringLiteral("ORION_METER_PROPOSER=yolo(setting)"));
+        }
+        // Default setting -> the certified pure-CV proposer.
+        {
+            QProcessEnvironment env;
+            const QString resolved = applyMeterProposerSetting(env, QStringLiteral("cv"), true);
+            QCOMPARE(env.value(key), QStringLiteral("cv"));
+            QVERIFY(resolved.endsWith(QStringLiteral("(setting)")));
+        }
+        // Development keeps an explicit launcher value (run_orion.local.ps1 A/B pin)...
+        {
+            QProcessEnvironment env;
+            env.insert(key, QStringLiteral("cv"));
+            const QString resolved = applyMeterProposerSetting(env, QStringLiteral("yolo"), true);
+            QCOMPARE(env.value(key), QStringLiteral("cv"));
+            QCOMPARE(resolved, QStringLiteral("ORION_METER_PROPOSER=cv(env)"));
+        }
+        // ...but never an unknown one: a garbage override is normalised, not forwarded.
+        {
+            QProcessEnvironment env;
+            env.insert(key, QStringLiteral("banana"));
+            const QString resolved = applyMeterProposerSetting(env, QStringLiteral("yolo"), true);
+            QCOMPARE(env.value(key), QStringLiteral("cv"));
+            QCOMPARE(resolved, QStringLiteral("ORION_METER_PROPOSER=cv(env)"));
+        }
+        // An EMPTY explicit value is silence, not an override.
+        {
+            QProcessEnvironment env;
+            env.insert(key, QString{});
+            const QString resolved = applyMeterProposerSetting(env, QStringLiteral("yolo"), true);
+            QCOMPARE(env.value(key), QStringLiteral("yolo"));
+            QVERIFY(resolved.endsWith(QStringLiteral("(setting)")));
+        }
+        // Production ignores the inherited process value entirely.
+        {
+            QProcessEnvironment env;
+            env.insert(key, QStringLiteral("cv"));
+            const QString resolved = applyMeterProposerSetting(env, QStringLiteral("yolo"), false);
+            QCOMPARE(env.value(key), QStringLiteral("yolo"));
+            QCOMPARE(resolved, QStringLiteral("ORION_METER_PROPOSER=yolo(production)"));
+        }
+
+#ifndef ORION_PRODUCTION_BUILD
+        // End to end from settings.json: the loader normalises the raw key and the env
+        // helper exports exactly that value.
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const QString rootDir = QDir(temp.path()).filePath(QStringLiteral("repo"));
+        const QJsonObject settings{{QStringLiteral("meter_proposer"), QStringLiteral("YOLO")}};
+        QVERIFY(createExecutableFixture(
+            QDir(rootDir).filePath(QStringLiteral("settings.json")),
+            QJsonDocument(settings).toJson(QJsonDocument::Compact)));
+        AppConfig config(rootDir);
+        QVERIFY(config.load());
+        QCOMPARE(config.data().meterProposer, QStringLiteral("yolo"));
+        QProcessEnvironment env;
+        const QString resolved = applyMeterProposerSetting(env, config.data().meterProposer, true);
+        QCOMPARE(env.value(key), QStringLiteral("yolo"));
+        QCOMPARE(resolved, QStringLiteral("ORION_METER_PROPOSER=yolo(setting)"));
+#endif
+    }
+
+    // [ORION_PILL_YOLO_ROUTE 2026-09-17] The Pill capsule is invisible to the CV contour
+    // locator (0 proposals on 642 labelled Pill frames: a 3 px fill core against gate 4's
+    // 8 px floor) and fully visible to the packaged ONNX detector (661/661, IoU 0.93).
+    // So a Pill launch takes the proposer the measurement supports, whatever the persisted
+    // meter_proposer says, and carries the style down beside it.
+    void pillStyleRoutesTheSidecarOntoThePackagedDetector()
+    {
+        const QString proposerKey = QString::fromLatin1(kMeterProposerEnvKey);
+        const QString styleKey = QString::fromLatin1(kMeterStyleEnvKey);
+        QCOMPARE(styleKey, QStringLiteral("ORION_METER_STYLE"));
+        QCOMPARE(QString::fromLatin1(kPillYoloRouteEnvKey),
+                 QStringLiteral("ORION_PILL_YOLO_ROUTE"));
+        const QString routeLog = QStringLiteral(
+            "METER STYLE: Pill -> proposer=yolo (contour locator cannot see the Pill capsule; "
+            "packaged detector is Pill-trained)");
+
+        // The live hazard this closes: style Pill persisted beside the certified cv proposer.
+        {
+            QProcessEnvironment env;
+            seedProposerEnv(env, QStringLiteral("cv"));
+            QCOMPARE(env.value(proposerKey), QStringLiteral("cv"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), true);
+            QVERIFY(route.routed);
+            QCOMPARE(env.value(proposerKey), QStringLiteral("yolo"));
+            QCOMPARE(env.value(styleKey), QStringLiteral("pill"));
+            QCOMPARE(route.resolvedProposer, QStringLiteral("yolo"));
+            QCOMPARE(route.log, routeLog);
+        }
+        // The style arrives from a hand-edited settings.json in any casing/padding.
+        {
+            QProcessEnvironment env;
+            seedProposerEnv(env, QStringLiteral("cv"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("  pILL "), true);
+            QVERIFY(route.routed);
+            QCOMPARE(env.value(proposerKey), QStringLiteral("yolo"));
+            QCOMPARE(env.value(styleKey), QStringLiteral("pill"));
+        }
+        // An explicit development A/B pin on cv also loses to the style: an arm that
+        // cannot see the meter measures nothing, so there is nothing to preserve.
+        {
+            QProcessEnvironment env;
+            env.insert(proposerKey, QStringLiteral("cv"));
+            seedProposerEnv(env, QStringLiteral("yolo"));
+            QCOMPARE(env.value(proposerKey), QStringLiteral("cv"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), true);
+            QVERIFY(route.routed);
+            QCOMPARE(env.value(proposerKey), QStringLiteral("yolo"));
+        }
+        // Already on yolo: the env is the same one either way, and the line still names
+        // the route so a launch log always says which proposer the style chose.
+        {
+            QProcessEnvironment env;
+            seedProposerEnv(env, QStringLiteral("yolo"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), true);
+            QVERIFY(route.routed);
+            QCOMPARE(env.value(proposerKey), QStringLiteral("yolo"));
+            QCOMPARE(env.value(styleKey), QStringLiteral("pill"));
+            QCOMPARE(route.log, routeLog);
+        }
+    }
+
+    // The other half of the contract, and the one that keeps the shipped style safe:
+    // anything that is not Pill leaves the environment EXACTLY as the pre-route build
+    // assembled it -- no forced proposer, no ORION_METER_STYLE, no log line.
+    void nonPillStylesKeepTodaysSidecarEnvironmentByteForByte()
+    {
+        const QString styleKey = QString::fromLatin1(kMeterStyleEnvKey);
+        const QStringList styles{QStringLiteral("Arrow2"), QStringLiteral("Straight"),
+                                 QStringLiteral("Dial"),   QStringLiteral("Sword"),
+                                 QString{}};
+        const QStringList proposers{QStringLiteral("cv"), QStringLiteral("yolo")};
+        for (const QString& style : styles) {
+            for (const QString& proposer : proposers) {
+                QProcessEnvironment env;
+                seedProposerEnv(env, proposer);
+                QStringList before = env.toStringList();
+                before.sort();
+                const MeterStyleRouteResult route = applyPillYoloRoute(env, style, true);
+                QStringList after = env.toStringList();
+                after.sort();
+                QVERIFY2(after == before,
+                         qPrintable(QStringLiteral("style %1 altered the sidecar env")
+                                        .arg(style.isEmpty() ? QStringLiteral("<empty>") : style)));
+                QVERIFY(!route.routed);
+                QVERIFY(route.log.isEmpty());
+                QVERIFY(!env.contains(styleKey));
+                QCOMPARE(route.resolvedProposer, proposer);
+            }
+        }
+    }
+
+    // The kill switch. Down, it restores the pre-route environment byte for byte -- and
+    // then the launch must SAY that the session is blind, which is the one thing the
+    // shipped build never did.
+    void pillYoloRouteKillSwitchRestoresThePreRouteEnvironmentAndSaysSo()
+    {
+        const QString proposerKey = QString::fromLatin1(kMeterProposerEnvKey);
+        const QString styleKey = QString::fromLatin1(kMeterStyleEnvKey);
+        const QString routeEnvKey = QString::fromLatin1(kPillYoloRouteEnvKey);
+
+        // Setting down (pill_yolo_route=false): env untouched + the mismatch line.
+        {
+            QProcessEnvironment env;
+            seedProposerEnv(env, QStringLiteral("cv"));
+            QStringList before = env.toStringList();
+            before.sort();
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), false);
+            QStringList after = env.toStringList();
+            after.sort();
+            QCOMPARE(after, before);
+            QVERIFY(!route.routed);
+            QVERIFY(!env.contains(styleKey));
+            QCOMPARE(env.value(proposerKey), QStringLiteral("cv"));
+            QCOMPARE(route.resolvedProposer, QStringLiteral("cv"));
+            QVERIFY(route.log.startsWith(QStringLiteral("METER STYLE MISMATCH:")));
+            QVERIFY(route.log.contains(QStringLiteral("style=Pill proposer=cv")));
+        }
+        // Env door (ORION_PILL_YOLO_ROUTE=0) with the setting still true.
+        {
+            QProcessEnvironment env;
+            env.insert(routeEnvKey, QStringLiteral(" 0 "));
+            seedProposerEnv(env, QStringLiteral("cv"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), true);
+            QVERIFY(!route.routed);
+            QCOMPARE(env.value(proposerKey), QStringLiteral("cv"));
+            QVERIFY(!env.contains(styleKey));
+            QVERIFY(route.log.startsWith(QStringLiteral("METER STYLE MISMATCH:")));
+        }
+        // ...but ONLY an exact "0". A mistyped kill switch must not ship a blind proposer.
+        for (const QString& noise : {QStringLiteral("false"), QStringLiteral("no"),
+                                     QString{}, QStringLiteral("00")}) {
+            QProcessEnvironment env;
+            env.insert(routeEnvKey, noise);
+            seedProposerEnv(env, QStringLiteral("cv"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), true);
+            QVERIFY2(route.routed, qPrintable(QStringLiteral("'%1' disabled the route").arg(noise)));
+            QCOMPARE(env.value(proposerKey), QStringLiteral("yolo"));
+        }
+        // A killed route over a proposer that CAN see the Pill is not a mismatch: the
+        // reader is not blind, so there is nothing to warn about.
+        {
+            QProcessEnvironment env;
+            seedProposerEnv(env, QStringLiteral("yolo"));
+            const MeterStyleRouteResult route =
+                applyPillYoloRoute(env, QStringLiteral("Pill"), false);
+            QVERIFY(!route.routed);
+            QVERIFY(route.log.isEmpty());
+            QCOMPARE(env.value(proposerKey), QStringLiteral("yolo"));
+            QVERIFY(!env.contains(styleKey));
+        }
+    }
+
+#ifndef ORION_PRODUCTION_BUILD
+    // End to end from settings.json: the key round-trips, an absent key takes the
+    // compiled default (true), and the loaded value is what the launch route reads.
+    void pillYoloRouteSettingRoundTripsThroughSettingsJson()
+    {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+
+        const QString killedRoot = QDir(temp.path()).filePath(QStringLiteral("killed"));
+        const QJsonObject killed{{QStringLiteral("meter_style"), QStringLiteral("Pill")},
+                                 {QStringLiteral("pill_yolo_route"), false}};
+        QVERIFY(createExecutableFixture(
+            QDir(killedRoot).filePath(QStringLiteral("settings.json")),
+            QJsonDocument(killed).toJson(QJsonDocument::Compact)));
+        AppConfig killedConfig(killedRoot);
+        QVERIFY(killedConfig.load());
+        QCOMPARE(killedConfig.data().meterStyle, QStringLiteral("Pill"));
+        QVERIFY(!killedConfig.data().pillYoloRoute);
+        // A save must not quietly re-enable it. (Snapshot first: save() writes through
+        // data_, so handing it a reference to data_ would be self-aliasing.)
+        const AppConfigData killedSnapshot = killedConfig.data();
+        QVERIFY(killedConfig.save(killedSnapshot));
+        const QJsonObject persisted =
+            QJsonDocument::fromJson(
+                [&] {
+                    QFile file(QDir(killedRoot).filePath(QStringLiteral("settings.json")));
+                    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+                }())
+                .object();
+        QVERIFY(persisted.contains(QStringLiteral("pill_yolo_route")));
+        QCOMPARE(persisted.value(QStringLiteral("pill_yolo_route")), QJsonValue(false));
+        AppConfig reloaded(killedRoot);
+        QVERIFY(reloaded.load());
+        QVERIFY(!reloaded.data().pillYoloRoute);
+
+        // An existing install that predates the key comes up ON, which is what puts a
+        // Pill user on the proposer that can see the meter without touching their file.
+        const QString legacyRoot = QDir(temp.path()).filePath(QStringLiteral("legacy"));
+        const QJsonObject legacy{{QStringLiteral("meter_style"), QStringLiteral("Pill")},
+                                 {QStringLiteral("meter_proposer"), QStringLiteral("cv")}};
+        QVERIFY(createExecutableFixture(
+            QDir(legacyRoot).filePath(QStringLiteral("settings.json")),
+            QJsonDocument(legacy).toJson(QJsonDocument::Compact)));
+        AppConfig legacyConfig(legacyRoot);
+        QVERIFY(legacyConfig.load());
+        QVERIFY(legacyConfig.data().pillYoloRoute);
+
+        // ...and the launch route reads exactly those two loaded fields.
+        QProcessEnvironment env;
+        seedProposerEnv(env, legacyConfig.data().meterProposer);
+        const MeterStyleRouteResult route = applyPillYoloRoute(
+            env, legacyConfig.data().meterStyle, legacyConfig.data().pillYoloRoute);
+        QVERIFY(route.routed);
+        QCOMPARE(env.value(QString::fromLatin1(kMeterProposerEnvKey)), QStringLiteral("yolo"));
+        QCOMPARE(env.value(QString::fromLatin1(kMeterStyleEnvKey)), QStringLiteral("pill"));
+    }
+#endif
 
 #ifndef ORION_PRODUCTION_BUILD
     void developmentConfigMigratesStalePathToActiveRepositoryImage()

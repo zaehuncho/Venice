@@ -29,7 +29,7 @@ Driver chain:
    `release/orion-package-<ver>.zip`, builds/signs the Ed25519 **auto-update** manifest, then
    calls `tools/verify_release_integrity.py` as the final ship gate. Refuses to package a build
    not configured `-DORION_PRODUCTION=ON` (`require_production_build()`, lines 529–549).
-3. `tools/security/pack_orion_release.py` — optional wrapper that runs an **external commercial
+3. `tools/security/pack_lethe_release.py` — optional wrapper that runs an **external commercial
    packer** (VMProtect/Themida-style) over the first-party PEs only, then re-audits. Currently
    **verify-only, no packer wired** (`release/orion-packing-report.json` shows
    `"(verify-only; no packer run)"`).
@@ -281,7 +281,7 @@ via the tool; the runbook must forbid manual zips.
    `signtool sign /fd SHA256 /tr <timestamp> /td SHA256 …` (EV cert on HSM per
    `docs/CODE_SIGNING.md`). Then `write_release_manifest()` hashes the **signed** bytes, and
    `verify_release_integrity.py` runs. (The existing packer wrapper
-   `tools/security/pack_orion_release.py` regenerates the manifest post-mutation — reuse that exact
+   `tools/security/pack_lethe_release.py` regenerates the manifest post-mutation — reuse that exact
    insertion order for signing; optionally run the commercial packer over the same first-party PE
    list, but **not** over `OrionSidecar.exe`'s numpy/cv2 native libs, which packers often corrupt.)
 9. **Enable the tamper-lock only after signing is proven.** `SecurityManager::enforceAuthenticode()`

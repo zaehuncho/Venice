@@ -204,7 +204,7 @@ def test_flicker_zero_reads_do_not_shield(monkeypatch):
     res1 = _feed(r, 1.00)                               # ghost 62%  (cold veto withholds)
     assert not res1.detected
     assert res1.rejection_reason == "cold_first_read_unproven"
-    assert _feed(r, 1.02, fill_top=None).detected       # blur 0.0   (guard unmoved)
+    assert not _feed(r, 1.02, fill_top=None).detected   # absent pixels, guard unmoved
     res2 = _feed(r, 1.04)                               # ghost 62%  (press clock forbids)
     assert not res2.detected
     assert res2.rejection_reason == "press_onset_implausible"

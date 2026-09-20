@@ -35,8 +35,8 @@ Rectangle {
         anchors.leftMargin: 1
         anchors.rightMargin: -1
         anchors.bottomMargin: -2
-        radius: parent.radius + 1
-        color: "#06090E"
+        radius: root.radius + 1
+        color: Theme.shadowHalo
         opacity: 0.55
     }
 
@@ -44,7 +44,7 @@ Rectangle {
     Rectangle {
         anchors.fill: parent
         anchors.margins: 1
-        radius: parent.radius - 1
+        radius: root.radius - 1
         gradient: Gradient {
             orientation: Gradient.Vertical
             GradientStop { position: 0.0; color: root.interactive && hoverHandler.hovered ? Theme.bgCardHover : Theme.bgCardTop }
@@ -57,8 +57,8 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        anchors.leftMargin: parent.radius
-        anchors.rightMargin: parent.radius
+        anchors.leftMargin: root.radius
+        anchors.rightMargin: root.radius
         anchors.topMargin: 1
         height: 1
         color: Theme.hairlineLight
@@ -97,11 +97,14 @@ Rectangle {
             visible: root.title.length > 0 || root.subtitle.length > 0
             Layout.fillWidth: true
 
+            // Header roles: title = body size at DemiBold, subtitle = small muted.
+            // Sizes come from the Theme ramp so every card header is identical;
+            // the fixed-height cards on the pages assume this header is ~36px.
             Text {
                 text: root.title
                 color: Theme.textPrimary
                 font.family: Theme.fontUi
-                font.pixelSize: 13
+                font.pixelSize: Theme.fontBody
                 font.weight: Font.DemiBold
                 visible: root.title.length > 0
                 elide: Text.ElideRight
@@ -111,7 +114,7 @@ Rectangle {
                 text: root.subtitle
                 color: Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 12
+                font.pixelSize: Theme.fontSmall
                 visible: root.subtitle.length > 0
                 elide: Text.ElideRight
                 Layout.fillWidth: true

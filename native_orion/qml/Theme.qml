@@ -56,26 +56,23 @@ QtObject {
     // High-contrast detector overlay tokens. Geometry and detector inputs never
     // depend on the UI theme.
     //
-    // The lock colour is BRIGHT BLUE — the owner's chosen default look
-    // (2026-08-06, replacing the original reference violet-magenta). It sits
-    // ~210 degrees off the meter's saturated red, so the stroke can never be
-    // confused with the bar it is tracing. On a floodlit white court a bright
-    // blue alone is only ~2.6:1 against white, which is exactly why the lock
-    // is never drawn as a bare stroke: the dark keylines below bracket it on
-    // both sides and carry the edge on a blown-out baseline.
+    // The lock colour is dodger blue per the 2026-09-14 owner directive
+    // ("blue, visible"), replacing the 2026-08-31 magenta. The lock is never
+    // drawn as a bare stroke: the dark keylines below bracket it on both sides
+    // and carry the edge on a blown-out baseline without covering the meter.
     //
     // This constant is the QML-side fallback/companion default only. The
     // runtime stroke is `orion.meterOverlayDrawColor`, whose factory default
     // (AppConfigData::kMeterOverlayDefaultColor) must stay in lockstep with
     // this value.
-    readonly property color meterLock: "#00A8FF"
+    readonly property color meterLock: "#1E90FF"
     // Keyline that brackets the lock stroke on BOTH sides. A bright stroke
     // alone fails in exactly the two places it matters: it disappears into a
     // blown-out white highlight, and it goes muddy where it touches the red
     // bar. A dark hairline inside and outside guarantees an edge against any
-    // backdrop without widening the stroke itself. Near-black with a blue bias
+    // backdrop without widening the stroke itself. Near-black with a navy bias
     // so it reads as part of the same mark and not as a separate grey box.
-    readonly property color meterLockKeyline: "#001626"
+    readonly property color meterLockKeyline: "#06182F"
 
     // ---- status ----
     readonly property color success: "#22C55E"
@@ -88,10 +85,30 @@ QtObject {
     readonly property color dangerDim: "#351A1E"
     readonly property color dangerBorder: "#74303A"
 
+    // Text drawn ON an accent/danger/success fill (buttons, selected chips, selection highlight).
+    readonly property color textOnAccent: "#FFFFFF"
+
+    // Log-viewer level colours: brighter than the status set so they read on mono text at 11-12px.
+    readonly property color logErr: "#FF6B6B"
+    readonly property color logWarn: "#FFC857"
+    readonly property color logOk: "#5BE39B"
+    readonly property color logInfo: "#6FD3E0"
+    readonly property color logText: "#AEB6C2"
+
+    // Drop halo drawn one pixel below cards and gate dialogs (soft elevation
+    // without the effects module). Shared so every raised surface sits the same.
+    readonly property color shadowHalo: "#06090E"
+
     // ---- shape ----
     readonly property int radiusCard: 14
     readonly property int radiusControl: 10
+    // Small chips, tab pills, and compact inline buttons (copy/paste/filter).
+    readonly property int radiusChip: 7
     readonly property int radiusPill: 15
+
+    // Standard height for a row control: combos, text fields, and the buttons
+    // that sit beside them. One value so a row of mixed controls stays level.
+    readonly property int controlHeight: 38
 
     // ---- spacing scale ----
     readonly property int spaceXs: 4
@@ -103,10 +120,13 @@ QtObject {
     // ---- type ramp ----
     readonly property string fontUi: "Segoe UI Variable"
     readonly property string fontMono: "Cascadia Mono"
-    readonly property int fontDisplay: 24
+    readonly property int fontDisplay: 24   // page title
+    readonly property int fontHeading: 20   // gate/dialog title, hero line
     readonly property int fontTitle: 15
     readonly property int fontBody: 13
+    readonly property int fontSmall: 12     // card subtitle, secondary rows, hints
     readonly property int fontCaption: 11
+    readonly property int fontMicro: 10     // uppercase eyebrow labels
 
     // ---- motion (deliberate, fast: ~150-250ms curves) ----
     readonly property int motionFast: 110

@@ -1,5 +1,10 @@
 # (This file's body is the exact text to paste into browser-Claude.)
 
+> **SUPERSEDED.** This is SellHub-era copy. The store is Gumroad and, since the owner's
+> 2026-09-15 rule, there is ONE plan: a free 3-day trial then **$25/month recurring**, plus a
+> one-time activation fee. No Day/Week/Lifetime tiers. See `BOT_DEPLOY_GUIDE.md` for the
+> two-product Gumroad checkout. Kept for the server/store build steps only.
+
 You are an operator building a complete, professional **Discord server + SellHub store** for a software product called **Orion**. Work top-to-bottom using the Discord web app (discord.com/app) and SellHub (sellhub.cx). Make it clean, branded, secure, and ready to sell. Whenever a step needs the owner (uploading an image, logging into SellHub, paying, providing a price), pause and ask them for it. Confirm the PLACEHOLDERS below before you start.
 
 ## ABOUT ORION (use for all copy)

@@ -104,10 +104,17 @@ enum class InputLinkRecoveryAction {
 };
 
 [[nodiscard]] inline constexpr InputLinkRecoveryAction inputLinkRecoveryAction(
-    int downHeartbeats, int inputOnlyAttempts, bool fullRestartEscalated) noexcept
+    int downHeartbeats, int inputOnlyAttempts, bool fullRestartEscalated,
+    bool inputOnlyRecoveryPending = false) noexcept
 {
     if (fullRestartEscalated) {
         return InputLinkRecoveryAction::HoldFailClosed;
+    }
+    // The outer stream intentionally remains Running during an in-place child
+    // repair. Suppress threshold re-evaluation until that bounded attempt has a
+    // verdict, otherwise a slow (but healthy) recovery can consume another retry.
+    if (inputOnlyRecoveryPending) {
+        return InputLinkRecoveryAction::None;
     }
 
     const int boundedAttempts = std::clamp(
@@ -126,31 +133,31 @@ enum class InputLinkRecoveryAction {
 }
 
 // A recovery result is authoritative only for the one attempt that is still pending while the
-// native session remains in Connecting. `rejectLate` is latched by timeout/error/disconnect and is
-// cleared only when a genuinely new recovery generation begins.
+// native stream generation remains Running. `rejectLate` is latched by timeout/error/disconnect
+// and is cleared only when a genuinely new recovery generation begins.
 [[nodiscard]] inline constexpr bool shouldAcceptInputRecoveryReady(
-    bool pending, bool rejectLate, bool connecting,
+    bool pending, bool rejectLate, bool sessionRunning,
     bool hasExplicitInputReady, bool inputReady) noexcept
 {
-    return pending && !rejectLate && connecting
+    return pending && !rejectLate && sessionRunning
         && hasExplicitInputReady && inputReady;
 }
 
 // Generation-scoped timer policy. A timer from an earlier recovery attempt must be inert even if a
-// later attempt happens to be Connecting when it fires.
+// later attempt happens to be Running when it fires.
 [[nodiscard]] inline constexpr bool inputRecoveryDeadlineApplies(
     quint64 timerGeneration, quint64 currentGeneration,
-    bool pending, bool connecting) noexcept
+    bool pending, bool sessionRunning) noexcept
 {
-    return timerGeneration == currentGeneration && pending && connecting;
+    return timerGeneration == currentGeneration && pending && sessionRunning;
 }
 
 // Running telemetry is authoritative revocation evidence for the independent
-// Chiaki input child. Permit exactly one smallest-scope recovery transition:
-// recoverInputLink() synchronously changes Running -> Connecting and latches
-// `pending`, so subsequent telemetry cannot request a duplicate child. Missing
-// evidence is treated the same as an explicit false verdict and remains
-// fail-closed.
+// Chiaki input child. Permit exactly one smallest-scope recovery attempt:
+// recoverInputLink() retains Running, independently revokes route authority,
+// and latches `pending`, so subsequent telemetry cannot request a duplicate
+// child. Missing evidence is treated the same as an explicit false verdict and
+// remains fail-closed.
 [[nodiscard]] inline constexpr bool shouldAutoRecoverInputFromTelemetry(
     bool running, bool recoveryPending,
     bool hasExplicitInputReady, bool inputReady) noexcept
@@ -183,7 +190,8 @@ inline constexpr int kSidecarGracefulShutdownMs = 5000;
 // never disagree about which mode we are in. Case-insensitive to match the env gate's compare.
 [[nodiscard]] inline bool isCaptureCardSource(const AppConfigData& config)
 {
-    return config.videoSource.compare(QStringLiteral("capture_card"), Qt::CaseInsensitive) == 0;
+    return !isXboxRemotePlay(config)
+        && config.videoSource.compare(QStringLiteral("capture_card"), Qt::CaseInsensitive) == 0;
 }
 
 // The delay the watchdog waits after tearing the sidecar down before respawning it.

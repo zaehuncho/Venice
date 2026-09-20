@@ -18,14 +18,51 @@ Item {
         spacing: 12
 
         Card {
-            title: "Meter Profile"
+            title: "Meter Detection"
             subtitle: "Automatic detection on every shot"
             Layout.fillWidth: true
-            Layout.preferredHeight: 180
+            // Sized from content, the same +84 header overhead every Card in this panel uses:
+            // the card gained a Detector row, a locked-style hint and a health line, and
+            // the old fixed 180 would crush the rows into each other.
+            Layout.preferredHeight: meterDetectionCol.implicitHeight + 84
 
             ColumnLayout {
+                id: meterDetectionCol
                 anchors.fill: parent
                 spacing: 11
+
+                // [METER DETECTION CARD 2026-09-10] Which proposer hands the reader its meter
+                // box. "cv" = the pure-CV landmark locator (Arrow2 geometry only, ~0.5 ms);
+                // "yolo" = the shipped ONNX detector (every style in the Style combo). The
+                // combo shows labels; the persisted value stays "cv" | "yolo" (the C++ setter
+                // normalises). The sidecar reads it ONCE at launch (ORION_METER_PROPOSER), so
+                // a change applies to the next preview/stream start, not mid-session.
+                // [2026-09-10 owner] YOLO shelved: Pure CV is the only path, the Style stays
+                // Arrow2. (SUPERSEDED for the Style combo on 2026-09-17 -- see below.)
+                readonly property bool pureCv: true
+
+                // [ORION_PILL_YOLO_ROUTE 2026-09-17] The Style combo is NO LONGER pinned by
+                // `pureCv`. Measured on 661 labelled 2K27 park frames (docs/PILL_STYLE_STATUS.md):
+                // the pure-CV locator proposes a box on 0 of 642 Pill frames, and the packaged
+                // detector reads 661/661 -- so a Pill player on this panel was choosing between
+                // "Arrow2" (wrong style) and a hidden persisted Pill that ran blind. Picking Pill
+                // here writes meter_style, and the NEXT sidecar launch routes itself onto the
+                // detector that can see it (RemotePlaySession + SidecarReaderProfile.h).
+                // `pureCv` is KEPT as the card's record of the shipped proposer choice (the
+                // Detector combo it also dimmed was removed with the rest of the proposer
+                // surface); nothing on this card binds it now that the Style combo is live.
+                //
+                // The combo trades in LABELS, the setting in style names: "Pill (beta)" persists
+                // as "Pill". A persisted style that is neither (a 2K26 "Dial"/"Sword") displays as
+                // Arrow2 without being rewritten -- the same display-only contract the lock had.
+                readonly property var styleOptions: ["Arrow2", "Pill (beta)"]
+                function styleLabelFor(style) {
+                    return String(style).trim().toLowerCase() === "pill" ? "Pill (beta)" : "Arrow2"
+                }
+                function styleValueFor(label) {
+                    return label === "Pill (beta)" ? "Pill" : "Arrow2"
+                }
+
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -35,11 +72,37 @@ Item {
                         Layout.fillWidth: true
                         spacing: 6
                         Text { text: "Style"; color: Theme.textMuted; font.family: Theme.fontUi; font.pixelSize: 11; font.weight: Font.DemiBold }
+                        // The two styles the shipped build can actually READ: Arrow2 on the
+                        // pure-CV locator, Pill on the packaged detector (which the launch
+                        // routes to automatically when this says Pill). The retired 2K26
+                        // entries (Arrow/Dial/Sword) and Straight -- which no proposer has
+                        // been measured on -- stay off the list rather than offering a choice
+                        // that lands the user on a blind session.
                         DashboardCombo {
+                            id: meterStyleCombo
+                            objectName: "meterStyleCombo"
                             Layout.fillWidth: true
-                            model: ["Arrow", "Arrow2", "Dial", "Pill", "Straight", "Sword"]
-                            value: orion.meterStyle
-                            onValueChanged: orion.meterStyle = value
+                            model: meterDetectionCol.styleOptions
+                            value: meterDetectionCol.styleLabelFor(orion.meterStyle)
+                            onValueChanged: {
+                                // Compare LABEL to LABEL, never label-to-style: a persisted
+                                // 2K26 value ("Dial"/"Sword"/"Straight") displays as Arrow2,
+                                // and comparing it against the style would make merely SHOWING
+                                // this panel rewrite it. Only a pick that moves the label off
+                                // what the setting already displays as writes the setting.
+                                if (value === meterDetectionCol.styleLabelFor(orion.meterStyle))
+                                    return
+                                orion.meterStyle = meterDetectionCol.styleValueFor(value)
+                            }
+                            // Same re-sync as the Detector combo: a user pick breaks the
+                            // `value` binding, so the combo must be re-pointed at the
+                            // persisted style whenever the settings round trip.
+                            Connections {
+                                target: orion
+                                function onSettingsChanged() {
+                                    meterStyleCombo.value = meterDetectionCol.styleLabelFor(orion.meterStyle)
+                                }
+                            }
                         }
                     }
 
@@ -47,20 +110,34 @@ Item {
                         Layout.fillWidth: true
                         spacing: 6
                         Text { text: "Color"; color: Theme.textMuted; font.family: Theme.fontUi; font.pixelSize: 11; font.weight: Font.DemiBold }
+                        // NBA 2K27 ships a WHITE-ONLY meter (Red/Purple retired 2026-08-27). Kept as a
+                        // real DashboardCombo so it sizes/aligns EXACTLY like the Style combo beside it
+                        // (a custom Rectangle broke the RowLayout width split and made both look buggy),
+                        // but White-only + disabled so it reads as locked and can't be changed. meterColor
+                        // is forced White in case a stored Red/Purple value survives a 2K26 profile.
                         DashboardCombo {
                             Layout.fillWidth: true
-                            // Only bar colours the reader can actually detect may be listed.
-                            // Yellow/Orange/Cyan stay OFF this list: they change the HUD label,
-                            // leave every mask red, and detect nothing with no explanation.
-                            // White joined on 2026-08-26 -- NBA 2K27 early access ships a
-                            // WHITE-ONLY meter, and White now has live reader support measured
-                            // off real capture-card frames (see meter_bar_colors._WHITE).
-                            model: ["White", "Red", "Purple"]
-                            value: orion.meterColor
-                            onValueChanged: orion.meterColor = value
+                            model: ["White"]
+                            value: "White"
+                            enabled: false
+                            opacity: 0.55        // greyed -> signals locked / not user-changeable
+                            Component.onCompleted: if (orion.meterColor !== "White") orion.meterColor = "White"
                         }
                     }
                 }
+
+                // [ORION_PILL_YOLO_ROUTE 2026-09-17] Sits under the Style/Color row rather than
+                // inside the Style column so the two combos keep the row height they share today.
+                Text {
+                    objectName: "meterStyleCaption"
+                    Layout.fillWidth: true
+                    text: "Pill: uses the packaged detector; timing validation in progress."
+                    color: Theme.textMuted
+                    wrapMode: Text.WordWrap
+                    font.family: Theme.fontUi
+                    font.pixelSize: 10
+                }
+
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -71,7 +148,7 @@ Item {
                         radius: 4
                         // meterBlindWarning is the HIGHEST-priority state: several whole shots
                         // were taken and the detector saw nothing, which almost always means the
-                        // Color above does not match the in-game meter.
+                        // Style or Color above does not match the in-game meter.
                         color: orion.meterBlindWarning ? Theme.danger
                                : orion.meterConfirmed ? Theme.success
                                : meterPanel.streamLive ? Theme.accent : Theme.textFaint
@@ -86,7 +163,10 @@ Item {
                     }
                     Item { Layout.fillWidth: true }
                     Text {
-                        text: orion.meterBlindWarning ? "NO METER — CHECK COLOR"
+                        // [2026-09-14 owner] was "NO METER — CHECK COLOR". "NO METER" is now the
+                        // name of a timing MODE on this page, and the mismatch is as often the
+                        // Style (Pill vs Straight) as the Colour.
+                        text: orion.meterBlindWarning ? "NO METER DETECTED"
                               : orion.meterConfirmed ? "METER LOCKED"
                               : meterPanel.streamLive ? "WATCHING" : "STANDBY"
                         color: orion.meterBlindWarning ? Theme.danger
@@ -97,7 +177,8 @@ Item {
                     }
                 }
 
-                // The actionable half of the warning: which colour is set, and which to try.
+                // The actionable half of the warning: the two settings that decide whether the
+                // reader can see this meter at all, both of which sit directly above.
                 Text {
                     Layout.fillWidth: true
                     visible: orion.meterBlindWarning
@@ -108,6 +189,21 @@ Item {
                     font.pixelSize: 10
                 }
 
+                // Reader detector health, straight from the sidecar (~2 s cadence):
+                // "<Pure CV | YOLO · DirectML> · <infer> ms · <idle|pending|locked> · locks N
+                // · <refused|drops> N". Native formats it; this only paints it. "--" until the
+                // first report and again after the sidecar exits, so it never quotes a ghost.
+                Text {
+                    objectName: "detectorHealthLine"
+                    Layout.fillWidth: true
+                    text: orion.detectorHealthLine && orion.detectorHealthLine.length > 0
+                          ? orion.detectorHealthLine : "--"
+                    color: Theme.textMuted
+                    elide: Text.ElideRight
+                    font.family: Theme.fontMono
+                    font.pixelSize: 10
+                }
+
                 // The "Live ETA / hold" toggle was removed 2026-08-06 (owner-directed) as
                 // part of cutting the customer surface down to controls people actually
                 // use. The overlay it governed still exists and still renders on its
@@ -115,11 +211,10 @@ Item {
                 // removal, not a behaviour change. orion.showLiveMeterMetrics is now
                 // UI-orphaned on the WRITE side; RemotePlayPage still READS it.
 
-                // NOTE: the meter telemetry box beside the lock has no toggle.
-                // It is drawn on exactly the same condition as the detection
-                // box itself (a fresh confirmed meter lock) and disappears with
-                // it, so there is nothing here to switch: turning it off would
-                // mean turning the detection box off.
+                // NOTE: the compact unboxed meter telemetry near the lock has
+                // no toggle. It is drawn on exactly the same condition as the
+                // detection lock itself (a fresh confirmed meter) and disappears
+                // with it, so there is nothing here to switch independently.
             }
         }
 
@@ -129,414 +224,21 @@ Item {
         // so nothing that reads a persisted setting changes behaviour -- this is a
         // surface removal, not a feature rip-out.
 
-        Card {
-            title: "Meter Delay"
-            subtitle: "Adds inbound network delay so the shot meter reads cleaner"
-            // [ORION_METER_DELAY_SHELVED 2026-08-12] HIDDEN unless the feature is already on.
-            //
-            // The subtitle above is measurably FALSE, which is why this is hidden rather than
-            // merely defaulted off. Measured 2026-08-12: at D=200 the reader's green window is
-            // 13.9 pp wide against 2.8 pp at D=0, and meter bounce-back goes from 16.8% to 100%.
-            // Delay makes the meter read WORSE, not cleaner. Shipping a control whose own
-            // description is backwards is a support burden and a bad first impression.
-            //
-            // NOT deleted, and the backend is untouched. The one live hypothesis left for the
-            // feature is the owner's contested-shot theory -- the intercept is inbound-only
-            // (MeterDelayIntercept.h:7), so the console's picture of the DEFENCE is stale by D,
-            // which may win contested shots even though it costs meter legibility. That is an
-            // outcome test (make% on contested shots), not a meter-quality one, and it has not
-            // been run.
-            //
-            // Gated on meterDelayEnabled rather than a hard `false` so bringing it back needs no
-            // rebuild: set "meter_delay_enabled": true in settings.json with the app CLOSED and
-            // the card reappears, fully functional, for that test. Default is false
-            // (AppConfig.h), so a shipping install never sees it.
-            visible: orion.meterDelayEnabled
+        // [ORION_RHYTHM_RESTORED 2026-09-11 owner] Rhythm is the last card in this panel.
+        RhythmCard {
+            objectName: "rhythmCard"
             Layout.fillWidth: true
-            // 84, not the old 70: a titled+subtitled Card's real overhead is
-            // 32 (margins) + ~37 (title/subtitle block) + 12 (header spacing) ≈ 81.
-            // At +70 the content column ran ~11px short of its implicitHeight, so
-            // the layout shaved every row a pixel or two and adjacent text visually
-            // collided ("glitchy"). +84 covers the overhead with slack; surplus just
-            // rests at the card bottom.
-            Layout.preferredHeight: meterDelayCol.implicitHeight + 84
-
-            ColumnLayout {
-                id: meterDelayCol
-                anchors.fill: parent
-                spacing: 10
-
-                // [ORION_METER_DELAY_AVAILABILITY 2026-08-08] Honesty banner. The delay
-                // is actuated by the WinDivert packet bridge; current installers ship
-                // and register it (packet_bridge\NexusVisionSvc.exe -> NexusVisionSvc,
-                // installer/orion.iss), but older installs, partial packages and failed
-                // service registrations have no backend — and without this banner the
-                // toggle flips and persists while nothing downstream can ever engage
-                // (the ship-blocker). The toggle stays operable so the preference
-                // survives, but the card can never silently lie about a headline
-                // feature.
-                // [ORION_METER_DELAY_ARM_STATE 2026-08-08] Same banner, second lie: on a
-                // dev rig the bridge can be RUNNING with the intercept DISARMED (nexus_svc
-                // ships disarmed; arming is an out-of-band operator action). The service
-                // reports that itself, and the card must show it instead of "Armed".
-                Rectangle {
-                    visible: !orion.meterDelayBackendAvailable
-                             || (orion.meterDelayEnabled && orion.meterDelayServiceDisarmed)
-                    Layout.fillWidth: true
-                    implicitHeight: meterDelayUnavailableText.implicitHeight + 16
-                    radius: 6
-                    color: Theme.warningDim
-                    border.color: Theme.warningBorder
-                    border.width: 1
-                    Text {
-                        id: meterDelayUnavailableText
-                        anchors.fill: parent
-                        anchors.margins: 8
-                        wrapMode: Text.WordWrap
-                        color: Theme.warning
-                        font.family: Theme.fontUi
-                        font.pixelSize: 12
-                        text: !orion.meterDelayBackendAvailable
-                              ? ("Not available on this install — the network-delay service "
-                                 + "is missing, so Meter Delay has no effect. Re-run the "
-                                 + "Venice installer as administrator to add it.")
-                              : ("The network-delay service is running but DISARMED, so "
-                                 + "Meter Delay is not being applied. Restart the bridge "
-                                 + "armed (--arm-meter-delay).")
-                    }
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    Text {
-                        // Just "Enable": the card's title + subtitle already name the
-                        // feature; repeating "Meter Delay" here taught nothing.
-                        text: "Enable"
-                        color: Theme.textPrimary
-                        font.family: Theme.fontUi
-                        font.pixelSize: 13
-                        font.weight: Font.DemiBold
-                    }
-                    Item { Layout.fillWidth: true }
-                    DashboardToggle {
-                        checked: orion.meterDelayEnabled
-                        onToggled: orion.meterDelayEnabled = checked
-                    }
-                }
-
-                // Live actuator state (Idle / Armed / Engaging / Active — holding N ms).
-                // Doubles as the second, always-current honesty line when the backend is
-                // unavailable or the connected service reports the intercept disarmed.
-                Text {
-                    visible: orion.meterDelayEnabled || !orion.meterDelayBackendAvailable
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    color: (orion.meterDelayBackendAvailable && !orion.meterDelayServiceDisarmed)
-                           ? Theme.textMuted : Theme.warning
-                    font.family: Theme.fontMono
-                    font.pixelSize: 11
-                    text: orion.meterDelayStatusText
-                }
-
-                // [ORION_METER_DELAY_LAYOUT 2026-08-09] Two rows, not one. This panel
-                // column is 336px wide (RemotePlayPage's setup Loader) and card
-                // margins leave ~302px of content; the old single row spent ~266px on
-                // the label, two 44px buttons, the 54px field, "ms", the InfoTip and
-                // six 8px gaps — the slider got the ~36px that remained, a nub
-                // narrower than two handle widths ("sliders are tiny"). Row 1 now
-                // gives the slider the whole width; row 2 carries the micro-adjust
-                // controls, which also makes typed entry a deliberate act instead of
-                // an accidental focus grab beside the handle. The enabled/opacity
-                // dimming moved up to this column so both rows fade together.
-                ColumnLayout {
-                    enabled: orion.meterDelayEnabled
-                    opacity: orion.meterDelayEnabled ? 1.0 : 0.4
-                    Behavior on opacity { NumberAnimation { duration: Theme.motionFast } }
-                    Layout.fillWidth: true
-                    spacing: 6
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-                        Text {
-                            text: "Delay"
-                            color: Theme.textMuted
-                            font.family: Theme.fontUi
-                            font.pixelSize: 12
-                            Layout.preferredWidth: 42
-                        }
-                        // [ORION_METER_DELAY_RANGE 2026-08-08] 200-300 step 5 -> 100-600
-                        // step 1 (owner: find the empirical physics ceiling, fine-tune
-                        // against the other timing knobs). The +/- buttons and the
-                        // exact-value field (row below) mirror ShotLeadCard's
-                        // micro-adjust idiom: 500 ms across a few hundred pixels puts
-                        // one pixel at ~2 ms, so 1 ms precision is unreachable by drag
-                        // alone.
-                        ThemedSlider {
-                            id: meterDelaySlider
-                            Layout.fillWidth: true
-                            // The whole point of the two-row split: the track must stay
-                            // usable. If some future sibling crowds this row again, the
-                            // layout overflows instead of silently crushing the slider.
-                            Layout.minimumWidth: 240
-                            from: 100
-                            to: 600
-                            stepSize: 1
-                            snapMode: Slider.SnapAlways
-                            value: orion.meterDelayMs
-                            onMoved: if (!pressed) orion.meterDelayMs = value
-                            onPressedChanged: if (!pressed) orion.meterDelayMs = value
-                            // Dragging a Slider overwrites `value` imperatively, which
-                            // breaks the binding above — without this re-sync the handle
-                            // stops tracking after the first drag, so the +/- buttons and
-                            // the typed field would visibly do nothing (same fix as
-                            // ShotLeadCard's slider).
-                            Connections {
-                                target: orion
-                                function onSettingsChanged() {
-                                    if (!meterDelaySlider.pressed) {
-                                        meterDelaySlider.value = orion.meterDelayMs
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-                        Button {
-                            id: meterDelayDown
-                            objectName: "meterDelayDownButton"
-                            text: "− 1"
-                            implicitWidth: 44
-                            implicitHeight: 28
-                            hoverEnabled: true
-                            font.family: Theme.fontUi
-                            font.pixelSize: 11
-                            onClicked: orion.meterDelayMs = orion.meterDelayMs - 1
-                            contentItem: Text {
-                                text: meterDelayDown.text
-                                color: Theme.textSecondary
-                                font: meterDelayDown.font
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                            background: Rectangle {
-                                radius: Theme.radiusControl
-                                color: meterDelayDown.down ? Theme.bgInset : Theme.bgField
-                                border.width: 1
-                                border.color: meterDelayDown.hovered ? Theme.borderStrong : Theme.borderSoft
-                            }
-                        }
-                        Button {
-                            id: meterDelayUp
-                            objectName: "meterDelayUpButton"
-                            text: "+ 1"
-                            implicitWidth: 44
-                            implicitHeight: 28
-                            hoverEnabled: true
-                            font.family: Theme.fontUi
-                            font.pixelSize: 11
-                            onClicked: orion.meterDelayMs = orion.meterDelayMs + 1
-                            contentItem: Text {
-                                text: meterDelayUp.text
-                                color: Theme.textSecondary
-                                font: meterDelayUp.font
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                            background: Rectangle {
-                                radius: Theme.radiusControl
-                                color: meterDelayUp.down ? Theme.bgInset : Theme.bgField
-                                border.width: 1
-                                border.color: meterDelayUp.hovered ? Theme.borderStrong : Theme.borderSoft
-                            }
-                        }
-                        Item { Layout.fillWidth: true }
-                        // Exact-value entry: type a number, Enter or focus-out commits.
-                        // The C++ setter clamps into [100, 600]; the binding restore
-                        // makes the field snap back to the applied value either way.
-                        TextField {
-                            id: meterDelayField
-                            objectName: "meterDelayValueField"
-                            Layout.preferredWidth: 72
-                            implicitHeight: 28
-                            horizontalAlignment: TextInput.AlignRight
-                            selectByMouse: true
-                            color: Theme.textPrimary
-                            font.family: Theme.fontMono
-                            font.pixelSize: 12
-                            validator: IntValidator { bottom: 100; top: 600 }
-                            text: orion.meterDelayMs
-                            onEditingFinished: {
-                                var v = parseInt(text)
-                                if (!isNaN(v)) {
-                                    orion.meterDelayMs = Math.max(100, Math.min(600, v))
-                                }
-                                text = Qt.binding(function() { return orion.meterDelayMs })
-                            }
-                            background: Rectangle {
-                                radius: Theme.radiusControl
-                                color: Theme.bgField
-                                border.width: 1
-                                border.color: meterDelayField.activeFocus ? Theme.borderStrong : Theme.borderSoft
-                            }
-                        }
-                        Text {
-                            text: "ms"
-                            color: Theme.textMuted
-                            font.family: Theme.fontMono
-                            font.pixelSize: 11
-                        }
-                        InfoTip { text: "Higher = cleaner meter but more input lag. 100-600 ms, 1 ms steps." }
-                    }
-                }
-
-                // [ORION_METER_DELAY_LEAD_KEYING 2026-08-09] Shot Lead offset for the DELAYED
-                // condition, shown WHERE THE DELAY IS SET because it is a property of the
-                // delay, not of the Shot Lead. Meter Delay holds the game-server -> console
-                // packet flow: it does not delay the video and it does not delay the release
-                // command, but it does change how the console responds to that release, so the
-                // Shot Lead calibrated with the delay off is wrong with it on. The 2026-08-09
-                // session is the whole argument: delay 175 with the delay-0 lead of 295 put 8
-                // of 8 graded landings outside the good band, while the same lead with the
-                // delay off held settled_fill 95-97. This offset is added ONLY while the delay
-                // is actually applied, so it also survives OffenseDefense mode and the D-pad-Up
-                // bypass flipping the condition mid-session — which a hand-retyped Shot Lead
-                // cannot. 0 (the default) reproduces the pre-keying build exactly.
-                ColumnLayout {
-                    objectName: "meterDelayLeadOffsetRow"
-                    enabled: orion.meterDelayEnabled
-                    opacity: orion.meterDelayEnabled ? 1.0 : 0.4
-                    Behavior on opacity { NumberAnimation { duration: Theme.motionFast } }
-                    Layout.fillWidth: true
-                    spacing: 4
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Text {
-                            text: "Shot Lead offset while delayed"
-                            color: Theme.textPrimary
-                            font.family: Theme.fontUi
-                            font.pixelSize: 12
-                        }
-                        InfoTip {
-                            text: "Added to Shot Lead ONLY while the meter delay is applied. "
-                                  + "The delay changes how the console answers the release, so "
-                                  + "the lead you tuned with the delay off is wrong with it on. "
-                                  + "Tune it the same way as Shot Lead: read the game's TIMING "
-                                  + "banner and nudge until it stops saying late/early. "
-                                  + "0 = the delay-off lead is used unchanged."
-                        }
-                        Item { Layout.fillWidth: true }
-                        TextField {
-                            id: meterDelayLeadOffsetField
-                            objectName: "meterDelayLeadOffsetField"
-                            Layout.preferredWidth: 72
-                            implicitHeight: 28
-                            horizontalAlignment: TextInput.AlignRight
-                            selectByMouse: true
-                            color: Theme.textPrimary
-                            font.family: Theme.fontMono
-                            font.pixelSize: 12
-                            validator: IntValidator { bottom: -200; top: 400 }
-                            text: orion.meterDelayLeadOffsetMs
-                            onEditingFinished: {
-                                var v = parseInt(text)
-                                if (!isNaN(v)) {
-                                    orion.meterDelayLeadOffsetMs =
-                                        Math.max(-200, Math.min(400, v))
-                                }
-                                text = Qt.binding(function() {
-                                    return orion.meterDelayLeadOffsetMs
-                                })
-                            }
-                            background: Rectangle {
-                                radius: Theme.radiusControl
-                                color: Theme.bgField
-                                border.width: 1
-                                border.color: meterDelayLeadOffsetField.activeFocus
-                                              ? Theme.borderStrong : Theme.borderSoft
-                            }
-                        }
-                        Text {
-                            text: "ms"
-                            color: Theme.textMuted
-                            font.family: Theme.fontMono
-                            font.pixelSize: 11
-                        }
-                    }
-                    // The ceiling this rig can actually schedule. Above it every live tip shot
-                    // aborts (fail-closed), which is the honest failure but a baffling one
-                    // without the number, so the number is always on screen.
-                    Text {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        font.family: Theme.fontUi
-                        font.pixelSize: 11
-                        color: orion.meterDelayLeadOffsetMs > orion.meterDelayLeadOffsetMaxMs
-                               ? Theme.danger : Theme.textMuted
-                        text: orion.meterDelayLeadOffsetMaxMs > 0
-                              ? (orion.meterDelayLeadOffsetMs > orion.meterDelayLeadOffsetMaxMs
-                                 ? "Above this rig's schedulable max (+"
-                                   + Math.round(orion.meterDelayLeadOffsetMaxMs)
-                                   + " ms) — live tip shots will abort while the delay is on."
-                                 : "Schedulable up to +"
-                                   + Math.round(orion.meterDelayLeadOffsetMaxMs)
-                                   + " ms on this rig (Tip Timing ceiling minus your Shot Lead).")
-                              : "Shot Lead already sits at the Tip Timing ceiling — no positive "
-                                + "offset is schedulable. Lower Shot Lead or raise Tip Timing."
-                    }
-                }
-
-                // [ORION_LEAD_CONFLICT_UI 2026-08-08 task #48] The Shot Lead ceiling, shown
-                // WHERE THE DELAY IS SET: the delay consumes the same visible runway the
-                // lead schedules against, so owners sweeping the delay slider see the
-                // applied delay and the "shots will abort" verdict change here, live (the
-                // applied value tracks the slider through the 100 ms/s ramp). Judges the
-                // COMMITTED Shot Lead setting; the Shot Lead card's copy judges its own
-                // slider handle.
-                ShotLeadUsableMaxIndicator {
-                    objectName: "meterDelayShotLeadUsableMaxIndicator"
-                    Layout.fillWidth: true
-                    visible: orion.meterDelayEnabled && orion.shotLeadMaxUsableMs > 0
-                    leadMs: orion.actuationLeadMs
-                }
-
-                // [ORION_DEFENSE_FLAG 2026-08-08] Option B master switch. Defense
-                // bypass is now MANUAL: D-pad Up (in a connected session) toggles a
-                // runtime defense flag — flag ON ramps the delay to 0 while the user
-                // defends, flag OFF re-applies it. This persisted toggle only decides
-                // whether that hotkey exists at all; unchecked = hotkey inert, delay
-                // always applied. The runtime flag itself is deliberately NOT
-                // persisted (every session starts with the delay applied), which is
-                // why this stayed a setting instead of being deleted (Option A) —
-                // that and MeterDelaySettingsPropertyTests pinning the property.
-                RowLayout {
-                    enabled: orion.meterDelayEnabled
-                    opacity: orion.meterDelayEnabled ? 1.0 : 0.4
-                    Behavior on opacity { NumberAnimation { duration: Theme.motionFast } }
-                    Layout.fillWidth: true
-                    Text {
-                        text: "Defense bypass (D-pad Up)"
-                        color: Theme.textPrimary
-                        font.family: Theme.fontUi
-                        font.pixelSize: 12
-                    }
-                    InfoTip {
-                        text: "Press D-pad Up in-game to toggle defense mode: ON pauses "
-                              + "the delay (no input lag while defending), OFF re-applies it. "
-                              + "Always starts OFF (delay active) each session. "
-                              + "Untick to disable the hotkey entirely."
-                    }
-                    Item { Layout.fillWidth: true }
-                    DashboardToggle {
-                        checked: orion.meterDelayBypassOnDefense
-                        onToggled: orion.meterDelayBypassOnDefense = checked
-                    }
-                }
-            }
         }
+
+        // METER DELAY CARD SHELVED (2026-09-12, owner: "port and shelve out meter delay").
+        // Measured 09-12: the delay never improved timing (it widens the meter in time but the
+        // lead absorbs it 1:1) and it only ever mattered for contested shots, where the miss is
+        // the precision floor on a narrower window, not a delay problem. UI removal ONLY: the
+        // backend (orion.meterDelayEnabled / meterDelayMs / meterDelayAppliedNowMs, the
+        // MeterDelayController, VeniceNetSvc, the D-pad Up bypass hotkey, the profile export
+        // keys and the C++ property tests) is untouched, so a persisted meter_delay_enabled
+        // still applies exactly as before -- it just has no control on this surface. The
+        // shipped default is OFF. Put the card back from git history if it is ever wanted.
 
         // NETWORK CARD REMOVED ENTIRELY (2026-08-06, owner: "the network card
         // it's useless"). It showed COURT IP / RTT / JITTER / PACKETS IN / OUT

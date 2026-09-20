@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QtCore/QJsonObject>
 #include <QtCore/QJsonValue>
 #include <QtCore/QString>
 #include <QtCore/QtGlobal>
@@ -41,6 +42,40 @@ namespace orion {
     }
     *tokenOut = token;
     return true;
+}
+
+// Fill measurements cross the same JSON boundary as pose tokens.  A phase
+// anchor is interpolated from two frames, so a coarse/sub-pixel transition (or
+// a sub-pixel re-latch) must be represented explicitly and compared before the
+// pair is joined.  Missing/malformed provenance is intentionally invalid: old
+// sidecars continue to provide display/sampler telemetry, while phase timing
+// stands down rather than guessing that two numerical rulers are compatible.
+struct MeterFillEstimatorIdentity {
+    QString mode;
+    quint64 generation = 0;
+
+    [[nodiscard]] bool isValid() const noexcept
+    {
+        return generation != 0
+            && (mode == QLatin1String("coarse") || mode == QLatin1String("subpixel"));
+    }
+};
+
+[[nodiscard]] inline MeterFillEstimatorIdentity decodeMeterFillEstimatorIdentity(
+    const QJsonObject& payload)
+{
+    MeterFillEstimatorIdentity identity;
+    const QString mode = payload.value(QStringLiteral("fill_estimator_mode"))
+                             .toString().trimmed().toLower();
+    quint64 generation = 0;
+    if ((mode != QLatin1String("coarse") && mode != QLatin1String("subpixel"))
+        || !decodePoseArmToken(
+            payload.value(QStringLiteral("fill_estimator_generation")), &generation)) {
+        return identity;
+    }
+    identity.mode = mode;
+    identity.generation = generation;
+    return identity;
 }
 
 } // namespace orion

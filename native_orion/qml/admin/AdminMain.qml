@@ -2,13 +2,16 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
+// Shell for OrionOwner.exe / OrionStaff.exe (contract §7). The window owns the
+// chrome, the sidebar, and the status strip; every screen lives in its own file
+// and talks to the `admin` context property (AdminToolController).
 ApplicationWindow {
     id: window
 
-    width: 1120
-    height: 720
-    minimumWidth: 1040
-    minimumHeight: 680
+    width: 1280
+    height: 840
+    minimumWidth: 1080
+    minimumHeight: 700
     visible: true
     title: admin.ownerMode ? "Orion Owner" : "Orion Staff"
     flags: Qt.Window | Qt.FramelessWindowHint
@@ -16,327 +19,38 @@ ApplicationWindow {
     font.family: Theme.fontUi
     font.pixelSize: Theme.fontBody
 
-    readonly property bool canAct: admin.authenticated && !admin.busy && !admin.securityLockActive
     readonly property color toolAccent: admin.ownerMode ? "#4F8CFF" : "#7C3AED"
+    readonly property bool canAct: admin.authenticated && !admin.busy && !admin.securityLockActive
+    property string page: admin.ownerMode ? "dashboard" : "licenses"
+    property bool showRaw: false
 
     Component.onCompleted: Theme.accent = toolAccent
 
-    component Card: Rectangle {
-        color: Theme.bgCard
-        radius: Theme.radiusCard
-        border.color: Theme.borderSoft
-        border.width: 1
-        Rectangle {
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            height: 1
-            radius: parent.radius
-            color: Theme.hairlineLight
+    // Owner and staff tools share this shell; the nav is the only split.
+    readonly property var navItems: admin.ownerMode
+        ? [
+            { key: "dashboard", label: "Dashboard", glyph: "#" },
+            { key: "licenses", label: "Licenses", glyph: "K" },
+            { key: "staff", label: "Staff", glyph: "S" },
+            { key: "audit", label: "Audit", glyph: "A" },
+            { key: "config", label: "Config", glyph: "C" }
+          ]
+        : [
+            { key: "licenses", label: "Licenses", glyph: "K" },
+            { key: "audit", label: "My audit", glyph: "A" },
+            { key: "account", label: "My access", glyph: "M" }
+          ]
+
+    function pageIndex(key) {
+        switch (key) {
+        case "dashboard": return 0
+        case "licenses": return 1
+        case "staff": return 2
+        case "audit": return 3
+        case "config": return 4
+        case "account": return 5
         }
-    }
-
-    component FieldBox: Rectangle {
-        id: fieldBox
-        property alias text: input.text
-        property alias placeholderText: input.placeholderText
-        property alias echoMode: input.echoMode
-        property alias input: input
-        property string iconText: ""
-        signal accepted()
-
-        Layout.fillWidth: true
-        Layout.preferredHeight: 46
-        radius: Theme.radiusControl
-        color: Theme.bgField
-        border.color: input.activeFocus ? Theme.accentBorder : Theme.borderSoft
-        border.width: input.activeFocus ? 2 : 1
-
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 13
-            anchors.rightMargin: 13
-            spacing: 10
-
-            Text {
-                visible: fieldBox.iconText.length > 0
-                text: fieldBox.iconText
-                color: input.activeFocus ? Theme.accentBorder : Theme.textFaint
-                font.pixelSize: 14
-                font.weight: Font.DemiBold
-                Layout.alignment: Qt.AlignVCenter
-            }
-
-            TextField {
-                id: input
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                verticalAlignment: TextInput.AlignVCenter
-                selectByMouse: true
-                color: Theme.textPrimary
-                placeholderTextColor: Theme.textFaint
-                font.family: Theme.fontUi
-                font.pixelSize: 13
-                background: null
-                Keys.onReturnPressed: fieldBox.accepted()
-            }
-        }
-    }
-
-    component DarkComboBox: ComboBox {
-        id: combo
-
-        implicitHeight: 40
-        font.family: Theme.fontUi
-        font.pixelSize: 13
-        leftPadding: 14
-        rightPadding: 34
-
-        contentItem: Text {
-            leftPadding: 14
-            rightPadding: 34
-            text: combo.displayText
-            color: combo.enabled ? Theme.textPrimary : Theme.textFaint
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
-            font: combo.font
-        }
-
-        indicator: Text {
-            anchors.right: parent.right
-            anchors.rightMargin: 13
-            anchors.verticalCenter: parent.verticalCenter
-            text: "v"
-            color: combo.enabled ? Theme.textMuted : Theme.textFaint
-            font.pixelSize: 12
-            font.weight: Font.DemiBold
-        }
-
-        background: Rectangle {
-            radius: Theme.radiusControl
-            color: combo.enabled ? Theme.bgField : Theme.bgInset
-            border.color: combo.activeFocus || combo.popup.visible ? Theme.accentBorder : Theme.borderSoft
-            border.width: combo.activeFocus || combo.popup.visible ? 2 : 1
-        }
-
-        delegate: ItemDelegate {
-            id: comboDelegate
-            required property var modelData
-            required property int index
-
-            width: combo.width - 8
-            height: 34
-            highlighted: combo.highlightedIndex === index
-
-            contentItem: Text {
-                text: comboDelegate.modelData
-                color: comboDelegate.highlighted ? Theme.textPrimary : Theme.textSecondary
-                verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
-                font.family: Theme.fontUi
-                font.pixelSize: 13
-            }
-
-            background: Rectangle {
-                radius: 8
-                color: comboDelegate.highlighted ? Theme.accentSoft : "transparent"
-            }
-        }
-
-        popup: Popup {
-            y: combo.height + 5
-            width: combo.width
-            implicitHeight: Math.min(contentItem.implicitHeight + 8, 150)
-            padding: 4
-
-            contentItem: ListView {
-                clip: true
-                implicitHeight: contentHeight
-                model: combo.popup.visible ? combo.delegateModel : null
-                currentIndex: combo.highlightedIndex
-                boundsBehavior: Flickable.StopAtBounds
-            }
-
-            background: Rectangle {
-                color: Theme.bgInset
-                radius: Theme.radiusControl
-                border.color: Theme.borderStrong
-                border.width: 1
-            }
-        }
-    }
-
-    component PrimaryButton: Button {
-        id: primaryControl
-        implicitHeight: 40
-        font.family: Theme.fontUi
-        font.pixelSize: 13
-        font.weight: Font.DemiBold
-
-        contentItem: Text {
-            text: primaryControl.text
-            color: primaryControl.enabled ? Theme.textPrimary : Theme.textFaint
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
-            font: primaryControl.font
-        }
-
-        background: Rectangle {
-            radius: Theme.radiusControl
-            color: primaryControl.enabled
-                   ? (primaryControl.down ? Theme.accentPressed : primaryControl.hovered ? Theme.accentHover : Theme.accent)
-                   : Theme.bgField
-            border.color: primaryControl.enabled ? Theme.accentBorder : Theme.borderSoft
-            border.width: 1
-        }
-    }
-
-    component SecondaryButton: Button {
-        id: secondaryControl
-        implicitHeight: 40
-        font.family: Theme.fontUi
-        font.pixelSize: 13
-        font.weight: Font.DemiBold
-
-        contentItem: Text {
-            text: secondaryControl.text
-            color: secondaryControl.enabled ? Theme.textSecondary : Theme.textFaint
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
-            font: secondaryControl.font
-        }
-
-        background: Rectangle {
-            radius: Theme.radiusControl
-            color: secondaryControl.enabled
-                   ? (secondaryControl.down ? Theme.bgField : secondaryControl.hovered ? Theme.bgCardHover : Theme.bgInset)
-                   : Theme.bgField
-            border.color: secondaryControl.enabled ? Theme.borderStrong : Theme.borderSoft
-            border.width: 1
-        }
-    }
-
-    component DangerButton: Button {
-        id: dangerControl
-        implicitHeight: 40
-        font.family: Theme.fontUi
-        font.pixelSize: 13
-        font.weight: Font.DemiBold
-
-        contentItem: Text {
-            text: dangerControl.text
-            color: dangerControl.enabled ? Theme.textPrimary : Theme.textFaint
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
-            font: dangerControl.font
-        }
-
-        background: Rectangle {
-            radius: Theme.radiusControl
-            color: dangerControl.enabled
-                   ? (dangerControl.down ? Qt.darker(Theme.danger, 1.25) : dangerControl.hovered ? "#FF5B5B" : Theme.danger)
-                   : Theme.bgField
-            border.color: dangerControl.enabled ? "#FF8A8A" : Theme.borderSoft
-            border.width: 1
-        }
-    }
-
-    component StatusPill: Rectangle {
-        property string label: ""
-        property color tone: Theme.textMuted
-
-        implicitWidth: pillText.implicitWidth + 20
-        implicitHeight: 26
-        radius: 13
-        color: Qt.rgba(tone.r, tone.g, tone.b, 0.12)
-        border.color: Qt.rgba(tone.r, tone.g, tone.b, 0.42)
-        border.width: 1
-
-        Text {
-            id: pillText
-            anchors.centerIn: parent
-            text: parent.label
-            color: parent.tone
-            font.pixelSize: 11
-            font.weight: Font.DemiBold
-        }
-    }
-
-    component OrionMark: Rectangle {
-        width: 54
-        height: 54
-        radius: 16
-        color: "#0B0F14"
-        border.color: Theme.accentBorder
-        border.width: 1
-
-        Rectangle {
-            anchors.centerIn: parent
-            width: 26
-            height: 26
-            radius: 13
-            color: "transparent"
-            border.color: Theme.accent
-            border.width: 2
-        }
-        Rectangle {
-            anchors.centerIn: parent
-            width: 12
-            height: 12
-            radius: 6
-            color: Theme.accent
-        }
-        Rectangle {
-            anchors.centerIn: parent
-            width: 5
-            height: 5
-            radius: 2.5
-            color: "#F4F7FA"
-        }
-    }
-
-    component StarBackdropLocal: Item {
-        property real density: 1.0
-        property bool interactive: false
-        property real constellationRadius: 120
-        property real constellationDistance: 72
-
-        Repeater {
-            model: Math.round(120 * parent.density)
-            Rectangle {
-                required property int index
-                property int n: index
-                width: n % 13 === 0 ? 5 : n % 5 === 0 ? 3 : 2
-                height: width
-                radius: width / 2
-                x: ((n * 73) % Math.max(1, parent.width - 8)) + 4
-                y: ((n * 41) % Math.max(1, parent.height - 8)) + 4
-                color: n % 17 === 0 ? Theme.accent : "#8EA0BA"
-                opacity: n % 17 === 0 ? 0.22 : 0.30
-            }
-        }
-
-        Canvas {
-            anchors.fill: parent
-            opacity: 0.20
-            onPaint: {
-                var ctx = getContext("2d")
-                ctx.reset()
-                ctx.strokeStyle = Theme.accent
-                ctx.lineWidth = 1
-                for (var i = 0; i < 8; ++i) {
-                    var x = 24 + ((i * 137) % Math.max(1, width - 96))
-                    var y = 32 + ((i * 89) % Math.max(1, height - 96))
-                    ctx.beginPath()
-                    ctx.moveTo(x, y)
-                    ctx.lineTo(Math.min(width - 24, x + constellationDistance), Math.min(height - 24, y + constellationRadius / 3))
-                    ctx.stroke()
-                }
-            }
-        }
+        return 1
     }
 
     Rectangle {
@@ -348,15 +62,7 @@ ApplicationWindow {
         border.color: Theme.borderSoft
         border.width: 1
 
-        StarBackdropLocal {
-            anchors.fill: parent
-            opacity: 0.78
-            interactive: !admin.authenticated
-            density: admin.authenticated ? 0.85 : 1.25
-            constellationRadius: 120
-            constellationDistance: 72
-        }
-
+        // ---- title bar -------------------------------------------------
         Rectangle {
             id: titleBar
             anchors.left: parent.left
@@ -409,10 +115,16 @@ ApplicationWindow {
                     font.weight: Font.DemiBold
                     anchors.verticalCenter: parent.verticalCenter
                 }
-                StatusPill {
-                    label: admin.authenticated ? admin.role : "Locked"
-                    tone: admin.authenticated ? Theme.success : Theme.warning
+                AdminPill {
                     anchors.verticalCenter: parent.verticalCenter
+                    label: admin.authenticated ? (admin.role.length > 0 ? admin.role : "signed in") : "locked"
+                    tone: admin.authenticated ? Theme.success : Theme.warning
+                }
+                AdminPill {
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: admin.authenticated && admin.ownerRoutes
+                    label: "owner routes"
+                    tone: Theme.accent
                 }
             }
 
@@ -465,564 +177,235 @@ ApplicationWindow {
             }
         }
 
-        Loader {
+        // ---- login gate ------------------------------------------------
+        AdminLoginPane {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: titleBar.bottom
             anchors.bottom: parent.bottom
-            sourceComponent: admin.authenticated ? dashboardPage : authGatePage
+            visible: !admin.authenticated
         }
-    }
 
-    Component {
-        id: authGatePage
-
+        // ---- authenticated body ---------------------------------------
         Item {
-            id: authRoot
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: titleBar.bottom
+            anchors.bottom: parent.bottom
+            visible: admin.authenticated
 
-            function submitPrimary() {
-                if (admin.busy)
-                    return
-                if (admin.ownerMode)
-                    admin.ownerLogin(ownerSecret.text)
-                else
-                    admin.staffLogin(staffDiscord.text)
-            }
-
-            Card {
-                id: authCard
-                width: 492
-                height: authColumn.implicitHeight + 54
-                anchors.centerIn: parent
-                color: "#0B1019"
-                border.color: Theme.borderStrong
+            Rectangle {
+                id: sidebar
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                width: 196
+                color: Theme.bgSidebar
+                border.color: "transparent"
 
                 Rectangle {
-                    anchors.fill: parent
-                    anchors.margins: -1
-                    radius: parent.radius + 1
-                    color: "transparent"
-                    border.color: Theme.accentGlow
-                    border.width: 1
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    width: 1
+                    color: Theme.hairline
                 }
 
                 ColumnLayout {
-                    id: authColumn
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    anchors.margins: 27
-                    spacing: 17
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 6
 
-                    RowLayout {
+                    Text {
                         Layout.fillWidth: true
-                        spacing: 14
+                        text: admin.staffName.length > 0 ? admin.staffName : (admin.ownerMode ? "Owner" : "Staff")
+                        color: Theme.textPrimary
+                        font.pixelSize: Theme.fontTitle
+                        font.weight: Font.DemiBold
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: admin.staffId.length > 0 ? admin.staffId : "break-glass session"
+                        color: Theme.textFaint
+                        font.pixelSize: Theme.fontMicro
+                        font.family: Theme.fontMono
+                        elide: Text.ElideMiddle
+                    }
 
-                        OrionMark {}
+                    Item { Layout.preferredHeight: 8 }
 
-                        ColumnLayout {
+                    Repeater {
+                        model: window.navItems
+                        delegate: Rectangle {
+                            id: navRow
+                            required property var modelData
+                            readonly property bool current: window.page === modelData.key
+
                             Layout.fillWidth: true
-                            spacing: 2
-                            Text {
-                                text: "ORION"
-                                color: Theme.textPrimary
-                                font.pixelSize: 27
-                                font.weight: Font.DemiBold
+                            Layout.preferredHeight: 36
+                            radius: Theme.radiusControl
+                            color: current ? Theme.accentSoft : navMouse.containsMouse ? Theme.bgCardHover : "transparent"
+                            border.color: current ? Theme.accentBorder : "transparent"
+                            border.width: 1
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 10
+                                spacing: 10
+                                Text {
+                                    text: navRow.modelData.glyph
+                                    color: navRow.current ? Theme.accentBorder : Theme.textFaint
+                                    font.family: Theme.fontMono
+                                    font.pixelSize: Theme.fontBody
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: navRow.modelData.label
+                                    color: navRow.current ? Theme.textPrimary : Theme.textSecondary
+                                    font.pixelSize: Theme.fontBody
+                                    elide: Text.ElideRight
+                                }
                             }
-                            Text {
-                                text: admin.ownerMode ? "Owner authentication required" : "Staff authentication required"
-                                color: Theme.textMuted
-                                font.pixelSize: 12
+
+                            MouseArea {
+                                id: navMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: window.page = navRow.modelData.key
                             }
                         }
-
-                        StatusPill {
-                            label: admin.securityLockActive ? "Security Lock" : "Online"
-                            tone: admin.securityLockActive ? Theme.danger : Theme.success
-                            Layout.alignment: Qt.AlignTop
-                        }
                     }
 
-                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.hairline }
+                    Item { Layout.fillHeight: true }
 
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 4
-                        Text {
-                            text: admin.ownerMode ? "Owner console locked" : "Staff console locked"
-                            color: Theme.textPrimary
-                            font.pixelSize: 19
-                            font.weight: Font.DemiBold
-                        }
-                        Text {
-                            Layout.fillWidth: true
-                            text: admin.ownerMode
-                                  ? "Enter the owner secret to unlock privileged license and staff controls."
-                                  : "Log in with your registered Discord ID, or enroll once with an owner-issued key."
-                            color: Theme.textMuted
-                            font.pixelSize: 12
-                            wrapMode: Text.WordWrap
-                        }
-                    }
-
-                    FieldBox {
-                        id: ownerSecret
-                        visible: admin.ownerMode
-                        placeholderText: "Owner secret"
-                        echoMode: TextInput.Password
-                        iconText: "#"
-                        onAccepted: authRoot.submitPrimary()
-                        Component.onCompleted: if (admin.ownerMode) input.forceActiveFocus()
-                    }
-
-                    FieldBox {
-                        id: staffDiscord
-                        visible: !admin.ownerMode
-                        placeholderText: "Discord ID"
-                        iconText: "@"
-                        onAccepted: authRoot.submitPrimary()
-                        Component.onCompleted: if (!admin.ownerMode) input.forceActiveFocus()
-                    }
-
-                    FieldBox {
-                        id: staffEnrollKey
-                        visible: !admin.ownerMode
-                        placeholderText: "Enrollment key"
-                        echoMode: TextInput.Password
-                        iconText: "#"
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 10
-
-                        PrimaryButton {
-                            Layout.fillWidth: true
-                            text: admin.busy ? "Verifying..." : admin.ownerMode ? "Unlock" : "Login"
-                            enabled: !admin.busy
-                            onClicked: authRoot.submitPrimary()
-                        }
-
-                        SecondaryButton {
-                            visible: !admin.ownerMode
-                            Layout.fillWidth: true
-                            text: "Enroll"
-                            enabled: !admin.busy
-                            onClicked: admin.staffEnroll(staffDiscord.text, staffEnrollKey.text)
-                        }
+                    AdminPill {
+                        Layout.alignment: Qt.AlignLeft
+                        visible: admin.killSwitchEngaged
+                        label: "KILL SWITCH ON"
+                        tone: Theme.danger
                     }
 
                     Text {
                         Layout.fillWidth: true
-                        text: admin.statusMessage
-                        visible: text.length > 0
-                        color: admin.securityLockActive ? Theme.danger : admin.busy ? Theme.textMuted : Theme.warning
-                        font.pixelSize: 12
+                        text: admin.securityState
+                        color: admin.securityLockActive ? Theme.danger : Theme.textFaint
+                        font.pixelSize: Theme.fontMicro
                         wrapMode: Text.WordWrap
-                        horizontalAlignment: Text.AlignHCenter
                     }
-
-                    Rectangle {
+                    Text {
                         Layout.fillWidth: true
-                        Layout.preferredHeight: 44
-                        radius: Theme.radiusControl
-                        color: Theme.bgInset
-                        border.color: Theme.borderSoft
-                        border.width: 1
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 13
-                            anchors.rightMargin: 13
-                            spacing: 8
-                            Text {
-                                Layout.fillWidth: true
-                                text: admin.securityState
-                                color: admin.securityLockActive ? Theme.danger : Theme.textFaint
-                                font.pixelSize: 11
-                                elide: Text.ElideRight
-                            }
-                            Text {
-                                text: "Machine " + admin.machineIdSuffix
-                                color: Theme.textFaint
-                                font.pixelSize: 11
-                                font.family: Theme.fontMono
-                            }
+                        text: "machine " + admin.machineIdSuffix
+                        color: Theme.textFaint
+                        font.pixelSize: Theme.fontMicro
+                        font.family: Theme.fontMono
+                        elide: Text.ElideMiddle
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: "v" + admin.appVersion + "  " + admin.updateState
+                        color: admin.updateAvailable ? Theme.warning : Theme.textFaint
+                        font.pixelSize: Theme.fontMicro
+                        elide: Text.ElideRight
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        AdminButton {
+                            Layout.fillWidth: true
+                            kind: "ghost"
+                            compact: true
+                            text: admin.updateAvailable ? "Update" : "Check"
+                            onClicked: admin.updateAvailable ? admin.startUpdate() : admin.checkUpdate()
+                        }
+                        AdminButton {
+                            Layout.fillWidth: true
+                            kind: "secondary"
+                            compact: true
+                            text: "Sign out"
+                            onClicked: admin.logout()
                         }
                     }
                 }
             }
-        }
-    }
-
-    Component {
-        id: dashboardPage
-
-        Item {
-            Component.onCompleted: if (admin.ownerMode) admin.refreshKillSwitch()
 
             ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 16
-                spacing: 12
+                anchors.left: sidebar.right
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                anchors.margins: 14
+                spacing: 10
 
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 112
-                    spacing: 12
-
-                    Card {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.margins: 16
-                            spacing: 14
-
-                            OrionMark {}
-
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 4
-                                Text {
-                                    text: admin.ownerMode ? "Owner Console" : "Staff Console"
-                                    color: Theme.textPrimary
-                                    font.pixelSize: 22
-                                    font.weight: Font.DemiBold
-                                }
-                                Text {
-                                    text: admin.ownerMode
-                                          ? "Privileged staff registration, license recovery, and emergency controls."
-                                          : "Role-limited license support tools bound to this machine."
-                                    color: Theme.textMuted
-                                    font.pixelSize: 12
-                                }
-                            }
-
-                            StatusPill {
-                                label: admin.securityLockActive ? "Locked" : "Authenticated"
-                                tone: admin.securityLockActive ? Theme.danger : Theme.success
-                            }
-                            StatusPill {
-                                label: admin.role
-                                tone: Theme.accent
-                            }
-                        }
-                    }
-
-                    Card {
-                        Layout.preferredWidth: 300
-                        Layout.fillHeight: true
-
-                        ColumnLayout {
-                            anchors.fill: parent
-                            anchors.margins: 12
-                            spacing: 6
-                            Text {
-                                text: admin.staffName.length ? admin.staffName : (admin.ownerMode ? "Owner" : "Staff")
-                                color: Theme.textPrimary
-                                font.pixelSize: 16
-                                font.weight: Font.DemiBold
-                                elide: Text.ElideRight
-                            }
-                            Text {
-                                text: "Machine " + admin.machineIdSuffix
-                                color: Theme.textMuted
-                                font.pixelSize: 11
-                                font.family: Theme.fontMono
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                SecondaryButton {
-                                    Layout.fillWidth: true
-                                    text: "Check Update"
-                                    enabled: !admin.busy
-                                    onClicked: admin.checkUpdate()
-                                }
-                                PrimaryButton {
-                                    Layout.fillWidth: true
-                                    text: "Apply"
-                                    enabled: admin.updateAvailable && !admin.busy
-                                    onClicked: admin.startUpdate()
-                                }
-                            }
-                        }
-                    }
-                }
-
-                RowLayout {
+                StackLayout {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    spacing: 12
+                    currentIndex: window.pageIndex(window.page)
+
+                    AdminDashboardPage {}
+                    AdminLicensesPage {}
+                    AdminStaffPage {}
+                    AdminAuditPage {}
+                    AdminConfigPage {}
+                    AdminAccountPage {}
+                }
+
+                // ---- status strip -----------------------------------
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: statusColumn.implicitHeight + 16
+                    radius: Theme.radiusControl
+                    color: Theme.bgCard
+                    border.color: admin.statusIsError ? Theme.dangerBorder : Theme.borderSoft
+                    border.width: 1
 
                     ColumnLayout {
-                        Layout.preferredWidth: 376
-                        Layout.maximumWidth: 398
-                        Layout.fillHeight: true
-                        spacing: 12
+                        id: statusColumn
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        spacing: 6
 
-                        Card {
+                        RowLayout {
                             Layout.fillWidth: true
-                            Layout.preferredHeight: 136
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.margins: 13
-                                spacing: 6
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: "Session"
-                                        color: Theme.textPrimary
-                                        font.pixelSize: 15
-                                        font.weight: Font.DemiBold
-                                    }
-                                    DangerButton {
-                                        text: "Lock"
-                                        enabled: admin.authenticated && !admin.busy
-                                        onClicked: admin.logout()
-                                    }
-                                }
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: admin.statusMessage
-                                    color: admin.securityLockActive ? Theme.danger : Theme.textSecondary
-                                    wrapMode: Text.WordWrap
-                                }
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: admin.securityState
-                                    color: admin.securityLockActive ? Theme.danger : Theme.textMuted
-                                    wrapMode: Text.WordWrap
-                                    font.pixelSize: 11
-                                }
-                                Text {
-                                    text: admin.updateState + (admin.latestVersion.length ? (" (" + admin.latestVersion + ")") : "")
-                                    color: admin.updateAvailable ? Theme.warning : Theme.textMuted
-                                    font.pixelSize: 11
-                                }
+                            spacing: 8
+
+                            Rectangle {
+                                Layout.preferredWidth: 8
+                                Layout.preferredHeight: 8
+                                radius: 4
+                                color: admin.busy ? Theme.warning : admin.statusIsError ? Theme.danger : Theme.success
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: admin.busy
+                                      ? "Working..."
+                                      : (admin.statusMessage.length > 0 ? admin.statusMessage : "Ready.")
+                                color: admin.statusIsError ? Theme.logErr : Theme.textSecondary
+                                font.pixelSize: Theme.fontSmall
+                                elide: Text.ElideRight
+                            }
+                            AdminButton {
+                                kind: "ghost"
+                                compact: true
+                                text: window.showRaw ? "Hide response" : "Raw response"
+                                onClicked: window.showRaw = !window.showRaw
+                            }
+                            AdminButton {
+                                kind: "ghost"
+                                compact: true
+                                visible: admin.resultText.length > 0
+                                text: "Clear"
+                                onClicked: admin.clearResult()
                             }
                         }
 
-                        Card {
-                            visible: admin.ownerMode
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 176
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.margins: 13
-                                spacing: 8
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: "Killswitch"
-                                        color: Theme.textPrimary
-                                        font.pixelSize: 15
-                                        font.weight: Font.DemiBold
-                                    }
-                                    StatusPill {
-                                        label: admin.killSwitchEngaged ? "Engaged" : "Released"
-                                        tone: admin.killSwitchEngaged ? Theme.danger : Theme.success
-                                    }
-                                }
-                                Text {
-                                    Layout.fillWidth: true
-                                    visible: admin.killSwitchReason.length > 0
-                                    text: admin.killSwitchReason
-                                    color: Theme.textMuted
-                                    font.pixelSize: 11
-                                    wrapMode: Text.WordWrap
-                                }
-                                FieldBox { id: killswitchReasonField; placeholderText: "Reason"; iconText: "R" }
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    DangerButton {
-                                        Layout.fillWidth: true
-                                        text: "Engage"
-                                        enabled: window.canAct
-                                        onClicked: admin.engageKillSwitch(killswitchReasonField.text)
-                                    }
-                                    PrimaryButton {
-                                        Layout.fillWidth: true
-                                        text: "Release"
-                                        enabled: window.canAct
-                                        onClicked: admin.releaseKillSwitch()
-                                    }
-                                    SecondaryButton {
-                                        Layout.fillWidth: true
-                                        text: "Refresh"
-                                        enabled: window.canAct
-                                        onClicked: admin.refreshKillSwitch()
-                                    }
-                                }
-                            }
-                        }
-
-                        Card {
-                            visible: admin.ownerMode
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: 320
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.margins: 14
-                                spacing: 8
-                                Text {
-                                    text: "Staff"
-                                    color: Theme.textPrimary
-                                    font.pixelSize: 15
-                                    font.weight: Font.DemiBold
-                                }
-                                ScrollView {
-                                    id: staffScroll
-                                    Layout.fillWidth: true
-                                    Layout.fillHeight: true
-                                    clip: true
-                                    contentWidth: availableWidth
-
-                                    ColumnLayout {
-                                        width: staffScroll.availableWidth
-                                        spacing: 8
-
-                                        FieldBox { id: newStaffDiscord; placeholderText: "Discord ID"; iconText: "@" }
-                                        FieldBox { id: newStaffName; placeholderText: "Name"; iconText: "N" }
-                                        RowLayout {
-                                            Layout.fillWidth: true
-                                            DarkComboBox {
-                                                id: newStaffRole
-                                                Layout.fillWidth: true
-                                                model: ["support", "admin", "owner"]
-                                            }
-                                            PrimaryButton {
-                                                Layout.preferredWidth: 102
-                                                text: "Create"
-                                                enabled: window.canAct
-                                                onClicked: admin.createStaff(newStaffDiscord.text, newStaffName.text, newStaffRole.currentText)
-                                            }
-                                        }
-                                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.hairline }
-                                        FieldBox { id: staffTarget; placeholderText: "Staff ID or Discord ID"; iconText: "S" }
-                                        FieldBox { id: staffReason; placeholderText: "Reason"; iconText: "R" }
-                                        GridLayout {
-                                            Layout.fillWidth: true
-                                            columns: 2
-                                            columnSpacing: 8
-                                            rowSpacing: 8
-                                            DangerButton {
-                                                Layout.fillWidth: true
-                                                text: "Disable"
-                                                enabled: window.canAct
-                                                onClicked: admin.disableStaff(staffTarget.text, staffReason.text)
-                                            }
-                                            PrimaryButton {
-                                                Layout.fillWidth: true
-                                                text: "Reset Machine"
-                                                enabled: window.canAct
-                                                onClicked: admin.resetStaffMachine(staffTarget.text, staffReason.text)
-                                            }
-                                            SecondaryButton {
-                                                Layout.columnSpan: 2
-                                                Layout.fillWidth: true
-                                                text: "Reissue Enrollment Key"
-                                                enabled: window.canAct
-                                                onClicked: admin.reissueStaffEnrollment(staffTarget.text, staffReason.text)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        Item { Layout.fillHeight: true; visible: !admin.ownerMode }
-                    }
-
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        spacing: 12
-
-                        Card {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 216
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.margins: 14
-                                spacing: 8
-                                Text {
-                                    text: "License"
-                                    color: Theme.textPrimary
-                                    font.pixelSize: 15
-                                    font.weight: Font.DemiBold
-                                }
-                                FieldBox { id: licenseKey; placeholderText: "License key"; iconText: "K" }
-                                FieldBox { id: licenseReason; placeholderText: "Reason"; iconText: "R" }
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    PrimaryButton {
-                                        Layout.fillWidth: true
-                                        text: "Lookup"
-                                        enabled: window.canAct
-                                        onClicked: admin.lookupLicense(licenseKey.text)
-                                    }
-                                    SecondaryButton {
-                                        Layout.fillWidth: true
-                                        text: "Reset HWID"
-                                        enabled: window.canAct
-                                        onClicked: admin.resetLicenseHwid(licenseKey.text, licenseReason.text)
-                                    }
-                                    DangerButton {
-                                        Layout.fillWidth: true
-                                        text: "Deactivate"
-                                        enabled: window.canAct
-                                        onClicked: admin.deactivateLicense(licenseKey.text, licenseReason.text)
-                                    }
-                                }
-                            }
-                        }
-
-                        Card {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: 240
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.margins: 14
-                                spacing: 8
-                                RowLayout {
-                                    Layout.fillWidth: true
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: "Result"
-                                        color: Theme.textPrimary
-                                        font.pixelSize: 15
-                                        font.weight: Font.DemiBold
-                                    }
-                                    SecondaryButton {
-                                        text: "Clear"
-                                        enabled: admin.resultText.length > 0
-                                        onClicked: admin.clearResult()
-                                    }
-                                }
-                                ScrollView {
-                                    Layout.fillWidth: true
-                                    Layout.fillHeight: true
-                                    TextArea {
-                                        text: admin.resultText
-                                        readOnly: true
-                                        wrapMode: TextEdit.Wrap
-                                        color: Theme.textSecondary
-                                        font.family: Theme.fontMono
-                                        font.pixelSize: 11
-                                        background: Rectangle {
-                                            color: Theme.bgField
-                                            border.color: Theme.borderSoft
-                                            radius: Theme.radiusControl
-                                        }
-                                    }
-                                }
-                            }
+                        AdminJsonView {
+                            visible: window.showRaw
+                            minimumHeight: 150
+                            text: admin.resultText.length > 0 ? admin.resultText : "(no response yet)"
                         }
                     }
                 }

@@ -13,7 +13,7 @@ def test_root_pytest_discovery_allowlist_and_exclusions():
     config = parser["pytest"]
 
     testpaths = set(config.get("testpaths", "").split())
-    assert testpaths == {"tests", "tools/security/packer/tests"}
+    assert testpaths == {"tests"}
     assert all((ROOT / path).is_dir() for path in testpaths)
 
     excluded = set(config.get("norecursedirs", "").split())

@@ -529,3 +529,106 @@ def test_sidecar_input_recovery_cannot_rearm_without_new_ready_marker(monkeypatc
     assert states == ["begin", "error"]
     assert "ready" not in states
     assert emitted[-1]["input_ready"] is False
+
+
+def test_start_stream_ack_does_not_delay_spawn_and_precedes_verdict(monkeypatch):
+    """2026-08-29: the `begin` ack is emitted OFF-THREAD so a contended _emit_lock (the
+    preview writer can hold it >1s) no longer delays the Chiaki spawn; the ack threads are
+    joined before the verdict so begin/waking still precede started on the wire, and a
+    rest-mode wake reported by the client surfaces as a `waking` event with its budget."""
+    import threading, time
+    sc = _load_sidecar()
+    events = []
+    def slow_emit(payload):
+        if payload.get("event") == "stream_promote" and payload.get("state") == "begin":
+            time.sleep(0.3)                     # simulate the lock held by the preview writer
+        events.append(dict(payload))
+    monkeypatch.setattr(sc, "_emit", slow_emit)
+    monkeypatch.setattr(sc, "_log", lambda *a, **k: None)
+
+    class _Orch:
+        def __init__(self):
+            self.promote_called_at = None
+            self.console_waking_callback = None
+        def promote_to_stream(self, ip=None, identity=None):
+            self.promote_called_at = time.perf_counter()
+            if callable(self.console_waking_callback):
+                self.console_waking_callback(25.0)   # client found the console resting
+            return True
+        def input_link_ready(self):
+            return True
+
+    orch = _Orch()
+    t0 = time.perf_counter()
+    assert sc._handle_start_stream(orch, {"console_ip": "1.2.3.4"}) is True
+    assert orch.promote_called_at is not None
+    assert orch.promote_called_at - t0 < 0.15          # spawn NOT blocked behind the 0.3s ack
+    names = [f"{e.get('event')}:{e.get('state', '')}" for e in events]
+    assert names.index("stream_promote:begin") < names.index("started:")
+    assert names.index("stream_promote:waking") < names.index("started:")
+    waking = [e for e in events if e.get("state") == "waking"][0]
+    assert waking["budget_ms"] == 25000 and waking["console_ip"] == "1.2.3.4"
+
+
+def test_prewarm_standby_spawns_during_preview_and_stops_with_orchestrator(monkeypatch):
+    """[ORION_STANDBY] The warm-preview sidecar asks the orchestrator to pre-boot the
+    Remote Play client; the prewarm loop must pass the connect-identical parameters
+    (console ip, capture-card input-only route, executable identity) to the pool and
+    exit when the orchestrator stops."""
+    import time
+    import remote_play_orchestrator as rpo
+
+    orch = _build_orch(monkeypatch)
+    calls = []
+
+    class _FakePool:
+        def ensure_spawned(self, **kwargs):
+            calls.append(kwargs)
+            return "spawned"
+
+    monkeypatch.setattr(rpo, "get_standby_pool", lambda: _FakePool())
+    monkeypatch.setattr(rpo, "standby_client_enabled", lambda: True)
+    orch._running = True
+    orch._client_manager = None
+    orch.config.console_ip = "5.6.7.8"
+
+    orch.prewarm_standby_client()
+    deadline = time.time() + 3.0
+    while not calls and time.time() < deadline:
+        time.sleep(0.02)
+    orch._running = False
+    thread = orch._standby_prewarm_thread
+    thread.join(timeout=3.0)
+
+    assert calls, "prewarm never attempted a standby spawn"
+    kwargs = calls[0]
+    assert kwargs["console_ip"] == "5.6.7.8"
+    # Capture-card preview => the promoted chiaki is INPUT-ONLY, so the standby
+    # must be spawned with the identical video-disable route.
+    assert kwargs["disable_video"] is True
+    assert not thread.is_alive()
+
+
+def test_prewarm_standby_idles_while_a_client_manager_exists(monkeypatch):
+    import time
+    import remote_play_orchestrator as rpo
+
+    orch = _build_orch(monkeypatch)
+    calls = []
+
+    class _FakePool:
+        def ensure_spawned(self, **kwargs):
+            calls.append(kwargs)
+            return "spawned"
+
+    monkeypatch.setattr(rpo, "get_standby_pool", lambda: _FakePool())
+    monkeypatch.setattr(rpo, "standby_client_enabled", lambda: True)
+    orch._running = True
+    orch._client_manager = object()  # live/attempted session owns the client
+
+    orch.prewarm_standby_client()
+    time.sleep(0.3)
+    orch._running = False
+    orch._standby_prewarm_thread.join(timeout=3.0)
+
+    assert calls == []

@@ -406,6 +406,81 @@ def test_sidecar_telemetry_loop_is_event_driven():
         "telemetry loop no longer reads the orchestrator's frame-ready event"
 
 
+# ===========================================================================
+#  Detector health -- the Meter Detection card's {"event":"detector_health"} line
+# ===========================================================================
+
+# The reader's documented snapshot (SimpleMeterReader.detector_health_snapshot).
+_HEALTH_SNAPSHOT = {
+    "provider": "cv-contour", "infer_ms": 0.53, "state": "locked",
+    "calls": 812, "found": 640, "locks": 12, "drops": 3, "hot_submit": 7, "reseat_x": 1,
+    "cv_hit": 640, "cv_no_tip": 150, "cv_no_outline": 22, "cv_outline_bridged": 4,
+}
+
+
+class _FakeReader:
+    def __init__(self, snapshot):
+        self._snapshot = snapshot
+
+    def detector_health_snapshot(self):
+        return self._snapshot
+
+
+def test_detector_health_wire_is_none_without_a_reader():
+    from types import SimpleNamespace
+    assert sidecar._detector_health_wire(SimpleNamespace()) is None
+    assert sidecar._detector_health_wire(SimpleNamespace(_meter_detector=None)) is None
+    # A reader without the snapshot (legacy chain) is not a reason to emit...
+    assert sidecar._detector_health_wire(SimpleNamespace(_meter_detector=object())) is None
+    # ...and neither is the reader failing closed (snapshot -> None).
+    assert sidecar._detector_health_wire(
+        SimpleNamespace(_meter_detector=_FakeReader(None))) is None
+
+
+def test_detector_health_wire_flattens_the_reader_snapshot():
+    from types import SimpleNamespace
+    payload = sidecar._detector_health_wire(
+        SimpleNamespace(_meter_detector=_FakeReader(dict(_HEALTH_SNAPSHOT))))
+    assert payload["event"] == "detector_health"
+    for key, value in _HEALTH_SNAPSHOT.items():
+        assert payload[key] == value
+    # Native parses it with QJsonDocument: the sidecar's separators must round-trip and
+    # the line must stay small (a status line, not a telemetry-sized payload).
+    line = json.dumps(payload, separators=(",", ":"))
+    assert json.loads(line) == payload
+    assert len(line) < 400
+
+
+def test_detector_health_wire_coerces_foreign_values_to_wire_types():
+    from types import SimpleNamespace
+    snapshot = {"provider": object(), "infer_ms": "0.4", "state": None, "locks": True,
+                "note": "x" * 200}
+    payload = sidecar._detector_health_wire(
+        SimpleNamespace(_meter_detector=_FakeReader(snapshot)))
+    assert isinstance(payload["provider"], str)      # never a raw object on the wire
+    assert payload["infer_ms"] == "0.4"              # strings pass through, bounded
+    assert payload["state"] is None
+    assert payload["locks"] is True
+    assert len(payload["note"]) == 48
+    json.dumps(payload)                              # always serialisable
+
+
+def test_sidecar_telemetry_loop_emits_detector_health_on_its_own_line():
+    """The health line rides the telemetry THREAD (one periodic mechanism) but never the
+    telemetry PAYLOAD (the engine's meter feed): its own small event at ~2 s."""
+    src = open(_SIDECAR_SRC, encoding="utf-8").read()
+    start = src.index("def _telemetry_loop():")
+    end = src.index("threading.Thread(target=_telemetry_loop", start)
+    loop = src[start:end]
+    assert "_detector_health_wire(orch)" in loop
+    assert "_emit(_health)" in loop
+    assert "_DETECTOR_HEALTH_INTERVAL_S" in loop
+    assert sidecar._DETECTOR_HEALTH_INTERVAL_S == 2.0
+    # Not a key of the engine-facing telemetry payload, by schema and by source.
+    assert "detector_health" not in (_REQUIRED_KEYS | _OPTIONAL_KEYS | _GREEN_KEYS | _SHOT_KEYS)
+    assert 'payload["detector_health"]' not in loop
+
+
 if __name__ == "__main__":
     # Standalone runner (no pytest dependency needed).
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

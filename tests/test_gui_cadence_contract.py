@@ -160,3 +160,54 @@ def test_authenticated_shell_backdrop_does_not_compete_with_live_video() -> None
     assert "Timer {" not in backdrop
     assert "Animation {" not in backdrop
     assert "ParticleSystem {" not in backdrop
+
+
+def test_virtual_disconnect_cleanup_is_not_optional_watchdog_work() -> None:
+    source = CONTROLLER_CPP.read_text(encoding="utf-8")
+    callback = _section(
+        source,
+        "connect(&controller_, &VirtualController::statusChanged",
+        "}, Qt::QueuedConnection);",
+    )
+    disconnected = callback[callback.index("if (!connected) {"):]
+    assert "squareOutputWatchdogEnabled_" not in disconnected
+    assert disconnected.index("automation_.reset();") < disconnected.index("neutralizeOwnedInput();")
+    assert "setMeterDelayShotCycle(false);" in disconnected
+
+
+def test_owned_input_cleanup_forces_exact_neutral_transaction_on_existing_route() -> None:
+    source = CONTROLLER_CPP.read_text(encoding="utf-8")
+    cleanup = _section(
+        source,
+        "void OrionAppController::neutralizeOwnedInput()",
+        "void OrionAppController::releaseFailedRemoteInputRoute()",
+    )
+    assert "QMutexLocker submitLock(&submitMutex_);" in cleanup
+    assert "directInputRouteCurrentlyOwned(" in cleanup
+    assert cleanup.index("if (directRouteOwned) {") < cleanup.index(
+        "orionInput_.sendDetailed(neutral, true, true)"
+    )
+    assert "InputRouteWriteResult::LocalUdpAccepted" in cleanup
+    assert "console_ack=0" in cleanup
+    assert "orionInput_.connect" not in cleanup.replace("orionInput_.connected()", "")
+
+
+def test_input_recovery_fences_actual_controller_write_sites() -> None:
+    source = CONTROLLER_CPP.read_text(encoding="utf-8")
+    gate = _section(source, "const bool directInputReady =", "preciseReleaseAlreadyDelivered =")
+    assert "remotePlay_.inputRecoveryPending()" in gate
+    idle = _section(source, "if (idleReassertEnabled && hookConnected", "const InputRouteWriteResult reassertResult")
+    assert "remotePlay_.inputRecoveryPending()" in idle
+    arm = _section(source, "void OrionAppController::syncEngineArmed()", "void OrionAppController::refreshPassiveLatencyAdaptationStatus")
+    assert "directInputWriteAllowed(remotePlay_.state(), remotePlay_.inputRecoveryPending())" in arm
+    assert "activeRouteDelivery = directInputReady" in source
+    assert ": PreciseFireDeliveryDecision{};" in source
+
+
+def test_input_recovery_retires_old_pipe_before_spawning_replacement() -> None:
+    source = CONTROLLER_CPP.read_text(encoding="utf-8")
+    handler = _section(source, "connect(&remotePlay_, &RemotePlaySession::inputRecoveryStarted", "connect(&remotePlay_, &RemotePlaySession::sidecarProcessGenerationStarted")
+    assert handler.index("syncEngineArmed();") < handler.index("QMutexLocker submitLock") < handler.index("orionInput_.resetConnection();")
+    session = (ROOT / "native_orion/src/RemotePlaySession.cpp").read_text(encoding="utf-8")
+    recovery = _section(session, "bool RemotePlaySession::recoverInputLink()", "QTimer::singleShot(kInputSessionRecoveryDeadlineMs")
+    assert recovery.index("inputRecoveryPending_ = true;") < recovery.index("emit inputRecoveryStarted();") < recovery.index('sendSidecarCommand({{"cmd", "recover_input"}})')

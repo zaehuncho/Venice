@@ -3,7 +3,10 @@ import threading
 import remote_play_orchestrator as rpo
 
 
-def _snapshot(backend, tier, suspect=False):
+def _snapshot(backend, tier, suspect=False, requested_fps=None):
+    # [ORION_CAPTURE_FPS 2026-09-14] requested_fps defaults on the dataclass, so leaving it
+    # unset here exercises the same path a pre-setting install takes (60).
+    extra = {} if requested_fps is None else {'requested_fps': requested_fps}
     return rpo._CaptureHealthSnapshot(
         backend=backend,
         tier=tier,
@@ -17,6 +20,7 @@ def _snapshot(backend, tier, suspect=False):
         core_black_run=9,
         core_static_run=10,
         suspect=suspect,
+        **extra,
     )
 
 
@@ -44,6 +48,7 @@ def test_capture_health_worker_is_off_loop_bounded_latest_wins_and_drains(monkey
             query_threads.append(threading.get_ident())
             assert window_s == 5.0
             return {
+                'stage_kind': 'capture',
                 'fps': 57.5,
                 'max_gap_ms': 24.5,
                 'late_gaps': 2,
@@ -86,12 +91,20 @@ def test_capture_health_worker_is_off_loop_bounded_latest_wins_and_drains(monkey
     assert 'tier=first' in rendered[0][1]
     assert all('tier=superseded' not in line for _, line in rendered)
     assert rendered[1][1] == (
-        "Capture health: SUSPECT cap_mode=? tier=latest tiers={'latest': 3} "
+        # [ORION_CAPTURE_FPS 2026-09-14] cap_req_fps is the rate the card was ASKED for; the
+        # NEGOTIATED rate is cap_mode's own `@<fps>` field. The pair is the whole point: a
+        # customer who selects 120 on a card that only does 60 is otherwise invisible.
+        # [ORION_STALL_ATTRIB 2026-09-15] gc2/gcms/stall ride at the FRONT, for the reason the
+        # emitter's own comment gives: the native relay trims a sidecar line to 300 chars and
+        # this one already renders longer, so anything appended to the tail is never visible.
+        # All three read 0 here because the attributor defaults to OFF (see stall_attributor).
+        "Capture health: SUSPECT cap_mode=? gc2=0 gcms=0 stall=0/0 "
+        "cap_req_fps=60 tier=latest tiers={'latest': 3} "
         "uniqfps=60 dup%=2 "
         "export_fps=59 gap_fps=1 cv_fps=58 detect_ms=1.5 "
         "raw_fps=57.5 raw_gap_max_ms=24.5 raw_late=2 "
+        "raw_stage=cap:16.25/1.75/6.50 "
         "source_skip=7 raw_gap_frame=321 raw_gap_event_ms=1750000000125 "
-        "raw_read_block_ms=16.25 raw_isolate_ms=1.75 raw_post_ms=6.50 "
         "preview_dup_refresh=8 "
         "core_black_run=9 core_static_run=10"
     )
@@ -100,6 +113,7 @@ def test_capture_health_worker_is_off_loop_bounded_latest_wins_and_drains(monkey
     # so a future field insertion cannot quietly push them back off the end again.
     assert rendered[1][1].index('SUSPECT') < 244
     assert rendered[1][1].index('cap_mode=') < 244
+    assert rendered[1][1].index('cap_req_fps=') < 244
 
 
 def test_capture_health_reports_the_driver_negotiated_mode(monkeypatch):
@@ -127,6 +141,14 @@ def test_capture_health_reports_the_driver_negotiated_mode(monkeypatch):
 
     assert len(rendered) == 1
     assert 'cap_mode=1920x1080@60/YUY2/buf1' in rendered[0]
+
+    # REQUESTED vs NEGOTIATED, side by side: ask for 120, get 60 back from the driver, and
+    # the line must show both rather than only the one that took.
+    rendered.clear()
+    rpo.RemotePlayOrchestrator._emit_capture_health_diagnostic(
+        _snapshot(Backend(), 'latest', requested_fps=120))
+    assert 'cap_mode=1920x1080@60/YUY2/buf1' in rendered[0]
+    assert 'cap_req_fps=120' in rendered[0]
 
 
 def test_capture_health_never_lets_a_mode_probe_break_the_health_line(monkeypatch):
@@ -232,3 +254,17 @@ def test_capture_health_handoff_fails_isolated_from_frame_delivery():
     orch._video_core_static_run = 0
 
     assert orch._queue_capture_health_diagnostic(False) is False
+
+
+def test_capture_health_suspect_reports_are_transition_immediate_and_rate_bounded():
+    orch = rpo.RemotePlayOrchestrator.__new__(rpo.RemotePlayOrchestrator)
+    orch._last_capture_health_log = 100.0
+    orch._capture_health_suspect = False
+
+    assert not orch._capture_health_report_due(101.0, False)
+    assert orch._capture_health_report_due(101.1, True)   # first SUSPECT
+    assert not orch._capture_health_report_due(101.2, True)
+    assert not orch._capture_health_report_due(106.0, True)
+    assert orch._capture_health_report_due(106.1, True)   # persistent: 5 s cadence
+    assert orch._capture_health_report_due(106.2, False)  # recovery transition
+    assert not orch._capture_health_report_due(106.3, False)

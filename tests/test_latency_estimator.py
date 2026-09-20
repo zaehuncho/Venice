@@ -1580,7 +1580,9 @@ def test_probe_ignores_sub_fmin_onset_samples(caplog):
     with caplog.at_level(logging.WARNING, logger="latency_estimator"):
         # the onset the live reader actually emits: below the template floor, monotone rising
         t = appear - 64.0
-        for f in (2.0, 6.0, 11.0, 16.0):
+        # Derive onset samples from the loaded prior: the fitted fmin changes
+        # with the registered model, so fixed values can cross above its floor.
+        for f in (float(fmin) * fraction for fraction in (0.2, 0.4, 0.6, 0.8)):
             est.update(t, f, present=True, fed=True)
             t += 16.0
         t = appear
@@ -1800,6 +1802,17 @@ def test_robust_to_transient_drops():
 # posterior walked further down every session. These cover the new path; every
 # pre-existing test uses a frozen-in-place synthetic that clamps f to F_stop and
 # therefore still exercises the unchanged crossing branch.
+#
+# 2026-09-15 SUPERSEDED for overshoots above RETRACTION_TOL_PCT. On 2K27 the
+# "overshoot then settle back" shape is not an ease-out at all: it is the game's
+# post-top-out RETRACTION, which only happens on a MISS (reverse causality --
+# the miss produces the snap-back, the latency did not change). Measured over
+# 111 banner-graded releases, onset-dated rows ran p50 269.7ms against 217.0ms
+# for crossing-dated rows on the same rig, and each one moved fixed_ms by
+# 30-47ms. Such traces are now rejected as deflate_retraction and the onset
+# branch survives only for sub-jitter overshoots (peak - f_stop <= 1.0pp), where
+# crossing and onset coincide anyway. The frozen-in-place path below is
+# unchanged and is still the reference contract.
 # ---------------------------------------------------------------------------
 
 def _overshoot_shot(est, t_rel_ms, cross_lag_ms, lock_lag_ms, f_stop=88.0,
@@ -1830,21 +1843,27 @@ def _overshoot_shot(est, t_rel_ms, cross_lag_ms, lock_lag_ms, f_stop=88.0,
         t += dt
 
 
-def test_overshoot_trace_labels_the_lock_not_the_crossing():
-    """A sub-cap overshoot must be labelled at the freeze onset, not the up-crossing.
+def test_overshoot_trace_is_rejected_as_a_retraction_not_labelled_at_its_onset():
+    """RETIRED CONTRACT (was test_overshoot_trace_labels_the_lock_not_the_crossing).
 
-    Sized to the default prior (mu=60, sd=12) so the posterior outlier gate admits it: the
-    crossing lands at 60ms (exactly the prior) and the lock 30ms later. The OLD crossing oracle
-    would report ~60; a lock-domain oracle must report ~90.
+    This trace -- cross at t_rel+60, peak 5pp over F_stop, settle back to F_stop 30ms later --
+    used to be REQUIRED to produce a ~90ms onset-dated label. The 2026-09-15 forensics on 111
+    banner-graded releases showed that on 2K27 this shape is the post-top-out retraction of a
+    MISSED shot, so the 30ms "lock lag" is retraction animation, not view latency, and folding it
+    into the label inflated the posterior by 30-47ms per occurrence. A 5pp settle-back is far
+    outside the 1.5pp plateau-jitter band, so it must now be rejected with no label at all and the
+    posterior must not move.
     """
     est = LatencyEstimator(freeze_win=4, lo_ms=10.0, hi_ms=500.0)
     base = 1_000_000.0
+    before_ms = est.value_ms()
     _overshoot_shot(est, t_rel_ms=base, cross_lag_ms=60.0, lock_lag_ms=30.0, base=base)
-    assert est.n_labels >= 1, (
-        f"sub-cap overshoot produced no label ({est.last_rejection})")
-    assert est.value_ms() > 75.0, (
-        f"label still in the crossing domain: {est.value_ms():.1f} (crossing=60, lock=90)")
-    assert est.lock_lag_ms > 10.0, f"lock lag not measured: {est.lock_lag_ms}"
+    assert est.n_labels == 0, "a retraction trace must not mint a label"
+    assert est.last_status == "rejected_deflate"
+    assert est.last_rejection == "deflate_retraction"
+    assert est.freeze_kind == "deflate"
+    assert est.lock_lag_ms == -1.0, "no label -> no lock-lag measurement"
+    assert est.value_ms() == before_ms, "rejected retraction moved the posterior"
 
 
 def test_frozen_in_place_is_unchanged_by_lock_domain_change():

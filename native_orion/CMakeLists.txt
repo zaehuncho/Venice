@@ -79,6 +79,10 @@ function(orion_apply_target_defaults target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive- /EHsc /Zc:__cplusplus /sdl /guard:cf)
         target_link_options(${target} PRIVATE /DYNAMICBASE /NXCOMPAT /guard:cf /CETCOMPAT)
+        # [2026-09-11] Release builds carry a PDB: two shutdown crash dumps could only be read down to
+        # "somewhere in the precise-fire thread" because the Release exe shipped no symbols.
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Zi>)
+        target_link_options(${target} PRIVATE $<$<CONFIG:Release>:/DEBUG:FULL>)
         if(ORION_PRODUCTION_HARDENING)
             target_compile_definitions(${target} PRIVATE
                 $<$<CONFIG:Release>:ORION_RELEASE_HARDENED=1>
@@ -105,6 +109,9 @@ endfunction()
 add_library(OrionCommon SHARED
     src/AppConfig.cpp
     src/AppConfig.h
+    # [ORION_BANNER_LEAD_TRIM 2026-09-15] header-only policy, listed so it shows in the IDE tree
+    # and so the settings/learning layer's dependency on it is explicit.
+    src/BannerLeadTrim.h
     src/Diagnostics.cpp
     src/Diagnostics.h
     src/OrionTypes.h
@@ -169,6 +176,7 @@ add_library(RemotePlayCore SHARED
     src/RemotePlayDecodePolicy.h
     src/RemotePlaySession.cpp
     src/RemotePlaySession.h
+    src/ShotGateProtocol.h
     src/VirtualController.cpp
     src/VirtualController.h
 )
@@ -412,6 +420,24 @@ set_source_files_properties(qml/components/TourRegistry.qml PROPERTIES QT_QML_SI
 
 set(ORION_ADMIN_QML_FILES
     qml/admin/AdminMain.qml
+    qml/admin/AdminLoginPane.qml
+    qml/admin/AdminDashboardPage.qml
+    qml/admin/AdminLicensesPage.qml
+    qml/admin/AdminStaffPage.qml
+    qml/admin/AdminAuditPage.qml
+    qml/admin/AdminConfigPage.qml
+    qml/admin/AdminAccountPage.qml
+    qml/admin/AdminButton.qml
+    qml/admin/AdminCard.qml
+    qml/admin/AdminCombo.qml
+    qml/admin/AdminField.qml
+    qml/admin/AdminJsonView.qml
+    qml/admin/AdminKeyValue.qml
+    qml/admin/AdminPill.qml
+    qml/admin/AdminReasonField.qml
+    qml/admin/AdminSecretReveal.qml
+    qml/admin/AdminStatTile.qml
+    qml/admin/AdminToggle.qml
     qml/Theme.qml
 )
 
@@ -482,7 +508,9 @@ qt_add_qml_module(OrionNative
         qml/components/MeterTelemetryHud.qml
         qml/components/ShotLeadCard.qml
         qml/components/RhythmCard.qml
+        qml/components/NoMeterCard.qml
         qml/components/ShotLeadUsableMaxIndicator.qml
+        qml/components/ShotVerdictTally.qml
         qml/components/TipTimingCard.qml
         qml/components/ColorSwatchRow.qml
         qml/components/PressedBadge.qml
@@ -491,7 +519,6 @@ qt_add_qml_module(OrionNative
         qml/pages/StreamSetupGate.qml
         qml/pages/LegalGate.qml
         qml/pages/UpdateGatePage.qml
-        qml/pages/GeneralPage.qml
         qml/pages/RemotePlayPage.qml
         qml/pages/DashboardPage.qml
         qml/pages/PatchNotesPage.qml
@@ -612,6 +639,36 @@ add_subdirectory(venicenet_service)
 
 if(ORION_BUILD_TESTS)
     enable_testing()
+    # Pure timing mathematics is always tested, independently of Qt's GUI
+    # harness. This component has no release authority until measured priors
+    # and boundaries are supplied by the live pipeline.
+    add_executable(GreenWindowMathChecks tests/GreenWindowMathTests.cpp)
+    orion_apply_target_defaults(GreenWindowMathChecks)
+    add_test(NAME GreenWindowMathChecks COMMAND GreenWindowMathChecks)
+    # GUI-subsystem QtTest output is not reliably streamed into CTest on Windows.
+    # Record the original invocation through a bounded wrapper; no retry or
+    # assertion changes. Each target/configuration/run gets independent evidence.
+    if(WIN32)
+        find_program(ORION_TEST_POWERSHELL NAMES powershell.exe REQUIRED)
+    endif()
+    function(orion_add_qtest target)
+        if(WIN32)
+            add_test(NAME ${target}
+                COMMAND "${ORION_TEST_POWERSHELL}"
+                    -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/run_orion_qtest.ps1"
+                    -TestExecutable "$<TARGET_FILE:${target}>"
+                    -TestName "${target}" -Configuration "$<CONFIG>"
+                    -LogDirectory "${CMAKE_CURRENT_BINARY_DIR}/Testing/QtTest"
+                    -TimeoutSeconds 120
+            )
+            # The child receives the original 120 s bound; 15 s is wrapper
+            # startup/termination/evidence grace, not extra test execution time.
+            set_tests_properties(${target} PROPERTIES TIMEOUT 135)
+        else()
+            add_test(NAME ${target} COMMAND ${target})
+        endif()
+    endfunction()
     add_executable(OrionNativeTests
         tests/AutomationEngineTests.cpp
         # [ORION_PACKET_BRIDGE_NAMES task #64] scServiceStartTriesBothNames pins the
@@ -619,6 +676,13 @@ if(ORION_BUILD_TESTS)
         venicenet/venicenet_service_route.cpp
     )
     orion_apply_target_defaults(OrionNativeTests)
+    # The verifier builds named targets, not ALL_BUILD. Keep the pure math
+    # executable fresh before CTest instead of relying on a prior manual build.
+    add_dependencies(OrionNativeTests GreenWindowMathChecks)
+    # [ORION_NO_METER_V2 2026-09-14 owner] The NO METER (input-timed) path is back IN the
+    # shipped app: the Live page carries the METER / NO METER switch again and AppConfig no
+    # longer forces input_timed_enabled=false. Nothing is compiled out and no target needs a
+    # define — the tests drive the same code the product runs.
     target_include_directories(OrionNativeTests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/venicenet")
     target_link_libraries(OrionNativeTests PRIVATE
@@ -633,7 +697,16 @@ if(ORION_BUILD_TESTS)
     if(WIN32)
         target_link_libraries(OrionNativeTests PRIVATE advapi32 crypt32 user32)
     endif()
-    add_test(NAME OrionNativeTests COMMAND OrionNativeTests)
+    orion_add_qtest(OrionNativeTests)
+    add_executable(OrionFireEpochClockTests
+        tests/FireEpochClockTests.cpp
+    )
+    orion_apply_target_defaults(OrionFireEpochClockTests)
+    target_link_libraries(OrionFireEpochClockTests PRIVATE
+        Qt6::Core
+        Qt6::Test
+    )
+    orion_add_qtest(OrionFireEpochClockTests)
     # Standalone so it builds and runs without the whole automation stack --
     # MeterDelayController depends on nothing but Qt6::Core.
     add_executable(OrionMeterDelayTests
@@ -653,7 +726,7 @@ if(ORION_BUILD_TESTS)
         Qt6::Core
         Qt6::Test
     )
-    add_test(NAME OrionMeterDelayTests COMMAND OrionMeterDelayTests)
+    orion_add_qtest(OrionMeterDelayTests)
     # The MeterDelay production fence was retired 2026-08-07 (feature ships as an
     # opt-in customer toggle). The OrionMeterDelayFenceDevTests /
     # OrionMeterDelayFenceProdTests pair asserted the fence held and is now void;
@@ -667,7 +740,22 @@ if(ORION_BUILD_TESTS)
         Qt6::Core
         Qt6::Test
     )
-    add_test(NAME OrionRemotePlayPathTests COMMAND OrionRemotePlayPathTests)
+    orion_add_qtest(OrionRemotePlayPathTests)
+    # [ORION_INPUT_DEAD_UX 2026-08-30] Dead-input UX contracts: the shared
+    # pressUndeliverable() predicate (log line == screen), the overlay severity
+    # gating, and the bounded input-session auto-retry planner (backoff, clean
+    # give-up, cold-vs-warm classification, press-triggered attempt throttle).
+    # Header-only policy under test, so this stays a small standalone binary.
+    add_executable(OrionInputRetryTests
+        tests/InputSessionRetryPolicyTests.cpp
+    )
+    orion_apply_target_defaults(OrionInputRetryTests)
+    target_link_libraries(OrionInputRetryTests PRIVATE
+        OrionCommon
+        Qt6::Core
+        Qt6::Test
+    )
+    orion_add_qtest(OrionInputRetryTests)
     # [VENICE_PROFILE 2026-08-08] venice-profile.json export/import contracts
     # (src/VeniceProfile.h): deterministic round trip, load-band clamping on import,
     # and the never-exports-license allowlist snapshot. Headless (structs + QJson);
@@ -682,7 +770,7 @@ if(ORION_BUILD_TESTS)
         Qt6::Core
         Qt6::Test
     )
-    add_test(NAME OrionVeniceProfileTests COMMAND OrionVeniceProfileTests)
+    orion_add_qtest(OrionVeniceProfileTests)
     add_executable(OrionPassiveCourtFlowTests
         tests/PassiveCourtFlowClassifierTests.cpp
     )
@@ -691,7 +779,7 @@ if(ORION_BUILD_TESTS)
         Qt6::Core
         Qt6::Test
     )
-    add_test(NAME OrionPassiveCourtFlowTests COMMAND OrionPassiveCourtFlowTests)
+    orion_add_qtest(OrionPassiveCourtFlowTests)
     add_executable(OrionPreviewPresentationTests
         tests/PreviewPresentationBufferTests.cpp
     )
@@ -707,7 +795,38 @@ if(ORION_BUILD_TESTS)
     target_compile_definitions(OrionPreviewPresentationTests PRIVATE
         ORION_QML_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"
     )
-    add_test(NAME OrionPreviewPresentationTests COMMAND OrionPreviewPresentationTests)
+    orion_add_qtest(OrionPreviewPresentationTests)
+    # [ORION_ACTIVITY_FEED / PROFILE 2026-09-14] The customer-facing Activity ring
+    # rule (ui_notifications::shouldEnterActivityRing, header-only) and the backend
+    # `profile` block parser (SecurityCore). Standalone: neither needs the GUI
+    # controller or the automation stack.
+    add_executable(OrionActivityFeedPolicyTests
+        tests/ActivityFeedPolicyTests.cpp
+    )
+    orion_apply_target_defaults(OrionActivityFeedPolicyTests)
+    target_link_libraries(OrionActivityFeedPolicyTests PRIVATE
+        OrionCommon
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    orion_add_qtest(OrionActivityFeedPolicyTests)
+    # [ORION_BANNER_VERDICT_LIVE 2026-09-14] The live shot-verdict tally's rules
+    # (orion::ShotVerdictTally, header-only): bucketing, the 10-shot window, seq de-dupe,
+    # the two resets, and THE suggestion sentence. Standalone like the policy suite above --
+    # it needs no controller instance (whose ctor spawns the packet bridge and whose dtor
+    # force-kills chiaki images machine-wide); the controller's Q_PROPERTY contract for the
+    # same feature is pinned in MeterDelaySettingsPropertyTests.
+    add_executable(OrionShotVerdictTallyTests
+        tests/ShotVerdictTallyTests.cpp
+    )
+    orion_apply_target_defaults(OrionShotVerdictTallyTests)
+    target_link_libraries(OrionShotVerdictTallyTests PRIVATE
+        Qt6::Core
+        Qt6::Test
+    )
+    orion_add_qtest(OrionShotVerdictTallyTests)
     add_executable(OrionOrderedFileLogSinkTests
         tests/OrderedFileLogSinkTests.cpp
         src/OrderedFileLogSink.cpp
@@ -718,7 +837,7 @@ if(ORION_BUILD_TESTS)
         Qt6::Core
         Qt6::Test
     )
-    add_test(NAME OrionOrderedFileLogSinkTests COMMAND OrionOrderedFileLogSinkTests)
+    orion_add_qtest(OrionOrderedFileLogSinkTests)
     add_executable(OrionInputProtocolTests
         tests/OrionInputProtocolTests.cpp
         src/OrionInputClient.cpp
@@ -729,7 +848,7 @@ if(ORION_BUILD_TESTS)
         Qt6::Core
         Qt6::Test
     )
-    add_test(NAME OrionInputProtocolTests COMMAND OrionInputProtocolTests)
+    orion_add_qtest(OrionInputProtocolTests)
     if(WIN32)
         add_executable(OrionDeepLinkTargetPolicyTests
             tests/DeepLinkTargetPolicyTests.cpp
@@ -742,7 +861,7 @@ if(ORION_BUILD_TESTS)
             Qt6::Test
             user32
         )
-        add_test(NAME OrionDeepLinkTargetPolicyTests COMMAND OrionDeepLinkTargetPolicyTests)
+        orion_add_qtest(OrionDeepLinkTargetPolicyTests)
 
         add_executable(OrionShmInteropTests
             tests/SharedMemoryFrameReaderTests.cpp
@@ -757,7 +876,19 @@ if(ORION_BUILD_TESTS)
             Qt6::Gui
             Qt6::Test
         )
-        add_test(NAME OrionShmInteropTests COMMAND OrionShmInteropTests)
+        orion_add_qtest(OrionShmInteropTests)
+
+        add_executable(OrionShmNotificationTests
+            tests/SharedMemoryFramePumpNotificationTests.cpp
+        )
+        orion_apply_target_defaults(OrionShmNotificationTests)
+        target_link_libraries(OrionShmNotificationTests PRIVATE
+            RemotePlayCore
+            Qt6::Core
+            Qt6::Gui
+            Qt6::Test
+        )
+        orion_add_qtest(OrionShmNotificationTests)
 
         # [ORION_PRECISE_WAIT] Wakeup-precision primitives for the precise-fire worker
         # (src/PreciseWaitTimer.h). Measures + pins the hires waitable-timer wake error and
@@ -771,7 +902,7 @@ if(ORION_BUILD_TESTS)
             Qt6::Test
             winmm
         )
-        add_test(NAME OrionPreciseWaitTests COMMAND OrionPreciseWaitTests)
+        orion_add_qtest(OrionPreciseWaitTests)
         # [ORION_METER_DELAY_UI 2026-08-08] Meta-object contract for the customer
         # meter-delay controls. MeterConfigPanel.qml binds orion.meterDelayEnabled /
         # meterDelayMs / meterDelayBypassOnDefense; nothing in the build fails when a
@@ -814,7 +945,7 @@ if(ORION_BUILD_TESTS)
             Qt6::Test
             advapi32 crypt32 user32 setupapi hid winmm xinput ws2_32 dwmapi ole32 oleaut32 strmiids iphlpapi
         )
-        add_test(NAME OrionMeterDelaySettingsTests COMMAND OrionMeterDelaySettingsTests)
+        orion_add_qtest(OrionMeterDelaySettingsTests)
         # QTEST_MAIN creates a QGuiApplication even for non-visual tests. On a
         # clean/headless runner Qt otherwise opens a hidden platform-plugin
         # MessageBox before QTest starts, which looks like a deadlocked test and
@@ -841,7 +972,7 @@ if(ORION_BUILD_TESTS)
                 list(APPEND _orion_test_path_mods "PATH=path_list_prepend:${_orion_opencv_bin}")
             endif()
         endif()
-        set_tests_properties(OrionNativeTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionPreciseWaitTests PROPERTIES
+        set_tests_properties(OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionShmNotificationTests OrionPreciseWaitTests PROPERTIES
             ENVIRONMENT "${_orion_test_env}"
             ENVIRONMENT_MODIFICATION "${_orion_test_path_mods}"
         )
@@ -862,7 +993,7 @@ if(ORION_BUILD_TESTS)
     if(WIN32)
         target_link_libraries(OrionUpdaterTests PRIVATE advapi32 crypt32 user32)
     endif()
-    add_test(NAME OrionUpdaterTests COMMAND OrionUpdaterTests)
+    orion_add_qtest(OrionUpdaterTests)
     if(WIN32)
         set(_orion_updater_test_path_mods
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
@@ -875,5 +1006,29 @@ if(ORION_BUILD_TESTS)
             ENVIRONMENT "${_orion_test_env}"
             ENVIRONMENT_MODIFICATION "${_orion_updater_test_path_mods}"
         )
+    endif()
+endif()
+
+if(ORION_BUILD_TESTS)
+    add_executable(OrionXboxPolicyTests tests/XboxRemotePlayPolicyTests.cpp)
+    orion_apply_target_defaults(OrionXboxPolicyTests)
+    target_link_libraries(OrionXboxPolicyTests PRIVATE OrionCommon RemotePlayCore Qt6::Core Qt6::Gui Qt6::Test)
+    orion_add_qtest(OrionXboxPolicyTests)
+    if(WIN32)
+        set_tests_properties(OrionXboxPolicyTests PROPERTIES
+            ENVIRONMENT "${_orion_test_env}"
+            ENVIRONMENT_MODIFICATION "${_orion_test_path_mods}")
+    endif()
+endif()
+
+if(ORION_BUILD_TESTS)
+    add_executable(OrionLauncherResponseTests tests/LauncherResponsivenessTests.cpp)
+    orion_apply_target_defaults(OrionLauncherResponseTests)
+    target_link_libraries(OrionLauncherResponseTests PRIVATE OrionCommon RemotePlayCore Qt6::Core Qt6::Gui Qt6::Test)
+    orion_add_qtest(OrionLauncherResponseTests)
+    if(WIN32)
+        set_tests_properties(OrionLauncherResponseTests PROPERTIES
+            ENVIRONMENT "${_orion_test_env}"
+            ENVIRONMENT_MODIFICATION "${_orion_test_path_mods}")
     endif()
 endif()

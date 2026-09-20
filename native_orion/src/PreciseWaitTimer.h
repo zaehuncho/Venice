@@ -18,11 +18,10 @@
 //
 // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timers fire at precise due times regardless of the
 // current process timer resolution, so waiting on one removes the dependency on the throttling
-// policy entirely. Both facilities here are consumed behind default-OFF env flags:
-//   ORION_PRECISE_WAIT_HIRES=1  -> the fire worker's coarse leg waits on this timer instead of
-//                                  the condvar (same predicate loop, same 1.2ms spin tail).
-//   ORION_TIMER_RES_GUARD=1     -> the process opts out of timer-resolution throttling so the
-//                                  existing timeBeginPeriod(1) request is honored even occluded.
+// policy entirely. Both facilities default ON; the environment variables are explicit
+// diagnostic opt-outs:
+//   ORION_PRECISE_WAIT_HIRES=0  -> use the legacy condition-variable coarse wait.
+//   ORION_TIMER_RES_GUARD=0     -> do not opt out of timer-resolution throttling.
 //
 // FAIL-CLOSED: nothing here can make a submit happen; both facilities only change when an
 // already-armed worker WAKES. A broken timer degrades to a bounded WaitForMultipleObjects

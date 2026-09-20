@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Venice — Jump-shot timing for NBA 2K27 on PS5</title>
+  <meta name="description" content="Venice is a Windows app that reads the NBA 2K27 shot meter over a capture card or PS5 Remote Play and times the release. Free 7-day trial, then $25/month.">
+  <meta name="theme-color" content="#06080c">
+  <meta name="color-scheme" content="dark">
+  <link rel="canonical" href="https://zaeorion.com/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Venice">
+  <meta property="og:title" content="Venice — Jump-shot timing for NBA 2K27 on PS5">
+  <meta property="og:description" content="A Windows app that reads the NBA 2K27 shot meter over a capture card or PS5 Remote Play and times the release. Free 7-day trial, then $25/month.">
+  <meta property="og:image" content="https://zaeorion.com/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Venice — jump-shot timing for NBA 2K27 on PS5">
+  <meta property="og:url" content="https://zaeorion.com/">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/favicon.ico?v=3" sizes="32x32">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=3">
+  <link rel="preload" href="/fonts/geist-latin-wght-normal-v1.woff2" as="font" type="font/woff2" crossorigin>
+  <!-- Inlined copy of /styles.css (the shared sheet the other pages link). tests/verify_site.py fails if the two differ. -->
+  <style>
+/* Venice — shared by the home page, legal pages, 404 and the Worker-rendered /discord and /connect pages. */
+
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/geist-latin-wght-normal-v1.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+/* Metric-matched fallback so the swap to Geist does not move text. */
+@font-face {
+  font-family: "Geist Fallback";
+  src: local("Arial"), local("ArialMT"), local("Helvetica");
+  size-adjust: 105.85%;
+  ascent-override: 94.94%;
+  descent-override: 27.87%;
+  line-gap-override: 0%;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #06080c;
+  --panel: #0b0f16;
+  --line: rgba(255, 255, 255, .09);
+  --line-2: rgba(255, 255, 255, .16);
+  --text: #f2f5f9;
+  --text-2: #a7b2bf;
+  --text-3: #8d99a7;
+  --blue-2: #6fb4ff;
+  --blue-3: #9fd0ff;
+  --btn: #1c67dd;
+  --btn-hover: #2470e4;
+  --ok: #8be3bb;
+  --error: #ffc2c2;
+  --radius: 12px;
+  --shell: min(1040px, 100% - 40px);
+  --header-h: 60px;
+  --font: "Geist", "Geist Fallback", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; scroll-behavior: smooth; }
+body {
+  margin: 0; min-height: 100vh;
+  background: var(--bg); color: var(--text);
+  font: 16px/1.6 var(--font);
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden; overflow-x: clip;
+}
+/* One soft light at the top of the page. */
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: radial-gradient(900px 420px at 50% -170px, rgba(38, 112, 255, .13), transparent 70%);
+}
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
+p, dl, dd { margin: 0; }
+ul, ol { margin: 0; padding: 0; }
+a { color: inherit; text-decoration: none; }
+img, svg { display: block; max-width: 100%; }
+button { font: inherit; color: inherit; }
+code {
+  font-family: var(--mono); font-size: .88em; color: var(--blue-3);
+  background: rgba(111, 180, 255, .1); border: 1px solid rgba(111, 180, 255, .18);
+  padding: .08em .42em; border-radius: 6px; white-space: nowrap;
+}
+:focus-visible { outline: 2px solid var(--blue-3); outline-offset: 2px; border-radius: 6px; }
+::selection { background: rgba(61, 134, 255, .45); color: #fff; }
+[hidden] { display: none !important; }
+
+.shell { width: var(--shell); margin-inline: auto; }
+.sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+.skip-link {
+  position: fixed; top: 10px; left: 10px; z-index: 100; padding: 9px 14px; border-radius: 8px;
+  background: #fff; color: #05070b; font-weight: 600; transform: translateY(-160%); transition: transform .2s;
+}
+.skip-link:focus { transform: none; }
+.icon { width: 18px; height: 18px; flex: none; }
+.inline-link, .sub a, .hint a, .facts a { color: var(--blue-3); text-decoration: underline; text-decoration-color: rgba(159, 208, 255, .4); text-underline-offset: 3px; }
+.inline-link:hover, .sub a:hover, .hint a:hover, .facts a:hover { text-decoration-color: currentColor; }
+.kicker { color: var(--blue-2); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+
+/* Star texture behind the page: painted once, redrawn only while the pointer parallax settles. */
+#starfield { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -2; pointer-events: none; }
+
+/* ---------- Buttons ---------- */
+.button {
+  --h: 44px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+  min-height: var(--h); padding: 0 18px; border: 1px solid transparent; border-radius: 10px;
+  font-size: 15px; font-weight: 600; line-height: 1.1; text-align: center; white-space: nowrap; cursor: pointer;
+  transition: background-color .18s, border-color .18s, color .18s;
+}
+.button.primary { color: #fff; background: var(--btn); border-color: var(--btn); }
+.button.primary:hover { background: var(--btn-hover); border-color: var(--btn-hover); }
+.button.ghost, .button.secondary { color: var(--text); background: rgba(255, 255, 255, .045); border-color: var(--line-2); }
+.button.ghost:hover, .button.secondary:hover { background: rgba(255, 255, 255, .085); border-color: rgba(255, 255, 255, .26); }
+.button.small { --h: 36px; padding: 0 14px; font-size: 14px; border-radius: 9px; }
+.button[aria-busy="true"] { cursor: progress; opacity: .8; }
+
+/* ---------- Header ---------- */
+.top { border-bottom: 1px solid var(--line); }
+.bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: var(--header-h); }
+.brand { display: inline-flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 650; letter-spacing: .2em; line-height: 1; }
+.brand-logo { width: 24px; height: 24px; }
+.brand-mark { display: grid; place-items: center; width: 26px; height: 26px; flex: none; }
+.brand-mark img, .brand-mark svg { width: 100%; height: 100%; object-fit: contain; }
+
+/* Connected Discord account. Both states share one grid cell, so the control keeps the same
+   width before and after /api/checkout/config resolves and the header never reflows. */
+.acct { display: grid; align-items: center; }
+.acct > * { grid-area: 1 / 1; display: flex; align-items: center; gap: 6px; visibility: hidden; }
+.acct[data-state="out"] .acct-out-state, .acct[data-state="in"] .acct-in-state { visibility: visible; }
+.acct-link {
+  display: inline-flex; align-items: center; gap: 8px; min-width: 0;
+  padding: 3px 12px 3px 3px; border: 1px solid var(--line-2); border-radius: 999px;
+  background: rgba(255, 255, 255, .045); transition: background-color .18s, border-color .18s;
+}
+.acct-link:hover { background: rgba(255, 255, 255, .085); border-color: rgba(255, 255, 255, .26); }
+.acct-avatar {
+  display: grid; place-items: center; flex: none; width: 26px; height: 26px; overflow: hidden; border-radius: 50%;
+  background: var(--btn); color: #fff; font-size: 12px; font-weight: 600; line-height: 1;
+}
+.acct-avatar img { width: 26px; height: 26px; object-fit: cover; }
+/* Capped so no username can make the signed-in control wider than the signed-out button. */
+.acct-name { max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 500; }
+.acct-signout { display: flex; }
+.acct-signout-button {
+  display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 1px solid var(--line); border-radius: 9px;
+  background: transparent; color: var(--text-3); cursor: pointer; transition: color .18s, background-color .18s, border-color .18s;
+}
+.acct-signout-button:hover { color: var(--text); background: rgba(255, 255, 255, .06); border-color: var(--line-2); }
+.acct-signout-button .icon { width: 16px; height: 16px; }
+
+/* ---------- Hero: name and gate side by side ---------- */
+.hero {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 420px); gap: 48px; align-items: center;
+  padding: clamp(48px, 8vw, 96px) 0 clamp(40px, 6vw, 72px);
+}
+.hero h1 { font-size: clamp(2.75rem, 2rem + 3vw, 4rem); letter-spacing: -.035em; line-height: 1; }
+.lede { margin-top: 14px; font-size: clamp(1.2rem, 1.05rem + .6vw, 1.5rem); font-weight: 500; letter-spacing: -.015em; line-height: 1.3; }
+.sub { margin-top: 14px; max-width: 44ch; color: var(--text-2); font-size: 16.5px; line-height: 1.6; }
+
+/* ---------- Purchase gate ---------- */
+.gate { padding: 22px; border: 1px solid rgba(111, 180, 255, .3); border-radius: var(--radius); background: var(--panel); }
+.gate-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.gate-head h2 { font-size: 17px; letter-spacing: -.015em; }
+.badge {
+  display: inline-flex; align-items: center; padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+  color: var(--blue-3); background: rgba(61, 134, 255, .14); border: 1px solid rgba(111, 180, 255, .3); font-size: 12.5px; font-weight: 600;
+}
+.gate-note { margin-top: 8px; padding-bottom: 18px; border-bottom: 1px solid var(--line); color: var(--text-2); font-size: 14px; }
+/* Every state is in the markup and only visibility is switched, inside one grid cell, so the gate
+   is exactly the same height in all four states and resolving it shifts nothing (CLS 0). */
+.states { display: grid; margin-top: 18px; }
+.state { grid-area: 1 / 1; display: flex; flex-direction: column; justify-content: center; gap: 10px; visibility: hidden; }
+.states[data-state="out"] .state-out, .states[data-state="join"] .state-join,
+.states[data-state="in"] .state-in, .states[data-state="done"] .state-done { visibility: visible; }
+.state .button { width: 100%; }
+.lead { display: grid; align-content: end; min-height: 2.9em; font-size: 14.5px; font-weight: 500; line-height: 1.45; }
+.hint { min-height: 2.9em; color: var(--text-3); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+/* The signed-in hint can gain a membership or old-backend note once the config resolves. */
+.state-in .hint { min-height: 4.4em; }
+.hint strong { color: var(--text-2); font-weight: 600; }
+.hint code { font-size: .92em; }
+.state-done { outline: none; }
+.state-done .lead { color: var(--ok); }
+.msg {
+  display: grid; justify-items: start; gap: 9px; margin-top: 14px; padding: 11px 13px; border-radius: 10px;
+  color: var(--error); background: rgba(255, 90, 90, .08); border: 1px solid rgba(255, 120, 120, .24); font-size: 13.5px; line-height: 1.5;
+}
+.msg.is-info { color: var(--text-2); background: rgba(255, 255, 255, .035); border-color: var(--line-2); }
+.fine { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--text-3); font-size: 12.5px; line-height: 1.55; }
+.fine a { color: var(--text-2); text-decoration: underline; text-decoration-color: rgba(167, 178, 191, .4); text-underline-offset: 3px; }
+.fine a:hover { color: var(--text); }
+
+/* ---------- Steps and details ---------- */
+.block { padding: clamp(36px, 5vw, 56px) 0; border-top: 1px solid var(--line); }
+.block h2 { font-size: 13px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--text-3); }
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px 32px; margin-top: 22px; list-style: none; }
+.steps li { display: flex; gap: 14px; align-items: flex-start; }
+.steps span {
+  display: grid; place-items: center; flex: none; width: 28px; height: 28px; border-radius: 8px;
+  color: var(--blue-3); background: rgba(61, 134, 255, .14); border: 1px solid rgba(111, 180, 255, .28);
+  font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600;
+}
+.steps p { padding-top: 3px; color: var(--text-2); font-size: 15px; line-height: 1.5; }
+.steps strong { color: var(--text); font-weight: 600; }
+.steps a { color: var(--blue-3); text-decoration: underline; text-decoration-color: rgba(159, 208, 255, .4); text-underline-offset: 3px; }
+.facts { margin-top: 10px; }
+.facts > div { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 4px 24px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.facts dt { color: var(--text); font-size: 15px; font-weight: 600; }
+.facts dd { color: var(--text-2); font-size: 15px; line-height: 1.55; }
+
+/* ---------- Footer ---------- */
+.foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 24px; padding: 22px 0 36px; }
+.foot nav { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.foot a { color: var(--text-2); font-size: 14px; border-radius: 6px; transition: color .18s; }
+.foot a:hover { color: var(--text); }
+.foot p { color: var(--text-3); font-size: 12.5px; }
+
+/* ---------- Checkout dialog (Stripe embedded) ---------- */
+.checkout-dialog {
+  width: min(960px, calc(100% - 24px)); height: min(800px, calc(100dvh - 24px)); padding: 0;
+  border: 1px solid var(--line-2); border-radius: var(--radius); background: #080b11; color: var(--text);
+  box-shadow: 0 30px 100px rgba(0, 0, 0, .75); overflow: hidden;
+}
+.checkout-dialog::backdrop { background: rgba(2, 4, 8, .82); }
+.checkout-shell { height: 100%; display: flex; flex-direction: column; }
+.checkout-shell > header {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 60px; padding: 0 14px 0 18px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.checkout-shell > header > div { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.checkout-shell header strong, .checkout-shell header small { display: block; }
+.checkout-shell header strong { font-size: 15px; font-weight: 600; }
+.checkout-shell header small { color: var(--text-3); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checkout-shell header button {
+  flex: none; width: 36px; height: 36px; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--line-2); background: rgba(255, 255, 255, .04); color: var(--text-2); font-size: 21px; line-height: 1;
+}
+.checkout-shell header button:hover { color: var(--text); background: rgba(255, 255, 255, .08); }
+.checkout-host { flex: 1; overflow: auto; }
+.checkout-host:empty { display: none; }
+.checkout-loading { flex: 1; display: grid; place-items: center; align-content: center; gap: 14px; color: var(--text-2); font-size: 14px; }
+.checkout-loading i { width: 26px; height: 26px; border: 2px solid #253341; border-top-color: var(--blue-2); border-radius: 50%; animation: spin 1s linear infinite; }
+.checkout-error { margin: auto; padding: 22px; max-width: 560px; color: var(--error); text-align: center; font-size: 15px; }
+.checkout-retry { display: flex; justify-content: center; padding: 0 22px 26px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- Worker-rendered pages: /discord (account) and /connect ---------- */
+main.shell > .brand { margin-top: 24px; }
+.account-page { min-height: 100dvh; padding-bottom: 60px; }
+.account-panel { width: min(600px, 100%); margin: 48px auto 0; padding: 28px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.account-panel h1, main.shell > .section h1 { margin: 10px 0 16px; font-size: clamp(1.6rem, 1.25rem + 1.4vw, 2.2rem); letter-spacing: -.025em; }
+.account-panel > p:not(.kicker), .account-trial p { color: var(--text-2); font-size: 15px; line-height: 1.7; }
+.account-identity { display: flex; align-items: center; gap: 16px; margin: 4px 0 18px; padding: 16px 0; border-block: 1px solid var(--line); }
+.account-avatar { display: grid; place-items: center; flex: none; width: 60px; height: 60px; overflow: hidden; border-radius: 50%; background: var(--btn); color: #fff; font-size: 24px; font-weight: 600; }
+.account-avatar img { width: 60px; height: 60px; object-fit: cover; }
+.account-identity .account-avatar span { margin: 0; color: #fff; font-size: 24px; font-weight: 600; }
+.account-identity strong, .account-identity span { display: block; }
+.account-identity strong { font-size: 18px; line-height: 1.2; }
+.account-identity span { margin-top: 5px; color: var(--text-3); font-size: 13px; overflow-wrap: anywhere; }
+.account-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }
+.account-trial { padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, .03); }
+.account-trial strong { font-size: 15px; }
+.account-trial p { margin-top: 6px; }
+.account-notice { margin-bottom: 16px; padding: 12px 14px; border: 1px solid rgba(95, 214, 160, .3); border-radius: 10px; background: rgba(95, 214, 160, .08); color: #c3f5dd !important; }
+.account-switch { display: inline-block; margin-top: 18px; padding: 0; border: 0; background: none; color: var(--blue-3); font-size: 14px; font-weight: 600; cursor: pointer; border-radius: 6px; }
+.account-switch:hover { text-decoration: underline; text-underline-offset: 4px; }
+main.shell > .section { max-width: 700px; padding-top: 48px; }
+main.shell > .section > p:not(.kicker) { margin-top: 12px; color: var(--text-2); font-size: 15.5px; line-height: 1.7; }
+main.shell > .section > p > .button { margin-top: 8px; }
+main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
+
+/* ---------- 404 ---------- */
+.notfound { min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 40px 0; text-align: center; }
+.hero-emblem { display: grid; place-items: center; width: 56px; height: 56px; margin: 0 auto 18px; border-radius: 14px; border: 1px solid var(--line-2); background: var(--panel); }
+.hero-emblem svg { width: 30px; height: 30px; }
+.notfound h1 { margin: 12px 0 10px; font-size: clamp(1.8rem, 1.3rem + 2vw, 2.6rem); letter-spacing: -.03em; }
+.notfound p:not(.kicker) { color: var(--text-2); font-size: 16px; }
+.notfound .button { margin-top: 24px; }
+
+/* ---------- Motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition-duration: .01ms !important; }
+  .checkout-loading i { animation: none; }
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 900px) {
+  .hero { grid-template-columns: 1fr; gap: 36px; padding-top: clamp(40px, 7vw, 56px); }
+  .gate { max-width: 560px; }
+  .steps { grid-template-columns: 1fr; gap: 18px; }
+}
+@media (max-width: 640px) {
+  :root { --shell: min(1040px, 100% - 32px); }
+  .gate { padding: 18px; }
+  .facts > div { grid-template-columns: 1fr; gap: 2px; }
+  .foot { flex-direction: column; align-items: flex-start; }
+  .account-panel { margin-top: 32px; padding: 20px 18px; }
+  .account-actions { display: grid; }
+  .account-actions .button { width: 100%; }
+}
+  </style>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <canvas id="starfield" aria-hidden="true"></canvas>
+
+  <svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="v-gradient" x1="0" y1="0" x2="150" y2="256" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#1f5edb"/>
+        <stop offset=".45" stop-color="#1f86f9"/>
+        <stop offset="1" stop-color="#5ab3fb"/>
+      </linearGradient>
+      <symbol id="v-mark" viewBox="0 0 256 256"><path fill="url(#v-gradient)" d="M0 4h66l49 110 28.5-39L82 203ZM191 4h64L153 251h-51l-10-25Z"/></symbol>
+      <symbol id="i-discord" viewBox="0 0 24 24"><path fill="currentColor" d="M19.3 5.3A16.4 16.4 0 0 0 15.2 4l-.5 1a15.2 15.2 0 0 0-5.4 0l-.5-1a16.4 16.4 0 0 0-4.1 1.3C2.1 9.2 1.4 13 1.8 16.7a16.6 16.6 0 0 0 5 2.5l1.1-1.7c-.6-.2-1.2-.5-1.7-.8l.4-.3a11.8 11.8 0 0 0 10.8 0l.4.3c-.5.3-1.1.6-1.7.8l1.1 1.7a16.5 16.5 0 0 0 5-2.5c.5-4.3-.8-8.1-2.9-11.4ZM8.7 14.5c-1 0-1.8-.9-1.8-2s.8-2 1.8-2 1.8.9 1.8 2-.8 2-1.8 2Zm6.6 0c-1 0-1.8-.9-1.8-2s.8-2 1.8-2 1.8.9 1.8 2-.8 2-1.8 2Z"/></symbol>
+      <symbol id="i-out" viewBox="0 0 16 16"><path d="M9.5 3H4v10h5.5M7.5 8h5.5m-2-2.2L13 8l-2 2.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    </defs>
+  </svg>
+
+  <header class="top">
+    <div class="shell bar">
+      <a class="brand" href="/" aria-label="Venice home">
+        <svg class="brand-logo" width="24" height="24" aria-hidden="true"><use href="#v-mark"/></svg>
+        <span class="brand-word">VENICE</span>
+      </a>
+      <div class="acct" data-account data-state="out">
+        <div class="acct-out-state">
+          <a class="button primary small" href="/auth/discord?return_to=%2F%23pricing">
+            <svg class="icon" aria-hidden="true"><use href="#i-discord"/></svg>Continue with Discord
+          </a>
+        </div>
+        <div class="acct-in-state">
+          <a class="acct-link" href="/discord" data-account-link aria-label="Discord account">
+            <span class="acct-avatar">
+              <img src="" alt="" width="26" height="26" loading="eager" decoding="async" data-account-avatar hidden>
+              <span aria-hidden="true" data-account-initial>V</span>
+            </span>
+            <span class="acct-name" data-account-name>Discord account</span>
+          </a>
+          <form class="acct-signout" action="/logout" method="post">
+            <button class="acct-signout-button" type="submit" aria-label="Sign out of Discord" title="Sign out">
+              <svg class="icon" aria-hidden="true"><use href="#i-out"/></svg>
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="shell hero" id="top" aria-labelledby="title">
+      <div class="intro">
+        <h1 id="title">Venice</h1>
+        <p class="lede">Jump-shot timing for NBA 2K27 on PS5.</p>
+        <p class="sub">A Windows app that reads the shot meter over Remote Play or capture card and times the release.</p>
+      </div>
+
+      <div class="gate" id="pricing" data-plan>
+        <div class="gate-head">
+          <h2>Get Venice — $25/month</h2>
+          <span class="badge">Free 7-day trial</span>
+        </div>
+        <p class="gate-note">Billed monthly after the trial. No activation fee. Cancel anytime.</p>
+
+        <div class="states" data-plan-actions data-state="out">
+          <div class="state state-out">
+            <p class="lead">Sign in with Discord to start the trial or subscribe.</p>
+            <a class="button primary" href="/auth/discord?return_to=%2F%23pricing"><svg class="icon" aria-hidden="true"><use href="#i-discord"/></svg>Continue with Discord</a>
+            <p class="hint">Try it free for 7 days — no card needed.</p>
+          </div>
+
+          <div class="state state-join">
+            <p class="lead">Join the Venice Discord to continue.</p>
+            <a class="button primary" href="https://discord.gg/yTuekgdgEN" target="_blank" rel="noopener" data-join-link><svg class="icon" aria-hidden="true"><use href="#i-discord"/></svg>Join the Venice Discord</a>
+            <button class="button ghost" type="button" data-join-refresh><span data-join-refresh-label>I’ve joined — refresh</span></button>
+            <p class="hint">Signed in as <strong data-account-name>your Discord account</strong>.</p>
+          </div>
+
+          <div class="state state-in">
+            <p class="lead">Start the free trial, or subscribe now.</p>
+            <button class="button primary" type="button" data-trial-claim><span data-trial-label>Start free 7-day trial</span></button>
+            <a class="button ghost" href="/buy" data-checkout>Subscribe — $25/month</a>
+            <p class="hint"><span data-trial-note hidden>Opens the Venice Discord — run <code>/claim_trial</code> there. </span><span data-membership-note hidden>We couldn’t confirm your membership — <a href="https://discord.gg/yTuekgdgEN" target="_blank" rel="noopener" data-join-link>join the server</a> first if you haven’t. </span>Signed in as <strong data-account-name>your Discord account</strong>.</p>
+          </div>
+
+          <div class="state state-done" tabindex="-1" data-plan-done>
+            <p class="lead">Your free trial has started.</p>
+            <p class="hint" data-trial-message>Check your Discord DMs, then get your one-time code to unlock Venice on your PC.</p>
+            <a class="button primary" href="/connect">Get your one-time code</a>
+          </div>
+        </div>
+
+        <div class="msg" role="alert" data-plan-error hidden>
+          <p data-plan-error-text></p>
+          <button class="button ghost small" type="button" data-plan-retry hidden>Try again</button>
+        </div>
+
+        <p class="fine">Secure checkout by Stripe. You must be signed in with Discord and in the Venice server to buy. <a href="https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00" target="_blank" rel="noopener">Manage or cancel</a>.</p>
+      </div>
+    </section>
+
+    <!-- OWNER: add real clips/vouches here (a short gameplay clip or real Discord vouches, shared with permission). Never invented reviews, user counts, ratings or results. -->
+
+    <section class="shell block" id="how-it-works" aria-labelledby="how-title">
+      <h2 id="how-title">How it works</h2>
+      <ol class="steps">
+        <li><span aria-hidden="true">1</span><p><strong>Sign in with Discord</strong> and join the Venice server.</p></li>
+        <li><span aria-hidden="true">2</span><p><strong>Start the free trial</strong>, or subscribe for $25 a month.</p></li>
+        <li><span aria-hidden="true">3</span><p><strong>Unlock Venice on your PC</strong> with a one-time code from <a href="/connect">zaeorion.com/connect</a>.</p></li>
+      </ol>
+    </section>
+
+    <section class="shell block" id="details" aria-labelledby="details-title">
+      <h2 id="details-title">Details</h2>
+      <dl class="facts">
+        <div><dt>Runs on</dt><dd>Windows PC. NBA 2K27 on PS5 only — there is no Xbox version.</dd></div>
+        <div><dt>Video</dt><dd>PS5 Remote Play or capture card (60 Hz).</dd></div>
+        <div><dt>Meter styles</dt><dd>Arrow2, and Pill (beta).</dd></div>
+        <div><dt>Discord-linked access</dt><dd>No licence key. A one-time code from <a href="/connect">zaeorion.com/connect</a> unlocks Venice on one PC — it works once and expires in 5 minutes. 3 free PC resets.</dd></div>
+        <div><dt>Free trial</dt><dd>7 days, no card. One per Discord account and one per PC. Also available with <code>/claim_trial</code> in the server.</dd></div>
+        <div><dt>Billing</dt><dd>$25 a month, no activation fee. Cancel anytime in the <a href="https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00" target="_blank" rel="noopener">billing portal</a>; access runs to the end of the paid period.</dd></div>
+      </dl>
+    </section>
+  </main>
+
+  <footer class="shell foot">
+    <nav aria-label="Footer">
+      <a href="https://discord.gg/yTuekgdgEN" rel="noopener">Discord</a>
+      <a href="/discord">Account</a>
+      <a href="/connect">One-time code</a>
+      <a href="https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00" target="_blank" rel="noopener">Billing</a>
+      <a href="/terms.html">Terms</a>
+      <a href="/privacy.html">Privacy</a>
+      <a href="/refunds.html">Refunds</a>
+    </nav>
+    <p>© 2026 Venice. Not affiliated with 2K, Take-Two Interactive or Sony Interactive Entertainment.</p>
+  </footer>
+
+  <dialog class="checkout-dialog" data-checkout-dialog aria-labelledby="checkout-title">
+    <div class="checkout-shell">
+      <header>
+        <div><svg width="22" height="22" aria-hidden="true"><use href="#v-mark"/></svg><span><strong id="checkout-title">Venice checkout</strong><small data-checkout-status>Preparing secure checkout…</small></span></div>
+        <button type="button" data-checkout-close aria-label="Close checkout">×</button>
+      </header>
+      <div id="checkout-host" class="checkout-host"></div>
+      <div class="checkout-loading" data-checkout-loading><i></i><span>Connecting your Discord identity…</span></div>
+      <p class="checkout-error" data-checkout-error hidden></p>
+      <div class="checkout-retry" data-checkout-retry-wrap hidden><button class="button ghost small" type="button" data-checkout-retry>Try again</button></div>
+    </div>
+  </dialog>
+</body>
+</html>

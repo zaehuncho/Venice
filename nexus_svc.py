@@ -1027,7 +1027,7 @@ class _InboundDelayBuffer:
         ``current_delay_ms`` or ``snapshot()``.
 
         Raises ``ValueError`` for non-numeric / non-finite input.  The value is
-        clamped to the hard [0, 300]ms safety range; the 150-170 / 100-250 bands
+        clamped to the hard [0, 600]ms safety range; the 150-170 / 100-600 bands
         are the controller's business, and intermediate ramp values (55, 110...)
         must pass through untouched.
         """

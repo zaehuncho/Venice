@@ -27,7 +27,7 @@ Every embed below. **All use color `2450411` (`#2563EB`).** Thumbnail = `orion_l
 **Description:**
 > **1. Be respectful.** No harassment, hate, slurs, or discrimination.
 > **2. No spam or self-promo.** No advertising other servers/products or unsolicited DMs.
-> **3. No leaking or reselling.** Sharing, cracking, or reselling Orion or keys = instant ban + voided license.
+> **3. No leaking or reselling.** Sharing, cracking, or reselling Orion or your account access = instant ban + voided license.
 > **4. Use the right channels.** Keep support in tickets, buys in the store.
 > **5. No chargebacks/fraud.** Chargebacks void your license and ban you permanently.
 > **6. English in public channels** so staff can moderate.
@@ -44,7 +44,7 @@ Every embed below. **All use color `2450411` (`#2563EB`).** Thumbnail = `orion_l
 **Field — Usage and Accessibility:**
 > The Software and its related scripts are designed for accessibility, research, and educational objectives. It is intended to assist users — including those with impairments or disabilities — in developing timing, reaction, and game-sense in a fun environment. All interactions with The Software should be responsible, ethical, and adhere to relevant laws, regulations, and platform guidelines.
 **Field — License:**
-> Purchase grants a single-user, non-transferable license for the duration of the purchased tier. Licenses may not be shared, resold, or redistributed. Keys found shared or sold are revoked without refund. Chargebacks or payment fraud void the license permanently.
+> Purchase grants a single-user, non-transferable license for the duration of the paid subscription period. Licenses may not be shared, resold, or redistributed. Access found shared or sold is revoked without refund. Chargebacks or payment fraud void the license permanently.
 **Field — Refunds:**
 > Due to the digital, instantly-delivered nature of The Software, **all sales are final**. If you cannot get it running, open a ticket — we'll help before any refund is considered.
 **Footer:** Last updated: {{DATE}} • © Orion
@@ -54,32 +54,35 @@ Every embed below. **All use color `2450411` (`#2563EB`).** Thumbnail = `orion_l
 ### `#how-to-buy` — How to Buy
 **Title:** 🛒 How to Buy Orion
 **Description:**
-> **1.** Head to **<#PRICING_CHANNEL_ID>** and pick a tier (Day / Week / Month / Lifetime).
-> **2.** Click **Purchase** (or run `/purchase` in <#PURCHASE_CHANNEL_ID>).
-> **3.** Pay via the checkout (crypto, card, PayPal, or more).
-> **4.** Your **license key + download** are delivered instantly in your DMs / the purchase channel, and the **💎 Customer** role is added automatically.
-> **5.** Open **<#DOWNLOADS_CHANNEL_ID>** + **<#SETUP_GUIDE_CHANNEL_ID>** and you're ready.
+> **1.** Head to **<#PRICING_CHANNEL_ID>** — there is one plan, **$25 / month**.
+> **2.** Click **Subscribe** (or run `/purchase` in <#PURCHASE_CHANNEL_ID>) and sign in with Discord on zaeorion.com.
+> **3.** Pay by card at the Stripe checkout. Stripe emails your receipt.
+> **4.** Access is linked to your **Discord account** instantly — the bot DMs your confirmation and the **💎 Customer** role is added automatically. There is no license key.
+> **5.** Open **<#DOWNLOADS_CHANNEL_ID>** + **<#SETUP_GUIDE_CHANNEL_ID>**, then unlock the app with a one-time code from https://zaeorion.com/connect and you're ready.
 >
 > Trouble? Open a ticket in **<#CREATE_TICKET_CHANNEL_ID>**.
-**Footer:** Instant delivery • Secure checkout via SellHub
+**Footer:** Instant access • Secure checkout via Stripe
 
 ---
 
-### `#pricing` — Pricing  *(one overview embed; SellHub also posts its own product cards in #purchase)*
+### `#pricing` — Pricing  *(one embed — owner rule 2026-09-15: ONE plan, no tiers)*
 **Image:** `orion_banner.png`
-**Title:** Orion — Pricing
-**Description:** Same full feature set on every tier — pick your duration. Secure instant delivery.
-**Fields (inline):**
-- 🟦 **Day** — `{{PRICE_DAY}}` | 24-hour access. Try it out.
-- 🟦 **Week** — `{{PRICE_WEEK}}` | 7 days. Grind a few sessions.
-- 🟦 **Month** — `{{PRICE_MONTH}}` | 30 days. Best value for regulars.
-- ⭐ **Lifetime** — `{{PRICE_LIFETIME}}` | Forever + all future updates.
-**Field — Every tier includes:**
+**Title:** Venice — Pricing
+**Description:** One plan, every feature. Start free, then keep it for $25 a month.
+**Fields:**
+- 🎁 **Free trial** | **3 days**, no card. Start it on zaeorion.com or run `/claim_trial`, then unlock the app with a one-time code from https://zaeorion.com/connect. Your Discord ID identifies the account but is not a password. One trial per account and per PC.
+- 💳 **Subscription** | **$25 / month**, flat — no activation or setup fee. Cancel any time in the Stripe billing portal; access runs to the end of the period you paid for.
+**Field — Included:**
 > ✓ AI-vision shot-meter timing (standstill • fades • go-to • tempo)
 > ✓ Auto-calibration to your setup • clean on-screen overlay
 > ✓ Low-latency release • regular updates • customer support
-**Buttons:** `🛒 Buy Now → {{STORE_URL}}`
-**Footer:** Prices in USD • All sales final (digital goods)
+> ✓ 3 free PC moves — after that each `/hwid_reset` takes 1 day off your subscription
+**Buttons:** `🛒 Subscribe → {{STORE_URL}}`
+**Footer:** Prices in USD • Recurring monthly • All sales final (digital goods)
+
+> There is **no Lifetime, Day or Week tier** any more. Access already sold keeps working until it
+> expires. Do not re-add a tier table here without the owner saying so — the bot's `/purchase` shows
+> no prices at all, and this embed is the only place a customer sees one.
 
 ---
 
@@ -88,10 +91,10 @@ Every embed below. **All use color `2450411` (`#2563EB`).** Thumbnail = `orion_l
 **Fields:**
 - **What is Orion?** | An AI-vision assistant that reads the NBA 2K shot meter and times your release to the green.
 - **What do I need?** | A PC and your PlayStation set up for Remote Play. Full requirements + setup are in the customer guide.
-- **How is it delivered?** | Instantly after purchase — license key + download in your DMs and the purchase channel; the 💎 Customer role is auto-added.
-- **Can I switch PCs?** | Your license is single-user for the tier's duration. Open a ticket for legitimate resets.
+- **How is it delivered?** | Instantly after purchase — access is linked to your Discord account (no license key); the bot DMs your confirmation and the 💎 Customer role is auto-added. Unlock the app with a one-time code from https://zaeorion.com/connect.
+- **Can I switch PCs?** | Venice runs on one PC at a time. You get 3 free resets with `/hwid_reset`; after that each reset takes 1 day off your subscription.
 - **Refund policy?** | Digital goods = all sales final. Open a ticket first; we'll get you running.
-- **Is there a free trial?** | The **Day** tier is the cheapest way to try everything.
+- **Is there a free trial?** | Yes — **3 days free, no card**. Start it on zaeorion.com or run `/claim_trial`.
 **Footer:** More questions? Open a ticket.
 
 ---
@@ -125,7 +128,7 @@ Every embed below. **All use color `2450411` (`#2563EB`).** Thumbnail = `orion_l
 **Description:**
 > Loved Orion? Drop a vouch in <#REVIEWS_CHANNEL_ID> using:
 > ```
-> +rep | Tier: (Day/Week/Month/Lifetime) | ⭐⭐⭐⭐⭐ | (your experience)
+> +rep | Plan: (Trial/Monthly) | ⭐⭐⭐⭐⭐ | (your experience)
 > ```
 > Screenshots/clips of your greens are very welcome 🟩
 **Footer:** Genuine vouches only — fakes get removed.

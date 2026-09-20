@@ -1,0 +1,64 @@
+{
+  "_meta": {
+    "channel": "#announcements",
+    "channel_id": "1549859272341332111",
+    "replaces_message_id": null,
+    "replaces_note": "#announcements is empty — nothing to replace.",
+    "post_as": "Triton, or the owner via Discohook. Nereus is the announcements bot, but its /announce builds its own embed and rejects links in the text, so use the plain alternative below if you post through Nereus.",
+    "post_only_when": "Live Stripe checkout is verified (/api/checkout/config returns a pk_live_ key) and the installer is published in #downloads. Posting earlier sends buyers to a checkout that provisions nothing.",
+    "nereus_alternative": {
+      "command": "/announce",
+      "kind": "update",
+      "title": "Venice is live",
+      "body": "Venice is open for NBA 2K27 on PS5. Start with the free 7-day trial: no card, one per Discord account and one per PC — claim it on the website or with /claim_trial here. After the trial it is 25 dollars a month, cancel any time from the billing portal, and you keep access to the end of the period you already paid for. To buy, sign in with Discord on the website and stay in this server. There is no licence key: your access lives on your Discord account and you unlock the app with a one-time code from the connect page, locked to one PC, with 3 free PC resets. You need a PS5 with a 60 Hz capture card or PS5 Remote Play. Xbox is not supported yet. Install from the downloads channel, follow the setup guide, and open a ticket if anything is missing."
+    }
+  },
+  "message": {
+    "content": "",
+    "embeds": [
+      {
+        "title": "Venice is live",
+        "color": 2450411,
+        "description": "Venice is a shot-timing companion for **NBA 2K27 on PS5**. It watches your capture feed and times the release for you.",
+        "fields": [
+          {
+            "name": "Start free",
+            "value": "A **7-day trial**, no card. One per Discord account and one per PC — claim it on [zaeorion.com](https://zaeorion.com/) or with `/claim_trial`.",
+            "inline": false
+          },
+          {
+            "name": "Then $25 / month",
+            "value": "Cancel any time in the [billing portal](https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00); access runs to the end of the period you paid for. To buy, sign in with Discord on the website and stay a member of this server.",
+            "inline": false
+          },
+          {
+            "name": "No keys to lose",
+            "value": "Access is linked to your Discord account. You unlock the app with a one-time code from [zaeorion.com/connect](https://zaeorion.com/connect) — one PC at a time, 3 free PC resets.",
+            "inline": false
+          },
+          {
+            "name": "What you need",
+            "value": "A PS5 with a **60 Hz capture card** or **PS5 Remote Play**, and a Windows PC. Xbox is not supported yet.",
+            "inline": false
+          },
+          {
+            "name": "Where to go",
+            "value": "Install from <#1549499799861067876>, set up with <#1549499802738499705>, questions in <#1549499767321534464>.",
+            "inline": false
+          }
+        ],
+        "footer": { "text": "Venice • Official" }
+      }
+    ],
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          { "type": 2, "style": 5, "label": "Start the free trial", "url": "https://zaeorion.com/" },
+          { "type": 2, "style": 5, "label": "Subscribe — $25/month", "url": "https://zaeorion.com/#pricing" }
+        ]
+      }
+    ],
+    "allowed_mentions": { "parse": [] }
+  }
+}

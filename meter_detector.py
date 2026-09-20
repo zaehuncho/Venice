@@ -157,6 +157,13 @@ class DetectResult:
     consecutive_frames: int
     raw_fill_pct: float = 0.0
     smoothed_fill_pct: float = 0.0
+    # Identity of the fill ruler used for ``fill_pct``.  The sidecar carries
+    # these fields to native timing so a two-frame anchor crossing is never
+    # interpolated across a coarse/sub-pixel (or re-latched) ruler boundary.
+    # Zero/empty is the backward-compatible, fail-closed value for producers
+    # that do not publish estimator provenance.
+    fill_estimator_mode: str = ""
+    fill_estimator_generation: int = 0
     velocity: float = 0.0
     accel: float = 0.0
     fill_velocity_pct_s: float = 0.0
@@ -199,6 +206,9 @@ class DetectResult:
     # Exact controller-origin physical-shot epoch for that proof. Zero means an
     # untokenized/local arm and is never automatic-calibration authority.
     gameplay_structure_epoch: int = 0
+    # Diagnostic frame-start identity, including samples that have not earned proof.
+    # This field never grants timing/ownership authority.
+    gameplay_sample_epoch: int = 0
 
 
 @dataclass

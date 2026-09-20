@@ -1,7 +1,6 @@
 {
   "schema": "orion.tip_registration.v2",
   "model_id": "tip-registration-global",
-  "model_version": "sha256-9ea949ad36b9",
   "u_grid": [
     0.0,
     0.019841,
@@ -70,103 +69,212 @@
   ],
   "g_vals": [
     0.0,
-    0.003934,
-    0.009342,
-    0.016398,
-    0.025259,
-    0.036055,
-    0.048876,
-    0.063758,
-    0.080657,
-    0.099445,
-    0.11992,
-    0.141824,
-    0.164871,
-    0.188772,
-    0.21325,
-    0.238056,
-    0.262983,
-    0.287881,
-    0.312667,
-    0.33733,
-    0.361927,
-    0.386565,
-    0.411371,
-    0.436449,
-    0.461849,
-    0.487555,
-    0.5135,
-    0.539609,
-    0.565848,
-    0.592256,
-    0.618963,
-    0.646152,
-    0.674009,
-    0.702646,
-    0.732038,
-    0.761985,
-    0.792101,
-    0.821846,
-    0.850588,
-    0.877683,
-    0.902563,
-    0.924817,
-    0.944229,
-    0.960771,
-    0.974569,
-    0.985851,
-    0.994899,
-    1.002022,
-    1.007527,
-    1.011707,
-    1.014824,
-    1.0171,
-    1.018709,
-    1.01978,
-    1.020371,
-    1.020373,
-    1.020375,
-    1.020377,
-    1.020379,
-    1.020381,
-    1.020383,
-    1.020385,
-    1.020387,
-    1.020389
+    0.002695,
+    0.006381,
+    0.011278,
+    0.017604,
+    0.025557,
+    0.035296,
+    0.046937,
+    0.060574,
+    0.076293,
+    0.09419,
+    0.11433,
+    0.136682,
+    0.161034,
+    0.186958,
+    0.213873,
+    0.24116,
+    0.26829,
+    0.294902,
+    0.320823,
+    0.346072,
+    0.370834,
+    0.395413,
+    0.420134,
+    0.445234,
+    0.470786,
+    0.496731,
+    0.522982,
+    0.549538,
+    0.576525,
+    0.604131,
+    0.632509,
+    0.661688,
+    0.691564,
+    0.721949,
+    0.752629,
+    0.783401,
+    0.814044,
+    0.844257,
+    0.873581,
+    0.901347,
+    0.926709,
+    0.948771,
+    0.966814,
+    0.980504,
+    0.990008,
+    0.99597,
+    0.999379,
+    1.001398,
+    1.003157,
+    1.00552,
+    1.008859,
+    1.012943,
+    1.017115,
+    1.020694,
+    1.02332,
+    1.025002,
+    1.025955,
+    1.026434,
+    1.026648,
+    1.026737,
+    1.026756,
+    1.026758,
+    1.02676
   ],
-  "u_tip": 0.927166,
+  "u_tip": 0.939566,
   "priors": {
     "g": [
-      366.667,
-      74.68,
-      20.805
+      433.333,
+      87.703,
+      5.81
     ],
     "0": [
-      266.667,
-      67.277,
-      32.7
+      350.0,
+      80.58,
+      12.6
     ],
     "1": [
-      366.667,
-      77.485,
-      20.0
+      433.333,
+      86.637,
+      7.395
     ],
     "2": [
-      450.0,
-      80.28,
-      17.72
+      583.333,
+      92.907,
+      0.0
     ]
   },
-  "q33": 333.33,
-  "q66": 400.0,
-  "n_shots": 164,
-  "n_sessions": 11,
-  "built_utc": "2026-07-06T19:15:06Z",
+  "q33": 400.0,
+  "q66": 466.67,
+  "n_shots": 157,
+  "n_sessions": 15,
+  "built_utc": "2026-09-03T16:24:22Z",
   "uncertainty": {
     "base_ms": 15.0,
     "horizon_scale": 0.4,
     "maximum_ms": 250.0,
     "basis": "conservative structural floor from leave-one-session-out horizon error"
   },
-  "note": "learn_template on full corpus; see tools/timing/tip_registration_eval.py for LOSO accuracy"
+  "note": "learn_template on selected corpus; see tools/timing/tip_registration_eval.py for LOSO accuracy",
+  "training": {
+    "csv_globs": [
+      "logs/diagnostics/detframes*.csv"
+    ],
+    "since_utc": "2026-09-01T00:00:00Z",
+    "sources": [
+      {
+        "path": "logs/diagnostics/detframes.csv",
+        "size_bytes": 11936603,
+        "sha256": "7A1018D5985386BCA5B196F4F4C4BFDBBA6EE897AF48E24C2156CEF8F529E2A5"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_170643.csv",
+        "size_bytes": 1955928,
+        "sha256": "864DD74AA1E66CB1158CADCCDEB3D79AEF17EA3EA4BE22A1A2CE18E868DCA122"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_170847.csv",
+        "size_bytes": 1488706,
+        "sha256": "2552B6EFAFC7B5832EE1CACB01A3A5ADE6B8A6B1CEEE30A114302DA03BD55F3D"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_170905.csv",
+        "size_bytes": 97277,
+        "sha256": "2224D62A9D11FF6F5CC4215CA3DA9E66D3F6D4D68B5664CB8C5221DF9378D84B"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_171346.csv",
+        "size_bytes": 3785740,
+        "sha256": "2AEFA7B26C8327D91CF6B5C93732A0EC2423751CC5E7B08875CF6709F250D58C"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_173414.csv",
+        "size_bytes": 6324743,
+        "sha256": "BC0372EB8795BCAE3362B7730FCBB28F2931534E5CF2AE66D9D3DAE8417E1B49"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_174522.csv",
+        "size_bytes": 3999930,
+        "sha256": "FD131CF4B28C45E361E2F71BB402BF38F84CEBA057040224A1204AF7BF9C8A11"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_175834.csv",
+        "size_bytes": 3200729,
+        "sha256": "E29844725F28C65BCC4F7F361E2C0C2C41110452F2F3CCA7496C44BAF064FEC9"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_181541.csv",
+        "size_bytes": 2623410,
+        "sha256": "F4E219E72933D28D9372161490DEEE60073549C443689479AF145ECB9BE820D0"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_184249.csv",
+        "size_bytes": 6055528,
+        "sha256": "2696AD338C85D5D038328552407B8BF94E7C8763462E4B5A942FBE10A1411061"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_185413.csv",
+        "size_bytes": 4554356,
+        "sha256": "F1B163290F6A1A9317A7EDB257A4506CAF8E9CD5FEC185F4FE24314FEDFFD0CB"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_185746.csv",
+        "size_bytes": 2308232,
+        "sha256": "D8847A9C1D56DD461EED65CAEA3859D80E6982F266BBD9CF6E879E00CC57FB12"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260901_190940.csv",
+        "size_bytes": 4655467,
+        "sha256": "6563D40F5B1E1F6731E34FC92735007D27A7D81F6CD2DE72DD740A351C2ECCD8"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_225033.csv",
+        "size_bytes": 7202182,
+        "sha256": "ADD1477038415C1D2DD148E88B1353F5E2BA1AAF4BB51E512FA614EEC585A28A"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_225245.csv",
+        "size_bytes": 1863728,
+        "sha256": "683CBAE6B0B997B39B60C91A79F8F818D9D249977CBFC5128714DE11B9FE7F81"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_225802.csv",
+        "size_bytes": 4446692,
+        "sha256": "03AC41820FBBC88E09347E23D7A9247BABB8F09D997D7D29D72EAD60AF7F94A0"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_230834.csv",
+        "size_bytes": 7317019,
+        "sha256": "B89F8F1682C22A5F89EECCF2DED22144D2B7BE50DDDB4980018CD5E2B08CDF2F"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_231158.csv",
+        "size_bytes": 3020619,
+        "sha256": "E07242359125B477F56759237E25E9C0496A397E36CA769A35AF146CE00CE7C5"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_232222.csv",
+        "size_bytes": 7335790,
+        "sha256": "50981A542B450FAB024FDB716C26E350D05555214C10F3F12E4B74A57BF5C466"
+      },
+      {
+        "path": "logs/diagnostics/detframes_20260902_234147.csv",
+        "size_bytes": 6236914,
+        "sha256": "96DEAF9F1320E1151570D0E51A9BA151E30D5549E18F79ECAB8BDA3C2DB9B432"
+      }
+    ]
+  },
+  "model_version": "sha256-4be90a1db390"
 }

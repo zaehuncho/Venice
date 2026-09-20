@@ -146,5 +146,9 @@ def test_customer_dashboard_omits_network_telemetry_surface() -> None:
     ):
         assert retired_network_copy not in source
 
-    assert 'objectName: "passiveTimingStatus"' in source
-    assert 'label: "Timing"' in source
+    # [2026-09-14 owner] The Timing readiness pill (objectName passiveTimingStatus) went
+    # with the whole "Production Setup" status card: every pill in it restated a control
+    # in the Connection form directly below. Timing adaptation is still passive and
+    # engine-side; it simply has no customer-facing chrome.
+    assert 'objectName: "passiveTimingStatus"' not in source
+    assert 'label: "Timing"' not in source

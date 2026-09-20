@@ -22,7 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 
-SCHEMA = "orion.sidecar_build.v3"
+SCHEMA = "orion.sidecar_build.v4"
 MANIFEST_NAME = "ORION_SIDECAR_BUILD.json"
 EXECUTABLE_NAME = "OrionSidecar.exe"
 BUILD_ID_MODULE = "native_orion/backend/orion_sidecar_build_id.py"
@@ -30,7 +30,52 @@ IDENTITY_TIMEOUT_S = 10.0
 MODEL_INPUTS = (
     "models/tip_registration.json",
     "models/latency_factory_prior.json",
+    "models/orion_meter_detector.onnx",
 )
+DETECTOR_MODEL_INPUT = "models/orion_meter_detector.onnx"
+# [ORION_BANNER_VERDICT_LIVE 2026-09-14] The live banner grader.
+#
+# banner_verdict_live.py re-uses tools/timing/panel_grade.py BY IMPORT (nothing about the
+# reading is re-implemented), and the grader needs its template library at runtime.
+#
+# The GRADER SHIPS COMPILED, never as readable source: docs/IP_PROTECTION_PLAN.md requires
+# readers to ship compiled, and panel_grade is a reader. The build script copies
+# tools/timing/panel_grade.py to the repo-root name orion_panel_grade.py, passes
+# --include-module=orion_panel_grade so Nuitka compiles it INTO the executable, and deletes
+# the copy afterwards; load_panel_grade() tries that module name first. So the grader is
+# bound into the identity as a SOURCE input (its bytes decide the compiled output) and is
+# NOT a file the dist carries.
+#
+# The npz is data and stays a bundled data input at its repository-relative path. A
+# compiled module has no readable source file beside it, so panel_grade's self-relative
+# LIB_PATH can miss; load_panel_grade()._resolve_library falls back to the npz beside the
+# module / the executable / at tools/timing inside the dist. Shipping the module without
+# the npz is still a silent feature-off (an empty library disables the reader), which is
+# why the npz is a build-gated input rather than best-effort.
+# [ORION_BANNER_DISTANCE 2026-09-17] banner_distance.py reads the panel's DISTANCE cell
+# (`23'5"`). It lives at the repo root, so the root glob already binds its bytes into the
+# identity and Nuitka already compiles it -- it is listed here only so the roster of what
+# the live banner reader depends on is in ONE place. It carries its own digit templates
+# inline, so unlike panel_grade there is no DATA input that can go missing.
+READER_SOURCE_INPUTS = (
+    "tools/timing/panel_grade.py",
+)
+BANNER_DISTANCE_MODULE = "banner_distance.py"
+READER_DATA_INPUTS = (
+    "tools/timing/panel_templates.npz",
+)
+# Build artefact: the transient repo-root copy of the grader that --include-module compiles.
+# Excluded from the root glob so the source digest is identical whether or not a previous
+# build left it behind; its CONTENT is bound via READER_SOURCE_INPUTS.
+GRADER_SHIM_MODULE = "orion_panel_grade.py"
+# Every non-source input the bundle must carry VERBATIM at the same relative path, and
+# whose bytes are bound into the embedded build identity.
+BUNDLE_DATA_INPUTS = MODEL_INPUTS + READER_DATA_INPUTS
+# npz is a zip container.
+NPZ_MAGIC = b"PK\x03\x04"
+# A source module and a template library are both far smaller than this; the bound is only
+# here so a wrong path cannot drag an arbitrary file into the identity.
+MAX_READER_DATA_BYTES = 8 * 1024 * 1024
 TIP_MODEL_VERSION_FIELDS = (
     "u_grid", "g_vals", "u_tip", "priors", "q33", "q66", "uncertainty",
 )
@@ -56,7 +101,16 @@ def source_files(root: Path) -> list[Path]:
 
     root = root.resolve()
     entry = root / "native_orion" / "backend" / "autogreen_sidecar.py"
-    candidates = [entry, *root.glob("*.py")]
+    roots = [p for p in root.glob("*.py") if p.name != GRADER_SHIM_MODULE]
+    # The banner grader lives outside the repo root but is compiled INTO the sidecar (see
+    # READER_SOURCE_INPUTS): bind its bytes here so a change to it invalidates the bundle,
+    # exactly as a change to a root module does.
+    readers = [root / relative for relative in READER_SOURCE_INPUTS]
+    for path in readers:
+        if not path.is_file():
+            raise FileNotFoundError(f"required sidecar reader source not found: {path}")
+        _validate_reader_data_input(path.relative_to(root).as_posix(), path)
+    candidates = [entry, *roots, *readers]
     files = sorted({path.resolve() for path in candidates if path.is_file()})
     if entry.resolve() not in files:
         raise FileNotFoundError(f"sidecar entry point not found: {entry}")
@@ -192,12 +246,35 @@ def validate_model_document(relative: str, payload: object) -> None:
         raise ValueError(f"unrecognized sidecar model input: {relative}")
 
 
+def _validate_reader_data_input(relative: str, path: Path) -> None:
+    """Content check for the banner grader's module + template library.
+
+    Deliberately dependency-free (no numpy import here): enough to prove the right KIND of
+    file is being bound, so a truncated or wrong-path input fails the build instead of
+    shipping a sidecar whose banner reader silently disables itself at runtime.
+    """
+
+    size = path.stat().st_size
+    if size <= 0 or size > MAX_READER_DATA_BYTES:
+        raise ValueError(f"sidecar reader data input has invalid size: {relative}")
+    if relative.endswith(".npz"):
+        if path.read_bytes()[:4] != NPZ_MAGIC:
+            raise ValueError(f"sidecar template library is not an npz archive: {relative}")
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"sidecar reader module is not readable UTF-8: {relative}: {exc}") from exc
+    if not text.strip():
+        raise ValueError(f"sidecar reader module is empty: {relative}")
+
+
 def model_input_files(root: Path) -> list[Path]:
-    """Resolve the exact runtime model allowlist without permitting path escape."""
+    """Resolve the exact runtime data allowlist without permitting path escape."""
 
     root = root.resolve()
     files: list[Path] = []
-    for relative in MODEL_INPUTS:
+    for relative in BUNDLE_DATA_INPUTS:
         path = (root / relative).resolve()
         try:
             path.relative_to(root)
@@ -205,13 +282,26 @@ def model_input_files(root: Path) -> list[Path]:
             raise ValueError(f"sidecar model input escapes repository root: {relative}") from exc
         if not path.is_file():
             raise FileNotFoundError(f"required sidecar model input not found: {path}")
-        if path.stat().st_size <= 0 or path.stat().st_size > 64 * 1024:
-            raise ValueError(f"sidecar model input has invalid size: {relative}")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            validate_model_document(relative, payload)
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"invalid sidecar model input {relative}: {exc}") from exc
+        size = path.stat().st_size
+        if relative in READER_DATA_INPUTS:
+            _validate_reader_data_input(relative, path)
+        elif relative == DETECTOR_MODEL_INPUT:
+            # ONNX is a protobuf with no fixed magic. Keep validation dependency-free
+            # here, bind every byte into the embedded digest, and let the build script
+            # load it through the exact packaged onnxruntime before compilation.
+            if size < 1024 or size > 64 * 1024 * 1024:
+                raise ValueError(f"sidecar detector model has invalid size: {relative}")
+            prefix = path.read_bytes()[:64]
+            if not prefix or not any(prefix):
+                raise ValueError(f"sidecar detector model has invalid content: {relative}")
+        else:
+            if size <= 0 or size > 64 * 1024:
+                raise ValueError(f"sidecar model input has invalid size: {relative}")
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                validate_model_document(relative, payload)
+            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid sidecar model input {relative}: {exc}") from exc
         files.append(path)
     return files
 

@@ -40,9 +40,13 @@ private:
 };
 
 constexpr int kReadyEventWaitMs = 250;
-// Two complete misses bound a wrong/lost ready event to 500 ms before we inspect
-// the committed mapping identity. A paused source remains healthy because only
-// an actual generation advance can raise the notification-integrity signal.
+// Two complete misses inspect the committed mapping identity. A first observed
+// advance is only a suspicion: the producer commits under the mapping mutex,
+// releases it, then signals the event. A timeout/probe can land between those
+// steps, especially on the first frame after startup or a pause. Require one
+// further complete event timeout before confirming the loss (at most 750 ms
+// from the start of a missing-event run). Healthy event delivery never waits
+// for this diagnostic confirmation and still reads immediately on Ready.
 constexpr int kMissedReadyProbeTimeouts = 2;
 
 quint64 monotonicNowNs() noexcept
@@ -184,6 +188,7 @@ void SharedMemoryFramePump::threadLoop()
     QString notificationError;
     int consecutiveEventTimeouts = 0;
     std::uint64_t lastDiagnosticGeneration = 0;
+    std::uint64_t pendingNotificationGeneration = 0;
     quint64 framesRead = 0;
 
     for (;;) {
@@ -240,6 +245,7 @@ void SharedMemoryFramePump::threadLoop()
             notificationError.clear();
             consecutiveEventTimeouts = 0;
             lastDiagnosticGeneration = 0;
+            pendingNotificationGeneration = 0;
             framesRead = 0;
         }
         if (!active || requestEpoch == 0) {
@@ -259,6 +265,7 @@ void SharedMemoryFramePump::threadLoop()
                 consecutiveEventTimeouts = 0;
                 notificationFailureRun = 0;
                 notificationError.clear();
+                pendingNotificationGeneration = 0;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     ++stats_.eventSignals;
@@ -333,6 +340,16 @@ void SharedMemoryFramePump::threadLoop()
                 readFailureRun = 0;
                 readError.clear();
                 if (generation > lastDiagnosticGeneration) {
+                    if (pendingNotificationGeneration == 0
+                        || generation < pendingNotificationGeneration) {
+                        // Do not count pre-commit idle time as time that this
+                        // particular notification has been missing. The next
+                        // full wait gives the just-committed writer its chance
+                        // to signal. Never copy/present a frame from a probe.
+                        pendingNotificationGeneration = generation;
+                        continue;
+                    }
+                    pendingNotificationGeneration = 0;
                     lastDiagnosticGeneration = generation;
                     ++notificationFailureRun;
                     notificationError = QStringLiteral(
@@ -346,6 +363,8 @@ void SharedMemoryFramePump::threadLoop()
                         workerEpoch, readerOpen, openFailureRun, openError,
                         readFailureRun, readError, notificationFailureRun,
                         notificationError, framesRead);
+                } else {
+                    pendingNotificationGeneration = 0;
                 }
                 continue;
             } else if (waitResult == SharedMemoryFrameWaitResult::Interrupted) {
@@ -439,6 +458,7 @@ void SharedMemoryFramePump::threadLoop()
             readError.clear();
             lastDiagnosticGeneration = std::max(
                 lastDiagnosticGeneration, source_->lastReadGeneration());
+            pendingNotificationGeneration = 0;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.framesRead;
@@ -514,7 +534,15 @@ void SharedMemoryFramePump::publishWorkerState(
         readyBatch_.framesRead = framesRead;
         if (!image.isNull()) {
             if (!readyBatch_.image.isNull()) {
-                ++stats_.readyFrameReplaced;
+                auto& preceding = readyBatch_.precedingFrames;
+                if (preceding.size() >= kMaxReadyFrames - 1) {
+                    preceding.erase(preceding.begin());
+                    ++stats_.readyFrameReplaced;
+                }
+                preceding.push_back({std::move(readyBatch_.image),
+                    readyBatch_.mappedFrameNumber, readyBatch_.eventFrameNumber,
+                    readyBatch_.sourceTimestampNs,
+                    readyBatch_.pumpReadCompletedTimestampNs});
             }
             readyBatch_.image = std::move(image);
             readyBatch_.mappedFrameNumber = mappedFrameNumber;
@@ -529,7 +557,9 @@ void SharedMemoryFramePump::publishWorkerState(
         readyBatch_.eventNotificationLosses = stats_.eventNotificationLosses;
         readyBatch_.readyFrameReplaced = stats_.readyFrameReplaced;
         readyBatch_.deliveryScheduleFailures = stats_.deliveryScheduleFailures;
-        stats_.maxReadyDepth = std::max<std::size_t>(stats_.maxReadyDepth, 1);
+        const std::size_t readyDepth = readyBatch_.precedingFrames.size()
+            + (readyBatch_.image.isNull() ? 0 : 1);
+        stats_.maxReadyDepth = std::max(stats_.maxReadyDepth, readyDepth);
         if (!deliveryScheduled_) {
             deliveryScheduled_ = true;
             scheduleDelivery = true;
@@ -568,10 +598,23 @@ void SharedMemoryFramePump::deliverLatest()
         batch = std::move(readyBatch_);
         readyBatch_ = {};
         readyValid_ = false;
+        batch.presentationDispatchTimestampNs = monotonicNowNs();
+        // A long stall or paused producer must not replay an old burst. Keep
+        // the newest image (the previous latest-only behaviour) regardless,
+        // but discard stale/invalid preceding images using our monotonic read
+        // clock, never a regenerated producer timestamp.
+        auto& preceding = batch.precedingFrames;
+        const auto firstRemoved = std::remove_if(preceding.begin(), preceding.end(),
+            [&batch](const SharedMemoryFramePumpImage& frame) {
+                const auto readNs = frame.pumpReadCompletedTimestampNs;
+                return readNs == 0 || readNs > batch.presentationDispatchTimestampNs
+                    || batch.presentationDispatchTimestampNs - readNs > kMaxBufferedAgeNs;
+            });
+        stats_.readyFrameReplaced += std::distance(firstRemoved, preceding.end());
+        preceding.erase(firstRemoved, preceding.end());
+        batch.readyFrameReplaced = stats_.readyFrameReplaced;
         ++stats_.deliveredBatches;
     }
-
-    batch.presentationDispatchTimestampNs = monotonicNowNs();
 
     // No member access after emission: a direct receiver may retire or destroy
     // the owning session during this callback.

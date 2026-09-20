@@ -1,0 +1,36 @@
+diff --git "a/C:\\Users\\aaron\\Desktop\\NexusVision\\.codex_artifacts\\stripe-embedded-page-20260916\\worker.ORIGINAL.js" "b/src\\worker.js"
+index 261d79d..6021879 100644
+--- "a/C:\\Users\\aaron\\Desktop\\NexusVision\\.codex_artifacts\\stripe-embedded-page-20260916\\worker.ORIGINAL.js"
++++ "b/src\\worker.js"
+@@ -226,7 +226,7 @@ async function createCheckoutSession(request, env, url) {
+   const returnUrl = `${canonicalOrigin(url)}/checkout/complete?session_id={CHECKOUT_SESSION_ID}`;
+   const body = new URLSearchParams({
+     mode: "subscription",
+-    ui_mode: "embedded",
++    ui_mode: "embedded_page",
+     "line_items[0][price]": env.STRIPE_PRICE_ID,
+     "line_items[0][quantity]": "1",
+     client_reference_id: session.discordId,
+diff --git "a/C:\\Users\\aaron\\Desktop\\NexusVision\\.codex_artifacts\\stripe-embedded-page-20260916\\worker.test.ORIGINAL.mjs" "b/tests\\worker.test.mjs"
+index 19066e1..555c5cf 100644
+--- "a/C:\\Users\\aaron\\Desktop\\NexusVision\\.codex_artifacts\\stripe-embedded-page-20260916\\worker.test.ORIGINAL.mjs"
++++ "b/tests\\worker.test.mjs"
+@@ -1,4 +1,5 @@
+ import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
+ import test from 'node:test';
+ import worker, {
+   checkoutConfigured,
+@@ -88,6 +89,12 @@ test('checkout remains fail-closed until all production secrets exist', () => {
+   }), true);
+ });
+ 
++test('Stripe Checkout uses the current embedded page mode', async () => {
++  const source = await readFile(new URL('../src/worker.js', import.meta.url), 'utf8');
++  assert.match(source, /ui_mode:\s*["']embedded_page["']/);
++  assert.doesNotMatch(source, /ui_mode:\s*["']embedded["']/);
++});
++
+ test('fallback Worker exposes no checkout secrets and keeps Gumroad live', async () => {
+   const config = await worker.fetch(new Request('https://zaeorion.com/api/checkout/config'), fallbackEnv);
+   assert.equal(config.status, 200);

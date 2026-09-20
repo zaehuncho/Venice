@@ -76,7 +76,7 @@ def test_decoder_mode_is_event_driven_but_window_mode_is_not():
     backend = Backend()
     assert rpo.RemotePlayOrchestrator._backend_is_event_driven("decoder", backend)
     assert rpo.RemotePlayOrchestrator._backend_is_event_driven("capture_card", backend)
-    assert not rpo.RemotePlayOrchestrator._backend_is_event_driven("wgc", backend)
+    assert rpo.RemotePlayOrchestrator._backend_is_event_driven("wgc", backend)
     assert not rpo.RemotePlayOrchestrator._backend_is_event_driven("decoder", object())
 
 
@@ -1297,7 +1297,7 @@ def test_pipe_consecutive_reject_latch_is_broken_and_logged_once(monkeypatch):
     assert backend._ready_evt.is_set()          # not yet latched
     assert backend._wire_reject_latched("producer_timestamp_stale") is True
 
-    # Monotonic baselines re-seeded, readiness dropped so the stall fails closed loudly.
+    # Readiness drops; ordering proof is retained until a real pipe reconnect.
     assert backend._wire_pts_last == 0 and backend._wire_producer_ts_last == 0
     assert not backend._ready_evt.is_set()
     assert len(errors) == 1
@@ -1359,18 +1359,34 @@ def test_stream_setup_hides_unsupported_split_hardware_decode_toggle():
 
 
 def test_launcher_copy_matches_the_enable_bot_controller_cta():
+    """The launcher's copy must quote the connect button by its real label.
+
+    [2026-09-14 owner] That label is now plain "Connect" ("Connecting…" / "Connected"),
+    replacing "Enable Bot + Controller" everywhere in QML. RemotePlaySession.cpp's own
+    setup message (emitted after the bundled Remote Play client opens) was retuned to
+    match in the same change, so the C++/QML pair is still pinned together here.
+    """
     root = Path(__file__).parents[1] / "native_orion" / "qml"
     tour = (root / "components" / "FirstRunTour.qml").read_text(encoding="utf-8")
     setup = (root / "components" / "StreamSetupForm.qml").read_text(encoding="utf-8")
+    live = (root / "pages" / "RemotePlayPage.qml").read_text(encoding="utf-8")
     notes = (root / "pages" / "PatchNotesPage.qml").read_text(encoding="utf-8")
     session = (root.parent / "src" / "RemotePlaySession.cpp").read_text(encoding="utf-8")
 
     assert "Start Stream" not in tour
     assert "Start Stream" not in setup
     assert "Start Stream" not in session
-    assert "Enable Bot + Controller" in tour
-    assert "Enable Bot + Controller" in setup
-    assert "press Enable Bot + Controller" in session
+    for qml in (tour, setup, live):
+        assert "Enable Bot" not in qml
+        assert "Bot + Controller" not in qml
+    assert "press Connect" in setup
+    assert "Press Connect to start." in tour
+    assert 'text: root.connecting ? "Connecting…"' in live
+    assert '(root.streamLive ? "Connected" : "Connect")' in live
+    # The .cpp keeps a provenance comment naming the retired label, so only the
+    # emitted STRING is pinned here.
+    assert "press Connect." in session
+    assert "press Enable Bot + Controller." not in session
     assert "Meter tab" not in notes
     assert "beside Live Capture" in notes
 
@@ -1618,7 +1634,7 @@ def test_native_sidecar_config_carries_selected_latency_route():
         source.index("QByteArray RemotePlaySession::buildSidecarConfig() const") :
         source.index("void RemotePlaySession::promoteWarmPreviewToStream()")
     ]
-    assert 'obj.insert(QStringLiteral("frame_source"), config_.videoSource);' in config_builder
+    assert 'obj.insert(QStringLiteral("frame_source"), xbox ? QStringLiteral("wgc") : config_.videoSource);' in config_builder
     assert "insertDecoderPipeProducerExpectation(obj, chiakiPath)" in config_builder
     policy = (root / "native_orion" / "src" / "RemotePlayExecutablePolicy.h").read_text(
         encoding="utf-8"

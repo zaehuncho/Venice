@@ -79,7 +79,10 @@ def test_live_activity_log_is_bounded_incremental_and_excludes_periodic_telemetr
     """Log rendering must not rebuild a large text document on the video GUI thread."""
     qml = PAGE.read_text(encoding="utf-8")
 
-    assert "readonly property int captureLogLimit: 36" in qml
+    # The controller keeps a bounded 1000-line ring and the virtualized ListView
+    # now mirrors that whole batch-safe tail. It remains incremental: this test
+    # still pins the remove/append path below rather than a QTextDocument rebuild.
+    assert "readonly property int captureLogLimit: 1000" in qml
     assert "function syncCaptureLogModel()" in qml
     assert "ListModel {" in qml
     assert 'id: captureLogModel' in qml

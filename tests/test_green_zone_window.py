@@ -15,6 +15,18 @@ import pytest
 
 import simple_meter_reader as smr
 
+
+# [ORION_READER_IDLE_PUBLISH_GATE 2026-09-15] The fixtures below feed a meter with NO press
+# armed and (mostly) a constant fill -- byte for byte the shape the reader's idle publication
+# gate now withholds from the engine and the overlay (see SimpleMeterReader._idle_publish_ok).
+# The gate is a PUBLICATION policy with its own suite (tests/test_idle_publish_gate.py); these
+# tests are about what the reader MEASURES, so the gate is switched off here and they keep
+# measuring it.
+@pytest.fixture(autouse=True)
+def _idle_publish_gate_off(monkeypatch):
+    monkeypatch.setenv("ORION_READER_IDLE_PUBLISH_GATE", "0")
+
+
 H, W = 1080, 1920
 RED_A = (0, 0, 255)
 RED_B = (40, 40, 255)

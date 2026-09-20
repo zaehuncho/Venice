@@ -1,6 +1,6 @@
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
+import OrionNative
 import "../components"
 
 // Silent startup update gate. Mounted by Main.qml whenever orion.updateGatePhase
@@ -47,12 +47,13 @@ Item {
         Item {
             id: checkSpinner
             Layout.alignment: Qt.AlignHCenter
-            width: 34; height: 34
+            Layout.preferredWidth: 34
+            Layout.preferredHeight: 34
             Repeater {
                 model: 8
                 Rectangle {
                     width: 5; height: 5; radius: 2.5
-                    color: "#4F8CFF"
+                    color: Theme.accent
                     opacity: 0.18 + 0.82 * (index / 8)
                     x: checkSpinner.width / 2 - 2.5 + (checkSpinner.width / 2 - 3) * Math.cos(index * Math.PI / 4)
                     y: checkSpinner.height / 2 - 2.5 + (checkSpinner.height / 2 - 3) * Math.sin(index * Math.PI / 4)
@@ -65,19 +66,21 @@ Item {
         Text {
             Layout.alignment: Qt.AlignHCenter
             text: "Checking for updates…"
-            color: "#9FB0C3"
-            font.family: "Segoe UI Variable"
-            font.pixelSize: 14
+            color: Theme.textSecondary
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontBody
         }
     }
 
     // ---- Update card -----------------------------------------------------
+    // Same shell as the Auth / Legal / Stream-setup gates: card radius, faint
+    // accent ring, and a soft halo underneath.
     Rectangle {
         id: cardWrap
         width: 540
         height: cardCol.implicitHeight + 56
         anchors.centerIn: parent
-        radius: 18
+        radius: Theme.radiusCard
         color: Theme.modalSurface
         border.color: Theme.modalBorder
         border.width: 1
@@ -86,10 +89,18 @@ Item {
         Rectangle {
             anchors.fill: parent
             anchors.margins: -1
-            radius: parent.radius + 1
+            radius: cardWrap.radius + 1
             color: "transparent"
-            border.color: Qt.rgba(79 / 255, 140 / 255, 255 / 255, 0.18)
+            border.color: Theme.accentSoft
             border.width: 1
+        }
+        Rectangle {
+            z: -1
+            anchors.fill: parent
+            anchors.topMargin: 3
+            radius: cardWrap.radius
+            color: Theme.shadowHalo
+            opacity: 0.5
         }
 
         opacity: 0
@@ -115,11 +126,11 @@ Item {
                 spacing: 14
 
                 Rectangle {
-                    width: 54
-                    height: 54
+                    Layout.preferredWidth: 54
+                    Layout.preferredHeight: 54
                     radius: 16
-                    color: "#0B0F14"
-                    border.color: "#4F8CFF"
+                    color: Theme.bgInset
+                    border.color: Theme.accent
                     border.width: 1
                     Image {
                         id: logoImg
@@ -134,9 +145,9 @@ Item {
                     Text {
                         anchors.centerIn: parent
                         text: "V"
-                        color: "#F4F7FA"
-                        font.family: "Segoe UI Variable"
-                        font.pixelSize: 24
+                        color: Theme.textPrimary
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontDisplay
                         font.weight: Font.DemiBold
                         visible: logoImg.status !== Image.Ready
                     }
@@ -146,18 +157,18 @@ Item {
                     spacing: 1
                     Text {
                         text: root.stuck ? "Update required" : "Updating Venice"
-                        color: "#F4F7FA"
-                        font.family: "Segoe UI Variable"
-                        font.pixelSize: 22
+                        color: Theme.textPrimary
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontHeading
                         font.weight: Font.DemiBold
                     }
                     Text {
                         text: orion.latestVersion.length > 0
                               ? "Venice " + orion.appVersion + "  →  " + orion.latestVersion
                               : "Venice " + orion.appVersion
-                        color: "#8A96A8"
-                        font.family: "Cascadia Mono"
-                        font.pixelSize: 12
+                        color: Theme.textMuted
+                        font.family: Theme.fontMono
+                        font.pixelSize: Theme.fontSmall
                     }
                 }
 
@@ -165,44 +176,44 @@ Item {
 
                 Rectangle {
                     Layout.alignment: Qt.AlignTop
-                    radius: 9
+                    radius: Theme.radiusChip
                     implicitHeight: 26
                     implicitWidth: channelText.implicitWidth + 20
-                    color: "#13202F"
-                    border.color: "#2A3A52"
+                    color: Theme.bgCardHover
+                    border.color: Theme.borderStrong
                     border.width: 1
                     Text {
                         id: channelText
                         anchors.centerIn: parent
                         text: orion.updateChannel.toUpperCase()
-                        color: "#9AA8BF"
-                        font.family: "Segoe UI Variable"
-                        font.pixelSize: 11
+                        color: Theme.textSecondary
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontCaption
                         font.weight: Font.DemiBold
                         font.letterSpacing: 1.0
                     }
                 }
             }
 
-            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#1B2738" }
+            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.hairline }
 
             // ---- Reinstall notice (only when stuck: forced + no updater) ----
             Rectangle {
                 Layout.fillWidth: true
                 visible: root.stuck
-                radius: 10
+                radius: Theme.radiusControl
                 implicitHeight: noticeText.implicitHeight + 20
-                color: "#2A2010"
-                border.color: "#6B521F"
+                color: Theme.warningDim
+                border.color: Theme.warningBorder
                 border.width: 1
                 Text {
                     id: noticeText
                     anchors.fill: parent
                     anchors.margins: 10
                     text: "The required Venice update helper is missing, so this update can't be applied. Reinstall Venice from the latest package."
-                    color: "#E8C872"
-                    font.family: "Segoe UI Variable"
-                    font.pixelSize: 12
+                    color: Theme.warning
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSmall
                     wrapMode: Text.WordWrap
                 }
             }
@@ -213,20 +224,23 @@ Item {
                 spacing: 6
                 visible: orion.updateNotes.length > 0 && !root.stuck
 
+                // Eyebrow label: the same treatment the stream-setup section labels
+                // use (micro, bold, tracked, uppercase).
                 Text {
                     text: "What's new"
-                    color: "#8A96A8"
-                    font.family: "Segoe UI Variable"
-                    font.pixelSize: 11
-                    font.weight: Font.DemiBold
-                    font.letterSpacing: 1.0
+                    color: Theme.textMuted
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontMicro
+                    font.weight: Font.Bold
+                    font.letterSpacing: 1.2
+                    font.capitalization: Font.AllUppercase
                 }
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: Math.min(notesText.implicitHeight + 24, 170)
-                    radius: 10
-                    color: "#080C12"
-                    border.color: "#1B2738"
+                    radius: Theme.radiusControl
+                    color: Theme.bgInset
+                    border.color: Theme.hairline
                     border.width: 1
                     Flickable {
                         anchors.fill: parent
@@ -237,9 +251,9 @@ Item {
                             id: notesText
                             width: parent.width
                             text: orion.updateNotes
-                            color: "#C3CDDB"
-                            font.family: "Segoe UI Variable"
-                            font.pixelSize: 12
+                            color: Theme.textSecondary
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.fontSmall
                             wrapMode: Text.WordWrap
                         }
                     }
@@ -252,9 +266,9 @@ Item {
                 text: root.stuck ? "Please reinstall to continue."
                       : root.canApply ? "Installing the latest version — Venice will restart automatically."
                       : "Continuing on the current version…"
-                color: "#8A96A8"
-                font.family: "Segoe UI Variable"
-                font.pixelSize: 12
+                color: Theme.textMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSmall
                 wrapMode: Text.WordWrap
             }
 
@@ -262,7 +276,7 @@ Item {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 6
                 radius: 3
-                color: "#16202C"
+                color: Theme.bgCardHover
                 clip: true
                 visible: !root.stuck
                 Rectangle {
@@ -270,7 +284,7 @@ Item {
                     width: parent.width * 0.34
                     height: parent.height
                     radius: 3
-                    color: "#4F8CFF"
+                    color: Theme.accent
                     x: -width
                     SequentialAnimation on x {
                         loops: Animation.Infinite
@@ -286,16 +300,16 @@ Item {
                 Layout.topMargin: 2
                 Text {
                     text: orion.updateState
-                    color: "#566273"
-                    font.family: "Segoe UI Variable"
-                    font.pixelSize: 11
+                    color: Theme.textFaint
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontCaption
                 }
                 Item { Layout.fillWidth: true }
                 Text {
                     text: "Signed updates · Ed25519 verified"
-                    color: "#566273"
-                    font.family: "Segoe UI Variable"
-                    font.pixelSize: 11
+                    color: Theme.textFaint
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontCaption
                 }
             }
         }

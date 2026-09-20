@@ -1,0 +1,3 @@
+# Routing lives in src/worker.js (assets run_worker_first), so static rules here are shadowed.
+# Kept as an empty rule set on purpose: tests/verify_site.py reads this file, and the old
+# /buy is handled by the Worker and fails closed unless Stripe is fully configured.

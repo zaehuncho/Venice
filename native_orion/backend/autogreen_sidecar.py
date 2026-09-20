@@ -26,6 +26,7 @@ import math
 import os
 import queue
 import signal
+import statistics
 import sys
 import threading
 import time
@@ -58,6 +59,78 @@ _emit_lock = threading.Lock()
 # being able to corrupt the command/telemetry channel. `_log`/`_emit` stay reserved for rare,
 # user-relevant events.
 _LOG = logging.getLogger("autogreen")
+
+
+def _detector_provider_smoke(
+    model_path: Path, *, warmup: int = 20, runs: int = 100,
+    p90_limit_ms: float = 35.0, output_path: Path | None = None,
+) -> int:
+    """Exercise the detector through the provider embedded by Nuitka.
+
+    Production intentionally requires DirectML: CUDAExecutionProvider depends
+    on a large CUDA/cuDNN DLL set that is not part of the release. Testing the
+    compiled executable catches a bundle that imports on the build host but
+    silently falls back to the timing-ineligible CPU provider after packaging.
+    """
+
+    try:
+        import numpy as np
+        from meter_detector_yolo import MeterYoloLocator
+
+        os.environ["ORION_METER_PROVIDER_PRIORITY"] = "dml,cpu"
+        detector = MeterYoloLocator(model_path=str(model_path))
+        if not detector.ok:
+            raise RuntimeError("detector did not load")
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        for _ in range(max(0, int(warmup))):
+            detector.detect_box(frame)
+        samples = []
+        for _ in range(max(1, int(runs))):
+            started = time.perf_counter()
+            detector.detect_box(frame)
+            samples.append((time.perf_counter() - started) * 1000.0)
+        ordered = sorted(samples)
+        p90 = ordered[min(len(ordered) - 1, math.ceil(0.90 * len(ordered)) - 1)]
+        p99 = ordered[min(len(ordered) - 1, math.ceil(0.99 * len(ordered)) - 1)]
+        payload = {
+            "ok": (
+                detector.provider == "DmlExecutionProvider"
+                and p90 <= float(p90_limit_ms)
+            ),
+            "provider": detector.provider,
+            "model": model_path.name,
+            "runs": len(samples),
+            "median_ms": round(statistics.median(samples), 3),
+            "p90_ms": round(p90, 3),
+            "p99_ms": round(p99, 3),
+            "max_ms": round(max(samples), 3),
+            "p90_limit_ms": float(p90_limit_ms),
+        }
+        line = json.dumps(payload, sort_keys=True)
+        if output_path is not None:
+            output_path.write_text(line + "\n", encoding="utf-8", newline="\n")
+        try:
+            print(line, flush=True)
+        except (AttributeError, OSError):
+            pass
+        return 0 if payload["ok"] else 5
+    except Exception as exc:
+        line = json.dumps(
+            {
+                "ok": False,
+                "provider": "unavailable",
+                "model": model_path.name,
+                "error": str(exc),
+            },
+            sort_keys=True,
+        )
+        if output_path is not None:
+            output_path.write_text(line + "\n", encoding="utf-8", newline="\n")
+        try:
+            print(line, flush=True)
+        except (AttributeError, OSError):
+            pass
+        return 6
 
 # FIX 3 (silent drops on the live path): every swallowed non-fatal fault on a path that MATTERS
 # (frame delivery, preview encode, telemetry emit, resource teardown) increments a counter here
@@ -704,6 +777,8 @@ def _apply_feed_health_override(payload: dict) -> bool:
         shot["confidence"] = 0.0
     payload.pop("green", None)
     payload.pop("bbox", None)
+    # [ORION_PROOF_DETECTOR_BOX 2026-09-19] the detector rectangle rides the bbox exactly
+    payload.pop("det_bbox", None)
     payload.pop("bbox_wh", None)
     payload.pop("tracking", None)
     payload.pop("fusion", None)
@@ -748,6 +823,37 @@ def _tip_registration_wire(raw) -> dict:
         return {}
 
 
+# [METER DETECTION CARD 2026-09-10] Cadence of the reader's detector-health line. It rides the
+# telemetry THREAD (one periodic mechanism) but never the telemetry PAYLOAD: the 60 Hz meter
+# feed is the engine's input and must not grow for a display value.
+_DETECTOR_HEALTH_INTERVAL_S = 2.0
+
+
+def _detector_health_wire(orch) -> dict | None:
+    """{"event":"detector_health", ...} for the native Meter Detection card, or None while the
+    orchestrator has no reader with a health snapshot (pre-warm, retired chain, legacy reader).
+
+    Flat copy of SimpleMeterReader.detector_health_snapshot(): provider ("cv-contour" or an
+    ONNX provider id), infer_ms, state (idle|pending|locked), calls/found/locks/drops/
+    hot_submit/reseat_x and the cv_* gate counters when the pure-CV proposer is active.
+    PRESENTATION ONLY -- native formats it into a status line; nothing reaches the engine."""
+    reader = getattr(orch, "_meter_detector", None)
+    snapshot_fn = getattr(reader, "detector_health_snapshot", None)
+    if not callable(snapshot_fn):
+        return None
+    snapshot = snapshot_fn()
+    if not isinstance(snapshot, dict):
+        return None
+    payload = {"event": "detector_health"}
+    for key, value in snapshot.items():
+        if value is None or isinstance(value, (bool, int, float)):
+            payload[str(key)] = value
+        else:
+            # Never let a foreign object (or a long string) break the JSONL line.
+            payload[str(key)] = str(value)[:48]
+    return payload
+
+
 def _read_processed_frame_snapshot(orch) -> dict:
     """Read detector completion metadata from one atomic orchestrator snapshot.
 
@@ -765,6 +871,9 @@ def _read_processed_frame_snapshot(orch) -> dict:
             reject_counts = {}
         frame_wh = getattr(snapshot, "frame_wh", (0, 0)) or (0, 0)
         raw_bbox = getattr(snapshot, "bbox", ()) or ()
+        # [ORION_PROOF_DETECTOR_BOX 2026-09-19] the pre-display-hug DETECTOR rectangle of the
+        # same frame; empty on an orchestrator that does not publish one (native falls back).
+        raw_det_bbox = getattr(snapshot, "det_bbox", ()) or ()
         raw_bbox_wh = getattr(snapshot, "bbox_wh", ()) or ()
         return {
             "seq": int(getattr(snapshot, "seq", 0) or 0),
@@ -788,6 +897,8 @@ def _read_processed_frame_snapshot(orch) -> dict:
                 getattr(snapshot, "gameplay_structure_epoch", 0)),
             "stage": str(getattr(snapshot, "stage", "") or ""),
             "bbox": tuple(int(v) for v in raw_bbox[:4]) if len(raw_bbox) >= 4 else (),
+            "det_bbox": (tuple(int(v) for v in raw_det_bbox[:4])
+                         if len(raw_det_bbox) >= 4 else ()),
             "bbox_wh": (tuple(int(v) for v in raw_bbox_wh[:2])
                         if len(raw_bbox_wh) >= 2 else ()),
             "green": _snapshot_pairs_dict(getattr(snapshot, "green", ())),
@@ -801,6 +912,7 @@ def _read_processed_frame_snapshot(orch) -> dict:
     frame_wh = getattr(orch, "_last_processed_frame_wh", (0, 0)) or (0, 0)
     meter_present = bool(getattr(orch, "_last_meter_present", False))
     raw_bbox = getattr(orch, "_last_meter_bbox", None)
+    raw_det_bbox = getattr(orch, "_last_meter_det_bbox", None)
     raw_bbox_wh = getattr(orch, "_last_meter_bbox_wh", None)
     raw_green = getattr(orch, "_last_green_window", None)
     legacy_seq = int(getattr(orch, "_last_processed_seq", 0) or 0)
@@ -843,6 +955,8 @@ def _read_processed_frame_snapshot(orch) -> dict:
         "stage": str(getattr(orch, "_last_meter_stage", "") or ""),
         "bbox": (tuple(int(v) for v in raw_bbox[:4])
                  if raw_bbox is not None and len(raw_bbox) >= 4 else ()),
+        "det_bbox": (tuple(int(v) for v in raw_det_bbox[:4])
+                     if raw_det_bbox is not None and len(raw_det_bbox) >= 4 else ()),
         "bbox_wh": (tuple(int(v) for v in raw_bbox_wh[:2])
                     if raw_bbox_wh is not None and len(raw_bbox_wh) >= 2 else ()),
         "green": dict(raw_green) if isinstance(raw_green, dict) else {},
@@ -951,12 +1065,56 @@ def _handle_start_stream(orch, msg: dict) -> bool:
     ip = str(msg.get("console_ip", "")).strip()
     console_identity = str(msg.get("console_identity", "")).strip().lower()
     # Ack FIRST (before the blocking bring-up) so the native knows a verdict is coming even while
-    # promote_to_stream is still inside its client-launch wait.
-    _emit({"event": "stream_promote", "state": "begin", "console_ip": ip})
+    # promote_to_stream is still inside its client-launch wait -- but OFF-THREAD (2026-08-29):
+    # _emit blocks on _emit_lock, which the preview/telemetry writers can hold for >1s (p50 1538ms
+    # measured on the packaged build). Emitting inline delayed the Chiaki spawn by that whole
+    # wait on EVERY Connect (the warm-path "3.4s to input ready" was mostly this). The ack
+    # threads are joined before any verdict emit so `begin`/`waking` always precede
+    # started/error on the wire; the native treats both as progress notes, never as verdicts.
+    _ack_threads = []
+    def _emit_async(payload) -> None:
+        t = threading.Thread(target=_emit, args=(payload,), name="promote-ack", daemon=True)
+        _ack_threads.append(t)
+        t.start()
+    def _ack_done() -> None:
+        for t in list(_ack_threads):
+            try:
+                t.join(timeout=5.0)
+            except Exception:
+                pass
+    _emit_async({"event": "stream_promote", "state": "begin", "console_ip": ip})
+    # Wake-aware deadline: when the client manager finds the console in rest mode and sends a
+    # wakeup, it reports the port-wait budget here; the native extends its promote deadline
+    # (sized for an AWAKE console) so a slow boot no longer ends in a forced "Connect again".
+    def _on_console_waking(budget_s: float) -> None:
+        try:
+            _emit_async({"event": "stream_promote", "state": "waking", "console_ip": ip,
+                         "budget_ms": int(max(0.0, float(budget_s)) * 1000.0)})
+        except Exception:
+            pass
+    try:
+        setattr(orch, "console_waking_callback", _on_console_waking)
+    except Exception:
+        pass
+    # [ORION_CONNECT_LATENCY 2026-08-29] Stamp the whole promotion and surface the
+    # client manager's per-stage breakdown in the native log, so the next latency
+    # question is answered by reading one line instead of re-deriving it from
+    # timer coincidences. _log goes out on the sidecar's own channel (not the
+    # WARNING-filtered python-logging relay), so the line always lands.
+    _promote_started = time.perf_counter()
+    def _log_promote_timing() -> None:
+        try:
+            total_ms = (time.perf_counter() - _promote_started) * 1000.0
+            summary = str(getattr(orch, "last_promotion_stage_summary", "") or "")
+            _log(f"start_stream timing: total={total_ms:.0f}ms"
+                 + (f" | {summary}" if summary else ""))
+        except Exception:
+            pass
     fn = getattr(orch, "promote_to_stream", None)
     if not callable(fn):
         _log("start_stream: orchestrator lacks promote_to_stream (old build) - "
              "no Chiaki/input link, the bot cannot reach the console", "error")
+        _ack_done()
         _emit({"event": "error",
                "msg": "Stream start failed: this build cannot promote the live preview to a "
                       "stream (orchestrator has no promote_to_stream). Reconnect to retry.",
@@ -975,12 +1133,16 @@ def _handle_start_stream(orch, msg: dict) -> bool:
         if not input_ready:
             _log("start_stream: promotion returned success without explicit current-session "
                  "readiness proof", "error")
+            _log_promote_timing()
+            _ack_done()
             _emit({"event": "error",
                    "msg": "Stream start failed: console input session readiness was not proven.",
                    "phase": "promote_to_stream",
                    "input_ready": False})
             return False
         _log(f"start_stream: Chiaki console input session ready (console_ip={ip or '-'})")
+        _log_promote_timing()
+        _ack_done()
         _emit({"event": "started", "msg": "stream promoted from warm preview",
                "input_ready": True})
         return True
@@ -988,6 +1150,8 @@ def _handle_start_stream(orch, msg: dict) -> bool:
     _hard, detail = _classify_promotion_failure(orch)
     _log(f"start_stream: Chiaki/input bring-up FAILED - no input will reach the console "
          f"({detail}) (console_ip={ip or '-'})", "error")
+    _log_promote_timing()
+    _ack_done()
     _emit({"event": "error",
            "msg": f"Stream start failed: {detail}",
            "phase": "promote_to_stream",
@@ -1500,6 +1664,15 @@ def main() -> int:
         "--build-identity-file",
         help="write the embedded source digest to this file and exit",
     )
+    identity.add_argument(
+        "--detector-smoke",
+        action="store_true",
+        help="benchmark the bundled production meter detector/provider and exit",
+    )
+    identity.add_argument(
+        "--detector-smoke-file",
+        help="write bundled detector/provider benchmark JSON to this file and exit",
+    )
     args = parser.parse_args()
 
     if args.build_identity or args.build_identity_file:
@@ -1512,6 +1685,26 @@ def main() -> int:
         else:
             print(digest, flush=True)
         return 0
+
+    if args.detector_smoke or args.detector_smoke_file:
+        root = (
+            Path(args.root).resolve()
+            if args.root
+            else Path(sys.executable).resolve().parent
+        )
+        _bootstrap(root)
+        configured_model = os.environ.get("ORION_METER_MODEL", "").strip()
+        model = (
+            Path(configured_model).resolve()
+            if configured_model
+            else root / "models" / "orion_meter_detector.onnx"
+        )
+        output_path = (
+            Path(args.detector_smoke_file).resolve()
+            if args.detector_smoke_file
+            else None
+        )
+        return _detector_provider_smoke(model, output_path=output_path)
 
     if not args.root or args.config_json is None:
         parser.error("--root and --config-json are required for sidecar runtime mode")
@@ -1611,6 +1804,25 @@ def main() -> int:
         frame_source=str(cfg.get("frame_source", "auto") or "auto"),
         wait_timeout_s=_safe_float(cfg.get("wait_timeout_s"), 40.0),
     )
+
+    # [ORION_DECODER_TIP_MARGINS 2026-09-14] Route-conditional locator margins, set BEFORE the
+    # reader/locator is built (remote_play_orchestrator constructs SimpleMeterReader later).
+    # Measured offline (tools/quality/reencode_gate_study.py, 283 true-meter + 1,213 adversarial
+    # frames re-encoded through the Chiaki rungs): every shape-gate metric keeps 3-10x margin under
+    # H.264, but 4:2:0 chroma subsampling washes the green tip's SATURATION, so first-sight locks
+    # drop to 83-91 % at 720p. S>=60 (+ tip px >=2) recovers to 93-99 % with 0 false locks and is
+    # exactly neutral on capture-card pixels -- which is why the capture-card route never sets it.
+    # setdefault: an explicit env (sweeps) always wins.
+    _src_for_margins = str(getattr(orch_config, "frame_source", "") or "").strip().lower()
+    _cc_route = _src_for_margins in ("capture_card", "capturecard", "card")         or _safe_bool(os.environ.get("ORION_CAPTURE_CARD"), False)
+    _decoder_route = (not _cc_route) and (
+        _src_for_margins in ("decoder", "pipe", "frame_pipe")
+        or _safe_bool(os.environ.get("ORION_REQUIRE_FRAME_PIPE"), False)
+        or _safe_bool(os.environ.get("ORION_FRAME_PIPE"), False)
+        or bool(str(os.environ.get("CHIAKI_ORION_FRAME_PIPE", "") or "").strip()))
+    if _decoder_route:
+        os.environ.setdefault("ORION_CV_GREEN_S_MIN", "60")
+        os.environ.setdefault("ORION_CV_TIP_PX_MIN", "2")
 
     _emit({
         "event": "log",
@@ -2310,8 +2522,26 @@ def main() -> int:
 
     input_ready_fn = getattr(orch, "input_link_ready", None)
     input_ready = bool(callable(input_ready_fn) and input_ready_fn())
-    _emit({"event": "started", "msg": "Chiaki autogreen sidecar running",
+    _emit({"event": "started", "msg": "Remote Play detector running",
            "input_ready": input_ready})
+
+    # [ORION_STANDBY 2026-08-30] Warm-preview mode (auto_launch_client=False, i.e.
+    # no Remote Play client was launched at start): pre-boot the client NOW in the
+    # fork's --standby mode so a later Connect promotes it (pays only the PS5
+    # handshake, ~0.6s) instead of paying the client's ~1-3s boot. The standby
+    # opens NO console session by construction; the promote path still requires
+    # the launch-scoped streaminfo readiness marker. Old orchestrators/clients:
+    # getattr keeps this inert, and the pool never spawns --standby at a binary
+    # that lacks it (spawn-free marker sniff — a pre-standby client would raise
+    # a visible modal parser-error dialog and linger, verified 2026-08-30).
+    # Kill switch: ORION_STANDBY_CLIENT=0.
+    if not orch_config.auto_launch_client and orch_config.platform.lower() != "xbox":
+        try:
+            _prewarm = getattr(orch, "prewarm_standby_client", None)
+            if callable(_prewarm):
+                _prewarm()
+        except Exception as _standby_exc:
+            _LOG.warning("standby prewarm not started: %s", _standby_exc)
 
     stop_evt = threading.Event()
 
@@ -2332,6 +2562,8 @@ def main() -> int:
             _stall_ms = float(os.environ.get("ORION_STALL_WATCHDOG_MS", "250") or "250")
         except Exception:
             _stall_ms = 250.0
+        # Next monotonic instant the detector-health line is due (0 = emit on the first pass).
+        _health_next = 0.0
         while not stop_evt.is_set():
             try:
                 # One immutable reference pairs seq, source identity, all timestamps,
@@ -2488,6 +2720,16 @@ def main() -> int:
                 if bbox:
                     try:
                         payload["bbox"] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+                        # [ORION_PROOF_DETECTOR_BOX 2026-09-19] The DETECTOR's rectangle for the
+                        # same frame, before the reader's display hug. The native ownership proof
+                        # judges shape CONTINUITY on it; the drawn `bbox` above is unchanged and
+                        # remains what the overlay and meter_x/meter_y use. Sent inside the same
+                        # try/except and from the same immutable snapshot, so the two rectangles
+                        # are always the same frame's or neither is sent.
+                        _dbb = _processed.get("det_bbox") or ()
+                        if _dbb:
+                            payload["det_bbox"] = [int(_dbb[0]), int(_dbb[1]),
+                                                   int(_dbb[2]), int(_dbb[3])]
                         # frame WxH the bbox was computed in -> native maps with the correct scale
                         # (not a stale captureWidth/Height), so the overlay box never jumps on a res flip.
                         _bwh = _processed["bbox_wh"]
@@ -2684,6 +2926,18 @@ def main() -> int:
             if (int(getattr(orch, "_telemetry_revision", 0) or 0)
                     <= int(_telemetry_state["sent_revision"])):
                 _telemetry_priority_evt.clear()
+            # [METER DETECTION CARD] Reader detector health as its OWN small line every
+            # ~2 s (see _DETECTOR_HEALTH_INTERVAL_S). Deliberately outside the payload
+            # try-block above: a health failure can never cost the engine a meter sample,
+            # and a payload failure never silences the card.
+            if time.monotonic() >= _health_next:
+                _health_next = time.monotonic() + _DETECTOR_HEALTH_INTERVAL_S
+                try:
+                    _health = _detector_health_wire(orch)
+                    if _health is not None:
+                        _emit(_health)
+                except Exception as exc:
+                    _note_drop("telemetry_detector_health", exc)
             # Event-driven meter feed (was a fixed 60Hz `stop_evt.wait(1/60)`): this loop is
             # the native engine's ONLY meter feed (shot.fill_pct / green / bbox). Waiting on
             # the orchestrator's per-frame `_frame_ready_evt` emits the payload the INSTANT a
@@ -2698,6 +2952,84 @@ def main() -> int:
 
     # Stdin command loop (so the launcher can update config / trigger actions)
     _court_ip_state = {"ip": None}   # last targeted court IP -> de-dupe the "retargeted" log spam
+
+    # [ORION_DISCONNECT_AUDIT 2026-09-19] F1: the long-blocking session commands move
+    # OFF the stdin reader.
+    #
+    # `start_stream` and `recover_input` call straight into blocking work with their
+    # own budgets -- recover_input_link() paces three attempts against a 17 s deadline,
+    # start_stream owns the whole promotion. They used to run ON the stdin thread, so
+    # while either was in flight NOTHING else could be read from stdin -- including
+    # `shutdown`. The native writes `shutdown`, waits kSidecarGracefulShutdownMs (5 s)
+    # and then `taskkill /F /T`s us. So pressing Disconnect while input recovery was
+    # running -- which is EXACTLY when the owner would press it, because input is dead
+    # and the video is still live -- could not be honoured: we were force-killed 5 s
+    # into a 17 s handler, chiaki_session_stop() never ran (console: "LAN cable
+    # disconnected") and orch.stop() never ran (Elgato handle still held, so the
+    # 3 s post-disconnect preview resume lands on a contended device).
+    #
+    # One worker, one queue: command ORDER between the offloaded commands is preserved
+    # exactly as before, and `shutdown` now jumps ahead of them -- which is the whole
+    # point. Both commands were already asynchronous from the native's point of view
+    # (it waits for {"event": "promote"/"started"/"error"} and input_recovery/ready
+    # against its own deadlines), so nothing downstream gains a new race.
+    _deferred_cmd_queue: "queue.Queue" = queue.Queue(maxsize=8)
+
+    def _deferred_command_worker():
+        while True:
+            try:
+                item = _deferred_cmd_queue.get(timeout=0.25)
+            except queue.Empty:
+                if stop_evt.is_set():
+                    return
+                continue
+            if item is None:
+                return
+            kind, payload = item
+            # A teardown began while this sat in the queue: the native has already
+            # stopped caring about the verdict and is waiting for us to exit.
+            if stop_evt.is_set():
+                continue
+            try:
+                if kind == "start_stream":
+                    _run_start_stream(payload)
+                elif kind == "recover_input":
+                    _handle_recover_input(orch)
+            except Exception as exc:
+                _LOG.exception("deferred command %s raised", kind)
+                _log(f"{kind} failed: {exc}", "error")
+
+    def _run_start_stream(msg):
+        try:
+            _handle_start_stream(orch, msg)
+        except Exception as exc:
+            # FIX 1: the handler raising is ALSO a failed promotion. Without the error
+            # event the native's belt-and-suspenders timer flips the UI to
+            # "Autogreen running" over a stream that never started.
+            _LOG.exception("start_stream handler raised")
+            _log(f"start_stream failed: {exc}", "error")
+            _emit({"event": "error",
+                   "msg": f"Stream start failed: {exc}",
+                   "phase": "promote_to_stream",
+                   "input_ready": False})
+
+    def _defer_command(kind, payload):
+        """Hand a long-blocking command to the worker. Never blocks the reader."""
+        try:
+            _deferred_cmd_queue.put_nowait((kind, payload))
+            return True
+        except queue.Full:
+            # The queue is bounded so a wedged handler cannot grow it without limit.
+            # Refusing is honest: the native has a deadline on both commands and will
+            # report the failure rather than wait forever on a lost instruction.
+            _note_drop(f"deferred_cmd_full_{kind}", RuntimeError("command queue full"))
+            _log(f"{kind} refused: a previous session command is still running", "warn")
+            return False
+
+    _deferred_cmd_thread = threading.Thread(
+        target=_deferred_command_worker, name="orion-session-cmd", daemon=True)
+    _deferred_cmd_thread.start()
+
     def _stdin_loop():
         for raw in sys.stdin:
             line = raw.strip()
@@ -2849,26 +3181,31 @@ def main() -> int:
                 # WARM-PREVIEW -> STREAM promotion: bring up Chiaki + input hook IN PLACE (no process
                 # restart, no capture/detector teardown) and re-emit {"event":"started"} so the native
                 # flips to Running. See _handle_start_stream for the full contract.
-                try:
-                    _handle_start_stream(orch, msg)
-                except Exception as exc:
-                    # FIX 1: the handler raising is ALSO a failed promotion. Without the error
-                    # event the native's belt-and-suspenders timer flips the UI to
-                    # "Autogreen running" over a stream that never started.
-                    _LOG.exception("start_stream handler raised")
-                    _log(f"start_stream failed: {exc}", "error")
+                # [F1 2026-09-19] Deferred to the session-command worker so a `shutdown`
+                # arriving mid-promotion can still be READ. Same handler, same events.
+                if not _defer_command("start_stream", msg):
                     _emit({"event": "error",
-                           "msg": f"Stream start failed: {exc}",
+                           "msg": "Stream start refused: a session command is still running",
                            "phase": "promote_to_stream",
                            "input_ready": False})
             elif cmd == "recover_input":
-                _handle_recover_input(orch)
+                # [F1 2026-09-19] Deferred for the same reason, and this is the one that
+                # actually bit: a Disconnect pressed during the 17 s input recovery.
+                _defer_command("recover_input", msg)
             elif cmd == "shot_gate_arm":
                 source = str(msg.get("source", "hw") or "hw")[:24]
                 shot_epoch = _safe_uint64(msg.get("shot_epoch"))
+                # [ORION_SHOT_GATE_TYPE 2026-09-15] shot_type/rhythm are OPTIONAL: an older
+                # native sends neither and the reader keeps the union meter-onset window.
+                shot_type = str(msg.get("shot_type", "") or "")[:24].strip()
+                rhythm = bool(msg.get("rhythm", 0))
                 fn = getattr(orch, "arm_shot_gate", None)
                 if callable(fn):
-                    fn(source, shot_epoch)
+                    try:
+                        fn(source, shot_epoch, shot_type, rhythm)
+                    except TypeError:
+                        # Older in-tree orchestrator: epoch-only arm, no type channel.
+                        fn(source, shot_epoch)
                 else:
                     # Older in-tree orchestrators expose only the internal helper.
                     legacy = getattr(orch, "_arm_shot_gate", None)
@@ -2877,6 +3214,26 @@ def main() -> int:
                             legacy(source, shot_epoch)
                         except TypeError:
                             legacy(source)
+            elif cmd == "shot_gate_release":
+                # [ORION_SHOT_GATE_RELEASE 2026-09-15] The engine's release edge, on the same
+                # channel as the arm. Ends the reader's press window at the instant the shot
+                # actually left the hand instead of letting it time out.
+                fn = getattr(orch, "release_shot_gate", None)
+                if callable(fn):
+                    try:
+                        fn(_safe_uint64(msg.get("shot_epoch")),
+                           float(msg.get("release_ms", 0.0) or 0.0))
+                    except (TypeError, ValueError):
+                        fn(_safe_uint64(msg.get("shot_epoch")))
+            elif cmd == "shot_gate_disarm":
+                # The press ended with NO release edge (manual cancel / engine abort).
+                fn = getattr(orch, "disarm_shot_gate", None)
+                if callable(fn):
+                    try:
+                        fn(_safe_uint64(msg.get("shot_epoch")),
+                           str(msg.get("reason", "disarm") or "disarm")[:32])
+                    except TypeError:
+                        fn(_safe_uint64(msg.get("shot_epoch")))
             elif cmd == "preview_transport":
                 # Native could not open/read the mapping.  Switch in place to
                 # the already-tested JPEG path; capture and detection continue.
@@ -2915,6 +3272,26 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        # [ORION_DISCONNECT_AUDIT 2026-09-19] THE PS5 DISCONNECT HANDSHAKE GOES FIRST.
+        # The native gives this whole teardown ~5 s (kSidecarGracefulShutdownMs) before
+        # `taskkill /F /T`. Everything below is local cleanup we can afford to lose --
+        # a dropped preview frame, a truncated diagnostic CSV. The Chiaki close is the
+        # ONE step with an external, non-recoverable consequence: skip it and the
+        # console never gets chiaki_session_stop(), so it reports the transport
+        # vanishing mid-session ("LAN cable was disconnected").
+        #
+        # It used to run inside orch.stop() BELOW the two preview joins (2.0 s + 1.0 s),
+        # so on a slow join the WM_CLOSE went out at t≈3 s and its own 3 s wait ran past
+        # the force-kill at t=5 s -- the orchestrator's own "GRACEFUL CHIAKI SHUTDOWN
+        # GOES FIRST" reasoning was correct and simply pre-empted one level up. This is
+        # a REORDER, not new work: orch.stop()'s call is idempotent and now a no-op.
+        _close_client_first = getattr(orch, "close_remote_play_client", None)
+        if callable(_close_client_first):
+            try:
+                _close_client_first()
+            except Exception as exc:
+                _LOG.exception("graceful Remote Play client close failed")
+                _log(f"chiaki close error: {exc}", "warn")
         _preview_stop.set()
         _preview_wake.set()
         _preview_thread.join(timeout=2.0)

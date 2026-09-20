@@ -24,7 +24,7 @@ $InstallerDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $InstallerDir
 
 if ([string]::IsNullOrWhiteSpace($PackageDir)) {
-    $PackageDir = Join-Path $Root "release\orion-package"
+    $PackageDir = Join-Path $Root "release\orion-package-packed"
 }
 $PackageDir = [System.IO.Path]::GetFullPath($PackageDir)
 

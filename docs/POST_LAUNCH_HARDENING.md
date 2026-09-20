@@ -48,13 +48,13 @@ Measured 2026-08-06 (`release/orion-package/`):
   backend-issued lease (`LeaseGate.cpp`), the entitlement cache is DPAPI-bound
   to the machine/user/build (`SecurityManager.cpp`), and the release manifest
   hash is verified before automation starts.
-- OrionPack's DLL path is blocked by `pack_orion_release.py`: packed DLLs
+- Lethe's DLL path is blocked by `pack_lethe_release.py`: packed DLLs
   currently unpack from `DllMain`, which is a real loader-lock risk. Fixing that
   is a design change, not a config flag.
 - MSVC hardening flags (CFG, CET, ASLR, LTCG, dead-code folding) are already on
   all four DLLs — they defend against *exploit chains*, not static reversing.
 
-**Fix (v1.0.1, ~½ day per `tools/security/packer/PHASE2_PHASE3_PLAN.md` §2C):**
+**Fix (v1.0.1, ~½ day per the Lethe repo's `PHASE2_PHASE3_PLAN.md` §2C — Lethe is now a standalone repo at `C:\Users\aaron\Desktop\Lethe`):**
 1. Add `/GR-` to SecurityCore compile flags — strips RTTI type_info structures
    that contain plaintext class names. Verify no `dynamic_cast`/`typeid` calls
    in SecurityCore (there aren't any — it's signal/slot only).
@@ -67,7 +67,7 @@ Measured 2026-08-06 (`release/orion-package/`):
    rollout, not a mass find-replace.
 
 Longer-term: implement the deferred-init pattern
-`pack_orion_release.py:validate_release_targets` is waiting for, so OrionPack
+`pack_lethe_release.py:validate_release_targets` is waiting for, so Lethe
 can protect DLLs the same way it protects EXEs.
 
 ---
@@ -85,7 +85,7 @@ Verified: not on the packer target list.
 
 **Fix (v1.0.1+):** Move the highest-value Python logic to native C++ where it
 gets the same protections as the other DLLs. Or wait until the deferred-init
-DLL packing lands and package the sidecar's C output as a DLL through OrionPack.
+DLL packing lands and package the sidecar's C output as a DLL through Lethe.
 
 ---
 
@@ -100,7 +100,7 @@ Not a gap — a reminder of what's already working so we don't over-scope v1.0.1
 - Backend `/api/activate` with per-machine trial guard, per-license machine
   count, and lease expiry.
 - MSVC CFG + CET + ASLR + LTCG + dead-code folding on all four DLLs.
-- OrionPack section encryption (AES-256-GCM) on all four shipping EXEs, with
+- Lethe section encryption (AES-256-GCM) on all four shipping EXEs, with
   code-hash-bound key and import elision — verified 2026-08-06:
   entropy 6.0 → 7.6, zero plaintext leaks on 3-probe redteam.
 - Anti-debug (gated, AV-clean) on the packed EXEs.

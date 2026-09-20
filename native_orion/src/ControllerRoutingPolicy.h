@@ -49,9 +49,35 @@ inline constexpr qint64 kControllerUiGuardMs = 120;
 // feedback sender is still uninitialized and a correctly fail-closed
 // OrionStream terminates the session.
 [[nodiscard]] inline constexpr bool directInputWriteAllowed(
-    RemotePlayState state) noexcept
+    RemotePlayState state, bool inputRecoveryPending = false) noexcept
 {
-    return state == RemotePlayState::Running;
+    // Input-only recovery retains Running for video/history continuity. A newly
+    // created pipe is not an initialized console transport; even a neutral seed
+    // must wait for the current recovery attempt's positive readiness verdict.
+    return state == RemotePlayState::Running && !inputRecoveryPending;
+}
+
+// [ORION_INPUT_DEAD_UX 2026-08-30] SINGLE SOURCE OF TRUTH for "a physical press
+// cannot reach the console right now". In capture-card mode the HDMI video keeps
+// flowing whatever the Chiaki INPUT session does, so a Disconnected/Error/
+// Connecting session looks completely alive on screen while every button is
+// dead (measured 08-28..08-30: 31 of 185 Square-edge epochs landed in exactly
+// such windows, worst 2m18s of active play against dead input). Both the
+// per-press "PRESS UNDELIVERABLE" forensic line and the on-screen input-dead
+// overlay MUST call this one predicate so the log and the screen can never
+// disagree. It deliberately reuses directInputWriteAllowed() — the fail-closed
+// write gate stays the authority; this only NAMES its refusal.
+//
+//   * !Running session  -> no route exists (writes are refused before Running);
+//   * Running but the direct pipe route is enabled and not connected -> the
+//     authoritative route is down (heartbeat recovery may be in flight).
+[[nodiscard]] inline constexpr bool pressUndeliverable(
+    RemotePlayState state,
+    bool inputPipeEnabled,
+    bool inputPipeConnected) noexcept
+{
+    return !directInputWriteAllowed(state)
+        || (inputPipeEnabled && !inputPipeConnected);
 }
 
 // Teardown/watchdog code may need to neutralize or relinquish a route after the
@@ -234,10 +260,82 @@ struct EngineArmDecision {
         && (state == RemotePlayState::Disconnected || state == RemotePlayState::Error);
 }
 
+// ── [ORION_DISCONNECT_AUDIT 2026-09-19] ─────────────────────────────────────
+// The three lifecycle decisions the 09-19 teardown audit added, as pure form so
+// each can be argued and regression-tested without a QProcess or a Qt GUI.
+
+// F3. A sidecar QProcess::finished belongs to a RETIRED generation when a DIFFERENT
+// process is already installed as the live one. The normal teardown is deliberately
+// NOT this case: stopSidecar() nulls the pointer before it waits, so an in-call
+// finished sees "no live process" and must still run the full crash classification
+// and sidecarExited() emission. Only a process that outlived waitForFinished +
+// taskkill /F + kill() -- and whose exit therefore lands after the 600/3000 ms
+// respawn beat installed a NEW sidecar -- may be ignored, because letting it run
+// nulls the LIVE process pointer, latches rejectLateSidecarStarted_ against the new
+// sidecar's `started`, and emits a spurious exit at the new session.
+[[nodiscard]] inline constexpr bool sidecarExitBelongsToRetiredGeneration(
+    bool haveLiveSidecarProcess,
+    bool liveSidecarProcessIsThisOne) noexcept
+{
+    return haveLiveSidecarProcess && !liveSidecarProcessIsThisOne;
+}
+
+// F7. The deferred preview->stream handoff timer. `state == Connecting` is a LEVEL,
+// not an identity: it cannot tell "still the connect that armed me" from "a later
+// connect that also happens to be Connecting". The intent generation is bumped by
+// start() and stop() ONLY -- deliberately not by the promote/recovery generations,
+// which process-level events also bump, so a late exit of the very process this
+// handoff is waiting to replace cannot cancel the handoff and strand Connecting.
+[[nodiscard]] inline constexpr bool deferredSidecarHandoffStillCurrent(
+    quint64 armedIntentGeneration,
+    quint64 currentIntentGeneration,
+    RemotePlayState state) noexcept
+{
+    return armedIntentGeneration == currentIntentGeneration
+        && state == RemotePlayState::Connecting;
+}
+
+// F8. A sidecar restart may never race a teardown. Every call site is independently
+// gated on a live session today, so this is defence in depth -- but the restart path
+// re-arms the embed watchdog that disconnectRemotePlay() just stopped and respawns
+// the sidecar, which is exactly the shape of "I pressed Disconnect and it came back".
+[[nodiscard]] inline constexpr bool sidecarRestartAllowedDuringLifecycle(
+    bool applicationShutdownActive,
+    bool remotePlayTeardownActive) noexcept
+{
+    return !applicationShutdownActive && !remotePlayTeardownActive;
+}
+
 enum class DesktopUiInputKind {
     Other,
     NavigationKey,
     MouseButton,
+    // [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] The two kinds the 2026-09-11
+    // press-edge guard never covered. Owner report: "when using the controller
+    // you can see it moving on the pc hovering over stuff" -- the visible symptom
+    // is the POINTER walking across Venice's controls and lighting up hover
+    // states, which is WM_MOUSEMOVE, not a mapped key or a click. Steam Input's
+    // desktop configuration (and DS4Windows/DualSenseX) map an analog STICK to
+    // the mouse cursor and the other stick to the wheel; neither produces the
+    // button/D-pad/trigger edge that opens the old 120 ms guard, so every such
+    // message sailed straight into the QML scene.
+    PointerMotion,
+    WheelScroll,
+};
+
+// Where a desktop UI message came from, as reported by Win32
+// GetCurrentInputMessageSource() while the message is being processed.
+//   * Hardware  -> IMO_HARDWARE: a real mouse/keyboard attached to this PC.
+//   * Injected  -> IMO_INJECTED/IMO_SYSTEM: SendInput() from another process.
+//                  Steam Input, DS4Windows and DualSenseX all translate pad
+//                  reports this way, so this is the exact discriminator between
+//                  "the owner touched his mouse" and "the pad drove the cursor".
+//   * Unknown   -> the API was unavailable or failed; fall back to the timing
+//                  guard rather than guessing.
+enum class DesktopUiInputOrigin {
+    Unknown,
+    Hardware,
+    Injected,
 };
 
 [[nodiscard]] inline constexpr bool controllerUiActivityPressEdge(
@@ -267,6 +365,120 @@ enum class DesktopUiInputKind {
         && nowMs <= guardUntilMs
         && (kind == DesktopUiInputKind::NavigationKey
             || kind == DesktopUiInputKind::MouseButton);
+}
+
+// ── [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] ───────────────────────────────
+// A stick pushed past the reader's own noise floor is the activity that drives a
+// mapped POINTER, and it never produces a press edge. normalizeHidAxis() already
+// zeroes |axis| < 8 before this sees it, so this threshold only has to clear
+// resting jitter on a worn stick; ~19 % deflection is deliberate movement.
+inline constexpr int kControllerUiStickDeflection = 24;
+// Longer than the 120 ms press guard because a mapped pointer keeps emitting
+// WM_MOUSEMOVE with its own smoothing tail after the stick recenters.
+inline constexpr qint64 kControllerUiPointerGuardMs = 220;
+
+[[nodiscard]] inline constexpr bool controllerUiPointerActivity(
+    int leftStickX,
+    int leftStickY,
+    int rightStickX,
+    int rightStickY,
+    int deflection = kControllerUiStickDeflection) noexcept
+{
+    const auto past = [deflection](int axis) noexcept {
+        return axis >= deflection || axis <= -deflection;
+    };
+    return past(leftStickX) || past(leftStickY)
+        || past(rightStickX) || past(rightStickY);
+}
+
+[[nodiscard]] inline constexpr bool desktopUiInputKindDrivesUi(
+    DesktopUiInputKind kind) noexcept
+{
+    return kind != DesktopUiInputKind::Other;
+}
+
+// The ONE decision behind the native event filter. Split by cause so each leg
+// can be argued on its own:
+//
+//   * streamActive == false           -> never suppress. Outside a live PS5
+//     session the pad is not "gameplay input" and the owner may legitimately be
+//     driving Venice with whatever Steam maps.
+//   * controllerUiModeActive == true  -> never suppress. The explicit escape
+//     hatch for any deliberately controller-driven UI (setup tour / a future
+//     "configure controller" mode) and for an owner who wants the old
+//     behaviour back (ORION_CONTROLLER_UI_PASSTHROUGH=1).
+//   * origin == Injected              -> suppress every UI-driving kind, with no
+//     timing window at all. During a live session an injected mouse/keyboard
+//     message is by construction not the owner's real mouse; this is the leg
+//     that finally covers pointer motion and the wheel, and it closes the
+//     ordering race in the old design (the mapped message could be dispatched
+//     before the 4 ms input poll observed the edge that opens the guard).
+//   * origin == Hardware -> pass while source isolation is enabled. UIAccess
+//     injection can also report hardware; test the actual mapper.
+//   * unknown origin (or source isolation disabled) -> the legacy key/click
+//     timing guard plus the stick-deflection pointer/wheel guard.
+[[nodiscard]] inline constexpr bool shouldIsolateDesktopUiInput(
+    bool streamActive,
+    bool controllerUiModeActive,
+    bool injectedIsolationEnabled,
+    DesktopUiInputOrigin origin,
+    qint64 nowMs,
+    qint64 pressGuardUntilMs,
+    qint64 pointerGuardUntilMs,
+    DesktopUiInputKind kind) noexcept
+{
+    if (!streamActive || controllerUiModeActive || !desktopUiInputKindDrivesUi(kind)) {
+        return false;
+    }
+    if (injectedIsolationEnabled) {
+        if (origin == DesktopUiInputOrigin::Injected) {
+            return true;
+        }
+        // A positive hardware-origin result is not a timing heuristic. Let the
+        // real mouse/keyboard work even while a stick keeps the guard active.
+        // Unknown origins retain the timing fallback; disabling source isolation
+        // explicitly restores the legacy heuristic for hardware-reporting mappers.
+        if (origin == DesktopUiInputOrigin::Hardware) {
+            return false;
+        }
+    }
+    switch (kind) {
+    case DesktopUiInputKind::NavigationKey:
+    case DesktopUiInputKind::MouseButton:
+        // Reuse the shipped predicate verbatim so the two can never diverge.
+        return shouldSuppressControllerMappedUiInput(
+            streamActive, nowMs, pressGuardUntilMs, kind);
+    case DesktopUiInputKind::PointerMotion:
+    case DesktopUiInputKind::WheelScroll:
+        return nowMs <= pointerGuardUntilMs;
+    case DesktopUiInputKind::Other:
+        break;
+    }
+    return false;
+}
+
+// [ORION_PAD_SILENT_HOLD 2026-09-11] Grace before the virtual pad is torn down once the
+// physical pad's report stream stops, decided by CASE:
+//   * enumerated + silent -> the pad is still on the bus. Live evidence (orion_native.log
+//     2026-09-11 20:52:13, 20:52:21, 21:07:18, 21:07:23 and eleven more in the rotated log):
+//     a USB DualSense on a port whose EnhancedPowerManagementEnabled default was still 1
+//     went silent for 4-52 s MID-PLAY with no PnP removal, then resumed on its own. The old
+//     2.5 s teardown was the only thing the console ever saw - the "random controller
+//     disconnect". The virtual pad is already submitted NEUTRAL at silence onset (the
+//     stuck-input safety), so holding it connected costs nothing: hold for 30 s and let the
+//     poll nudge the HID collection once (open + input-report poll, the same wake the
+//     connect gate uses).
+//   * not enumerated -> a real unplug (GIDC_REMOVAL). Nothing to wake; keep the 2.5 s
+//     armed / 8 s idle teardown so a Square held at unplug never stays latched.
+inline constexpr qint64 kSilentEnumeratedPadHoldMs = 30000;
+[[nodiscard]] inline constexpr qint64 silentPadTeardownGraceMs(
+    bool enumerated,
+    bool armedOrOwning) noexcept
+{
+    if (enumerated) {
+        return kSilentEnumeratedPadHoldMs;
+    }
+    return armedOrOwning ? 2500 : 8000;
 }
 
 } // namespace orion

@@ -74,3 +74,36 @@ def test_export_stats_snapshot_is_a_rate_pair():
     fps, gap = b.export_stats()
     assert 30.0 <= fps <= 46.0      # ~38 fps delivered
     assert 15.0 <= gap <= 30.0      # ~22 missing wire identities/s
+
+
+def test_decoder_cadence_stats_attributes_the_worst_publication_gap(monkeypatch):
+    """Decoder health separates pipe transfer, conversion, and ring publication."""
+    b = _backend()
+    now_ns = 10_000_000_000
+    epoch_ns = 1_750_000_000_000_000_000
+    monkeypatch.setattr("chiaki_backend.time.perf_counter_ns", lambda: now_ns)
+
+    # Tuple schema: ring QPC/epoch, seq, producer QPC, payload QPC,
+    # conversion QPC.  The final 40 ms publication gap is the worst one.
+    with b._cadence_lock:
+        b._cadence_samples.extend((
+            (now_ns - 50_000_000, epoch_ns - 50_000_000, 10,
+             now_ns - 58_000_000, now_ns - 55_000_000, now_ns - 51_000_000),
+            (now_ns - 40_000_000, epoch_ns - 40_000_000, 11,
+             now_ns - 48_000_000, now_ns - 45_000_000, now_ns - 41_000_000),
+            (now_ns, epoch_ns, 12,
+             now_ns - 12_000_000, now_ns - 9_000_000, now_ns - 2_000_000),
+        ))
+
+    stats = b.cadence_stats(window_s=5.0)
+
+    assert stats["stage_kind"] == "decoder"
+    assert stats["samples"] == 3
+    assert stats["fps"] == pytest.approx(40.0)
+    assert stats["max_gap_ms"] == pytest.approx(40.0)
+    assert stats["late_gaps"] == 1
+    assert stats["worst_gap_frame_number"] == 12
+    assert stats["worst_gap_event_ns"] == epoch_ns
+    assert stats["read_block_ms"] == pytest.approx(3.0)
+    assert stats["isolate_ms"] == pytest.approx(7.0)
+    assert stats["post_ms"] == pytest.approx(2.0)

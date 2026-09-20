@@ -1,0 +1,58 @@
+[
+  {
+    "name": "purchase",
+    "description": "Subscribe to Venice — the store link and your current license",
+    "type": 1
+  },
+  {
+    "name": "claim_trial",
+    "description": "Claim your free 3-day Venice trial (connect link arrives by DM)",
+    "type": 1
+  },
+  {
+    "name": "hwid_reset",
+    "description": "Unbind your license so you can activate on a new PC",
+    "type": 1
+  },
+  {
+    "name": "deliver",
+    "description": "STAFF: mint a license for a user (audited)",
+    "type": 1,
+    "default_member_permissions": "0",
+    "options": [
+      { "type": 6, "name": "user", "description": "recipient", "required": true },
+      { "type": 3, "name": "plan", "description": "license plan (month is the only one sold)", "required": true,
+        "choices": [
+          { "name": "month (30 days)", "value": "month" }
+        ] },
+      { "type": 3, "name": "reason", "description": "why (goes in the audit log, max 200 chars)", "required": true, "max_length": 200 },
+      { "type": 4, "name": "days", "description": "override length in days", "required": false, "min_value": 1, "max_value": 3650 }
+    ]
+  },
+  {
+    "name": "keygen",
+    "description": "STAFF (admin+): mint unassigned license keys (audited)",
+    "type": 1,
+    "default_member_permissions": "0",
+    "options": [
+      { "type": 3, "name": "plan", "description": "license plan (month is the only one sold)", "required": true,
+        "choices": [
+          { "name": "month (30 days)", "value": "month" },
+          { "name": "lifetime (staff comp — never sold)", "value": "lifetime" }
+        ] },
+      { "type": 3, "name": "reason", "description": "why (goes in the audit log, max 200 chars)", "required": true, "max_length": 200 },
+      { "type": 4, "name": "count", "description": "how many keys (1-25)", "required": false, "min_value": 1, "max_value": 25 },
+      { "type": 4, "name": "days", "description": "override length in days", "required": false, "min_value": 1, "max_value": 3650 },
+      { "type": 3, "name": "note", "description": "optional note stored with the keys", "required": false, "max_length": 200 }
+    ]
+  },
+  {
+    "name": "lookup",
+    "description": "Look up a license — your own, or (staff) another user's",
+    "type": 1,
+    "options": [
+      { "type": 6, "name": "user", "description": "Discord user to look up (staff only)", "required": false },
+      { "type": 3, "name": "key", "description": "license key (gateway bot / OrionStaff only)", "required": false, "max_length": 32 }
+    ]
+  }
+]

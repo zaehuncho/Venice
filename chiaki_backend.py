@@ -10,6 +10,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -462,48 +463,93 @@ class FrameDecoder:
 class FrameRingBuffer:
     """Lock-free-ish ring buffer for passing frames between threads.
 
-    The writer (decode thread) always succeeds - overwrites oldest frame.
+    The writer overwrites the oldest frame unless its optional age budget expired.
     The reader (CV thread) gets the latest frame without blocking.
     """
 
-    def __init__(self, capacity: int = 4) -> None:
+    def __init__(self, capacity: int = 4, *, max_frame_age_ns: int = 0) -> None:
         self._capacity = max(2, capacity)
+        # Opt-in for sources with a proven capture clock. Legacy capture routes
+        # keep their existing behavior; the decoded pipe supplies its same 50 ms
+        # budget here so waiting for this lock cannot bypass its earlier checks.
+        self._max_frame_age_ns = max(0, int(max_frame_age_ns))
         self._buffer: List[Optional[FrameData]] = [None] * self._capacity
         self._write_idx = 0
         self._read_idx = 0
+        self._ordered_source_generation = 0
+        self._ordered_capture_ns = 0
+        self.last_put_rejection = ""
         self._lock = threading.Lock()
         self._event = threading.Event()
 
-    def put(self, frame: FrameData) -> None:
+    def put(self, frame: FrameData) -> bool:
         with self._lock:
+            self.last_put_rejection = ""
             # This is the actual latest-wins publication boundary. Preserve the
             # producer/capture clock and stamp queue visibility separately so any
             # decode, copy, validation, or delayed callback time remains observable.
-            frame.publication_timestamp_ns = time.perf_counter_ns()
+            publication_ns = time.perf_counter_ns()
+            if self._max_frame_age_ns:
+                capture_ns = int(frame.capture_timestamp_ns or frame.timestamp_ns or 0)
+                if capture_ns <= 0 or publication_ns - capture_ns > self._max_frame_age_ns:
+                    self.last_put_rejection = "publication_timestamp_stale"
+                    return False
+                # Latest wins means newest SOURCE instant, not whichever copy
+                # happened to finish last. A delayed completion inside the age
+                # budget must not displace fresher pixels or emit a duplicate.
+                # Only clock-attested routes opt in; source replacement/clear
+                # resets this ordering domain. Rejected/stale reads never do.
+                if (frame.source_generation == self._ordered_source_generation
+                        and self._ordered_capture_ns > 0
+                        and capture_ns <= self._ordered_capture_ns):
+                    self.last_put_rejection = "publication_source_not_newer"
+                    return False
+                self._ordered_source_generation = frame.source_generation
+                self._ordered_capture_ns = capture_ns
+            frame.publication_timestamp_ns = publication_ns
             frame.publication_epoch_ns = time.time_ns()
             self._buffer[self._write_idx % self._capacity] = frame
             self._write_idx += 1
             self._event.set()
+            return True
 
     def get_latest(self, timeout: float = 0.05) -> Optional[FrameData]:
         """Get the most recent frame, blocking up to timeout."""
         if not self._event.wait(timeout):
             return None
         with self._lock:
-            if self._write_idx == 0:
+            # Two waiters can observe the same event before either acquires
+            # the lock. Only one consumes that publication; the other must
+            # not deliver the same sample again as a new wakeup.
+            if self._write_idx == self._read_idx:
                 return None
-            idx = (self._write_idx - 1) % self._capacity
-            frame = self._buffer[idx]
+            frame = self._latest_fresh_locked()
             self._read_idx = self._write_idx
             self._event.clear()
             return frame
 
     def get_latest_nonblocking(self) -> Optional[FrameData]:
         with self._lock:
-            if self._write_idx == 0:
+            return self._latest_fresh_locked()
+
+    def _latest_fresh_locked(self) -> Optional[FrameData]:
+        """Peek without consuming, with the same source-age budget as put()."""
+        if self._write_idx == 0:
+            return None
+        idx = (self._write_idx - 1) % self._capacity
+        frame = self._buffer[idx]
+        if frame is not None and self._max_frame_age_ns:
+            capture_ns = int(frame.capture_timestamp_ns or frame.timestamp_ns or 0)
+            if (capture_ns <= 0
+                    or time.perf_counter_ns() - capture_ns > self._max_frame_age_ns):
+                # A scheduling pause AFTER publication still ages the pixels.
+                # Do not pass them to CV, or leave a stale event causing a
+                # wakeup loop. The next put() sets a new wakeup immediately.
+                self._buffer[idx] = None
+                self._read_idx = self._write_idx
+                self._event.clear()
                 return None
-            idx = (self._write_idx - 1) % self._capacity
-            return self._buffer[idx]
+        return frame
 
     @property
     def frames_available(self) -> int:
@@ -520,6 +566,9 @@ class FrameRingBuffer:
             self._buffer = [None] * self._capacity
             self._write_idx = 0
             self._read_idx = 0
+            self._ordered_source_generation = 0
+            self._ordered_capture_ns = 0
+            self.last_put_rejection = ""
             self._event.clear()
 
 
@@ -1176,9 +1225,11 @@ class OrionFramePipeBackend:
     _VERSION = 2
     # Authoritative freshness budget. producer_monotonic_ns and arrival_perf_ns are BOTH
     # QueryPerformanceCounter samples (see orionframeexport.cpp monotonicNowNs), so this
-    # difference is a true elapsed duration and never drifts. This is the ONLY staleness
-    # test on the wire path -- see _wire_pts_reason for why PTS must not be used for one.
-    _MAX_PRODUCER_AGE_NS = 50_000_000    # producer callback -> full payload read
+    # difference is a true elapsed duration and never drifts. Check the same budget
+    # after payload arrival AND immediately before publication, so a conversion or
+    # scheduling stall cannot enqueue pixels that have already aged out.
+    # See _wire_pts_reason for why PTS must not be used as a freshness clock.
+    _MAX_PRODUCER_AGE_NS = 50_000_000    # producer callback -> frame publication
     _MAX_PRODUCER_FUTURE_NS = 2_000_000  # only QPC conversion/rounding tolerance
     # Liveness escape: no freshness gate may reject 100% of frames indefinitely. After this
     # many CONSECUTIVE rejects the monotonic baselines are re-seeded and readiness is
@@ -1208,7 +1259,10 @@ class OrionFramePipeBackend:
                  producer_identity_api=None) -> None:
         self._pipe_name = pipe_name
         self._connect_timeout_s = connect_timeout_s
-        self._ring = FrameRingBuffer(capacity=2)
+        self._ring = FrameRingBuffer(
+            capacity=2, max_frame_age_ns=self._MAX_PRODUCER_AGE_NS)
+        # Keep in-flight conversion outside this short publication/stop fence.
+        self._publication_lock = threading.Lock()
         self._keep_payload = bool(keep_payload)   # dual-capture recorder: archive raw NV12
         self._bt709 = os.environ.get("ORION_PIPE_BT709", "1").strip().lower() \
             not in ("0", "false", "no", "off")
@@ -1263,11 +1317,24 @@ class OrionFramePipeBackend:
         self._export_fps_t0 = time.perf_counter()
         self._wire_reject_counts: Dict[str, int] = {}
         self._wire_reject_last_log_s: Dict[str, float] = {}
+        # Decoder-pipe cadence attribution.  Keep only primitive timestamps on
+        # the reader hot path; the health worker copies and aggregates this
+        # bounded deque off-thread.  Each sample is:
+        #   (ring_done_qpc, ring_done_epoch, callback_seq, producer_qpc,
+        #    payload_done_qpc, conversion_done_qpc)
+        # This makes producer->pipe, conversion/isolation, and ring publication
+        # separately observable without changing frame timestamps or cadence.
+        self._cadence_lock = threading.Lock()
+        self._cadence_samples = deque(maxlen=512)
+        self._cadence_health_window_s = 5.0
         # Reusable YUV->BGR scratch, keyed by geometry.  These hold INTERMEDIATES
         # only; the returned frame is always freshly allocated because the ring
         # keeps a reference to it (the OWNDATA isolation contract in _reader_loop).
         # Measured 1080p: 6.91 ms -> 3.95 ms per frame, bit-identical output.
         self._cvt_geom: Tuple[int, int] = (0, 0)
+        self._cvt_half_geom: Tuple[int, int] = (0, 0)
+        self._cvt_u_half: Optional[np.ndarray] = None
+        self._cvt_v_half: Optional[np.ndarray] = None
         self._cvt_u_full: Optional[np.ndarray] = None
         self._cvt_v_full: Optional[np.ndarray] = None
         self._cvt_merged: Optional[np.ndarray] = None
@@ -1469,6 +1536,8 @@ class OrionFramePipeBackend:
             self._export_count = 0
             self._wire_seq_gaps = 0
             self._export_fps_t0 = time.perf_counter()
+            with self._cadence_lock:
+                self._cadence_samples.clear()
             self._ring.clear()
             self._connected = True
             self._set_producer_identity_state("pending", "")
@@ -1480,25 +1549,53 @@ class OrionFramePipeBackend:
 
     def _read_exact(self, n: int) -> Optional[bytes]:
         import win32file
-        buf = bytearray()
-        while len(buf) < n and not self._stop_evt.is_set():
+        # ReadFile already owns immutable bytes. The common complete-read path
+        # must not copy a 1080p payload into a bytearray and back into bytes.
+        # Allocate assembly storage only for a genuinely fragmented read; no
+        # packet, decoder callback, or reference frame is skipped here.
+        chunks = None
+        received = 0
+        while received < n and not self._stop_evt.is_set():
             try:
-                hr, data = win32file.ReadFile(self._handle, n - len(buf))
+                hr, data = win32file.ReadFile(self._handle, n - received)
             except Exception:
                 return None
-            if not data:
+            if not data or len(data) > n - received:
                 return None
-            buf += data
-        return bytes(buf) if len(buf) == n else None
+            if received == 0 and len(data) == n:
+                return data if type(data) is bytes else bytes(data)
+            if chunks is None:
+                chunks = []
+            # Keep ReadFile's immutable chunks and assemble exactly once.
+            # Growing a bytearray repeatedly and freezing it at the end
+            # copied every byte at least twice on fragmented 1080p reads.
+            # Freeze non-bytes providers now: they may reuse their buffer
+            # on the next read, unlike the real immutable ReadFile result.
+            chunks.append(data if type(data) is bytes else bytes(data))
+            received += len(data)
+        if received != n:
+            return None
+        return b"".join(chunks) if chunks is not None else b""
 
     def _split_planes(self, payload: bytes, w: int, h: int, fmt: int):
-        """(y, u, v) half-res chroma planes as arrays; y is a ZERO-COPY view of the payload."""
+        """Return Y and half-res chroma; NV12 chroma scratch lasts until the next call.
+
+        Y always views immutable payload bytes. The converter consumes U/V before
+        the next frame and never exposes this reusable scratch in a FrameData.
+        """
         buf = np.frombuffer(payload, dtype=np.uint8)
         y = buf[: w * h].reshape(h, w)
         if fmt == self._FMT_NV12:
-            uv = buf[w * h:].reshape(h // 2, w)
-            u = np.ascontiguousarray(uv[:, 0::2])
-            v = np.ascontiguousarray(uv[:, 1::2])
+            uv = buf[w * h:].reshape(h // 2, w // 2, 2)
+            if self._cvt_half_geom != (w, h) or self._cvt_u_half is None:
+                self._cvt_u_half = np.empty((h // 2, w // 2), dtype=np.uint8)
+                self._cvt_v_half = np.empty((h // 2, w // 2), dtype=np.uint8)
+                self._cvt_half_geom = (w, h)
+            u, v = self._cvt_u_half, self._cvt_v_half
+            # Deinterleave into stable contiguous destinations rather than
+            # allocating two strided-array copies every frame (~1 MB at 1080p).
+            # Interpolation and the BT.709 transform remain bit-for-bit unchanged.
+            cv2.mixChannels([uv], [u, v], [0, 0, 1, 1])
         elif fmt == self._FMT_I420:
             q = w * h // 4
             u = buf[w * h: w * h + q].reshape(h // 2, w // 2)
@@ -1624,37 +1721,27 @@ class OrionFramePipeBackend:
         self._wire_reject_latch_logged = False
 
     def _wire_reject_latched(self, reason: str) -> bool:
-        """Count a consecutive reject and break a 100%-reject latch.
+        """Request a fresh connection after sustained invalid frames.
 
-        No freshness gate may reject every frame indefinitely -- that is a liveness
-        bug regardless of which gate does it, and it is exactly how the PTS drift
-        latch killed the feed silently for minutes.  After
-        ``_WIRE_REJECT_REBASELINE_FRAMES`` consecutive rejects this re-seeds the
-        MONOTONIC baselines and clears readiness.
-
-        This never relaxes freshness.  Only ordering baselines are reset -- the
-        state a single bogus sample (a far-future producer stamp, a PTS jump) can
-        poison permanently so that every later frame is mis-classified.  True
-        elapsed age is re-checked against the real QPC clock on every frame by
-        _producer_timestamp_reason, and that budget is untouched, so a genuinely
-        stale producer keeps being rejected.  Returns True when the escape fired.
+        Repeated rejection is not evidence of a valid new baseline. Retain ordering
+        proof until _connect_once establishes a new source generation. Callers break
+        the reader loop on True, rather than resuming on a weakened baseline.
         """
         self._wire_consecutive_rejects += 1
         if self._wire_consecutive_rejects < self._WIRE_REJECT_REBASELINE_FRAMES:
             return False
-        self._wire_pts_last = 0
-        self._wire_producer_ts_last = 0
         self._wire_consecutive_rejects = 0
         # A reader that accepts nothing is NOT ready.  Clearing readiness makes the
         # stall fail closed loudly (the transport watchdog sees it) instead of the
         # detector starving behind a stale "ready" flag.
         self._ready_evt.clear()
+        self._ring.clear()
         if not self._wire_reject_latch_logged:
             self._wire_reject_latch_logged = True
             logger.error(
                 "OrionFramePipeBackend: %d consecutive wire rejects (latest reason=%s); "
-                "re-baselining monotonic state and clearing readiness. The freshness "
-                "budget is unchanged -- genuinely stale frames are still rejected.",
+                "retiring the pipe connection and clearing readiness. Ordering and "
+                "freshness stay enforced until a new source generation.",
                 self._WIRE_REJECT_REBASELINE_FRAMES, reason)
         return True
 
@@ -1684,12 +1771,13 @@ class OrionFramePipeBackend:
         if pts <= 0:
             return "pts_missing"
         if self._wire_pts_last > 0 and pts <= self._wire_pts_last:
-            self._wire_pts_last = pts
             return "pts_regression"
         self._wire_pts_last = pts
         return ""
 
     def _reader_loop(self) -> None:
+        connection_generation = self._connection_generation
+        handle = self._handle
         while not self._stop_evt.is_set():
             lease_reason = self._producer_lease_reason_now()
             if lease_reason:
@@ -1742,7 +1830,9 @@ class OrionFramePipeBackend:
                 break
             self._wire_producer_ts_last = producer_monotonic_ns
             payload = self._read_exact(payload_len)
-            if payload is None:
+            if (payload is None or self._stop_evt.is_set()
+                    or self._connection_generation != connection_generation
+                    or self._handle is not handle):
                 break
             # Stamp as soon as the complete wire frame is available.  Conversion can
             # cost several ms at 1080p and must be INCLUDED in downstream frame age,
@@ -1754,7 +1844,8 @@ class OrionFramePipeBackend:
                 producer_monotonic_ns, arrival_perf_ns)
             if timestamp_reason:
                 self._note_wire_reject(timestamp_reason, seq, generation)
-                self._wire_reject_latched(timestamp_reason)
+                if self._wire_reject_latched(timestamp_reason):
+                    break
                 if self._wire_seq_last and seq > self._wire_seq_last + 1:
                     self._wire_seq_gaps += (seq - self._wire_seq_last - 1)
                 self._wire_seq_last = seq
@@ -1762,7 +1853,8 @@ class OrionFramePipeBackend:
             pts_reason = self._wire_pts_reason(pts)
             if pts_reason:
                 self._note_wire_reject(pts_reason, seq, generation)
-                self._wire_reject_latched(pts_reason)
+                if self._wire_reject_latched(pts_reason):
+                    break
                 # Progress the producer sequence even for a rejected frame so the
                 # next sample cannot disguise it as a sequence discontinuity.
                 if self._wire_seq_last and seq > self._wire_seq_last + 1:
@@ -1771,7 +1863,6 @@ class OrionFramePipeBackend:
                 if pts_reason == "pts_regression":
                     break
                 continue
-            self._note_wire_accept()
             if self._accept_wire_mode(w, h, fmt):
                 # Geometry/format is part of latency provenance.  Advancing the
                 # source generation fences in-flight detection and forces a cold
@@ -1797,6 +1888,7 @@ class OrionFramePipeBackend:
                 self._export_count = 0
                 self._wire_seq_gaps = 0
                 self._export_fps_t0 = _now
+            frame_source_generation = self._source_generation
             frame = self._to_bgr(payload, w, h, fmt)
             if frame is None:
                 continue
@@ -1822,36 +1914,78 @@ class OrionFramePipeBackend:
             publication_perf_ns = time.perf_counter_ns()
             publication_epoch_ns = arrival_epoch_ns + (
                 publication_perf_ns - arrival_perf_ns)
-            self._ring.put(FrameData(frame=frame, timestamp_ns=producer_monotonic_ns,
-                                     epoch_ns=source_epoch_ns,
-                                     capture_timestamp_ns=producer_monotonic_ns,
-                                     capture_epoch_ns=source_epoch_ns,
-                                     publication_timestamp_ns=publication_perf_ns,
-                                     publication_epoch_ns=publication_epoch_ns,
-                                     frame_number=seq, pts=pts,
-                                     decode_latency_ms=(publication_perf_ns
-                                                        - producer_monotonic_ns) / 1e6,
-                                     y_plane=y_view,
-                                     payload=(payload if self._keep_payload else None),
-                                     fmt=(fmt if self._keep_payload else -1),
-                                     source_generation=self._source_generation,
-                                     producer_generation=generation,
-                                     producer_sequence=seq,
-                                     producer_timestamp_ns=producer_monotonic_ns,
-                                     arrival_timestamp_ns=arrival_perf_ns,
-                                     producer_identity_verified=(
-                                         self._producer_identity_state == "verified"),
-                                     producer_process_id=int(
-                                         self._bound_producer_expectation.pid or 0),
-                                     producer_launch_generation=int(
-                                         self._bound_producer_expectation.launch_generation or 0),
-                                     decoder_width=int(w),
-                                     decoder_height=int(h),
-                                     decoder_format=int(fmt),
-                                     integrity_isolated=True))
-            # Readiness means a complete, fresh, valid v2 frame is already in the
-            # ring -- never merely that the reader thread or named pipe exists.
-            self._ready_evt.set()
+            with self._publication_lock:
+                # stop() may complete while conversion is still in flight.
+                # Never publish/rearm readiness for that dead connection, even
+                # if a replacement has already cleared the shared stop event.
+                if (self._stop_evt.is_set()
+                        or self._connection_generation != connection_generation
+                        or self._source_generation != frame_source_generation
+                        or self._handle is not handle):
+                    break
+                # Payload arrival is not publication: conversion, ownership
+                # checks or scheduling can consume the remaining freshness
+                # budget. Drop that frame and immediately read the next one;
+                # never restamp its old pixels or introduce a smoothing queue.
+                publication_check_ns = time.perf_counter_ns()
+                timestamp_reason = self._producer_timestamp_reason(
+                    producer_monotonic_ns, publication_check_ns)
+                if timestamp_reason:
+                    reason = timestamp_reason.replace("producer_", "publication_", 1)
+                    self._note_wire_reject(reason, seq, generation)
+                    if self._wire_reject_latched(reason):
+                        break
+                    continue
+                published = self._ring.put(FrameData(frame=frame, timestamp_ns=producer_monotonic_ns,
+                                         epoch_ns=source_epoch_ns,
+                                         capture_timestamp_ns=producer_monotonic_ns,
+                                         capture_epoch_ns=source_epoch_ns,
+                                         publication_timestamp_ns=publication_perf_ns,
+                                         publication_epoch_ns=publication_epoch_ns,
+                                         frame_number=seq, pts=pts,
+                                         decode_latency_ms=(publication_check_ns
+                                                            - producer_monotonic_ns) / 1e6,
+                                         y_plane=y_view,
+                                         payload=(payload if self._keep_payload else None),
+                                         fmt=(fmt if self._keep_payload else -1),
+                                         source_generation=self._source_generation,
+                                         producer_generation=generation,
+                                         producer_sequence=seq,
+                                         producer_timestamp_ns=producer_monotonic_ns,
+                                         arrival_timestamp_ns=arrival_perf_ns,
+                                         producer_identity_verified=(
+                                             self._producer_identity_state == "verified"),
+                                         producer_process_id=int(
+                                             self._bound_producer_expectation.pid or 0),
+                                         producer_launch_generation=int(
+                                             self._bound_producer_expectation.launch_generation or 0),
+                                         decoder_width=int(w),
+                                         decoder_height=int(h),
+                                         decoder_format=int(fmt),
+                                         integrity_isolated=True))
+                if published is False:
+                    # The ring's own lock is the final visibility boundary. A
+                    # scheduling stall there can consume the remaining budget
+                    # AFTER the pre-publication check above; do not reset the
+                    # reject streak, emit cadence, or signal ready for that frame.
+                    reason = (getattr(self._ring, "last_put_rejection", "")
+                              or "publication_timestamp_stale")
+                    self._note_wire_reject(reason, seq, generation)
+                    if self._wire_reject_latched(reason):
+                        break
+                    continue
+                self._note_wire_accept()
+                ring_done_perf_ns = time.perf_counter_ns()
+                ring_done_epoch_ns = publication_epoch_ns + (
+                    ring_done_perf_ns - publication_perf_ns)
+                with self._cadence_lock:
+                    self._cadence_samples.append((
+                        ring_done_perf_ns, ring_done_epoch_ns, int(seq),
+                        int(producer_monotonic_ns), int(arrival_perf_ns),
+                        int(publication_perf_ns)))
+                # Readiness means a complete, fresh, valid v2 frame is already in the
+                # ring -- never merely that the reader thread or named pipe exists.
+                self._ready_evt.set()
         # Disconnected / stopped -> return to the _run supervisor, which closes + retries.
         return
 
@@ -1863,6 +1997,70 @@ class OrionFramePipeBackend:
         readback, and latest-wins overwrite as well as transport discontinuities.
         """
         return (self._export_fps, self._export_gap_fps)
+
+    def cadence_stats(self, window_s: Optional[float] = None) -> Dict[str, Any]:
+        """Return decoder-pipe cadence and the worst gap's local stage costs.
+
+        ``read_block_ms`` maps to producer callback -> complete pipe payload,
+        ``isolate_ms`` maps to YUV conversion plus ownership validation, and
+        ``post_ms`` maps to FrameData/ring publication.  The legacy field names
+        intentionally match the capture-card backend so the existing off-loop
+        health sink can consume both without route-specific hot-path logic.
+        """
+        try:
+            span_s = float(window_s) if window_s is not None \
+                else float(self._cadence_health_window_s)
+        except (TypeError, ValueError, OverflowError):
+            span_s = float(self._cadence_health_window_s)
+        span_ns = int(max(0.1, span_s) * 1e9)
+        now_ns = time.perf_counter_ns()
+        with self._cadence_lock:
+            snapshot = tuple(self._cadence_samples)
+        samples = tuple(
+            sample for sample in snapshot
+            if now_ns - int(sample[0]) <= span_ns
+        )
+        empty = {
+            "stage_kind": "decoder",
+            "samples": len(samples),
+            "fps": 0.0,
+            "max_gap_ms": 0.0,
+            "late_gaps": 0,
+            "worst_gap_frame_number": 0,
+            "worst_gap_event_ns": 0,
+            "read_block_ms": 0.0,
+            "isolate_ms": 0.0,
+            "post_ms": 0.0,
+        }
+        if len(samples) < 2:
+            return empty
+
+        worst_previous, worst_current = max(
+            zip(samples, samples[1:]),
+            key=lambda pair: max(0, int(pair[1][0]) - int(pair[0][0])),
+        )
+        gaps = tuple(
+            max(0, int(current[0]) - int(previous[0]))
+            for previous, current in zip(samples, samples[1:])
+        )
+        covered_s = max(1e-9, (int(samples[-1][0]) - int(samples[0][0])) / 1e9)
+        nominal_ns = 1e9 / max(1.0, float(self._config.fps or 60))
+        producer_ns = int(worst_current[3])
+        payload_done_ns = int(worst_current[4])
+        conversion_done_ns = int(worst_current[5])
+        ring_done_ns = int(worst_current[0])
+        return {
+            "stage_kind": "decoder",
+            "samples": len(samples),
+            "fps": (len(samples) - 1) / covered_s,
+            "max_gap_ms": max(gaps) / 1e6,
+            "late_gaps": sum(1 for gap in gaps if gap > nominal_ns * 1.5),
+            "worst_gap_frame_number": int(worst_current[2]),
+            "worst_gap_event_ns": int(worst_current[1]),
+            "read_block_ms": max(0, payload_done_ns - producer_ns) / 1e6,
+            "isolate_ms": max(0, conversion_done_ns - payload_done_ns) / 1e6,
+            "post_ms": max(0, ring_done_ns - conversion_done_ns) / 1e6,
+        }
 
     def _close(self) -> None:
         self._release_producer_lease()
@@ -1891,8 +2089,10 @@ class OrionFramePipeBackend:
         return self._connected and self._ready_evt.is_set()
 
     def stop(self) -> None:
-        self._stop_evt.set()
-        self._ready_evt.clear()
+        with self._publication_lock:
+            self._stop_evt.set()
+            self._ready_evt.clear()
+            self._ring.clear()
         # Synchronous ReadFile can otherwise outlive the join timeout.  Closing the
         # handle first wakes it; then wait for the supervisor to exit before return.
         self._connected = False
@@ -1940,6 +2140,23 @@ def load_chiaki_config(settings_path: Optional[str] = None) -> ChiakiConfig:
     cfg.codec = str(rp.get("codec", cfg.codec) or "h265")
     cfg.hw_decoder = str(rp.get("hw_decoder", cfg.hw_decoder) or "auto")
     cfg.chiaki_path = str(rp.get("chiaki_path", cfg.chiaki_path) or "")
+    # 2026-09-09 [ORION_CHIAKI_SESSION_OVERRIDE]: launcher-scoped overrides for the negotiated
+    # Remote Play session (resolution / fps / bitrate / codec). The app never writes a
+    # "remote_play" block, so an experiment set here survives the app's own settings saves.
+    # Used for the console-side input-latency A/B (does the PS5's input cadence follow the
+    # session fps / encode load?). Unset = unchanged.
+    _r = os.environ.get("ORION_CHIAKI_RESOLUTION", "").strip().lower()
+    if _r in ("720p", "1080p"):
+        cfg.resolution = _r
+    _f = os.environ.get("ORION_CHIAKI_FPS", "").strip()
+    if _f.isdigit():
+        cfg.fps = max(30, min(120, int(_f)))
+    _b = os.environ.get("ORION_CHIAKI_BITRATE_KBPS", "").strip()
+    if _b.isdigit():
+        cfg.bitrate_kbps = max(5000, min(100000, int(_b)))
+    _c = os.environ.get("ORION_CHIAKI_CODEC", "").strip().lower()
+    if _c in ("h264", "h265"):
+        cfg.codec = _c
     cfg.adaptive_bitrate = bool(rp.get("adaptive_bitrate", cfg.adaptive_bitrate))
     cfg.disable_nagle = bool(rp.get("disable_nagle", cfg.disable_nagle))
     cfg.force_iframe_interval = max(1, min(60, int(rp.get("force_iframe_interval", cfg.force_iframe_interval) or 8)))

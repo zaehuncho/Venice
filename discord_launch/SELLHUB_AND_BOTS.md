@@ -1,5 +1,10 @@
 # Orion — SellHub Store + Bots
 
+> **SUPERSEDED.** This is SellHub-era copy. The store is Gumroad and, since the owner's
+> 2026-09-15 rule, there is ONE plan: a free 3-day trial then **$25/month recurring**, plus a
+> one-time activation fee. No Day/Week/Lifetime tiers. See `BOT_DEPLOY_GUIDE.md` for the
+> two-product Gumroad checkout. Kept for the server/store build steps only.
+
 Three bots: **SellHub** (store + `/purchase` + auto-roles), **Wick** (security + verification), **a ticket bot** (support). Set them up in that priority. Keep all bot roles **above** `💎 Customer`/`⭐ Lifetime` so auto-role assignment works.
 
 ---

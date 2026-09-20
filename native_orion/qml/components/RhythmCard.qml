@@ -3,83 +3,73 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import OrionNative
 
-// [ORION_RHYTHM 2026-08-13] Rhythm — how long Venice holds the right stick UP on the release
-// flick, in milliseconds. Sits directly under Shot Lead because the two are the pair a user
-// actually tunes: Shot Lead decides WHEN the flick starts, this decides HOW the flick reads.
-//
-// This control already existed, buried inside the Tempo Remap card's Tuning expander, where it
-// was effectively undiscoverable. It also had a dead lower half: AutomationEngine takes
-// `std::max(flickHold, releasePulseMs)` and releasePulseMs is a fixed 50.0, so every value under
-// 50 executed as 50 with nothing in the UI saying so (this owner had 16 stored and had been
-// running 50 the whole time). The config clamp now floors at 50, so what is shown here is what
-// the engine runs -- do not lower `from` below 50 without also lowering that floor, or the dead
-// zone comes straight back.
+// Tempo is an opt-in toggle; its input selector appears only while enabled.
 Card {
     id: root
-    title: "Rhythm"
-    subtitle: "How long Venice holds the stick up on the release flick"
-    Layout.preferredHeight: col.implicitHeight + 84
+    property bool inputTimed: false
+    readonly property bool tempoOn: inputTimed ? orion.inputTimedRhythmEnabled : orion.tempoEnabled
+    readonly property string selectedPath: inputTimed ? "Button" : orion.tempoInputPath
+    title: "Tempo"
+    subtitle: "One meter timing, button or stick input"
+    Layout.preferredHeight: tempoOn ? 202 : 126
 
-    // Only meaningful when the tempo gesture owns the shot. A Button-mode shot never generates
-    // an RS-up flick, so the control is shown disabled rather than hidden: hiding it would make
-    // the setting look absent instead of inapplicable.
-    readonly property bool flickActive: orion.tempoEnabled
+    function selectPath(index) {
+        if (!root.tempoOn || root.inputTimed || (index !== 0 && index !== 1)) return
+        orion.tempoInputPath = releasePath.model[index]
+    }
 
-    ColumnLayout {
-        id: col
-        anchors.fill: parent
+    Column {
+        anchors.left: parent.left
+        anchors.right: parent.right
         spacing: 10
 
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 10
-
+        Item {
+            width: parent.width
+            height: tempoToggle.height
             Text {
-                text: "Flick"
-                color: Theme.textMuted
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.tempoOn ? "On" : "Off — standard button shots"
+                color: Theme.textSecondary
                 font.family: Theme.fontUi
-                font.pixelSize: 12
-                Layout.preferredWidth: 46
+                font.pixelSize: Theme.fontSmall
             }
-
-            Slider {
-                id: rhythmSlider
-                Layout.fillWidth: true
-                enabled: root.flickActive
-                // 50 = the engine floor (releasePulseMs). 200 covers the deliberate, slow-push
-                // end of rhythm shooting; settings.json still accepts up to 500 for anyone who
-                // wants to go further, and a stored value above 200 simply pins the handle --
-                // nothing is written back unless the user actually moves it.
-                from: 50
-                to: 200
-                stepSize: 1
-                value: Math.max(50, Math.min(200, orion.tempoFlickHoldMs))
-                onMoved: if (!pressed) orion.tempoFlickHoldMs = value
-                onPressedChanged: if (!pressed) orion.tempoFlickHoldMs = value
-            }
-
-            Text {
-                text: (rhythmSlider.pressed ? rhythmSlider.value : orion.tempoFlickHoldMs).toFixed(0) + " ms"
-                color: Theme.textPrimary
-                font.family: Theme.fontMono
-                font.pixelSize: 12
-                Layout.preferredWidth: 52
-                horizontalAlignment: Text.AlignRight
+            DashboardToggle {
+                id: tempoToggle
+                objectName: "tempoToggle"
+                anchors.right: parent.right
+                checked: root.tempoOn
+                onToggled: function(value) {
+                    if (root.inputTimed) orion.inputTimedRhythmEnabled = value
+                    else orion.tempoEnabled = value
+                }
             }
         }
 
+        DashboardCombo {
+            id: releasePath
+            objectName: "releasePathSelector"
+            width: parent.width
+            visible: root.tempoOn
+            // The shelved input-timed route is Square-only; do not expose a
+            // trigger it cannot own, or change meter settings through that card.
+            enabled: !root.inputTimed
+            model: ["Button", "Stick"]
+            value: root.selectedPath
+            onActivated: function(index) {
+                root.selectPath(index)
+                value = Qt.binding(function() { return root.selectedPath })
+            }
+        }
         Text {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
+            width: parent.width
+            visible: root.tempoOn
+            text: root.selectedPath === "Stick" ? "Hold the right stick; meter-timed tempo release"
+                  : "Hold Square; release with a stick flick"
             color: Theme.textMuted
             font.family: Theme.fontUi
-            font.pixelSize: 11
-            // [ORION_CARD_TRIM 2026-08-13] One line per state. The 50 ms floor's full rationale
-            // (a sub-frame edge can fall between console polls) lives in the file header and in
-            // AppConfig, where someone changing it will actually be looking.
-            text: root.flickActive
-                  ? "Shorter is snappier, longer more deliberate. 50 ms is the floor."
-                  : "Inactive — Tempo is off, so no stick flick is generated."
+            font.pixelSize: 10
+            wrapMode: Text.WordWrap
         }
     }
 }

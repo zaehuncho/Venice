@@ -7,10 +7,12 @@
 #include "OrionInputClient.h"
 #include "OrderedFileLogSink.h"
 #include "ControllerDeviceSelector.h"
+#include "InputSessionRetryPolicy.h"
 #include "LeaseGate.h"
 #include "LatencyRouteAttestationHandshake.h"
 #include "LicenseClient.h"
 #include "LiveMeterHudPolicy.h"
+#include "ManualShotTally.h"
 #include "MeterBoxRing.h"
 #include "MeterDelayController.h"
 #include "MeterDetector.h"
@@ -22,6 +24,8 @@
 #include "ReleaseMarkerDeliveryGate.h"
 #include "SecurityManager.h"
 #include "ShotIntentPolicy.h"
+#include "ShotVerdictTally.h"
+#include "SquareOutputWatchdog.h"
 #include "UiNotificationPolicy.h"
 #include "VeniceNetClient.h"
 #include "VirtualController.h"
@@ -40,6 +44,7 @@
 #include <QtGui/QImage>
 #include <QtQuick/QQuickImageProvider>
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -68,6 +73,34 @@ struct PreciseFireDeliverySnapshot final {
     bool pipePacketValid = false;
     quint64 routeGeneration = 0;
     LatencyControllerRoute route = LatencyControllerRoute::None;
+    // Immutable scheduler-vs-delivery timing. commandIssuedMs is the fire
+    // authority consumed by AutomationEngine. activeRouteCompleteMs remains
+    // separate so a slow local ACK/submit is observable without teaching that
+    // delay as scheduler lateness.
+    double commandIssuedMs = -1.0;
+    double activeRouteCompleteMs = -1.0;
+    double activeRouteDurationMs = -1.0;
+    OrionInputTransactionTiming pipeTiming{};
+    double fireEpochMs = -1.0;
+};
+
+// [ORION_TIP_FRAME_NATIVE 2026-09-17] What the post-submit `Release submit:` line needs in order
+// to say WHERE ON THE CONSOLE'S OWN FRAME GRID the command actually landed, snapshotted at
+// releaseIssued because the shot (and its grid) is reset long before that line is written.
+//
+// WHY THIS EXISTS. docs/POLL_PHASE_TRACKER.md §10 could prove that the SCHEDULE carried the
+// frame-centre offset and that the FIRE did not, but only by reconstructing the grid offline from
+// a different log line. One line settles it live: the grid phase of the release and its signed
+// distance to the centre it was aimed at, computed from the same GameFramePhase estimate the
+// reservation logged.
+struct ReleaseFrameGridSnapshot {
+    // The shot's own recovered grid, carried whole so the release phase is computed against the
+    // SAME estimate the reservation logged rather than a re-derived one.
+    orion::game_frame_phase::Estimate grid{};
+    QString fireTargetMode;    // "frame_centre" | "instant" | empty (never reached a vision arm)
+    double leadMs = -1.0;      // the lead THIS shot's arm spent; the command lands lead ms later
+    double alignedFireAtMs = -1.0;    // the instant the armed token was aiming at
+    double unalignedFireAtMs = -1.0;  // what the bare tip alone would have armed
 };
 
 // Cached WinMM axis ranges (JOYCAPS wXmin/wXmax etc.) so the per-tick WinMM fast path can
@@ -123,6 +156,40 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(bool authenticated READ authenticated NOTIFY authChanged)
     Q_PROPERTY(bool authBusy READ authBusy NOTIFY authChanged)
     Q_PROPERTY(QString authMessage READ authMessage NOTIFY authChanged)
+    // MOTD (docs/ADMIN_PANEL_V2_CONTRACT.md §5): the owner's notice, carried by the
+    // /api/license/check heartbeat and /api/version as `motd {text, level, until}`.
+    // RemotePlayPage shows it in the top-centre banner slot while motdVisible is
+    // true: text present, not past `until`, and not dismissed. Dismissal lives in
+    // memory only (never in settings) and a changed text re-shows the banner.
+    Q_PROPERTY(QString motdText READ motdText NOTIFY motdChanged)
+    Q_PROPERTY(QString motdLevel READ motdLevel NOTIFY motdChanged)   // info | warn | maint
+    Q_PROPERTY(double motdUntil READ motdUntil NOTIFY motdChanged)    // Unix seconds; 0 == no expiry
+    Q_PROPERTY(bool motdVisible READ motdVisible NOTIFY motdChanged)
+    // ── Licence / profile facts (bound by the Sidebar licence strip + flyout) ─────────────────────────────────
+    // The backend's `profile` block on /api/activate + every /api/license/check
+    // heartbeat (LicenseProfile, LicenseClient.h), refreshed on both. The CURRENT
+    // live Lambda does not send one, so every property here reads as its
+    // empty/zero default until the new backend ships — the page must render
+    // either way. `profileKnown` is the honest "the server actually told us".
+    Q_PROPERTY(bool profileKnown READ profileKnown NOTIFY profileChanged)
+    Q_PROPERTY(QString profileDiscordId READ profileDiscordId NOTIFY profileChanged)
+    Q_PROPERTY(QString profileDiscordName READ profileDiscordName NOTIFY profileChanged)
+    Q_PROPERTY(QString profilePlan READ profilePlan NOTIFY profileChanged)
+    Q_PROPERTY(double profileExpiryEpochS READ profileExpiryEpochS NOTIFY profileChanged)
+    // Whole days remaining, rounded UP (a licence with 4 h left still says "1").
+    //   -1 == unknown (no profile yet)      -2 == lifetime (no expiry)
+    // profileLifetime is the same fact as a bool so QML can branch without
+    // hard-coding the sentinel.
+    Q_PROPERTY(int profileDaysLeft READ profileDaysLeft NOTIFY profileChanged)
+    Q_PROPERTY(bool profileLifetime READ profileLifetime NOTIFY profileChanged)
+    Q_PROPERTY(double profileActivatedEpochS READ profileActivatedEpochS NOTIFY profileChanged)
+    Q_PROPERTY(int profileHwidResetsUsed READ profileHwidResetsUsed NOTIFY profileChanged)
+    Q_PROPERTY(int profileHwidResetsFreeTotal READ profileHwidResetsFreeTotal NOTIFY profileChanged)
+    Q_PROPERTY(int profileHwidResetsFreeRemaining READ profileHwidResetsFreeRemaining NOTIFY profileChanged)
+    Q_PROPERTY(int profileHwidPaidCredits READ profileHwidPaidCredits NOTIFY profileChanged)
+    // Support identity for the Profile page's "Machine" row. Suffix only — the
+    // full fingerprint stays native-side, exactly like licenseKeyMasked.
+    Q_PROPERTY(QString machineIdMasked READ machineIdMasked NOTIFY authChanged)
     // Zero-typing activation: a license key delivered via the orion://activate?key=...
     // deep link (protocol handler in main.cpp). AuthGate pre-fills its key field from
     // this; cleared once consumed. Never auto-submits — the user still clicks Unlock.
@@ -188,6 +255,22 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     // part of the meter-box/detection overlay family. Own notify signal so the
     // per-press flip never rides the statusChanged fan-out.
     Q_PROPERTY(bool physicalSquarePressed READ physicalSquarePressed NOTIFY physicalSquarePressedChanged)
+    // [ORION_INPUT_DEAD_UX 2026-08-30] The "video alive, input dead" trap, surfaced. In
+    // capture-card mode the HDMI feed keeps playing whatever the Chiaki input session does, so a
+    // failed promotion / dropped session leaves the game looking perfectly alive while every
+    // button press is dead (owner: "sometimes the bot won't shoot even when holding square.
+    // That must NOT happen"). These properties drive the unmissable overlay on the live preview.
+    // The CORE condition is orion::pressUndeliverable() — the exact predicate the per-press
+    // "PRESS UNDELIVERABLE" forensic line evaluates — so the log and the screen cannot disagree.
+    //   inputDeadOverlayActive: show the overlay (input undeliverable + live video + the player
+    //                           either asked for a session or just pressed into dead input);
+    //   inputDeadCritical:      terminal dead state (red, screaming) vs Connecting (amber note);
+    //   inputDeadHeadline/Detail: what is happening + what will fix it (retrying / press
+    //                           Connect / console waking / recovering input link).
+    Q_PROPERTY(bool inputDeadOverlayActive READ inputDeadOverlayActive NOTIFY inputDeliveryStateChanged)
+    Q_PROPERTY(bool inputDeadCritical READ inputDeadCritical NOTIFY inputDeliveryStateChanged)
+    Q_PROPERTY(QString inputDeadHeadline READ inputDeadHeadline NOTIFY inputDeliveryStateChanged)
+    Q_PROPERTY(QString inputDeadDetail READ inputDeadDetail NOTIFY inputDeliveryStateChanged)
     Q_PROPERTY(QString controllerLedStatus READ controllerLedStatus NOTIFY statusChanged)
     Q_PROPERTY(QString chiakiEmbedStatus READ chiakiEmbedStatus NOTIFY statusChanged)
     Q_PROPERTY(bool qmlRenderMode READ qmlRenderMode NOTIFY statusChanged)
@@ -205,6 +288,7 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
 
     Q_PROPERTY(QString consoleIp READ consoleIp WRITE setConsoleIp NOTIFY settingsChanged)
     Q_PROPERTY(QString remotePlayConsole READ remotePlayConsole WRITE setRemotePlayConsole NOTIFY settingsChanged)
+    Q_PROPERTY(QString xboxRemotePlayWindowTitle READ xboxRemotePlayWindowTitle WRITE setXboxRemotePlayWindowTitle NOTIFY settingsChanged)
     Q_PROPERTY(bool streamSetupComplete READ streamSetupComplete NOTIFY settingsChanged)
     // First-run preflight wizard (capture card / Remote Play / test shot) finished or
     // skipped once. AppShell auto-opens the wizard while this is false.
@@ -212,6 +296,10 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(bool legalAccepted READ legalAccepted NOTIFY settingsChanged)
     Q_PROPERTY(QString videoSource READ videoSource WRITE setVideoSource NOTIFY settingsChanged)
     Q_PROPERTY(int captureCardIndex READ captureCardIndex WRITE setCaptureCardIndex NOTIFY settingsChanged)
+    // [ORION_CAPTURE_FPS 2026-09-14] Capture-card refresh rate. The setter SNAPS to {30, 60, 120}
+    // (AppConfigData::snappedCaptureCardFps), so QML can only ever persist a rate the card can be
+    // asked for. Reaches the sidecar as ORION_CAPTURE_FPS.
+    Q_PROPERTY(int captureCardFps READ captureCardFps WRITE setCaptureCardFps NOTIFY settingsChanged)
     Q_PROPERTY(QStringList captureDeviceList READ captureDeviceList NOTIFY captureDevicesChanged)
     Q_PROPERTY(bool hardwareDecode READ hardwareDecode WRITE setHardwareDecode NOTIFY settingsChanged)
     Q_PROPERTY(QString controllerType READ controllerType WRITE setControllerType NOTIFY settingsChanged)
@@ -295,9 +383,19 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(QString tempoInputSource READ tempoInputSource WRITE setTempoInputSource NOTIFY settingsChanged)
     Q_PROPERTY(QString tempoRemapType READ tempoRemapType WRITE setTempoRemapType NOTIFY settingsChanged)
     Q_PROPERTY(double tempoWaitMs READ tempoWaitMs WRITE setTempoWaitMs NOTIFY settingsChanged)
+    // [ORION_RHYTHM_FLICK_DELAY 2026-09-14] Rhythm flick trim, -50..+50 ms. POSITIVE fires the
+    // right-stick flick LATER, negative earlier, and it applies ONLY to a shot whose release will
+    // actually be the flick (AutomationEngine::rhythmFlickReleasePending()). A trim on top of
+    // Shot Lead, never a lead of its own.
+    Q_PROPERTY(double rhythmFlickDelayMs READ rhythmFlickDelayMs WRITE setRhythmFlickDelayMs NOTIFY settingsChanged)
     Q_PROPERTY(double tempoFallbackMs READ tempoFallbackMs WRITE setTempoFallbackMs NOTIFY settingsChanged)
     Q_PROPERTY(double tempoFlickHoldMs READ tempoFlickHoldMs WRITE setTempoFlickHoldMs NOTIFY settingsChanged)
     Q_PROPERTY(double tempoMinStickHoldMs READ tempoMinStickHoldMs WRITE setTempoMinStickHoldMs NOTIFY settingsChanged)
+    // [ORION_TEMPO_RELEASE_STYLE 2026-09-15 owner] Rhythm's release EDGE: "flick" (the opposing
+    // full-scale RS deflection every build before this shipped) or "letgo" (the stick driven to
+    // neutral at the same instant, so the player keeps holding down and Venice lets go for them).
+    // Ignore-unknown on the way in: anything else leaves the current style alone.
+    Q_PROPERTY(QString tempoReleaseStyle READ tempoReleaseStyle WRITE setTempoReleaseStyle NOTIFY settingsChanged)
 
     Q_PROPERTY(QString shotState READ shotState NOTIFY statusChanged)
     Q_PROPERTY(QString activeBotShotType READ activeBotShotType NOTIFY statusChanged)
@@ -437,6 +535,12 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     // the physical controller edge) and cleared by the first genuine raw detection.
     Q_PROPERTY(bool meterBlindWarning READ meterBlindWarning NOTIFY meterBlindChanged)
     Q_PROPERTY(QString meterBlindHint READ meterBlindHint NOTIFY meterBlindChanged)
+    // Reader detector health for the Meter Detection card (PRESENTATION ONLY). Fed by the
+    // sidecar's {"event":"detector_health"} line every ~2 s; formatted here into one compact
+    // mono line ("Pure CV · 1.2 ms · locked · locks 12 · refused 3") plus the raw provider
+    // id. Own low-fanout signal: it moves every couple of seconds and has one subscriber.
+    Q_PROPERTY(QString detectorHealthLine READ detectorHealthLine NOTIFY detectorHealthChanged)
+    Q_PROPERTY(QString detectorProvider READ detectorProvider NOTIFY detectorHealthChanged)
     Q_PROPERTY(QString shotMode READ shotMode NOTIFY statusChanged)
     Q_PROPERTY(int meterRejectedBoxX READ meterRejectedBoxX NOTIFY meterBoxChanged)
     Q_PROPERTY(int meterRejectedBoxY READ meterRejectedBoxY NOTIFY meterBoxChanged)
@@ -457,6 +561,56 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     // Session verdict tally (graded shots only) for the Live Shot green-rate readout.
     Q_PROPERTY(int sessionVerdicts READ sessionVerdicts NOTIFY statusChanged)
     Q_PROPERTY(int sessionGreens READ sessionGreens NOTIFY statusChanged)
+    // User-entered game results, not inferred greens or a calibration input.
+    Q_PROPERTY(int manualShotMakes READ manualShotMakes NOTIFY manualShotTallyChanged)
+    Q_PROPERTY(int manualShotMisses READ manualShotMisses NOTIFY manualShotTallyChanged)
+    Q_PROPERTY(int manualShotTotal READ manualShotTotal NOTIFY manualShotTallyChanged)
+    // ═══════════════════════════════════════════════════════════════════════
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14 owner] The live shot-verdict tally, read off the
+    // GAME'S OWN feedback banner by the sidecar (RemotePlaySession::bannerVerdict) and
+    // rolled over the LAST 10 shots by ShotVerdictTally. This is the answer to "can't tell
+    // if I found my value or not because sometimes it's green": the owner does not have to
+    // count banners any more, and the suggestion line names the direction to move.
+    //
+    // PRESENTATION ONLY: nothing here reaches the engine, the telemetry snapshot or any
+    // timing path. The window is auto-cleared on every committed Release timing / fade trim
+    // / Shot Lead change, so the tally always describes the CURRENT value.
+    //
+    // Its own low-fanout notifier (NOT statusChanged): it changes about once per shot and
+    // has exactly two subscribers, the ShotVerdictTally mounts on NoMeterCard and ShotLeadCard.
+    Q_PROPERTY(int bannerGreen10 READ bannerGreen10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(int bannerEarly10 READ bannerEarly10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(int bannerLate10 READ bannerLate10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(int bannerOther10 READ bannerOther10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(int bannerCount10 READ bannerCount10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(int bannerContested10 READ bannerContested10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(QString bannerLastTiming READ bannerLastTiming NOTIFY bannerTallyChanged)
+    Q_PROPERTY(QString bannerLastCoverage READ bannerLastCoverage NOTIFY bannerTallyChanged)
+    // One char per verdict, oldest -> newest (g/e/l/o) for the 10-dot strip.
+    Q_PROPERTY(QString bannerPattern10 READ bannerPattern10 NOTIFY bannerTallyChanged)
+    Q_PROPERTY(QString bannerSuggestion READ bannerSuggestion NOTIFY bannerTallyChanged)
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15 owner] The bounded closed loop's own two properties.
+    // `bannerLeadTrimMs` is the additive term the banner loop has earned for the CURRENT display
+    // bucket (Standstill -- the reference type, and the one the owner tunes on), in ms; the card
+    // shows one caption under the slider and hides it at 0. Read-only by construction: this is
+    // EVIDENCE, and the owner's own slider value is never touched by it.
+    Q_PROPERTY(double bannerLeadTrimMs READ bannerLeadTrimMs NOTIFY bannerLeadTrimChanged)
+    Q_PROPERTY(bool bannerLeadTrimEnabled READ bannerLeadTrimEnabled
+                   NOTIFY bannerLeadTrimChanged)
+    // [ORION_LEAD_AUTO_SEED 2026-09-15 owner] The plug-and-play Shot Lead, for the ONE caption
+    // under the slider on an install nobody has tuned. `leadAutoSeedActive` is false the moment
+    // the owner sets a value of their own (the caption disappears and their number rules);
+    // `leadAutoSeedKind` is "measured" once this rig's latency estimator is authoritative and
+    // "placeholder" until then, which is the difference between "measured latency 208 ms + 69 ms
+    // margin" and "calibrating...". Read-only by construction: the seed is DERIVED, and
+    // actuation_lead_ms is never written by it.
+    Q_PROPERTY(bool leadAutoSeedActive READ leadAutoSeedActive NOTIFY leadAutoSeedChanged)
+    Q_PROPERTY(double leadAutoSeedMs READ leadAutoSeedMs NOTIFY leadAutoSeedChanged)
+    Q_PROPERTY(QString leadAutoSeedKind READ leadAutoSeedKind NOTIFY leadAutoSeedChanged)
+    Q_PROPERTY(double leadAutoSeedMeasuredMs READ leadAutoSeedMeasuredMs
+                   NOTIFY leadAutoSeedChanged)
+    Q_PROPERTY(double leadAutoSeedMarginMs READ leadAutoSeedMarginMs
+                   NOTIFY leadAutoSeedChanged)
     Q_PROPERTY(bool wifiModeActive READ wifiModeActive NOTIFY telemetryChanged)
     // Defense Mode: physical-pad toggle disarms shot automation (pass-through).
     Q_PROPERTY(bool defenseModeActive READ defenseModeActive NOTIFY statusChanged)
@@ -474,6 +628,9 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(bool safeModeActive READ safeModeActive NOTIFY statusChanged)
     Q_PROPERTY(QString safeModeReason READ safeModeReason NOTIFY statusChanged)
     Q_PROPERTY(QString logText READ logText NOTIFY logsChanged)
+    // Customer Activity feed (engineering telemetry removed). Shares logsChanged:
+    // both rings are published on the same 200 ms flush beat.
+    Q_PROPERTY(QString activityText READ activityText NOTIFY logsChanged)
     Q_PROPERTY(bool coreActive READ coreActive NOTIFY statusChanged)
     Q_PROPERTY(QString scriptState READ scriptState NOTIFY statusChanged)
     Q_PROPERTY(QString scriptDetail READ scriptDetail NOTIFY statusChanged)
@@ -492,6 +649,10 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(QString statusAge READ statusAge NOTIFY statusAgeChanged)
     Q_PROPERTY(QString netSyncReason READ netSyncReason NOTIFY statusChanged)
     Q_PROPERTY(QString meterStyle READ meterStyle WRITE setMeterStyle NOTIFY settingsChanged)
+    // Meter box proposer ("cv" | "yolo") — the Meter Detection card's Detector combo.
+    // Exported to the sidecar as ORION_METER_PROPOSER at launch; a change applies to
+    // the next sidecar launch (the locator singleton reads it once).
+    Q_PROPERTY(QString meterProposer READ meterProposer WRITE setMeterProposer NOTIFY settingsChanged)
     Q_PROPERTY(QString meterColor READ meterColor WRITE setMeterColor NOTIFY settingsChanged)
     Q_PROPERTY(bool meterEnabled READ meterEnabled WRITE setMeterEnabled NOTIFY settingsChanged)
     Q_PROPERTY(bool autoMeterColor READ autoMeterColor WRITE setAutoMeterColor NOTIFY settingsChanged)
@@ -521,6 +682,7 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     // (learning ON); Manual = locked to the slider values (frozen). Inverse of freezeCalibration.
     Q_PROPERTY(bool autoTune READ autoTune WRITE setAutoTune NOTIFY settingsChanged)
     Q_PROPERTY(bool tempoEnabled READ tempoEnabled WRITE setTempoEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(QString tempoInputPath READ tempoInputPath WRITE setTempoInputPath NOTIFY settingsChanged)
     Q_PROPERTY(bool noDipEnabled READ noDipEnabled WRITE setNoDipEnabled NOTIFY settingsChanged)
     Q_PROPERTY(double noDipLeadMs READ noDipLeadMs WRITE setNoDipLeadMs NOTIFY settingsChanged)
     // [ORION_USER_LEAD] Shot Lead — the single user-facing timing control. actuationLeadMs is the
@@ -540,6 +702,12 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
                    WRITE setMeterDelayLeadOffsetMs NOTIFY settingsChanged)
     Q_PROPERTY(double meterDelayLeadOffsetMaxMs READ meterDelayLeadOffsetMaxMs
                    NOTIFY settingsChanged)
+    // [ORION_METER_DELAY_LEAD_AUTO 2026-09-10] The delay the current Shot Lead can absorb while
+    // tip shots stay schedulable (ceiling - lead), and the offset the engine is adding right
+    // now (0 = auto follows the applied delay). Presentation only.
+    Q_PROPERTY(double meterDelayMaxUsableMs READ meterDelayMaxUsableMs NOTIFY settingsChanged)
+    Q_PROPERTY(double meterDelayLeadOffsetAppliedMs READ meterDelayLeadOffsetAppliedMs
+                   NOTIFY meterDelayStatusTextChanged)
     // [ORION_LEAD_CALIBRATION] Guided lead calibration. Everything else in the timing stack
     // self-tunes -- the animation constant is learned per jumpshot and persisted -- but the LEAD
     // is this machine's capture-to-screen latency, and capture hardware varies enormously between
@@ -617,6 +785,29 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     // measurement yet. Shown on the Tip Timing card beside a diverging manual value; consumed
     // by nothing on the decision path.
     Q_PROPERTY(double tipTimingMeasuredMs READ tipTimingMeasuredMs NOTIFY tipTimingChanged)
+    Q_PROPERTY(bool inputTimedEnabled READ inputTimedEnabled WRITE setInputTimedEnabled NOTIFY settingsChanged)
+    Q_PROPERTY(bool inputTimedPaused READ inputTimedPaused WRITE setInputTimedPaused NOTIFY settingsChanged)
+    Q_PROPERTY(double inputTimedDelayMs READ inputTimedDelayMs WRITE setInputTimedDelayMs NOTIFY settingsChanged)
+    Q_PROPERTY(double inputTimedLeadMs READ inputTimedLeadMs WRITE setInputTimedLeadMs NOTIFY settingsChanged)
+    Q_PROPERTY(bool inputTimedRhythmEnabled READ inputTimedRhythmEnabled WRITE setInputTimedRhythmEnabled NOTIFY settingsChanged)
+    // [ORION_NO_METER_V2 2026-09-14 owner] THE NO METER control: the reference press->release
+    // hold in ms (500..800). The card presents it as a 1..100 slider over 500 + 3*(v-1).
+    Q_PROPERTY(double noMeterHoldMs READ noMeterHoldMs WRITE setNoMeterHoldMs NOTIFY settingsChanged)
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14 owner] The fade-only trim in ms (-60..+60, 0 = the
+    // shipped Δ). The card presents it as a -20..+20 slider at 3 ms a step.
+    Q_PROPERTY(double noMeterFadeTrimMs READ noMeterFadeTrimMs WRITE setNoMeterFadeTrimMs NOTIFY settingsChanged)
+    // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] The console's input-sampling period (ms)
+    // and the snap switch, exposed so the card can show the LIVE frame count under a drag
+    // (settingsChanged only fires on commit) using the engine's own arithmetic.
+    Q_PROPERTY(double consoleFrameMs READ consoleFrameMs NOTIFY settingsChanged)
+    Q_PROPERTY(bool noMeterFrameQuantize READ noMeterFrameQuantize NOTIFY settingsChanged)
+    // The COMMITTED Standstill hold as the console will actually see it: whole frames, and the
+    // millisecond that count is worth. These are what the card's caption reads between drags.
+    Q_PROPERTY(int noMeterHoldFrames READ noMeterHoldFrames NOTIFY settingsChanged)
+    Q_PROPERTY(double noMeterHoldSnappedMs READ noMeterHoldSnappedMs NOTIFY settingsChanged)
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14 owner] ON (default): in NO METER mode the blind
+    // hold is the DEADLINE and vision owns any release it can actually see. OFF: pure blind.
+    Q_PROPERTY(bool noMeterVisionAssist READ noMeterVisionAssist WRITE setNoMeterVisionAssist NOTIFY settingsChanged)
     Q_PROPERTY(bool noMeterEnabled READ noMeterEnabled WRITE setNoMeterEnabled NOTIFY settingsChanged)
     Q_PROPERTY(QString noMeterReleasePoint READ noMeterReleasePoint WRITE setNoMeterReleasePoint NOTIFY settingsChanged)
     Q_PROPERTY(double noMeterBaseOffsetMs READ noMeterBaseOffsetMs WRITE setNoMeterBaseOffsetMs NOTIFY settingsChanged)
@@ -695,6 +886,63 @@ public:
     [[nodiscard]] bool authenticated() const noexcept { return authenticated_; }
     [[nodiscard]] bool authBusy() const noexcept { return authBusy_; }
     [[nodiscard]] QString authMessage() const noexcept { return authMessage_; }
+    [[nodiscard]] QString motdText() const noexcept { return motd_.text; }
+    [[nodiscard]] QString motdLevel() const noexcept { return motd_.level; }
+    [[nodiscard]] double motdUntil() const noexcept { return static_cast<double>(motd_.untilEpochS); }
+    [[nodiscard]] bool motdVisible() const;
+    // Hides the current MOTD for this process only; the next notice with a
+    // different text shows again.
+    Q_INVOKABLE void dismissMotd();
+    // ── Profile page accessors (see the Q_PROPERTY block above) ──────────────
+    [[nodiscard]] bool profileKnown() const noexcept { return profile_.known; }
+    [[nodiscard]] QString profileDiscordId() const noexcept { return profile_.discordUserId; }
+    [[nodiscard]] QString profileDiscordName() const noexcept { return profile_.discordUsername; }
+    [[nodiscard]] QString profilePlan() const noexcept { return profile_.plan; }
+    [[nodiscard]] double profileExpiryEpochS() const noexcept
+    {
+        return static_cast<double>(profile_.expiryEpochS);
+    }
+    [[nodiscard]] bool profileLifetime() const noexcept { return profile_.lifetime(); }
+    [[nodiscard]] int profileDaysLeft() const noexcept;
+    [[nodiscard]] double profileActivatedEpochS() const noexcept
+    {
+        return static_cast<double>(profile_.activatedAtEpochS);
+    }
+    [[nodiscard]] int profileHwidResetsUsed() const noexcept { return profile_.hwidResetsUsed; }
+    [[nodiscard]] int profileHwidResetsFreeTotal() const noexcept
+    {
+        return profile_.hwidResetsFreeTotal;
+    }
+    [[nodiscard]] int profileHwidResetsFreeRemaining() const noexcept
+    {
+        return profile_.hwidResetsFreeRemaining;
+    }
+    [[nodiscard]] int profileHwidPaidCredits() const noexcept { return profile_.hwidPaidCredits; }
+    [[nodiscard]] QString machineIdMasked() const;
+    // Puts the Discord user id on the clipboard (it is the handle support asks
+    // for). No-op with a log line when the backend has not sent one.
+    Q_INVOKABLE void copyProfileDiscordId();
+    // Pure policy shared by profileDaysLeft() and the timeLeft strings, so the
+    // hero number on Profile and the "Time left" row can never disagree.
+    // nowEpochS == 0 is treated as "no clock"; expiry <= 0 with known == true is
+    // LIFETIME. Exposed static for the unit test (the suite never constructs a
+    // controller — see MeterDelaySettingsPropertyTests.cpp's header note).
+    [[nodiscard]] static int licenseDaysLeft(bool known, qint64 expiryEpochS,
+                                             qint64 nowEpochS) noexcept
+    {
+        if (!known) {
+            return -1;
+        }
+        if (expiryEpochS <= 0) {
+            return -2;   // lifetime
+        }
+        const qint64 remaining = expiryEpochS - nowEpochS;
+        if (remaining <= 0) {
+            return 0;
+        }
+        // Round UP: four hours left is still a day the customer can play.
+        return static_cast<int>((remaining + 86399) / 86400);
+    }
     [[nodiscard]] QString licenseState() const noexcept { return licenseState_; }
     [[nodiscard]] QString serverState() const noexcept { return serverState_; }
     [[nodiscard]] QString updateState() const noexcept { return updateState_; }
@@ -756,6 +1004,14 @@ public:
     [[nodiscard]] bool controllerUsbPowerFixAvailable() const noexcept { return controllerUsbPowerFixAvailable_; }
     [[nodiscard]] double controllerLastInputAgeMs() const noexcept { return controllerLastInputAgeMs_; }
     [[nodiscard]] bool physicalSquarePressed() const noexcept { return pressedOverlayLatch_.held(); }
+    [[nodiscard]] bool inputDeadOverlayActive() const noexcept {
+        return inputDeadSeverity_ != InputDeadSeverity::None;
+    }
+    [[nodiscard]] bool inputDeadCritical() const noexcept {
+        return inputDeadSeverity_ == InputDeadSeverity::Critical;
+    }
+    [[nodiscard]] QString inputDeadHeadline() const noexcept { return inputDeadHeadline_; }
+    [[nodiscard]] QString inputDeadDetail() const noexcept { return inputDeadDetail_; }
     [[nodiscard]] QString controllerLedStatus() const noexcept { return controllerLedStatus_; }
     [[nodiscard]] QString chiakiEmbedStatus() const noexcept { return chiakiEmbedStatus_; }
     [[nodiscard]] bool qmlRenderMode() const noexcept { return qmlRenderMode_; }
@@ -767,6 +1023,10 @@ public:
 
     [[nodiscard]] QString consoleIp() const noexcept { return config_.data().remotePlayConsoleIp; }
     [[nodiscard]] QString remotePlayConsole() const noexcept { return config_.data().remotePlayConsole; }
+    [[nodiscard]] QString xboxRemotePlayWindowTitle() const { return config_.data().xboxRemotePlayWindowTitle; }
+    void setXboxRemotePlayWindowTitle(const QString& value);
+    Q_INVOKABLE QStringList xboxRemotePlayWindows() const;
+    Q_INVOKABLE void openXboxRemotePlay();
     [[nodiscard]] bool streamSetupComplete() const noexcept { return config_.data().streamSetupComplete; }
     [[nodiscard]] bool preflightComplete() const noexcept { return config_.data().preflightComplete; }
     [[nodiscard]] QString pendingActivationKey() const noexcept { return pendingActivationKey_; }
@@ -774,8 +1034,9 @@ public:
     [[nodiscard]] bool legalAccepted() const noexcept {
         return config_.data().legalAcceptedVersion >= AppConfigData::kCurrentLegalVersion;
     }
-    [[nodiscard]] QString videoSource() const noexcept { return config_.data().videoSource; }
+    [[nodiscard]] QString videoSource() const noexcept { return isXboxRemotePlay(config_.data()) ? QStringLiteral("wgc") : config_.data().videoSource; }
     [[nodiscard]] int captureCardIndex() const noexcept { return config_.data().captureCardIndex; }
+    [[nodiscard]] int captureCardFps() const noexcept { return config_.data().captureCardFps; }
     [[nodiscard]] QStringList captureDeviceList() const { return captureDeviceList_; }
     [[nodiscard]] bool hardwareDecode() const noexcept { return config_.data().hardwareDecode; }
     [[nodiscard]] QString controllerType() const noexcept { return config_.data().controllerType; }
@@ -877,8 +1138,10 @@ public:
     [[nodiscard]] QString tempoInputSource() const noexcept { return config_.data().remotePlayInputSource; }
     [[nodiscard]] QString tempoRemapType() const noexcept { return config_.data().tempoRemapType; }
     [[nodiscard]] double tempoWaitMs() const noexcept { return config_.data().tempoWaitMs; }
+    [[nodiscard]] double rhythmFlickDelayMs() const noexcept { return config_.data().rhythmFlickDelayMs; }
     [[nodiscard]] double tempoFallbackMs() const noexcept { return config_.data().tempoFallbackTimeoutMs; }
     [[nodiscard]] double tempoFlickHoldMs() const noexcept { return config_.data().tempoFlickHoldMs; }
+    [[nodiscard]] QString tempoReleaseStyle() const { return config_.data().tempoReleaseStyle; }
     [[nodiscard]] double tempoMinStickHoldMs() const noexcept { return config_.data().tempoMinStickHoldMs; }
 
     [[nodiscard]] QString shotState() const noexcept { return shotState_; }
@@ -901,18 +1164,18 @@ public:
     // meter exists), this can never paint a lock on a stale or distractor bbox during an idle hold.
     [[nodiscard]] bool meterConfirmed() const noexcept { return meterConfirmed_; }
     [[nodiscard]] bool meterBlindWarning() const noexcept { return meterBlindWarning_; }
-    // Names the colour currently configured and the one to try instead. Red and Purple are the
-    // only supported bar colours (see meter_bar_colors.SUPPORTED), so the alternative is always
-    // the other one.
+    // [2026-09-14 owner] Generic. This used to name a colour and offer "the other one" — a
+    // Red/Purple choice inherited from 2K26. 2K27's meter is WHITE, the Style picker (Pill vs
+    // Straight) is at least as likely to be the mismatch, and the old wording sent the owner to
+    // change a setting that was already correct. The card's Style and Color controls sit
+    // directly above this line, so naming them is the whole instruction.
     [[nodiscard]] QString meterBlindHint() const
     {
-        const bool isRed = config_.data().meterColor.compare(
-            QLatin1String("Red"), Qt::CaseInsensitive) == 0;
         return QStringLiteral(
-                   "Detection is set to %1. If your in-game shot meter is %2, change Color above.")
-            .arg(isRed ? QStringLiteral("Red") : QStringLiteral("Purple"),
-                 isRed ? QStringLiteral("Purple") : QStringLiteral("Red"));
+            "Check the Style and Color settings match your in-game meter.");
     }
+    [[nodiscard]] QString detectorHealthLine() const { return detectorHealthLine_; }
+    [[nodiscard]] QString detectorProvider() const { return detectorProvider_; }
     // Shot mode for the overlay readout (TARGET is always the tip; only the label differs).
     [[nodiscard]] QString shotMode() const noexcept {
         if (shot_.mode == ShotMode::TempoSquare || shot_.mode == ShotMode::TempoStick)
@@ -1013,6 +1276,11 @@ public:
     [[nodiscard]] int shotsReleased() const noexcept { return automation_.shotsReleased(); }
     [[nodiscard]] int shotsAborted() const noexcept { return automation_.shotsAborted(); }
     [[nodiscard]] QString logText() const;
+    // [ORION_ACTIVITY_FEED 2026-09-14] The CUSTOMER feed: the same stream with
+    // engineering telemetry removed by ui_notifications::shouldEnterActivityRing.
+    // logText() above is unchanged (the Debug page still shows the raw ring) and
+    // logs/orion_native.log still receives every line either way.
+    [[nodiscard]] QString activityText() const;
     [[nodiscard]] bool coreActive() const noexcept { return coreActive_; }
     [[nodiscard]] QString scriptState() const noexcept { return scriptState_; }
     [[nodiscard]] QString scriptDetail() const noexcept { return scriptDetail_; }
@@ -1022,6 +1290,40 @@ public:
     [[nodiscard]] QString meterRuntimeState() const noexcept { return meterRuntimeState_; }
     [[nodiscard]] int sessionVerdicts() const noexcept { return sessionVerdicts_; }
     [[nodiscard]] int sessionGreens() const noexcept { return sessionGreens_; }
+    [[nodiscard]] int manualShotMakes() const noexcept { return manualShotTally_.makes(); }
+    [[nodiscard]] int manualShotMisses() const noexcept { return manualShotTally_.misses(); }
+    [[nodiscard]] int manualShotTotal() const noexcept { return manualShotTally_.total(); }
+    Q_INVOKABLE void recordManualShotResult(bool made);
+    Q_INVOKABLE void undoManualShotResult();
+    Q_INVOKABLE void resetManualShotResults();
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14] Live shot-verdict tally readers. Every one of
+    // these is a pure read of the rolling window; the rules themselves live in
+    // ShotVerdictTally.h so they can be pinned without constructing this controller.
+    [[nodiscard]] int bannerGreen10() const noexcept { return bannerTally_.green(); }
+    [[nodiscard]] int bannerEarly10() const noexcept { return bannerTally_.early(); }
+    [[nodiscard]] int bannerLate10() const noexcept { return bannerTally_.late(); }
+    [[nodiscard]] int bannerOther10() const noexcept { return bannerTally_.other(); }
+    [[nodiscard]] int bannerCount10() const noexcept { return bannerTally_.count(); }
+    [[nodiscard]] int bannerContested10() const noexcept { return bannerTally_.contested(); }
+    [[nodiscard]] QString bannerLastTiming() const { return bannerTally_.lastTiming(); }
+    [[nodiscard]] QString bannerLastCoverage() const { return bannerTally_.lastCoverage(); }
+    [[nodiscard]] QString bannerPattern10() const { return bannerTally_.pattern(); }
+    [[nodiscard]] QString bannerSuggestion() const { return bannerTally_.suggestion(); }
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] The caption under the Shot Lead slider. "Standstill" is
+    // the display bucket on purpose: it is the reference type the whole blind/trim family is
+    // measured against, and it is the type the owner is standing in while he reads the card.
+    [[nodiscard]] double bannerLeadTrimMs() const { return bannerLeadTrimMs_; }
+    [[nodiscard]] bool bannerLeadTrimEnabled() const noexcept { return bannerLeadTrimEnabled_; }
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] The auto-seed caption's five reads. The margin comes from
+    // the SETTING (it is a shipped constant, not engine state), the other four from the engine.
+    [[nodiscard]] bool leadAutoSeedActive() const noexcept { return leadAutoSeedActive_; }
+    [[nodiscard]] double leadAutoSeedMs() const noexcept { return leadAutoSeedMs_; }
+    [[nodiscard]] QString leadAutoSeedKind() const { return leadAutoSeedKind_; }
+    [[nodiscard]] double leadAutoSeedMeasuredMs() const noexcept { return leadAutoSeedMeasuredMs_; }
+    [[nodiscard]] double leadAutoSeedMarginMs() const { return config_.data().aimMarginMs; }
+    // The card's Reset link, and the automatic clear behind every committed change to the
+    // value being tuned (Release timing, the fade trim, Shot Lead).
+    Q_INVOKABLE void resetBannerTally();
     [[nodiscard]] bool wifiModeActive() const { return automation_.wifiModeActive(); }
     [[nodiscard]] bool defenseModeActive() const noexcept { return defenseModeActive_; }
     [[nodiscard]] QString defenseTriggerButton() const { return config_.data().defenseTriggerButton; }
@@ -1048,6 +1350,7 @@ public:
     [[nodiscard]] QString statusAge() const noexcept { return statusAge_; }
     [[nodiscard]] QString netSyncReason() const noexcept { return netSyncReason_; }
     [[nodiscard]] QString meterStyle() const noexcept { return config_.data().meterStyle; }
+    [[nodiscard]] QString meterProposer() const noexcept { return config_.data().meterProposer; }
     [[nodiscard]] QString meterColor() const noexcept { return config_.data().meterColor; }
     [[nodiscard]] bool meterEnabled() const noexcept { return config_.data().meterEnabled; }
     [[nodiscard]] bool autoMeterColor() const noexcept { return config_.data().autoMeterColor; }
@@ -1061,6 +1364,19 @@ public:
     [[nodiscard]] double actuationLeadMinMs() const noexcept { return AppConfigData::kActuationLeadMinMs; }
     [[nodiscard]] double actuationLeadMaxMs() const noexcept { return AppConfigData::kActuationLeadMaxMs; }
     // [ORION_METER_DELAY_LEAD_KEYING 2026-08-09] see the Q_PROPERTY note.
+    [[nodiscard]] double meterDelayMaxUsableMs() const noexcept
+    {
+        const double lead = config_.data().actuationLeadMs;
+        if (!std::isfinite(lead) || lead <= 0.0) {
+            return 0.0;
+        }
+        const double v = shotLeadMaxUsableMs() - lead;
+        return std::isfinite(v) ? std::max(0.0, v) : 0.0;
+    }
+    [[nodiscard]] double meterDelayLeadOffsetAppliedMs() const noexcept
+    {
+        return automation_.appliedMeterDelayLeadOffsetMsForUi();
+    }
     [[nodiscard]] double meterDelayLeadOffsetMs() const noexcept
     {
         return config_.data().meterDelayLeadOffsetMs;
@@ -1086,6 +1402,67 @@ public:
     [[nodiscard]] double leadAuthorityMs() const noexcept { return leadAuthorityMs_; }
     [[nodiscard]] double leadAuthoritySdMs() const noexcept { return leadAuthoritySdMs_; }
     [[nodiscard]] int leadAuthoritySamples() const noexcept { return leadAuthoritySamples_; }
+    [[nodiscard]] bool inputTimedEnabled() const noexcept { return config_.data().inputTimedEnabled; }
+    [[nodiscard]] bool inputTimedPaused() const noexcept { return inputTimedPaused_; }
+    [[nodiscard]] double inputTimedDelayMs() const noexcept { return config_.data().inputTimedDelayMs; }
+    [[nodiscard]] double inputTimedLeadMs() const noexcept { return config_.data().inputTimedLeadMs; }
+    [[nodiscard]] bool inputTimedRhythmEnabled() const noexcept { return config_.data().inputTimedRhythmEnabled; }
+    void setInputTimedEnabled(bool value);
+    void setInputTimedPaused(bool value);
+    void setInputTimedDelayMs(double value);
+    void setInputTimedLeadMs(double value);
+    void setInputTimedRhythmEnabled(bool value);
+    // [ORION_NO_METER_V2 2026-09-14] The blind-release reference hold (ms), clamped into
+    // [kNoMeterHoldMinMs, kNoMeterHoldMaxMs] on the way in.
+    [[nodiscard]] double noMeterHoldMs() const noexcept { return config_.data().noMeterHoldMs; }
+    void setNoMeterHoldMs(double value);
+    // [ORION_NO_METER_FADE_TRIM 2026-09-14] The fade-only trim (ms), clamped into
+    // [kNoMeterFadeTrimMinMs, kNoMeterFadeTrimMaxMs] on the way in.
+    [[nodiscard]] double noMeterFadeTrimMs() const noexcept
+    {
+        return config_.data().noMeterFadeTrimMs;
+    }
+    void setNoMeterFadeTrimMs(double value);
+    // === [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] THE CARD'S FRAME READOUT ============
+    //
+    // The console judges the release on a FRAME, so "650 ms" is really "39 frames" and 641 ms is
+    // really "38.46 frames" — a hold that coin-flips between two frames. The card leads with the
+    // frame count for exactly that reason, and these are the numbers it reads.
+    //
+    // THE STANDSTILL hold, deliberately: Standstill's Δ is 0 by construction, so this is H_ref
+    // itself on the grid — the quantity the slider under the caption controls. The fades carry
+    // their own Δ (and their own trim, whose readout says how many frames IT is worth) and the
+    // Rhythm offset belongs to the Rhythm card, so folding either in here would make the caption
+    // describe something other than the slider it sits above.
+    //
+    // They read the PERSISTED settings, i.e. the same source the slider writes. An offline sweep
+    // driving ORION_CONSOLE_FRAME_MS moves the engine and not this readout; that is the intended
+    // asymmetry for every env override in this app, and the arm line logs the grid it truly used.
+    [[nodiscard]] double consoleFrameMs() const noexcept
+    {
+        return clampedConsoleFrameMs(config_.data().consoleFrameMs);
+    }
+    [[nodiscard]] bool noMeterFrameQuantize() const noexcept
+    {
+        return config_.data().noMeterFrameQuantize;
+    }
+    [[nodiscard]] double noMeterHoldSnappedMs() const noexcept
+    {
+        // The same order the engine's blindReleaseHold() uses: floor, then snap.
+        const double floored = std::max(kBlindReleaseFloorMs, config_.data().noMeterHoldMs);
+        return noMeterFrameQuantize() ? snappedConsoleFrameMs(floored, consoleFrameMs())
+                                      : floored;
+    }
+    [[nodiscard]] int noMeterHoldFrames() const noexcept
+    {
+        return consoleFrameCount(noMeterHoldSnappedMs(), consoleFrameMs());
+    }
+    // [ORION_NO_METER_VISION_ASSIST 2026-09-14] The hybrid switch. Default TRUE.
+    [[nodiscard]] bool noMeterVisionAssist() const noexcept
+    {
+        return config_.data().noMeterVisionAssist;
+    }
+    void setNoMeterVisionAssist(bool value);
     [[nodiscard]] bool noMeterEnabled() const noexcept { return config_.data().noMeterEnabled; }
     [[nodiscard]] QString noMeterReleasePoint() const noexcept { return config_.data().noMeterReleasePoint; }
     [[nodiscard]] double noMeterBaseOffsetMs() const noexcept { return config_.data().noMeterBaseOffsetMs; }
@@ -1244,6 +1621,7 @@ public:
     Q_INVOKABLE void acceptLegalAgreement();
     void setVideoSource(const QString& value);
     void setCaptureCardIndex(int value);
+    void setCaptureCardFps(int value);
     void setHardwareDecode(bool value);
     void setControllerType(const QString& value);
     void setAutoReconnect(bool value);
@@ -1388,8 +1766,10 @@ public slots:
     void setTempoInputSource(const QString& value);
     void setTempoRemapType(const QString& value);
     void setTempoWaitMs(double value);
+    void setRhythmFlickDelayMs(double value);
     void setTempoFallbackMs(double value);
     void setTempoFlickHoldMs(double value);
+    void setTempoReleaseStyle(const QString& value);
     void setTempoMinStickHoldMs(double value);
     void setRttSyncMode(const QString& value);
     void setPacketCaptureEnabled(bool value);
@@ -1409,12 +1789,15 @@ public slots:
     void setManualSyncAdjustMs(double value);
     void setManualOffsetMs(double value);
     void setMeterStyle(const QString& value);
+    void setMeterProposer(const QString& value);
     void setMeterColor(const QString& value);
     void setMeterEnabled(bool value);
     void setAutoTune(bool value);
     void setAutoMeterColor(bool value);
     void setDetectionConfidencePercent(int value);
     void setTempoEnabled(bool value);
+    [[nodiscard]] QString tempoInputPath() const;
+    void setTempoInputPath(const QString& value);
     void setNoDipEnabled(bool value);
     void setNoDipLeadMs(double value);
     // [ORION_USER_LEAD] Writing the Shot Lead is always an explicit USER act — it clamps into
@@ -1487,10 +1870,28 @@ public slots:
 
 signals:
     void authChanged();
+    void motdChanged();
+    // Profile block refreshed (activation or heartbeat). Its own low-fanout
+    // notifier: the Profile page must not re-evaluate on every broad status tick.
+    void profileChanged();
     // A deep-linked activation key arrived/was consumed (orion://activate).
     void pendingActivationKeyChanged();
     void navigationChanged();
     void statusChanged();
+    void manualShotTallyChanged();
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14] The live shot-verdict tally moved: one graded
+    // banner arrived, or the window was cleared (session start/end, a committed slider
+    // change, the card's Reset). Low fan-out on purpose - it fires about once per shot and
+    // only the two ShotVerdictTally mounts listen.
+    void bannerTallyChanged();
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] The banner loop's trim moved (an application, a reset
+    // on a committed Shot Lead change, or the restore at app start). Its own low fan-out
+    // notifier for the same reason bannerTallyChanged has one: it fires about once per shot and
+    // only one caption listens.
+    void bannerLeadTrimChanged();
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] Its own low-fanout notifier, like the trim's: it changes
+    // about once per shot while an untuned install converges and has exactly one subscriber.
+    void leadAutoSeedChanged();
     void leadCalibrationChanged();
     void sessionTimeChanged();
     void statusAgeChanged();
@@ -1543,12 +1944,19 @@ signals:
     // Meter-blind safety net toggled. Its own signal (not statusChanged) because it changes at
     // most once every few shots and has exactly one subscriber (the Meter Profile status line).
     void meterBlindChanged();
+    // Reader detector health line refreshed (~2 s cadence from the sidecar). One subscriber
+    // (the Meter Detection card), so it stays off statusChanged/settingsChanged.
+    void detectorHealthChanged();
     void poseOverlayChanged();
     // [PRESSED OVERLAY 2026-08-08] The raw physical Square-held state flipped.
     // Emitted synchronously from the input poll (syncPressedOverlay), on the same
     // tick as the "Physical shot epoch" record. Exactly one subscriber (the
     // PressedBadge on the Live Capture preview), so it stays off statusChanged.
     void physicalSquarePressedChanged();
+    // [ORION_INPUT_DEAD_UX 2026-08-30] The input-dead overlay verdict (severity or its
+    // headline/detail text) changed. Own signal so a per-press latch flip repaints only the
+    // overlay bindings, not the statusChanged fan-out.
+    void inputDeliveryStateChanged();
     // [VENICE_PROFILE 2026-08-08] Result line for the Debug page's Venice Profile card
     // (runVeniceProfileAction). Exactly one subscriber; the import's settings fan-out
     // still rides settingsChanged via saveConfigSilently as usual.
@@ -1562,6 +1970,11 @@ private:
     [[nodiscard]] QString formatHelperError(const QString& operation, const QJsonObject& result) const;
     [[nodiscard]] QString rectSummary(const QRect& rect) const;
     void appendLog(const QString& message);
+    // [ORION_ACTIVITY_FEED 2026-09-14] One plain-language customer event. Writes
+    // the SAME text to the optional orion_user.log sink (no-op while the
+    // ORION_USER_LOG flag is off) and through appendLog, so it lands in the
+    // Activity ring and the diagnostic log without inventing a second wording.
+    void appendCustomerEvent(const QString& plainText);
     // [ORION_PAD_LIVE_INPUT_GATE 2026-08-07] True when a real HID input report
     // has landed in the last 3 s. Distinct from `rawInputPresent_`, which goes
     // true on mere enumeration (pollPhysicalController's findRawInputController
@@ -1569,6 +1982,10 @@ private:
     // `rawInputPresent_` so a pad that enumerated but never sent a HID report
     // can't take Remote Play into a hung "connected but no input" state.
     [[nodiscard]] bool hasRecentRawInput() const noexcept;
+    // [ORION_PAD_SILENT_HOLD 2026-09-11] Open the selected pad's HID collection and poll one
+    // input report (the D0 resume + firmware nudge the connect gate relies on), without the
+    // confirm loop. Returns true when the collection opened; the out-params report both steps.
+    bool nudgePhysicalPadOnce(bool* opened, bool* answered);
     // [ORION_PAD_LIVE_INPUT_GATE 2026-08-08] Connect-click recovery for an
     // enumerated-but-silent pad (padConnectGateAction ==
     // WakeProbeThenRecheck): open the HID collection (forces a USB
@@ -1600,6 +2017,32 @@ private:
     // Meter-blind safety net. Called once per sidecar detection frame with the CV-INDEPENDENT
     // physical shot epoch and whether THIS frame was a genuine raw meter detection.
     void observeMeterBlindness(quint64 physicalShotEpoch, bool genuineRawDetection);
+    // Formats one sidecar {"event":"detector_health"} object into detectorHealthLine_ /
+    // detectorProvider_. Presentation only — reads nothing from and writes nothing to the
+    // engine.
+    void observeDetectorHealth(const QJsonObject& health);
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14] One graded shot off the game's own feedback
+    // banner (RemotePlaySession::bannerVerdict). Buckets it into the rolling window and
+    // writes one plain Activity line. Presentation only - reads nothing from and writes
+    // nothing to the engine.
+    // [ORION_BANNER_COVERAGE_ABSENT 2026-09-19] `hasCoverage` is the panel's LAYOUT (did it have
+    // a coverage CELL at all), forwarded to the engine's trim; defaulted TRUE so an older sidecar
+    // keeps the 2026-09-18 strict coverage gate.
+    void observeBannerVerdict(const QString& timing, const QString& timingColor,
+                              const QString& coverage, double ncc, qint64 frameEpochMs,
+                              int seq, int attributed, qint64 releaseSeq,
+                              double releaseDelayMs, bool hasCoverage = true);
+    // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] One post-release retraction measurement off the
+    // reader (RemotePlaySession::releaseOracle) -- the banner-free input to the SAME bounded Shot
+    // Lead trim. Unlike the tally this reaches the engine; see the definition for the fences.
+    void observeReleaseOracle(qint64 releaseSeq, double gapPx, const QString& proxy);
+    // [ORION_SHOT_RANGE 2026-09-17] One THREE/MID reading off the sidecar
+    // (RemotePlaySession::shotRange). Forwarded straight to the engine, which fences it on the
+    // live press's own shot-gate epoch; see AutomationEngine::noteShotRange.
+    void observeShotRange(qint64 releaseSeq, const QString& range, double conf);
+    // Clears the window AND the de-dupe watermark: a new session restarts the sidecar's
+    // verdict counter at 1. Called on stream start and on disconnect/error.
+    void resetBannerTallyForSession();
     // First update-check result arms (offer/force) or clears the startup gate;
     // later checks only refresh the status pill (no mid-session re-block).
     void resolveUpdateGate(UpdateGateAction action);
@@ -1635,6 +2078,7 @@ private:
     // Safe to call from the GUI-freeze worker after automation_.setArmed(false).
     void disarmPreciseFire(bool confirmSubmitted = false);
     void fencePreciseFireToken(quint64 token, bool fallbackTakeover);
+    void applyPendingPhaseAnchorRefinement();
     void confirmPreciseFire(quint64 token, double actualMs,
                             PreciseFireDeliveryStage stage, uint32_t transportSeq,
                             const PreciseFireDeliverySnapshot& snapshot);
@@ -1683,6 +2127,10 @@ private:
     void updateReleaseOwnershipTrace(const ControllerState& physical, const ControllerState& output,
                                      bool submitOk, qint64 nowMs);
     void flushReleaseOwnershipTrace();
+    // [ORION_OUTPUT_DIVERGENCE 2026-09-14 owner] Evidence only. Compares the engine's final
+    // output against the pad's own packet each tick and logs one line when a non-Square button
+    // or trigger has disagreed continuously for kOutDivergeMinMs_, and one when it stops.
+    void observeOutputDivergence(const ControllerState& physical, const ControllerState& output);
     void applyControllerLightbar(bool force = false);
     void setControllerLedStatus(const QString& status);
     void notifyTelemetryStatusAtHumanCadence(qint64 nowMs);
@@ -1697,6 +2145,7 @@ private:
     // unplug + final Disconnected state). Split out so disconnectRemotePlay can run it inline
     // or deferred. See disconnectRemotePlay().
     void finishRemotePlayTeardown();
+    void unplugRemoteController();
     void finishMeterCalibration();
     // One monotonic release may contribute at most one user-visible grade. Both the
     // colour-window grade and calibration-only banner verdict route through here so
@@ -1759,6 +2208,10 @@ private:
     // ViGEm sole output). When enabled, the engine output is ALSO written to chiaki's pipe each tick
     // (pre-encryption = jitter-free release); ViGEm stays submitted as the live fallback.
     OrionInputClient orionInput_;
+    bool squareOutputWatchdogEnabled_ = false;
+    SquareOutputWatchdog squareOutputWatchdog_;
+    // Caller holds submitMutex_; transport method also takes its IO fence.
+    bool releaseStaleSquareOutputLocked(const QString& reason);
     // Hook write-coalesce: steady-clock microsecond stamp of the last PRECISE FIRE-THREAD pipe
     // write. The GUI tick (4ms cadence) skips its own hook write within this window of a fire so a
     // shot release emits ONE coalesced hook packet, not the fire write + an immediate duplicate
@@ -1769,6 +2222,10 @@ private:
     // tick only, so no atomicity needed). writeCount/failures otherwise surface only on a release
     // tick, so a mid-session silent fallback to ViGEm would be invisible until the next shot.
     qint64 lastHookHeartbeatMs_ = 0;
+    // Require a sustained physically/output-neutral interval before the
+    // synchronous liveness ACK. Engine Idle alone includes Square debounce and
+    // pass-through gestures; probing there stalls their first input samples.
+    qint64 hookIdleNeutralSinceMs_ = -1;
     // Input-link recovery watchdog. Consecutive 1/s heartbeats seen with a Running
     // stream but no direct hook first trigger three input-child-only recoveries,
     // then one contained full restart after a final grace. A verified pipe write
@@ -1818,6 +2275,7 @@ private:
     // fade. Fed false on route loss so a pad unplugged mid-hold cannot leave the
     // badge lit. See PressedOverlayPolicy.h for the full contract.
     SquareHeldLatch pressedOverlayLatch_{};
+    SquareUpAuditTracker squareUpAuditTracker_{};
     // Same-tick change detection + emission for the badge. Inline so the input
     // poll's fast path pays one branch when nothing changed.
     void syncPressedOverlay(bool held)
@@ -1830,6 +2288,42 @@ private:
     // It deliberately survives stream/engine resets so delayed sidecar traffic can
     // never collide with the next shot. Zero is permanently invalid.
     quint64 physicalShotEpochCounter_ = 0;
+    // ── [ORION_INPUT_DEAD_UX 2026-08-30] input-session auto-retry + dead-input overlay ─────────
+    // See InputSessionRetryPolicy.h for the state machine and the full safety argument
+    // (bounded attempts, backoff, cold-vs-warm classification, why it cannot double-spawn).
+    // Kill switch: ORION_INPUT_SESSION_AUTORETRY=0 disables scheduling; the overlay is NOT
+    // killable (visibility of dead input must never be optional).
+    InputSessionRetryPlanner inputRetryPlanner_;
+    // True from an accepted user Connect until a user Disconnect / shutdown: "the player asked
+    // for a session". Gates both auto-retry and the loud overlay so the pre-Connect preview
+    // browse stays quiet.
+    bool inputSessionIntentActive_ = false;
+    // Set around the retry machinery's own disconnect+connect calls so they are not mistaken
+    // for fresh user intent (which would reset the bounded attempt budget mid-loop).
+    bool inputRetryInFlightReconnect_ = false;
+    // >0 while a retry timer is armed (holds the 1-based attempt number it will fire as).
+    int inputRetryPendingAttempt_ = 0;
+    // The planner ran out of budget (or was killed by env): the overlay switches from
+    // "retrying" to "press Connect".
+    bool inputRetryGaveUp_ = false;
+    // Wall-clock ms of the last press that landed while input was undeliverable. Latches the
+    // overlay on for kUndeliverablePressLatchMs even outside session intent — a press into dead
+    // input proves the player believes they are connected. Written on the SAME tick as the
+    // "PRESS UNDELIVERABLE" forensic line, from the SAME predicate.
+    qint64 lastUndeliverablePressMs_ = 0;
+    // Wall-clock ms since Running-with-pipe-down was first observed (0 = healthy). Feeds the
+    // overlay's Running-edge debounce (runningPipeDownConfirmed); the log line is undebounced.
+    qint64 runningPipeDownSinceMs_ = 0;
+    // Cached overlay verdict + text (compared in refreshInputDeliveryState so the NOTIFY only
+    // fires on real changes).
+    InputDeadSeverity inputDeadSeverity_ = InputDeadSeverity::None;
+    QString inputDeadHeadline_;
+    QString inputDeadDetail_;
+    void refreshInputDeliveryState();
+    void handleInputSessionFailure(int failureClass, bool wakeObserved);
+    void scheduleInputSessionRetry(const InputSessionRetryDecision& decision,
+                                   InputSessionFailureClass cls);
+    void fireScheduledInputSessionRetry(quint64 generation, bool coldRestart, int attempt);
     RemoteFrameProvider* frameProvider_ = nullptr;
     // Latest decoded preview frame, cached so the Train button can crop the anchor
     // template + meter region from exactly what the user sees.
@@ -1876,6 +2370,9 @@ private:
     ApplicationShutdownPhase applicationShutdownPhase_ = ApplicationShutdownPhase::Running;
     bool remotePlayTeardownActive_ = false;
     bool remotePlayTeardownDeferred_ = false;
+    bool remotePlayTeardownStopRequested_ = false;
+    bool remotePlayTeardownSynchronous_ = false;
+    bool captureRefreshInFlight_ = false;
     // Monotonic fence for delayed full-reconnect callbacks. Every accepted
     // Connect/Disconnect intent and every newly scheduled recovery advances it,
     // so an old timer can never tear down a newer manual session.
@@ -1955,6 +2452,19 @@ private:
     QString authTokenId_;      // token_id of the HMAC(token_id:license_key:expires) record
     qint64 authTokenExpires_ = 0;   // epoch seconds
     LeaseGate leaseGate_;
+    // MOTD (contract §5). motd_ is the last STRUCTURED server notice (a transport
+    // blip never clears it); motdDismissed_ is in-memory only and resets whenever
+    // the text changes; motdExpiryTimer_ hides the banner the moment `until` passes.
+    LicenseMotd motd_;
+    bool motdDismissed_ = false;
+    QTimer motdExpiryTimer_;
+    void applyServerMotd(const LicenseMotd& motd);
+    // Profile page state (LicenseProfile). Written only by applyLicenseProfile()
+    // from an activation or a heartbeat that actually carried a `profile`; a
+    // backend without one leaves the last known block intact rather than blanking
+    // the page mid-session.
+    LicenseProfile profile_;
+    void applyLicenseProfile(const LicenseProfile& profile);
     QString serverState_ = QStringLiteral("Venice service");
     QString updateState_ = QStringLiteral("Checking");
     QString updateGatePhase_ = QStringLiteral("checking");
@@ -2008,6 +2518,10 @@ private:
     quint64 qmlPreviewStaleAcksWindow_ = 0;
     int qmlPreviewLastAcknowledgedSerial_ = -1;
     static constexpr qint64 kQmlPreviewStatsIntervalMs_ = 5000;
+    // [ORION_ACTIVITY_FEED 2026-09-14] Healthy-cadence twin of the above: the
+    // qml_preview_pipeline gauge logs once a minute unless the window recorded a
+    // stale presentation ack, which restores the 5 s beat.
+    static constexpr qint64 kQmlPreviewStatsHealthyIntervalMs_ = 60000;
     QString captureSourceHealth_ = QStringLiteral("waiting_for_first_frame");
     bool capturePreviewActive_ = false;
     QString backendMessage_ = QStringLiteral("Remote Play helper has not been checked.");
@@ -2046,10 +2560,15 @@ private:
     // held "sticky" for a short window after the last sighting so a 1-frame detector miss
     // mid-shot doesn't flicker the box off (clean box for all shots).
     qint64 lastMeterSeenMs_ = 0;
-    // Wall-clock ms of the last FRESH, REAL (raw, non-echo) detection — drives meterConfirmed
-    // (the overlay box gate). Distinct from lastMeterSeenMs_, which also advances on stale/echo
-    // samples kept for the readout; those must NOT keep the lock box alive during an idle hold.
+    // Wall-clock ms of the last FRESH, REAL (raw, non-echo) detection. It feeds
+    // the presentation-only meterConfirmed lease; timing and measured HUD values
+    // retain their stricter freshness budgets. Distinct from lastMeterSeenMs_,
+    // which also advances on stale/echo samples kept for the readout; those must
+    // NOT keep the lock box alive during an idle hold.
     qint64 lastRealMeterSeenMs_ = 0;
+    // Presentation-only visual evidence clock. Unlike lastRealMeterSeenMs_, it
+    // is not renewed by empty post-shot echoes or unstructured idle candidates.
+    qint64 lastMeterOverlayVisualSeenMs_ = 0;
     bool meterConfirmed_ = false;
     // ---- meter-blind safety net (see the meterBlindWarning property) ----
     // The physical shot epoch currently being observed; 0 = none seen yet.
@@ -2062,6 +2581,10 @@ private:
     // Three whole shots with zero genuine detections. High enough that an occluded or
     // off-screen meter cannot trip it, low enough that a wrong colour is caught in seconds.
     static constexpr int kMeterBlindStreakTrip_ = 3;
+    // ---- reader detector health (Meter Detection card, presentation only) ----
+    // Empty until the sidecar's first detector_health line; cleared when the sidecar exits.
+    QString detectorHealthLine_;
+    QString detectorProvider_;
     // Human-readable visibility notices use genuine raw lock freshness, not
     // AutomationEngine's shot-scoped detectionPresence state.
     bool userMeterVisible_ = false;
@@ -2168,6 +2691,16 @@ private:
     QVariantList poseIndicator_;
     int frameSerial_ = 0;
     QStringList logs_;
+    // [ORION_ACTIVITY_FEED 2026-09-14] The customer ring. Same cap as logs_, but
+    // it only ever receives the lines ui_notifications::shouldEnterActivityRing
+    // classifies as human events, so 1000 entries is hours of real activity
+    // instead of minutes of telemetry.
+    QStringList customerLogs_;
+    // [ORION_ACTIVITY_FEED 2026-09-14] Last logged NetworkBridge connection state
+    // ("connected - <message>"). connectionChanged fires on every `error` event
+    // the diagnostics service answers with, not only on a real transition, so the
+    // line is emitted only when this value actually changes.
+    QString lastNetworkBridgeStateLine_;
     // appendLog() is hit from hot loops. The GUI owns this short pending batch and the UI ring;
     // flushPendingLogs() transfers it to appLogSink_'s ordered disk worker on the 200 ms beat.
     QStringList pendingLogDiskLines_;
@@ -2194,9 +2727,31 @@ private:
     int sessionVerdicts_ = 0;
     int sessionGreens_ = 0;
     int lastSessionGradedReleaseSeq_ = 0;
+    ManualShotTally manualShotTally_;
+    // [ORION_BANNER_VERDICT_LIVE 2026-09-14] The last 10 graded banners. Fed only by
+    // observeBannerVerdict(); read only by the bannerXxx properties above.
+    ShotVerdictTally bannerTally_;
+    // [ORION_BANNER_LEAD_TRIM 2026-09-15] The published half of the engine's banner trim: the
+    // display bucket's value in ms and whether the loop is armed. Written ONLY from the engine's
+    // bannerLeadTrimUpdated signal (and from the settings apply, for the flag), so the UI can
+    // never disagree with the value the scheduler is actually spending.
+    double bannerLeadTrimMs_ = 0.0;
+    bool bannerLeadTrimEnabled_ = true;
+    // [ORION_LEAD_AUTO_SEED 2026-09-15] The auto-seed caption's published state. Mirrors the
+    // engine; never written back to it and never persisted.
+    bool leadAutoSeedActive_ = false;
+    double leadAutoSeedMs_ = 0.0;
+    double leadAutoSeedMeasuredMs_ = 0.0;
+    QString leadAutoSeedKind_;
     QHash<QString, QString> lastVerdictByType_;
     // Defense Mode runtime state (settings live in AppConfigData).
     bool defenseModeActive_ = false;
+    // [2026-09-14 owner] "for no meter remove the pause timing". The Pause row is gone from
+    // NoMeterCard, so nothing on screen could clear a pause — a launch-time `true` here would be
+    // NO METER selected, armed, and silently never firing, with no control to find. The property
+    // and its setter stay (tests, and any future hotkey), but the ONLY thing that sets it now is
+    // an explicit setInputTimedPaused call.
+    bool inputTimedPaused_ = false;
     bool prevDefenseTriggerDown_ = false;
     qint64 lastDefenseToggleMs_ = 0;
     // Silent auto-update: periodic background re-check; applies when idle.
@@ -2272,6 +2827,12 @@ private:
     // never be re-pressed on top of a release the thread already wrote (= pump fake).
     OrionPreciseFireThread* fireThread_ = nullptr;
     QMutex submitMutex_;
+#ifdef Q_OS_WIN
+    // Process-level Windows timer-throttling opt-out. Startup deliberately
+    // defers this while on battery and no stream is active; the Running
+    // transition consumes the deferred request exactly once.
+    bool timerResolutionThrottleOptOutApplied_ = false;
+#endif
     // The GUI thread publishes arms; the GUI-freeze watchdog may revoke one.
     // The fire worker itself is fenced by submitMutex_ + its own mutex.
     std::atomic<quint64> lastArmedFireToken_{0};
@@ -2301,6 +2862,8 @@ private:
     // [ORION_PAD_TEARDOWN_GRACE 2026-08-07] Latch so the "still waiting" warning
     // is emitted at most once per grace period, not every 50 ms poll tick.
     bool physicalMissingGraceWarned_ = false;
+    // [ORION_PAD_SILENT_HOLD 2026-09-11] One HID-collection nudge per silence episode.
+    bool physicalMissingNudged_ = false;
     QString rawInputLabel_;
     QString rawInputDevicePath_;
     QString activePhysicalDevicePath_;
@@ -2328,6 +2891,18 @@ private:
     // previous state makes this edge-triggered: a held/noisy report cannot lock
     // out the user's real mouse indefinitely.
     qint64 controllerUiGuardUntilMs_ = 0;
+    // [ORION_CONTROLLER_UI_ISOLATION 2026-09-19] A stick mapped to the desktop
+    // POINTER never produces a press edge, so it never opened the guard above and
+    // the cursor walked over Venice lighting up hover states mid-session. This is
+    // the level-triggered twin: it stays open while any stick is deflected past
+    // kControllerUiStickDeflection and for kControllerUiPointerGuardMs after.
+    qint64 controllerUiPointerGuardUntilMs_ = 0;
+    // Explicit escape hatch (ORION_CONTROLLER_UI_PASSTHROUGH=1): deliberately
+    // controller-driven UI, and the owner's way back to pre-2026-09-19 behaviour.
+    bool controllerUiPassthrough_ = false;
+    // ORION_CONTROLLER_UI_INJECTED_ISOLATION=0 disables the injected-source leg
+    // only, leaving the timing guards intact.
+    bool controllerUiInjectedIsolation_ = true;
     bool controllerUiSuppressionLogged_ = false;
     ControllerState previousControllerUiState_{};
     bool directPipeOwnsInput_ = false;
@@ -2361,6 +2936,10 @@ private:
     quint64 pendingSubmitFireToken_ = 0;
     uint32_t pendingSubmitTransportSeq_ = 0;
     PreciseFireDeliverySnapshot pendingSubmitSnapshot_{};
+    // [ORION_TIP_FRAME_NATIVE 2026-09-17] Set beside pendingSubmitSnapshot_ at releaseIssued and
+    // cleared with it on every reset path, so the frame-grid fields on `Release submit:` can
+    // never describe a different shot than the rest of that line.
+    ReleaseFrameGridSnapshot pendingSubmitFrameGrid_{};
     ReleaseMarkerDeliveryGate releaseMarkerDeliveryGate_;
     // Per-release ownership trace: accumulates physical-vs-output Square across the
     // entire Releasing+Cooldown window so a "Release ownership:" summary can prove
@@ -2380,6 +2959,15 @@ private:
     QString ownBackend_;           // authoritative route captured at window start (PIPE/XUSB/DS4)
     QString ownSrc_;               // input source token captured at window start
     QString ownKind_;              // device kind token captured at window start
+    // [ORION_OUTPUT_DIVERGENCE 2026-09-14 owner] "buttons sometimes are weird, it seemed like it
+    // was holding L2 for me". One slot per watched field, in the order observeOutputDivergence
+    // lists them (l2, r2, cross, circle, triangle, l1, r1, l3, r3 — Square excluded, because the
+    // release logic legitimately owns it). -1 = agreeing with the pad right now.
+    static constexpr qint64 kOutDivergeMinMs_ = 40;
+    std::array<qint64, 9> outDivergeSinceMs_{{-1, -1, -1, -1, -1, -1, -1, -1, -1}};
+    std::array<qint64, 9> outDivergeLoggedMs_{{-1, -1, -1, -1, -1, -1, -1, -1, -1}};
+    std::array<bool, 9> outDivergeReported_{};
+    int outDivergeEvents_ = 0;     // reported divergences this session
     // Previous engine shot-state for the "Shot state:" transition logger.
     HoldState prevShotState_ = HoldState::Idle;
     qint64 lastVirtualConnectAttemptMs_ = 0;
@@ -2420,6 +3008,11 @@ private:
     // rather than Orion's own virtual mirror.
     bool forceVirtualNeutral_ = false;
     bool forceVirtualNeutralLogged_ = false;
+    // [ORION_PRESS_DELIVERY_AUDIT 2026-08-30] Edge-dedup key for the post-submit
+    // "SQUARE SUPPRESSED" invariant audit (physical Square held while the state
+    // submitted to the console carries Square-up). Empty = not suppressed. One
+    // log line per attributed reason-window, never per tick.
+    QString lastSquareSuppressionLogged_;
 
     int playerCount_ = 0;
     int legitPlayerCount_ = 0;

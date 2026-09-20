@@ -6,7 +6,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "pack_orion_release", ROOT / "tools" / "security" / "pack_orion_release.py"
+    "pack_lethe_release", ROOT / "tools" / "security" / "pack_lethe_release.py"
 )
 pack = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pack)

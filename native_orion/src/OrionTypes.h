@@ -85,6 +85,11 @@ struct ControllerState {
 };
 
 struct DetectionResult {
+    // Clock-read fidelity, not a shot lead or latency-tuning parameter. The
+    // sum of native epoch/steady and engine/steady pairing uncertainty must
+    // fit within 1 ms before the sample may influence timing. Wide brackets
+    // are missing timing evidence, never a fabricated early capture instant.
+    static constexpr qint64 kNativeClockPrecisionBudgetNs = 1'000'000;
     bool detected = false;
     bool staleFrame = false;
     bool ghostFrame = false;
@@ -97,6 +102,23 @@ struct DetectionResult {
     int y = 0;
     int width = 0;
     int height = 0;
+    // [ORION_PROOF_DETECTOR_BOX 2026-09-19] The DETECTOR's own rectangle for the same frame,
+    // i.e. x/y/width/height BEFORE the reader's presentation transform
+    // (ORION_READER_BOX_TIGHT, which the launcher runs at mode 2). The two differ by 0..18 px
+    // per edge — `_tight_display_box`'s side/top/bottom "reach", re-derived from this frame's
+    // colour-path pixels — so the DRAWN rectangle of a perfectly still 26x110 meter swings
+    // 26..44 px wide while the detector's stays 26. x/y/width/height remain what is DRAWN
+    // (overlay + meter_x/meter_y continuity are unchanged); only detection-geometry judgements
+    // (the ownership proof's shape gate) may read these.
+    //
+    // Zero width/height means the sidecar did not send one (older sidecar, or the presentation
+    // transform is off, in which case the two rectangles are identical anyway). Every consumer
+    // must fall back to x/y/width/height then, so this field can never change behaviour on a
+    // frame that does not carry it.
+    int detX = 0;
+    int detY = 0;
+    int detWidth = 0;
+    int detHeight = 0;
     // Coordinate space of x/y/width/height. The sidecar stamps this as
     // bbox_wh on the same immutable detector snapshot as the bbox; using the
     // independently advancing capture_width/height telemetry can otherwise
@@ -112,6 +134,12 @@ struct DetectionResult {
     int rejectedWidth = 0;
     int rejectedHeight = 0;
     double fillPct = 0.0;
+    // Coarse row-walk companion plus the exact identity of the ruler used for
+    // fillPct.  Missing provenance from an older sidecar remains display-safe
+    // but is fail-closed for two-frame phase-anchor interpolation.
+    double coarseFillPct = -1.0;
+    QString fillEstimatorMode;
+    quint64 fillEstimatorGeneration = 0;
     double confidence = 0.0;
     int consecutiveFrames = 0;
     double velocityPctS = 0.0;
@@ -120,6 +148,13 @@ struct DetectionResult {
     double targetPct = 96.0;
     double profileTimingMs = 0.0;
     double frameAgeMs = 0.0;
+    // Native-only earliest steady bound of the frameAgeMs evaluation.
+    // Never decoded from JSON: it accounts for local parsing/Qt delivery delay
+    // and conservatively includes clock-pair uncertainty, not sidecar transit
+    // a second time. A descheduled pairing can only make the age older.
+    // Zero retains the legacy/direct-producer age contract.
+    qint64 nativeFrameAgeSampleSteadyNs = 0;
+    qint64 nativeFrameAgeSampleBracketNs = 0;
     int candidateCount = 0;
     bool releaseReady = false;
     bool velocityStable = false;

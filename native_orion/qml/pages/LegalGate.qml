@@ -36,8 +36,8 @@ Item {
             z: -1
             anchors.fill: parent
             anchors.topMargin: 3
-            radius: parent.radius
-            color: "#06090E"
+            radius: cardWrap.radius
+            color: Theme.shadowHalo
             opacity: 0.5
         }
 
@@ -65,7 +65,7 @@ Item {
                     text: "Legal Agreement & Rules"
                     color: Theme.textPrimary
                     font.family: Theme.fontUi
-                    font.pixelSize: 20
+                    font.pixelSize: Theme.fontHeading
                     font.weight: Font.DemiBold
                 }
                 Text {
@@ -73,7 +73,7 @@ Item {
                     text: "Please read and accept before using Venice."
                     color: Theme.textMuted
                     font.family: Theme.fontUi
-                    font.pixelSize: 12
+                    font.pixelSize: Theme.fontSmall
                     wrapMode: Text.WordWrap
                 }
             }
@@ -87,9 +87,10 @@ Item {
                 clip: true
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
                 ScrollBar.vertical: ScrollBar {
+                    id: legalScrollBar
                     policy: ScrollBar.AsNeeded
                     width: 6
-                    contentItem: Rectangle { radius: 3; color: parent.pressed ? Theme.scrollbarThumbActive : Theme.scrollbarThumb }
+                    contentItem: Rectangle { radius: 3; color: legalScrollBar.pressed ? Theme.scrollbarThumbActive : Theme.scrollbarThumb }
                     background: Rectangle { color: "transparent" }
                 }
 
@@ -102,10 +103,10 @@ Item {
                         wrapMode: Text.WordWrap
                         color: Theme.textSecondary
                         font.family: Theme.fontUi
-                        font.pixelSize: 13
+                        font.pixelSize: Theme.fontBody
                         lineHeight: 1.25
                         textFormat: Text.StyledText
-                        text: "<b style='color:#F4F7FA'>Disclaimer</b><br>" +
+                        text: "<b style='color:" + Theme.textPrimary + "'>Disclaimer</b><br>" +
                               "• Venice is provided \"as is\", without warranty of any kind. You use it entirely at your own risk.<br>" +
                               "• Venice is <b>not</b> affiliated with, endorsed by, or sponsored by Take-Two Interactive, 2K, Visual Concepts, Sony Interactive Entertainment, PlayStation, or the NBA. All trademarks belong to their respective owners.<br>" +
                               "• Using automation or third-party tools with online games may violate the game's and platform's Terms of Service and can result in warnings, suspension, or a permanent ban of your account. You accept this risk.<br>" +
@@ -116,10 +117,10 @@ Item {
                         wrapMode: Text.WordWrap
                         color: Theme.textSecondary
                         font.family: Theme.fontUi
-                        font.pixelSize: 13
+                        font.pixelSize: Theme.fontBody
                         lineHeight: 1.25
                         textFormat: Text.StyledText
-                        text: "<b style='color:#F4F7FA'>Rules of Use</b><br>" +
+                        text: "<b style='color:" + Theme.textPrimary + "'>Rules of Use</b><br>" +
                               "• For personal use only. Do not resell, redistribute, or share your license key.<br>" +
                               "• Do not use Venice to harass, defraud, or harm other players.<br>" +
                               "• You are solely responsible for complying with all applicable laws and the terms of any service you use it with.<br>" +
@@ -130,27 +131,28 @@ Item {
                         wrapMode: Text.WordWrap
                         color: Theme.textMuted
                         font.family: Theme.fontUi
-                        font.pixelSize: 11
+                        font.pixelSize: Theme.fontCaption
                         lineHeight: 1.2
                         text: "By clicking \"I Agree\" you confirm you have read, understood, and accept this agreement and the rules above."
                     }
                 }
             }
 
+            // 46px matches the Unlock / Continue CTAs on the other gates.
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 10
                 DangerButton {
                     text: "Decline & Exit"
                     implicitWidth: 130
-                    implicitHeight: 44
+                    implicitHeight: 46
                     onClicked: Qt.quit()
                 }
                 Item { Layout.fillWidth: true }
                 PrimaryButton {
                     text: "I Agree"
                     implicitWidth: 160
-                    implicitHeight: 44
+                    implicitHeight: 46
                     onClicked: orion.acceptLegalAgreement()
                 }
             }

@@ -18,23 +18,24 @@ Item {
     // True while the field holds a key delivered by the orion://activate deep link
     // (cleared the moment the user edits the field or unlock starts).
     property bool deepLinkFilled: false
-    // True once the user attempted an unlock — gates the error card so the idle
-    // "Enter a license key" prompt keeps rendering as plain muted text.
+    // True once the user attempted a connection — gates the error card.
     property bool attempted: false
 
     // Map the raw backend message onto an actionable next step (onboarding.md §4).
     readonly property string errorHint: {
         var m = (orion.authMessage || "").toLowerCase()
         if (/machine|device|another|bound|hwid/.test(m))
-            return "That's the machine lock doing its job. Moving to your own new PC? Run /hwid_reset in the Discord (self-service, once per 24h). Never activated it yourself? Open a ticket — your key may have leaked."
+            return "This account is linked to another PC. Run /hwid_reset in Discord, then connect this PC again. If that was not you, open a ticket."
         if (/expire/.test(m))
-            return "Your license period has ended. Grab a new tier from the store, or check #pricing in the Discord."
+            return "Your trial or subscription has ended. Run /status in Discord or renew on the Venice website."
+        if (/discord_signin|required/.test(m))
+            return "Sign in with the Discord account that owns your trial or subscription, then use a fresh one-time code."
         if (/invalid|unknown|not found|format/.test(m))
-            return "Copy the key straight from your Venice bot DM (click the spoiler to reveal, then copy — don't retype it). Bought but no DM? Run /redeem in the Discord with your order email."
+            return "That one-time code is invalid, expired, or already used. Open Connect Discord again for a fresh code."
         if (/timed out|timeout|network|connect|offline|unreach|tls|certificate/.test(m))
             return "Couldn't reach the license server. Check your internet connection and try again in a moment."
         if (/rate limit/.test(m))
-            return "Too many attempts in a row — wait a moment, then press Unlock once."
+            return "Too many attempts in a row — wait a moment, then try the connection once."
         return ""
     }
 
@@ -94,8 +95,8 @@ Item {
             z: -1
             anchors.fill: parent
             anchors.topMargin: 3
-            radius: parent.radius
-            color: "#06090E"
+            radius: cardWrap.radius
+            color: Theme.shadowHalo
             opacity: 0.5
         }
 
@@ -169,7 +170,7 @@ Item {
                 }
             }
 
-            // ---- Key field ----
+            // ---- One-time connection code ----
             Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 50
@@ -177,7 +178,7 @@ Item {
                 color: Theme.bgField
                 border.color: keyField.activeFocus ? Theme.focusRing : Theme.borderSoft
                 border.width: keyField.activeFocus ? 2 : 1
-                Behavior on border.color { ColorAnimation { duration: 160 } }
+                Behavior on border.color { ColorAnimation { duration: Theme.motionBase } }
 
                 TextField {
                     id: keyField
@@ -185,7 +186,7 @@ Item {
                     anchors.leftMargin: 14
                     anchors.rightMargin: pasteBtn.width + 20
                     verticalAlignment: TextInput.AlignVCenter
-                    placeholderText: "Enter license key"
+                    placeholderText: "One-time Discord connection code"
                     color: Theme.textPrimary
                     placeholderTextColor: Theme.textFaint
                     font.family: Theme.fontUi
@@ -198,8 +199,7 @@ Item {
                     onTextEdited: root.deepLinkFilled = false
                 }
 
-                // One-click paste — the key arrives via a Discord DM, so paste is
-                // the whole activation flow (typos in 16+ char keys are the enemy).
+                // One-click paste for the short-lived code shown after Discord sign-in.
                 Button {
                     id: pasteBtn
                     anchors.right: parent.right
@@ -220,33 +220,34 @@ Item {
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
                         font.family: Theme.fontUi
-                        font.pixelSize: 12
+                        font.pixelSize: Theme.fontSmall
                         font.weight: Font.DemiBold
                         Behavior on color { ColorAnimation { duration: Theme.motionFast } }
                     }
                     background: Rectangle {
-                        radius: 7
+                        radius: Theme.radiusChip
                         color: pasteBtn.hovered ? Theme.bgCardHover : Theme.bgCard
                         border.color: pasteBtn.hovered ? Theme.borderStrong : Theme.borderSoft
                         border.width: 1
                         Behavior on color { ColorAnimation { duration: Theme.motionFast } }
+                        Behavior on border.color { ColorAnimation { duration: Theme.motionFast } }
                     }
                 }
             }
 
-            // Deep-link confirmation: the key came from the activation link, ready to go.
+            // Deep-link confirmation: the code came from Discord sign-in.
             RowLayout {
                 visible: root.deepLinkFilled
                 Layout.fillWidth: true
                 Layout.topMargin: -8
                 spacing: 7
-                Text { text: "✓"; color: Theme.success; font.pixelSize: 12; font.weight: Font.Bold }
+                Text { text: "✓"; color: Theme.success; font.family: Theme.fontUi; font.pixelSize: Theme.fontSmall; font.weight: Font.Bold }
                 Text {
                     Layout.fillWidth: true
-                    text: "Key filled from your activation link — press Unlock."
+                    text: "Code filled from Discord sign-in — press Unlock."
                     color: Theme.success
                     font.family: Theme.fontUi
-                    font.pixelSize: 12
+                    font.pixelSize: Theme.fontSmall
                     wrapMode: Text.WordWrap
                 }
             }
@@ -258,6 +259,27 @@ Item {
                 text: orion.authBusy ? "Verifying license…" : "Unlock"
                 enabled: root.ready
                 onClicked: root.tryUnlock()
+            }
+
+            Button {
+                Layout.fillWidth: true
+                text: "Connect Discord"
+                hoverEnabled: true
+                onClicked: Qt.openUrlExternally("https://zaeorion.com/connect")
+                contentItem: Text {
+                    text: parent.text
+                    color: parent.hovered ? Theme.textPrimary : Theme.accent
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontBody
+                    font.weight: Font.DemiBold
+                }
+                background: Rectangle {
+                    radius: Theme.radiusControl
+                    color: parent.hovered ? Theme.bgCardHover : Theme.bgCard
+                    border.color: Theme.borderSoft
+                }
             }
 
             // ---- Status / error surface ----
@@ -287,13 +309,13 @@ Item {
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 8
-                        Text { text: "✕"; color: Theme.danger; font.pixelSize: 12; font.weight: Font.Bold }
+                        Text { text: "✕"; color: Theme.danger; font.family: Theme.fontUi; font.pixelSize: Theme.fontSmall; font.weight: Font.Bold }
                         Text {
                             Layout.fillWidth: true
                             text: "Activation failed"
                             color: Theme.danger
                             font.family: Theme.fontUi
-                            font.pixelSize: 13
+                            font.pixelSize: Theme.fontBody
                             font.weight: Font.DemiBold
                         }
                     }
@@ -302,7 +324,7 @@ Item {
                         text: orion.authMessage
                         color: Theme.textSecondary
                         font.family: Theme.fontUi
-                        font.pixelSize: 12
+                        font.pixelSize: Theme.fontSmall
                         lineHeight: 1.25
                         wrapMode: Text.WordWrap
                     }
@@ -312,7 +334,7 @@ Item {
                         text: root.errorHint
                         color: Theme.textMuted
                         font.family: Theme.fontUi
-                        font.pixelSize: 11
+                        font.pixelSize: Theme.fontCaption
                         lineHeight: 1.3
                         wrapMode: Text.WordWrap
                     }
@@ -325,10 +347,10 @@ Item {
                 visible: text.length > 0 && !cardCol.showErrorCard
                 color: orion.authBusy ? Theme.textSecondary : Theme.textMuted
                 font.family: Theme.fontUi
-                font.pixelSize: 12
+                font.pixelSize: Theme.fontSmall
                 wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
-                Behavior on color { ColorAnimation { duration: 200 } }
+                Behavior on color { ColorAnimation { duration: Theme.motionSlow } }
             }
 
             // ---- Footer: version + inline server status (no bubble) ----
@@ -340,19 +362,22 @@ Item {
                     text: Theme.productName + " " + orion.displayVersion
                     color: Theme.textFaint
                     font.family: Theme.fontUi
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontCaption
                 }
                 Item { Layout.fillWidth: true }
                 Rectangle {
-                    width: 6; height: 6; radius: 3
+                    Layout.preferredWidth: 6
+                    Layout.preferredHeight: 6
+                    radius: 3
                     Layout.alignment: Qt.AlignVCenter
                     color: root.serverOnline ? Theme.success : Theme.danger
+                    Behavior on color { ColorAnimation { duration: Theme.motionSlow } }
                 }
                 Text {
                     text: root.serverOnline ? "Online" : "Offline"
                     color: Theme.textMuted
                     font.family: Theme.fontUi
-                    font.pixelSize: 11
+                    font.pixelSize: Theme.fontCaption
                 }
             }
         }

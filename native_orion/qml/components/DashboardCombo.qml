@@ -5,7 +5,9 @@ import OrionNative
 ComboBox {
     id: control
     property string value: ""
-    implicitHeight: 36
+    // Same height as the TextFields and buttons it shares rows with
+    // (StreamSetupForm console row, Profiles row) so mixed rows stay level.
+    implicitHeight: Theme.controlHeight
     implicitWidth: 180
     hoverEnabled: true
 
@@ -36,10 +38,14 @@ ComboBox {
     }
 
     background: Rectangle {
-        radius: Theme.radiusControl - 1
-        color: Theme.bgField
-        border.color: control.hovered || control.activeFocus ? Theme.accentBorder : Theme.borderSoft
+        radius: Theme.radiusControl
+        color: control.pressed ? Theme.bgInset : Theme.bgField
+        // Keyboard focus shows the same ring the TextFields use; hover stays the
+        // softer accent border so the two states read differently.
+        border.color: control.activeFocus ? Theme.focusRing
+                      : control.hovered ? Theme.accentBorder : Theme.borderSoft
         border.width: 1
+        Behavior on color { ColorAnimation { duration: Theme.motionFast } }
         Behavior on border.color { ColorAnimation { duration: Theme.motionBase } }
     }
 
@@ -48,7 +54,8 @@ ComboBox {
         y: (control.height - height) / 2
         text: "⌄"
         color: control.hovered ? Theme.textSecondary : Theme.textMuted
-        font.pixelSize: 13
+        font.family: Theme.fontUi
+        font.pixelSize: Theme.fontBody
         Behavior on color { ColorAnimation { duration: Theme.motionBase } }
     }
 
@@ -58,7 +65,7 @@ ComboBox {
         implicitHeight: contentItem.implicitHeight + 8
         padding: 4
         background: Rectangle {
-            color: "#0E1521"
+            color: Theme.modalSurface
             radius: Theme.radiusControl
             border.color: Theme.borderSoft
             border.width: 1
@@ -77,15 +84,15 @@ ComboBox {
         height: 34
         contentItem: Text {
             text: modelData
-            color: highlighted ? "#FFFFFF" : Theme.textSecondary
+            color: highlighted ? Theme.textOnAccent : Theme.textSecondary
             verticalAlignment: Text.AlignVCenter
             leftPadding: 10
             font.family: Theme.fontUi
-            font.pixelSize: 12
+            font.pixelSize: Theme.fontSmall
         }
         background: Rectangle {
             color: highlighted ? Theme.accent : (control.currentIndex === index ? Theme.accentSoft : "transparent")
-            radius: 7
+            radius: Theme.radiusChip
             Behavior on color { ColorAnimation { duration: Theme.motionFast } }
         }
     }

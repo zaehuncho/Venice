@@ -1,0 +1,33 @@
+{
+  "description": "Strict HSV masks from saved prerelease crops; JPEG-derived, not raw runtime bytes.",
+  "green": "40 <= H <= 85; S >= 90; V >= 90 (OpenCV HSV)",
+  "white": "V >= 200; S <= 65 (OpenCV HSV)",
+  "samples": [
+    {
+      "index": 2896,
+      "source": "ep19_f002896_1_raw.jpg",
+      "source_sha256": "3752966ee8f9dae845f65224bb9eeb471bfdcf8d711eda20a72273b673011dae",
+      "bbox_xywh": [
+        488,
+        320,
+        27,
+        119
+      ],
+      "command_relative_ms": -52.53564453125,
+      "strict_green_pixels": 6
+    },
+    {
+      "index": 4293,
+      "source": "ep27_f004293_1_raw.jpg",
+      "source_sha256": "f2959e69edc4a3545b0f7a8487bbe370117b25d73b7f50bfaf4dda13197d60e6",
+      "bbox_xywh": [
+        819,
+        340,
+        27,
+        119
+      ],
+      "command_relative_ms": -2.559814453125,
+      "strict_green_pixels": 6
+    }
+  ]
+}

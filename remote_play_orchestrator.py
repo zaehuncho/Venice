@@ -1,11 +1,15 @@
+import collections
+import json
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 import queue
 import time
 from dataclasses import dataclass, field, fields, is_dataclass
+from functools import wraps
 import cv2
 import numpy as np
 import win32con
@@ -13,12 +17,57 @@ from virtual_controller import PhysicalControllerReader, DS4Button
 from controller_remap import RemapEngine, RemapConfig
 from rtt_sync_engine import RTTSyncEngine, RTTSyncConfig
 from decoder_pipe_identity import stable_executable_snapshot
+from async_diagnostic_csv import AsyncDiagnosticCsv
 logger = logging.getLogger('RemotePlayOrchestrator')
+
+
+def _with_shot_gate_lock(fn):
+    """Serialize short gate/control transitions, never pixel inference.
+
+    Snapshot plus reader handoff must be atomic with a physical arm. Otherwise an
+    expired snapshot can clear the epoch that the control thread just installed.
+    The fallback supports lightweight diagnostic/test instances built via __new__.
+    """
+    @wraps(fn)
+    def guarded(self, *args, **kwargs):
+        lock = getattr(self, '_shot_gate_lock', None)
+        if lock is None:
+            lock = self.__dict__.setdefault('_shot_gate_lock', threading.RLock())
+        with lock:
+            return fn(self, *args, **kwargs)
+    return guarded
+
+
+def _configure_opencv_threads() -> int:
+    """Bound the process-wide OpenCV pool once, before video workers start."""
+    raw = os.environ.get('ORION_CV2_THREADS', '').strip()
+    requested = 1
+    source = 'default'
+    if raw:
+        try:
+            override = int(raw)
+            # The native API takes a signed int. Negative values restore the
+            # machine-wide default, defeating this process's bounded pool.
+            if not 0 <= override <= 0x7fffffff:
+                raise ValueError('thread count is outside the nonnegative int range')
+        except (TypeError, ValueError, OverflowError):
+            logger.warning('runtime hygiene: invalid ORION_CV2_THREADS=%r; using default=1', raw)
+        else:
+            requested = override
+            source = 'override'
+    # Zero disables parallel regions; OpenCV reports one executing thread for
+    # both zero and one. Preserve the requested override in the startup log.
+    cv2.setNumThreads(requested)
+    effective = int(cv2.getNumThreads())
+    logger.info('runtime hygiene: OpenCV threads=%d requested=%d source=%s',
+                effective, requested, source)
+    return effective
+
 
 # --- stdout JSONL IPC lock (bughunt #4) --------------------------------------------------
 # Every JSONL line this process writes to stdout must hold ONE lock: the sidecar's preview
 # emitter writes ~130KB base64 lines that split across several underlying BufferedWriter
-# writes, so an unlocked concurrent writer (pose_landmark — the no-meter RELEASE trigger —
+# writes, so an unlocked concurrent writer (pose_landmark â€” the no-meter RELEASE trigger â€”
 # pose_overlay every frame, calibrate_meter_status) could interleave mid-line and corrupt
 # BOTH lines (native QJsonDocument::fromJson drops them silently; a lost meter sample at
 # the tip = mistimed release). autogreen_sidecar adopts this same lock for its _emit, so
@@ -268,7 +317,7 @@ def _frames_identical(a, b) -> bool:
 # compressed reader never binds the retired chain here. DetectorConfig (a plain
 # dataclass, no torch at module scope) is imported lazily where det_config is built.
 # NOTE: remote_play_cv still imports meter_detector at ITS module scope for
-# DetectResult/DetectorConfig — that import is torch-free (torch only loads inside the
+# DetectResult/DetectorConfig â€” that import is torch-free (torch only loads inside the
 # flag-gated *_infer try_load paths, and only when a MeterDetector is instantiated).
 try:
     from remote_play_cv import RemotePlayCVConfig, GreenWindowAnalyzer
@@ -285,13 +334,37 @@ except Exception as exc:
     RemotePlayClientManager = None
     find_remote_play_window = None
     logger.warning('Remote Play client manager unavailable: %s', exc)
+try:
+    from remote_play_client import get_standby_pool, standby_client_enabled
+except Exception:
+    get_standby_pool = None
+    standby_client_enabled = None
+try:
+    # [ORION_CONNECT_LATENCY 2026-09-14] CONSOLE ADDRESS DRIFT prewarm: resolves a silent
+    # configured console address off the connect path (see remote_play_client).
+    from remote_play_client import prewarm_console_host
+except Exception:
+    prewarm_console_host = None
+try:
+    # [ORION_STALL_ATTRIB 2026-09-15] Names the thread that ate a consumer-callback gap.
+    # Optional and inert when absent; see stall_attributor.py for the whole instrument.
+    import stall_attributor as _stall
+except Exception:
+    _stall = None
+
+@dataclass(frozen=True, slots=True)
+class _DetectionLatencyLabel:
+    """Diagnostic phase captured before publication can trigger a native release."""
+    release_seq: int
+    phase: str
+
 
 @dataclass
 class _MeterTrackPayload:
     """Per-frame tracking the sidecar serializes into the emitted JSON's ``tracking`` object
     (autogreen_sidecar `_dataclass_payload` -> asdict). The native engine reads
     ``tracking.velocity_pct_s`` / ``acceleration_pct_s2`` / ``eta_to_target_ms``
-    (RemotePlaySession.cpp) — these were 0 because this object was never populated. The detector
+    (RemotePlaySession.cpp) â€” these were 0 because this object was never populated. The detector
     computes the real fill velocity (healthy 250-650 %/s); this carries it to the native half.
     ``fill_pct`` is included so the native engine has a DIRECT path to the detector's real fill
     (vs. the remap engine's shot.fill_pct which can be one frame stale in capture-card mode)."""
@@ -299,6 +372,11 @@ class _MeterTrackPayload:
     acceleration_pct_s2: float = 0.0
     eta_to_target_ms: float = -1.0
     fill_pct: float = -1.0
+    coarse_fill_pct: float = -1.0
+    fill_estimator_mode: str = ""
+    # Canonical decimal string: the native parser rejects JSON numbers so this
+    # remains exact if the process-monotonic counter ever exceeds 2^53.
+    fill_estimator_generation: str = "0"
     confidence: float = 0.0
 
 
@@ -367,6 +445,11 @@ class _ProcessedFrameSnapshot:
     gameplay_structure_epoch: int = 0
     stage: str = ""
     bbox: tuple = ()
+    # [ORION_PROOF_DETECTOR_BOX 2026-09-19] The same frame's DETECTOR rectangle, before the
+    # reader's display hug (ORION_READER_BOX_TIGHT). Native judges the ownership proof's shape
+    # continuity on this one; `bbox` above stays what is DRAWN. Empty when the reader did not
+    # publish one, in which case native falls back to `bbox`.
+    det_bbox: tuple = ()
     bbox_wh: tuple = ()
     green: tuple = ()
     tracking: tuple = ()
@@ -554,6 +637,57 @@ def _scope_reject(reason: str) -> str:
     return ''
 
 
+# [ORION_CAPTURE_FPS 2026-09-14] Allowed capture-card refresh rates, mirrored from
+# native_orion/src/AppConfig.h (AppConfigData::captureCardFps / snappedCaptureCardFps).
+# These are the only rates an Elgato-class 1080p HDMI card negotiates.
+CAPTURE_FPS_ALLOWED = (30, 60, 120)
+CAPTURE_FPS_DEFAULT = 60
+
+
+def snap_capture_fps(value) -> int:
+    """Snap a requested capture-card rate to the nearest allowed mode.
+
+    SNAP, never clamp, and never pass a raw number through: ``cap.set(CAP_PROP_FPS, x)``
+    is advisory, so asking a card for 45 yields whatever the driver feels like while
+    CadenceLock goes on modelling a 45 Hz grid that does not exist.  Ties resolve to the
+    LOWER rate (the safer request on a bandwidth-limited USB card), matching the C++
+    ``snappedCaptureCardFps`` exactly.  Anything non-numeric is the default, 60 -- the
+    rate every build before this setting existed hard-coded.
+    """
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        return CAPTURE_FPS_DEFAULT
+    return min(CAPTURE_FPS_ALLOWED, key=lambda allowed: (abs(requested - allowed), allowed))
+
+
+def requested_capture_fps(env=None) -> int:
+    """The capture-card rate this launch asks for, from ORION_CAPTURE_FPS.
+
+    Written by RemotePlaySession.cpp in the capture-card branch only (the decoder branch
+    removes it), so a missing/blank value is the ordinary decoder or standalone case and
+    means "the default, 60".
+    """
+    source = os.environ if env is None else env
+    raw = str(source.get('ORION_CAPTURE_FPS', '') or '').strip()
+    if not raw:
+        return CAPTURE_FPS_DEFAULT
+    return snap_capture_fps(raw)
+
+
+def capture_suspect_run_frames(fps=None) -> tuple:
+    """(black_core_run, static_core_run) frame thresholds for the SUSPECT warning.
+
+    Both used to be hard-sized for a 60fps card (15 and 30 frames = 0.25 s and 0.5 s).
+    Expressed in frames they mean a different WALL-CLOCK dropout at every other rate, so
+    derive them from the rate the card was actually asked for.  At 60 -- the shipped
+    default and the only rate any build before this setting ran -- this returns exactly
+    the historical (15, 30).
+    """
+    rate = max(1, snap_capture_fps(CAPTURE_FPS_DEFAULT if fps is None else fps))
+    return (max(1, int(round(rate * 0.25))), max(1, int(round(rate * 0.5))))
+
+
 def _latency_route_scope(config) -> str:
     """Stable fixed-path identity for reusable measured-latency posteriors.
 
@@ -735,6 +869,10 @@ def get_default_gateway():
 #               previous frame + the stale verdict (encoder-skip duplicate) + sample validity, the
 #               measurement variance R fed to the temporal estimators, and the decoder keyframe
 #               flag (ORF2 fork export; 0 until wired). -1 / defaults until each producer lands.
+#   coarse_fill_pct..frame_integrity_generation = the exact fill-ruler identity that reached the
+#               native phase estimator.  These are deliberately appended: a batch must be able to
+#               prove that both samples of an interpolated anchor used one coarse/subpixel
+#               generation and one capture-source generation without disturbing legacy readers.
 _DETCSV_HEADER = ('t_ms,detected,fill_pct,confidence,x,y,w,h,rejection_reason,'
                   'green_center_pct,green_confidence,frame_w,frame_h,'
                   'wall_ms,fed,stab_streak,stab_tracking,stab_jump_px,acq_gate_px,'
@@ -744,18 +882,24 @@ _DETCSV_HEADER = ('t_ms,detected,fill_pct,confidence,x,y,w,h,rejection_reason,'
                   'pts,rel_seq,mtr_phase,'
                   'q_frame,q_session,edge_curv,sig_width,ncc_margin,roi_sad,stale,valid,'
                   'R_used,is_iframe,'
-                  'det_x,det_y,det_w,det_h')
+                  'det_x,det_y,det_w,det_h,'
+                  'coarse_fill_pct,fill_estimator_mode,fill_estimator_generation,'
+                  'frame_integrity_generation,'
+                  'sample_shot_epoch,gameplay_structure_verified,gameplay_structure_epoch,'
+                  'raw_fed,reader_stage,processed_seq,source_epoch_ms,source_identity,backend_frozen')
 # wall_ms is written %.3f, NOT %.0f: the capture stamp is nanosecond-sourced end to end
 # (backend capture_epoch_ns -> _frame_measurement_epoch_ms -> here), and the old integer-ms
 # truncation at THIS line was the reason every offline frame-interval census read a median of
-# exactly 17.000ms — a 1ms-quantized grid defeats any sub-frame/lattice measurement. Column
+# exactly 17.000ms â€” a 1ms-quantized grid defeats any sub-frame/lattice measurement. Column
 # count/order unchanged (schema guard: tests/test_detframes_schema.py).
 _DETCSV_ROW_FMT = ('%.1f,%d,%.2f,%.3f,%d,%d,%d,%d,%s,%.1f,%.3f,%d,%d,'
                    '%.3f,%d,%d,%d,%.1f,%.1f,%s,%s,%d,%d,%d,%d,%.1f,%.1f,%d,%d,%.1f,'
                    '%d,%.3f,%d,%d,%s,%d,'
                    '%d,%d,%s,'
                    '%.3f,%.3f,%.4f,%.2f,%.3f,%.2f,%d,%d,%.4f,%d,'
-                   '%d,%d,%d,%d')
+                   '%d,%d,%d,%d,'
+                   '%.2f,%s,%d,%d,'
+                   '%d,%d,%d,%d,%s,%d,%.3f,%d,%d')
 
 
 @dataclass(frozen=True)
@@ -780,6 +924,12 @@ class _CaptureHealthSnapshot:
     core_black_run: int
     core_static_run: int
     suspect: bool
+    # [ORION_CAPTURE_FPS 2026-09-14] The rate the capture card was ASKED for (ORION_CAPTURE_FPS).
+    # Carried on the snapshot rather than read off the orchestrator because the emitter is a
+    # @staticmethod running on the diagnostics worker â€” it has no `self`, by design, so that
+    # formatting never touches the frame-delivery thread's state. Defaulted so every existing
+    # construction (and every test that builds one) stays valid.
+    requested_fps: int = CAPTURE_FPS_DEFAULT
 
 
 class _LatestCaptureHealthSink:
@@ -887,7 +1037,13 @@ class RemotePlayOrchestrator:
         # immediately instead of waiting up to ~16.7ms for the next fixed 60Hz tick (and the
         # 60fps emit ceiling is lifted). Read via getattr on the sidecar side -> inert-safe.
         self._frame_ready_evt = threading.Event()
+        # Separate capture -> detector handoff. Do not share the completed-frame
+        # telemetry event: its consumer clears that event independently.
+        self._detector_frame_ready_evt = threading.Event()
         self._video_callback = None
+        self._client_lifecycle_lock = threading.RLock()
+        self._client_stop_requested = False
+        self._client_launch_inflight = False
         self._client_manager = None
         self._input_link_ready = False
         self._input_link_checked_at = 0.0
@@ -895,6 +1051,13 @@ class RemotePlayOrchestrator:
         self._window_handle = None
         self._meter_detector = None
         self._green_analyzer = None
+        # [ORION_BANNER_VERDICT_LIVE] Live reader of the game's own shot-feedback panel
+        # (banner_verdict_live.BannerVerdictLive). Created at the top of the processing loop,
+        # None whenever the gate is off or tools/timing/panel_grade.py is unavailable.
+        # Fed frames by the detect loop (submit) and release edges by release_shot_gate
+        # (note_release); a panel with no bot release behind it is logged but NOT forwarded,
+        # so a replay screen can never inflate the activity feed or the shot tally.
+        self._banner_verdict = None
         self._fill_forecaster = None       # model #3, lazily loaded iff ORION_FILL_FORECAST=1
         self._fill_forecast_log_n = 0      # throttle the predTipMs telemetry line
         # Latest fill-forecast, published for the sidecar telemetry loop to fold into the SAME
@@ -910,6 +1073,10 @@ class RemotePlayOrchestrator:
         self._tip_reg = None
         self._tip_reg_log_n = 0
         self._last_tip_reg = None
+        # A predictor's fill history belongs to one source and one reader ruler.
+        # Native phase samples already carry this identity; auxiliary predictors
+        # must not blend the old ruler into a freshly re-seated camera lock.
+        self._prediction_sample_identity = None
         # POST-HOC full-shot refit label (per archived shot): {'n', 'tip_epoch_ms', 'conf'}.
         # The Phase-1 clock prior EMAs learn from THIS (template extrapolation survives the
         # release-freeze censoring the observed peak), never from the frozen self-grade.
@@ -975,15 +1142,18 @@ class RemotePlayOrchestrator:
         # retaining safe unscoped cold learning from otherwise valid frames.
         self._decoder_warm_cache_revoked = False
         self._decoder_latency_route_lock = threading.Lock()
-        # Capture-card (HDMI) mode: the card is the EXCLUSIVE video source — never fall back to the
+        # Capture-card (HDMI) mode: the card is the EXCLUSIVE video source â€” never fall back to the
         # remote-play decoder pipe / window capture (that showed the remote-play video = the user's bug).
-        self._cc_mode = (str(getattr(config, 'frame_source', '') or '').lower() in ('capture_card', 'capturecard', 'card')
+        self._xbox_mode = str(getattr(config, 'platform', '')).lower() == 'xbox'
+        self._xbox_window = None
+        self._cc_mode = (not self._xbox_mode and (str(getattr(config, 'frame_source', '') or '').lower() in ('capture_card', 'capturecard', 'card')
                          or os.environ.get('ORION_CAPTURE_CARD', '').strip().lower() in ('1', 'true', 'yes', 'on'))
+                         )
         # Native production builds set this only for the no-capture-card Remote
         # Play source. It is a one-way stricter policy: the decoder pipe must be
         # the detector's eye, and no window/WGC fallback may gain authority.
         self._frame_pipe_required = (
-            not self._cc_mode
+            not self._xbox_mode and not self._cc_mode
             and os.environ.get('ORION_REQUIRE_FRAME_PIPE', '').strip().lower()
             in ('1', 'true', 'yes', 'on'))
         self._cc_last_retry = 0.0          # capture-loop background re-attempt throttle
@@ -1035,6 +1205,9 @@ class RemotePlayOrchestrator:
         self._pending_frame_isolated = False
         self._pending_source_frame_number = 0
         self._pending_source_identity = 0
+        # Owned exclusively by the detector-processing thread. Generic frame
+        # integrity rejects must not discard its learned meter ruler.
+        self._detector_processed_source_identity = 0
         self._pending_backend_frozen = False
         # Diagnostic-only capture -> backend-publication delay for the latest raw
         # FrameData. It never enters detector authority, frame age, or release math.
@@ -1077,7 +1250,7 @@ class RemotePlayOrchestrator:
         self._last_y_plane = None          # y_plane committed WITH self._last_frame
         # A0 unified timebase: epoch-ms stamp of the last UNIQUE frame (taken at the backend
         # read when a frame backend is active). This is the ONE clock the reader velocity,
-        # tip-registration, latency oracle, and the native engine's fusion all share — the
+        # tip-registration, latency oracle, and the native engine's fusion all share â€” the
         # release markers are already epoch ms, so capture-epoch stamps make the fill
         # timeline and the release timeline directly subtractable.
         self._last_frame_epoch_ms = 0.0
@@ -1087,13 +1260,13 @@ class RemotePlayOrchestrator:
         self._last_frame_measurement_epoch_ms = 0.0
         # P1 fix: the capture thread publishes (frame, ts, y_plane, pts, epoch_ms,
         # measurement_epoch_ms, seq, source_frame_number, backend_frozen,
-        # integrity_generation) as ONE
+        # integrity_generation, source_identity) as ONE
         # atomic tuple; the processing thread reads this single reference so a mid-detect()
         # commit of a newer frame can't skew the staleness clock (was: live _last_frame_ts
         # read AFTER detect() under-reported frame age -> fired early). D5: `seq` rides INSIDE
         # the tuple so the snapshot is self-describing (the loop can only mark done the frame it
         # actually processed); seq 0 is the never-published init value, matching _frame_seq.
-        self._frame_bundle = (None, 0.0, None, 0, 0.0, 0.0, 0, 0, True, 0)
+        self._frame_bundle = (None, 0.0, None, 0, 0.0, 0.0, 0, 0, True, 0, 0)
         # Reader stage of the last processed frame (track/track_green/acquire/coast/no_meter);
         # shipped in the sidecar payload so the engine can tell a fresh read from a coast.
         self._last_meter_stage = ''
@@ -1140,6 +1313,11 @@ class RemotePlayOrchestrator:
         self._stall_active = False
         self._fps = 0
         self._capture_fps = 0
+        # [ORION_CAPTURE_FPS 2026-09-14] The rate the capture card was ASKED for this launch
+        # (ORION_CAPTURE_FPS). Resolved here so the health line can print requested-vs-negotiated
+        # even before a backend exists, and so the decoder path reports the same default the
+        # backend would have used.
+        self._requested_capture_fps = requested_capture_fps()
         self._unique_frame_fps = 0
         self._duplicate_frame_pct = 0.0
         # --- CV-throughput profiling (separates the 38fps cap's cause). The
@@ -1164,7 +1342,7 @@ class RemotePlayOrchestrator:
         # Per-frame meter tracking published to the native engine (velocity/accel/eta). The sidecar
         # telemetry loop serializes this into the emitted JSON's `tracking` object; native reads
         # velocity_pct_s from it (0 until now because it was never assigned). Populated every processed
-        # frame below — with the detector's live velocity on a detection, zeroed on a loss.
+        # frame below â€” with the detector's live velocity on a detection, zeroed on a loss.
         self._last_meter_track = None
         # Companion `fusion` object (native prefers it over `tracking`). No separate release-fusion is
         # computed in this build, so it stays None -> the sidecar omits `fusion` and native uses `tracking`.
@@ -1190,13 +1368,14 @@ class RemotePlayOrchestrator:
         # live roi_not_found dropout: the whole frame can keep changing (uniqfps high)
         # while the captured video core is black/stale, so the detector sees a
         # meterless frame the on-screen video (and an OBS recording) clearly has. Pure
-        # diagnostics — they do NOT change capture behavior.
+        # diagnostics â€” they do NOT change capture behavior.
         self._last_capture_tier = ''
         self._tier_counts = {}
         self._video_core_hash = None
         self._video_core_black_run = 0     # consecutive good frames with a black core
         self._video_core_static_run = 0    # whole-frame changed but core did NOT
         self._last_capture_health_log = 0.0
+        self._capture_health_suspect = False
         # cadence_stats(), export_stats(), formatting, and logger handlers used to
         # execute synchronously here every ~5 seconds.  Live evidence showed the
         # resulting callback gap recurring at ~32 ms even while raw capture stayed
@@ -1210,8 +1389,8 @@ class RemotePlayOrchestrator:
         self._detdiag_enabled = os.environ.get('ORION_DETDIAG', '').strip() in ('1', 'true', 'True', 'yes')
         self._last_detect_log_ts = 0.0
         # Throttle interval (seconds) between DETDIAG lines. DETDIAG is opt-in (off by
-        # default), and when it's ON you want to actually SEE detection — 1/s is too
-        # sparse to segment shots or compute a within-shot fed-rate — so the default is
+        # default), and when it's ON you want to actually SEE detection â€” 1/s is too
+        # sparse to segment shots or compute a within-shot fed-rate â€” so the default is
         # dense (~10/s). Override with ORION_DETDIAG_INTERVAL (e.g. 1.0 for a quiet
         # long run, 0.04 for ~25/s). The detector still runs every frame; this only
         # samples WHICH results get logged, so the fed-RATE estimate stays unbiased.
@@ -1223,7 +1402,7 @@ class RemotePlayOrchestrator:
         # (stale-bytecode check): logs the resolved DETDIAG interval + whether the
         # meter_detector tracking-latch fix is present. RETIREMENT GUARD: the latch
         # probe only imports meter_detector when the LEGACY chain is actually
-        # selected — with the simple/compressed reader the retired chain is never
+        # selected â€” with the simple/compressed reader the retired chain is never
         # imported by the orchestrator at all.
         if (os.environ.get('ORION_SIMPLE_READER', '1').strip().lower() in ('1', 'true', 'yes', 'on')
                 or os.environ.get('ORION_COMPRESSED_READER', '0').strip().lower() in ('1', 'true', 'yes', 'on')):
@@ -1236,108 +1415,193 @@ class RemotePlayOrchestrator:
                 _latch = "import_failed"
         logger.warning("ORION_BUILD_MARKER detdiag_interval=%.3f stability_tracking_latch=%s",
                        self._detdiag_interval, _latch)
-        # [ORION_RUNTIME_HYGIENE] Optional cv2 worker-pool cap (ORION_CV2_THREADS=<int>; 0 = run
-        # everything on the calling thread). Default ABSENT = untouched (cv2's default pool is one
-        # worker per logical core — 16 on the rig). Decode, detect, telemetry and the 1 kHz input
-        # router all share THIS process; a 16-thread parallel_for fan-out on small-ROI ops
-        # oversubscribes the cores the pipe-reader/detect threads need, which can surface live as
-        # detect() spikes. Offline replay (2026-08-06, 900 frames of session_20260804_201020)
-        # measured NO cost to capping: median 0.57ms at 1 thread vs 0.58ms at 16, p99 1.02 vs
-        # 1.11ms — the reader gains nothing from the big pool, so shedding it is free.
-        _cv2_threads = os.environ.get('ORION_CV2_THREADS', '').strip()
-        if _cv2_threads:
-            try:
-                cv2.setNumThreads(max(0, int(_cv2_threads)))
-                logger.warning('runtime hygiene: cv2.setNumThreads applied -> %d (ORION_CV2_THREADS=%s)',
-                               cv2.getNumThreads(), _cv2_threads)
-            except (TypeError, ValueError):
-                logger.warning('runtime hygiene: invalid ORION_CV2_THREADS=%r ignored', _cv2_threads)
-        # Full-rate per-frame detection CSV, written DIRECTLY to a file — this BYPASSES
-        # the native stderr->orion_native.log relay, which throttles warnings to ~1/s
-        # (that's why the DETDIAG log lines above can't be used to measure within-shot
-        # fed-rate). Added for the 2026-06-12 live batch: fades/Go-To released blind
-        # ("meter not visible") and there was no per-frame rejection record to explain WHY
-        # the meter was lost mid-shot.
-        # DEFAULT FLIPPED TO OFF (opt-in) for shipping: the file is opened LINE-BUFFERED and
-        # a row is written per frame, i.e. ~60 synchronous flushes/second on the CAPTURE
-        # thread, for every customer, forever. That is a diagnostic cost nobody outside a
-        # measurement batch should pay. Set ORION_DETCSV=1 to turn it back on for diagnosis;
-        # the rotation/cap behaviour below is unchanged. ~50 bytes/row (~10 MB/hr), rotated
-        # per session, so it still can't grow unbounded when enabled.
+        # Capture, tracking and preview already have dedicated workers. OpenCV's
+        # per-core default pool (16 on the development rig) oversubscribes those
+        # workers for small-ROI operations. Use one thread unless explicitly
+        # overridden; change only parallelism, never pixels or frame cadence.
+        # Configure before initialization starts detector/capture/preview work.
+        _configure_opencv_threads()
+        # Full-rate detection CSV remains opt-in. The writer owns all filesystem
+        # operations; capture only formats a timestamped row and offers it to a
+        # bounded FIFO. Queue/disk/logger delays never become detector-frame delays.
         self._detcsv = None
         self._detcsv_t0 = 0.0
         self._detcsv_enabled = os.environ.get('ORION_DETCSV', '0').strip() in ('1', 'true', 'True', 'yes', 'on')
-        if self._detcsv_enabled:
-            try:
-                _csv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'diagnostics')
-                os.makedirs(_csv_dir, exist_ok=True)
-                _csv_path = os.path.join(_csv_dir, 'detframes.csv')
-                # Rotate instead of truncate: every sidecar restart used to wipe the
-                # previous session's frames (a multi-connect sitting kept only the
-                # LAST connect). detframes.csv stays the latest session (what the
-                # diagnostic tools read by default); prior sessions survive as
-                # timestamped siblings, capped to the newest 8.
-                try:
-                    if os.path.exists(_csv_path) and os.path.getsize(_csv_path) > 0:
-                        _stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(os.path.getmtime(_csv_path)))
-                        os.replace(_csv_path, os.path.join(_csv_dir, 'detframes_%s.csv' % _stamp))
-                    # Cap raised 8 -> 24 (env ORION_DETCSV_KEEP): the 2026-07-02 six-restart
-                    # reconnect storm rotated the batch's only GOOD sessions out of existence —
-                    # the two dead-capture connects survived, the data didn't. Each CSV is a few
-                    # MB; 24 is cheap insurance for measurement batches.
-                    _keep = max(1, int(os.environ.get('ORION_DETCSV_KEEP', '24')))
-                    _old = sorted(f for f in os.listdir(_csv_dir)
-                                  if f.startswith('detframes_') and f.endswith('.csv'))
-                    for _f in _old[:-_keep]:
-                        os.remove(os.path.join(_csv_dir, _f))
-                except OSError:
-                    pass
-                self._detcsv = open(_csv_path, 'w', buffering=1, encoding='utf-8')
-                self._detcsv.write(_DETCSV_HEADER + '\n')
-                self._detcsv_t0 = time.perf_counter()
-                logger.warning('detframes.csv -> full-rate per-frame log active (bypasses relay throttle)')
-            except Exception as _e:
-                logger.warning('detframes.csv open failed: %s', _e)
-                self._detcsv = None
+        self._start_detcsv()
         # Opt-in frame dump (ORION_FRAMEDUMP=1): saves exactly what the SIDECAR
-        # detector sees on the live stream — both the raw captured frame and an
-        # annotated overlay (bbox + fill line + green band) — so live detection can
+        # detector sees on the live stream â€” both the raw captured frame and an
+        # annotated overlay (bbox + fill line + green band) â€” so live detection can
         # be inspected without a console. Throttled + capped so it can't fill disk.
         self._framedump_enabled = os.environ.get('ORION_FRAMEDUMP', '').strip() in ('1', 'true', 'True', 'yes')
-        self._framedump_dir = os.environ.get('ORION_FRAMEDUMP_DIR', '').strip() or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'logs', 'diagnostics', 'framedump')
+        # ORION_FRAMEDUMP_ROOT is normally consumed by the LAUNCHER, which composes
+        # ORION_FRAMEDUMP_DIR = <root>\session_<stamp>.  Honour it here too so a sidecar
+        # started without the launcher still lands on the operator's chosen volume
+        # instead of the repo default on C: (7 GB free on this workstation).
+        self._framedump_dir = (os.environ.get('ORION_FRAMEDUMP_DIR', '').strip()
+                               or os.environ.get('ORION_FRAMEDUMP_ROOT', '').strip()
+                               or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                               'logs', 'diagnostics', 'framedump'))
+        self._init_framedump_press_window()
         try:
             self._framedump_interval = max(0.0, float(os.environ.get('ORION_FRAMEDUMP_INTERVAL', '0.2')))
         except ValueError:
             self._framedump_interval = 0.2
+        # PRESS-WINDOW mode writes only ~60 frames per shot but writes ALL of them, so the
+        # 900-frame default (15 shots) is the wrong cap for a session; 20000 is ~330 shots.
+        # [ORION_FRAMEDUMP_PRESS_BANNER 2026-09-17] With the banner leg on, a shot is
+        # ~140 (Standstill) to ~230 (Go-To) frames, so the same 20000 is ~110-140 shots.
+        # It is left where it is on purpose: the cap is a SAFETY stop, and the real limit
+        # on a long session is the disk floor, not the frame count.  Halve the bytes with
+        # ORION_FRAMEDUMP_RAW_ONLY=1 (the offline studies read only *_raw).
+        _fd_max_default = '20000' if self._framedump_press_window else '900'
         try:
-            self._framedump_max = max(1, int(os.environ.get('ORION_FRAMEDUMP_MAX', '900')))
+            self._framedump_max = max(1, int(os.environ.get('ORION_FRAMEDUMP_MAX', _fd_max_default)))
         except ValueError:
-            self._framedump_max = 900
+            self._framedump_max = int(_fd_max_default)
         self._framedump_count = 0
+        # Set once the dump has seen its first gameplay-eligible frame (see _dump_frame).
+        # A PRESS is gameplay by definition, so press-window mode needs no gate at all.
+        self._framedump_armed = (self._framedump_press_window
+                                 or os.environ.get('ORION_FRAMEDUMP_GATE', '1').strip()
+                                 in ('0', 'false', 'False', 'no'))
         self._framedump_last_ts = 0.0
         # Raw-only skips the annotated overlay PNG (the offline rise-report only reads *_raw.png),
         # halving the per-frame write cost.
         self._framedump_raw_only = os.environ.get('ORION_FRAMEDUMP_RAW_ONLY', '').strip() in ('1', 'true', 'True', 'yes')
         self._framedump_q = None
         self._framedump_writer = None
+        self._framedump_writer_stop = threading.Event()
         self._framedump_dropped = 0
-        if self._framedump_enabled:
-            try:
-                os.makedirs(self._framedump_dir, exist_ok=True)
-            except Exception:
-                pass
-            # ASYNC writer: PNG encoding is heavy; doing it inline on the capture thread (especially
-            # at a small interval) stalls the stream -> black frames -> watchdog -> SAFE MODE (which
-            # disarms automation for the whole session). Hand frames to a bounded DROP-queue + a
-            # daemon writer so the dump can NEVER block capture: if the writer can't keep up we drop
-            # dump frames rather than stall the live stream.
-            self._framedump_q = queue.Queue(maxsize=64)
-            self._framedump_writer = threading.Thread(
-                target=self._framedump_writer_loop, name='framedump-writer', daemon=True)
-            self._framedump_writer.start()
+        self._framedump_reported_dropped = 0
+        self._framedump_disabled_reason = ''
+        # A deep queue does not make diagnostics safer: it retains hundreds of MB of full-resolution
+        # frames and lets the PNG worker keep competing with capture long after the producer falls
+        # behind.  One pending frame plus the frame currently being encoded is the complete backlog.
+        # The producer drops before copying when this slot is occupied.
+        #
+        # PRESS-WINDOW mode is the exception the rule was not written for.  It writes a
+        # BOUNDED BURST (~60 frames, ~1 s) and then nothing at all until the next press, so
+        # a deep queue here does not retain frames "long after the producer falls behind" --
+        # it is the only thing that lets a 60 fps burst survive a writer hiccup.  The burst
+        # is JPEG (4.3 ms full frame / 0.6 ms crop, measured) so the queue drains faster
+        # than it fills and a 96-slot ring is ~24 MiB of 720p references at worst.
+        # (resolved in _init_framedump_press_window, which owns the mode-dependent default)
+        # Runtime disk guard.  Absolute AND percentage floors matter: 5 GiB is critical on this
+        # workstation's 1 TiB system volume, while 2% alone is too small on a compact capture drive.
+        # Invalid/unsafe overrides fall back to conservative values rather than disabling the guard.
+        try:
+            _min_free_gb = max(1.0, float(os.environ.get('ORION_FRAMEDUMP_MIN_FREE_GB', '10')))
+        except ValueError:
+            _min_free_gb = 10.0
+        try:
+            self._framedump_min_free_pct = max(
+                0.5, min(25.0, float(os.environ.get('ORION_FRAMEDUMP_MIN_FREE_PCT', '2'))))
+        except ValueError:
+            self._framedump_min_free_pct = 2.0
+        self._framedump_min_free_bytes = int(_min_free_gb * (1024 ** 3))
+        # PNG encoding is off-thread but still shares CPU and storage bandwidth with capture.  Bound
+        # its average duty cycle; callers that need denser research data may opt upward, but never
+        # beyond 50% through this diagnostic path.
+        try:
+            _duty_pct = max(
+                5.0, min(50.0, float(os.environ.get('ORION_FRAMEDUMP_MAX_DUTY_PCT', '25'))))
+        except ValueError:
+            _duty_pct = 25.0
+        self._framedump_max_duty = _duty_pct / 100.0
+        try:
+            self._framedump_max_write_s = max(
+                0.05, min(2.0, float(os.environ.get('ORION_FRAMEDUMP_MAX_WRITE_MS', '250')) / 1000.0))
+        except ValueError:
+            self._framedump_max_write_s = 0.250
+        # [2026-09-14] SLOW WRITE == BACK OFF, NOT DEATH.  A single PNG write over
+        # _framedump_max_write_s used to call _framedump_disable('writer_stall'), which is
+        # PERMANENT for the process generation.  That is what ended session_20260914_204600 after
+        # 2096 frames / 6 minutes of a 67-minute batch: the writer had been running at ~35 ms per
+        # frame all session and one write took ~350 ms, so the dump died an hour before the aborts
+        # it was launched to capture.  (The same guard killed session_20260914_135124 after ONE
+        # frame on D:.)  The pressure the guard exists to remove is real, so keep it -- but express
+        # it as a cooldown: skip frames while writes are slow, resume automatically when they are
+        # fast again, and reserve permanent disabling for disk-full / directory faults.
+        try:
+            self._framedump_backoff_max_s = max(
+                0.5, min(120.0, float(os.environ.get('ORION_FRAMEDUMP_BACKOFF_MAX_S', '15'))))
+        except ValueError:
+            self._framedump_backoff_max_s = 15.0
+        try:
+            self._framedump_heartbeat_s = max(
+                0.0, min(600.0, float(os.environ.get('ORION_FRAMEDUMP_HEARTBEAT_S', '60'))))
+        except ValueError:
+            self._framedump_heartbeat_s = 60.0
+        # Consecutive hard write EXCEPTIONS (not slow writes) before the dump is given up on.
+        try:
+            self._framedump_max_error_streak = max(
+                1, min(100, int(os.environ.get('ORION_FRAMEDUMP_MAX_ERRORS', '5'))))
+        except ValueError:
+            self._framedump_max_error_streak = 5
+        # The env opt-in is separate from the LIVE flag: the live flag is cleared by every stop()
+        # and by the back-off/disable paths, and _start_framedump() consults the opt-in to decide
+        # whether a fresh capture generation gets a writer back.
+        self._framedump_env_enabled = bool(self._framedump_enabled)
+        self._framedump_permanent_stop = ''
+        self._framedump_skipped = 0
+        self._framedump_backoff_until = 0.0
+        self._framedump_backoff_s = 0.0
+        self._framedump_slow_streak = 0
+        self._framedump_error_streak = 0
+        self._framedump_last_write_ms = 0.0
+        self._framedump_last_write_ts = 0.0
+        self._framedump_heartbeat_ts = 0.0
+        self._framedump_generation = 0
+        self._framedump_enabled = False
+        self._start_framedump()
+        # [ORION_SHOT_RECORDS 2026-09-16] "Labels for free": one JSON line per shot the
+        # owner takes, joining the press, the reader's first sight, the release marker,
+        # the RELEASE ORACLE and the game's own banner verdict on the shot-gate physical
+        # epoch.  Created here (not in the processing loop) so a capture restart does not
+        # start a second corpus file mid-session.  None when ORION_SHOT_RECORDS=0 or the
+        # module/output is unavailable; every call site is guarded.
+        self._shot_records = None
+        # Fallback meter-onset clock for the record: the FIRST frame of this press on
+        # which the reader reported a detection.  Written by the detect loop from fields
+        # that frame already computed (see _processing_loop); read on the control thread.
+        self._shot_record_onset_epoch = 0
+        self._shot_record_onset_done = False
+        self._shot_record_icon_next = 0.0
+        try:
+            from shot_records import ShotRecorder as _ShotRecorder
+            # [ORION_FRAMEDUMP_SESSION_DIR 2026-09-17] One label for both outputs: the
+            # record file and the press-window frame folder carry the same session stamp, so
+            # a JSONL row and its frames join by (session, epoch) instead of by epoch alone
+            # -- which was ambiguous the moment two sessions shared one dump root.
+            self._shot_records = _ShotRecorder.create(
+                log=logger, session=str(getattr(self, '_framedump_session', '') or ''))
+        except Exception as _sr_exc:
+            logger.warning('shot records unavailable: %s', _sr_exc)
+        # The nameplate "3"-cell sampler is OPT-IN: it is the only thing in this batch that
+        # reads pixels the detect thread had no reason to read (one 22x22 ROI mean at
+        # 10 Hz, 0.026 ms measured).  tools/diagnostics/hud_3pt_icon.py's own detector is
+        # an 8-scale template sweep at 157.7 ms/frame and can never run live.
+        self._shot_record_icon = str(
+            os.environ.get('ORION_SHOT_RECORD_ICON', '0') or '0').strip().lower() in (
+                '1', 'true', 'yes', 'on')
+        # [ORION_SHOT_RANGE 2026-09-17] THREE or MID for the live press, read off the same
+        # nameplate "3" cell 40-120 ms after the Square edge and sent to the engine on the
+        # existing stdout JSONL channel so the fade trim can key on RANGE as well as on
+        # (type, tempo).  The detect thread only appends a frame REFERENCE; every pixel
+        # read, the vote and the emit happen on the reader's own worker.  See shot_range.py
+        # for the calibration status -- the verdict ships as `unknown` until it is armed.
+        self._shot_range = None
+        try:
+            from shot_range import ShotRangeReader as _ShotRangeReader, anchor_plate
+            self._shot_range = _ShotRangeReader.create(
+                emit=emit_stdout_jsonl, plate_fn=anchor_plate,
+                on_result=self._shot_range_result, log=logger)
+        except Exception as _srg_exc:
+            logger.warning('shot range unavailable: %s', _srg_exc)
         self._last_fps_time = time.perf_counter()
         self._last_meter_bbox = None
+        # [ORION_PROOF_DETECTOR_BOX 2026-09-19] the same frame's DETECTOR rectangle (pre display hug)
+        self._last_meter_det_bbox = None
         self._last_meter_bbox_wh = None   # (w,h) of the frame the bbox was computed in (overlay-map scale)
         self._last_green_window = None
         # Release-window diagnostic bridge: the reader owns the immutable native release id and
@@ -1368,6 +1632,7 @@ class RemotePlayOrchestrator:
         # and its coast is extended for fast-fade blur. Auto-expires (bounded) and re-arms on each
         # shot-start; a fresh detected meter also refreshes it so a live shot stays armed. Inert for
         # the serving chain (MeterDetector has no set_shot_state).
+        self._shot_gate_lock = threading.RLock()
         self._shot_gate_deadline_seq = -1
         self._shot_gate_deadline_monotonic = -1.0
         # SEPARATE hardware-arm deadline (plan B1 [fix]): set ONLY by _arm_shot_gate (physical
@@ -1468,12 +1733,12 @@ class RemotePlayOrchestrator:
                     in ('1', 'true', 'yes', 'on')
                 # Park IS the RED rec-mode meter. PIN meter_color=Red (+ disable auto-colour) when
                 # park is on, so park activation and the constrained colour read NEVER depend on a
-                # mislabeled/auto-thrashed meter_color — the historical misconfig that silently ran
+                # mislabeled/auto-thrashed meter_color â€” the historical misconfig that silently ran
                 # the wrong-colour mask and false-locked on park reds (the "old buggy detection").
                 #
                 # SCOPE (2026-08-04): the pin belongs to the LEGACY serving chain's park path and
                 # ONLY to it.  `park_temporal_enabled` defaults ON, so an unscoped pin overwrote
-                # meter_color on EVERY launch — including for the SimpleMeterReader built from
+                # meter_color on EVERY launch â€” including for the SimpleMeterReader built from
                 # this same det_config below, which has no park path at all.  That made the UI
                 # colour picker completely inert: a user selecting Purple got a Red mask, no
                 # detections, and no explanation.  CompressedMeterReader must be excluded too:
@@ -1499,7 +1764,7 @@ class RemotePlayOrchestrator:
                 # native, timing stack) consumes it UNCHANGED. A head-to-head proved it matches the
                 # chain on accuracy at ~1% of the code with ZERO decor false-locks
                 # (logs/diagnostics/simple_vs_chain/FINAL_*.txt).
-                # DEFAULT FLIPPED to '1': this IS the shipped path — the native launcher injects
+                # DEFAULT FLIPPED to '1': this IS the shipped path â€” the native launcher injects
                 # ORION_SIMPLE_READER=1 on every real launch, so the old '0' default only ever
                 # applied to entry points that DON'T inject it (tools, harnesses, a bare sidecar
                 # run), which then fell through to the retired chain and errored. Opt OUT with
@@ -1570,7 +1835,7 @@ class RemotePlayOrchestrator:
                         'The shipped path is ORION_SIMPLE_READER=1.')
                 # Detector-stack fields APPENDED to the one built-line (a separate WARNING 1ms
                 # later was eaten by the native relay's WARNING throttle, 2026-07-04): everything
-                # below announces itself at INFO, which the relay drops — batch forensics could
+                # below announces itself at INFO, which the relay drops â€” batch forensics could
                 # not even tell whether the v6 locator had loaded. key=value, no spaces in values.
                 try:
                     _loc = getattr(self._meter_detector, '_locator', None)
@@ -1629,7 +1894,7 @@ class RemotePlayOrchestrator:
                     if self._tip_reg is not None:
                         logger.warning('Tip registration ENABLED -> regTipMs/regConf telemetry')
                         # B2: wire the fit into a robust reader (trajectory gate + dead-reckoned
-                        # coast read the last online fit through predict_fill). Guarded — the
+                        # coast read the last online fit through predict_fill). Guarded â€” the
                         # serving chain has no set_fit_provider; absent hook = features inert.
                         _sfp = getattr(self._meter_detector, 'set_fit_provider', None)
                         if callable(_sfp) and hasattr(self._tip_reg, 'predict_fill'):
@@ -1644,6 +1909,24 @@ class RemotePlayOrchestrator:
                     _sgs = getattr(self._meter_detector, 'set_green_grade_sink', None)
                     if callable(_sgs):
                         _sgs(self._on_green_grade)
+                except Exception:
+                    pass
+                # [ORION_RELEASE_ORACLE_TRIM 2026-09-15] The reader's post-release retraction
+                # measurement leaves as ONE JSON line per release on the banner verdict's own
+                # stdout channel (RemotePlaySession parses `event == "release_oracle"` and feeds
+                # gap_px + verdict_proxy to the Shot Lead trim). The reader can find this writer
+                # by itself through sys.modules, but the wiring is made explicit here so the
+                # data path is greppable next to the other sinks. Guarded: an older reader
+                # without the hook simply keeps its ERROR line.
+                try:
+                    _ros = getattr(self._meter_detector, 'set_release_oracle_sink', None)
+                    if callable(_ros):
+                        # [ORION_SHOT_RECORDS] The tee forwards the identical bytes to the
+                        # native after handing the record a copy; the engine's trim is
+                        # unaffected whether or not the recorder exists.
+                        _ros(self._shot_record_oracle_sink
+                             if getattr(self, '_shot_records', None) is not None
+                             else emit_stdout_jsonl)
                 except Exception:
                     pass
                 # Frozen-meter latency oracle + boot-probe (ORION_MEASURE_LATENCY, default on).
@@ -1688,7 +1971,7 @@ class RemotePlayOrchestrator:
         self._video_callback = callback
 
     def _on_pose_landmark(self, landmark):
-        """Callback for pose timing detector — emits pose_landmark event for C++ engine."""
+        """Callback for pose timing detector â€” emits pose_landmark event for C++ engine."""
         try:
             import json as _json
             arm_token = _parse_pose_arm_token(getattr(landmark, "arm_token", 0))
@@ -1777,6 +2060,7 @@ class RemotePlayOrchestrator:
         except Exception:
             return None
 
+    @_with_shot_gate_lock
     def _arm_shot_gate(self, source: str = "hw", shot_epoch=0,
                        notify_reader_start: bool = True):
         """Arm a shot-gated meter reader (SimpleMeterReader) for a bounded window from the current
@@ -1789,14 +2073,16 @@ class RemotePlayOrchestrator:
 
         Returns (incoming_epoch, effective_epoch, notified_reader) so the public native-command
         entry can log a one-line receipt without re-deriving the epoch arbitration."""
+        incoming_epoch = _parse_pose_arm_token(shot_epoch)
+        current_epoch = _parse_pose_arm_token(getattr(self, '_shot_gate_epoch', 0))
+        if 0 < incoming_epoch < current_epoch:
+            return incoming_epoch, current_epoch, False
         _gate_now = time.perf_counter()
         self._shot_gate_deadline_seq = self._frame_seq + self._shot_gate_arm_frames
         self._shot_gate_hw_deadline_seq = self._frame_seq + self._shot_gate_arm_frames
         self._shot_gate_deadline_monotonic = _gate_now + self._shot_gate_max_seconds
         self._shot_gate_hw_deadline_monotonic = _gate_now + self._shot_gate_max_seconds
         self._shot_gate_source = str(source)
-        incoming_epoch = _parse_pose_arm_token(shot_epoch)
-        current_epoch = _parse_pose_arm_token(getattr(self, '_shot_gate_epoch', 0))
         # Native/controller epochs are monotonic and authoritative. An untokenized local
         # input-router or later pose refresh may extend detector wake-up, but once a native
         # epoch exists it must never overwrite that epoch or reset the reader's shot identity.
@@ -1839,31 +2125,388 @@ class RemotePlayOrchestrator:
                 logger.debug("set_shot_state(arm) failed: %s", e)
         return incoming_epoch, effective_epoch, notified_reader
 
-    def arm_shot_gate(self, source: str = "hw", shot_epoch=0):
+    def _forward_shot_gate_shot_type(self, epoch: int, shot_type: str, rhythm: bool) -> bool:
+        """Hand the reader the engine's classification for `epoch`. -> did it take it?
+
+        [ORION_SHOT_GATE_TYPE 2026-09-15] Guarded exactly like every other reader hook on this
+        path: an older reader without the method simply keeps the union onset window. Never
+        raises -- a missing type costs a wider expectation window, never a frame.
+        """
+        if epoch <= 0 or not str(shot_type or "").strip():
+            return False
+        fn = getattr(self._meter_detector, "notify_physical_shot_type", None)
+        if not callable(fn):
+            return False
+        try:
+            fn(epoch, str(shot_type), bool(rhythm))
+            return True
+        except Exception as exc:
+            logger.debug("notify_physical_shot_type failed: %s", exc)
+            return False
+
+    @_with_shot_gate_lock
+    def arm_shot_gate(self, source: str = "hw", shot_epoch=0, shot_type="", rhythm=False):
         """Public, input-only wake-up used by the native first-edge command.
 
         It grants detector acquisition/coast state only. Release authority remains
         in the native engine and its later tokenized pose_arm/vision-epoch checks.
+
+        [ORION_SHOT_GATE_TYPE 2026-09-15] `shot_type` is the engine's own classification of
+        this press ("Standstill" / "Left Fade" / ...) and `rhythm` whether the release carries
+        the Rhythm flick offset. Both are OPTIONAL: an old native sends neither and the reader
+        keeps the union meter-onset window, which is exactly the pre-change behaviour. The
+        native re-sends the SAME epoch with source="type_upgrade" when its blind 200 ms grace
+        re-types a Standstill into a fade; that lands here as a duplicate epoch (notify=0, the
+        reader's shot identity and its early trajectory are kept) and updates only the type.
         """
+        incoming_epoch = _parse_pose_arm_token(shot_epoch)
+        current_epoch = _parse_pose_arm_token(getattr(self, '_shot_gate_epoch', 0))
+        if 0 < incoming_epoch < current_epoch:
+            logger.warning("SHOT-GATE STALE ARM IGNORED: epoch=%d current_epoch=%d",
+                           incoming_epoch, current_epoch)
+            return False
         incoming_epoch, effective_epoch, notified_reader = self._arm_shot_gate(
             source, shot_epoch, notify_reader_start=True)
+        # AFTER the arm: notify_physical_shot_start installs the epoch the type belongs to.
+        typed = self._forward_shot_gate_shot_type(effective_epoch, shot_type, rhythm)
         self._shot_gate_edge_pending = True
+        # [ORION_SHOT_RECORDS 2026-09-16] THE PRESS IS THE RECORD'S t=0.  Both of these are
+        # O(1) on this thread (a dict insert and a deque replay of at most PRE_MS of frame
+        # REFERENCES); neither touches the disk, the detector or the engine.  A duplicate
+        # epoch (the native's source=type_upgrade re-arm) updates the type in place and
+        # leaves the open window and the press timestamp exactly where they were.
+        rec = getattr(self, '_shot_records', None)
+        if rec is not None and effective_epoch > 0:
+            try:
+                rec.note_press(effective_epoch, ts_ms=time.time() * 1000.0,
+                               mono_ms=time.perf_counter() * 1000.0, source=source,
+                               shot_type=shot_type, rhythm=rhythm)
+            except Exception as exc:
+                logger.debug('shot record note_press failed: %s', exc)
+        # [ORION_SHOT_RANGE 2026-09-17] The range window is press-anchored exactly as the
+        # record is, so it opens on the same edge and on the same clock.  A duplicate epoch
+        # (the native's type_upgrade re-arm) is refused inside note_press: the press did not
+        # move, and restarting its window would throw away frames already collected.
+        _rng = getattr(self, '_shot_range', None)
+        if _rng is not None and effective_epoch > 0:
+            try:
+                _rng.note_press(effective_epoch, time.perf_counter() * 1000.0)
+            except Exception as exc:
+                logger.debug('shot range note_press failed: %s', exc)
+        if effective_epoch > 0 and int(getattr(self, '_shot_record_onset_epoch', 0)) != int(
+                effective_epoch):
+            self._shot_record_onset_epoch = int(effective_epoch)
+            self._shot_record_onset_done = False
+            self._shot_record_icon_next = 0.0
+        self.framedump_press_open(effective_epoch)
         # PERMANENT t=0 RECEIPT FORENSICS (one line per physical shot edge). This is the
         # arrival half of the native's silent Path A ("shot_gate_arm send" on the native
         # side); the existing "SHOT-GATE ARMED/DISARMED" lines fire only on gate
         # TRANSITIONS, so a per-shot receipt was previously invisible whenever the gate
         # stayed armed across shots. notify=0 with a nonzero epoch means the epoch did
         # not advance (duplicate/stale arm) so the reader's shot identity was kept.
+        # [ORION_SHOT_GATE_TYPE 2026-09-15] shot_type/rhythm/typed are APPENDED to the line, so
+        # every existing reader of this receipt is unaffected. `unclassified` is EMITTED, never
+        # omitted, when the arm carried no type -- a reader must be able to separate "this edge
+        # was never typed" from "this build predates the field". typed=0 with a nonzero
+        # shot_type means the reader refused/lacks the hook and stayed on the union window.
         try:
             logger.warning(
                 "SHOT-GATE ARM RECEIPT: src=%s epoch=%d effective_epoch=%d notify=%d "
-                "frame_seq=%d",
+                "frame_seq=%d shot_type=%s rhythm=%d typed=%d",
                 str(source)[:24], incoming_epoch, effective_epoch,
-                int(notified_reader), self._frame_seq)
+                int(notified_reader), self._frame_seq,
+                (str(shot_type).strip().replace(" ", "_")[:24] or "unclassified"),
+                int(bool(rhythm)), int(typed))
         except Exception:
             pass
         return True
 
+    def release_shot_gate(self, shot_epoch=0, release_ms=0.0):
+        """The engine issued this press's RELEASE edge (native `shot_gate_release`).
+
+        [ORION_SHOT_GATE_RELEASE 2026-09-15] The arrival half of the native's
+        "shot_gate_release send" line. The reader's press window (player_anchor.ARM, which
+        bounds the nameplate anchor and the meter-onset expectation) ends HERE instead of
+        timing out on ORION_ANCHOR_ARM_S ~1 s after the ball has left the hand.
+
+        Detector acquisition/coast state is NOT touched: the latency oracle and the
+        release-window diagnostic still need roughly 1.2 s of post-release meter frames, and
+        _settle_shot_gate remains the only owner of those deadlines.
+        """
+        # [ORION_BANNER_VERDICT_LIVE 2026-09-15] This edge is the ONLY thing that makes the
+        # game's next shot-feedback panel ours. It is the single funnel for every engine
+        # release -- the normal one and the METER BACKSTOP one -- so the live banner reader
+        # binds its verdicts here and refuses to forward a panel nobody shot (a replay
+        # screen re-read 16 times in 39 s on 2026-09-15). disarm_shot_gate deliberately does
+        # NOT feed it: a cancelled press is not a shot. Never raises, costs one lock.
+        _bv = getattr(self, '_banner_verdict', None)
+        if _bv is not None:
+            try:
+                _bv.note_release(_parse_pose_arm_token(shot_epoch), release_ms)
+            except Exception:
+                pass
+        return self._close_shot_gate_press(shot_epoch, "release", release_ms)
+
+    def disarm_shot_gate(self, shot_epoch=0, reason="disarm"):
+        """The press ended with NO release edge: a manual cancel, a tap, or an engine abort.
+
+        Same effect on the reader as release_shot_gate -- the press is over either way, and an
+        anchor left armed on a press nobody will ever shoot is pure cost plus a false-lock
+        licence on whatever comes on screen next.
+        """
+        return self._close_shot_gate_press(shot_epoch, str(reason or "disarm"), None)
+
+    @_with_shot_gate_lock
+    def _close_shot_gate_press(self, shot_epoch, reason: str, release_ms):
+        """Shared body of release_shot_gate/disarm_shot_gate + their one receipt line."""
+        epoch = _parse_pose_arm_token(shot_epoch)
+        closed = False
+        fn = getattr(self._meter_detector, "notify_physical_shot_release", None)
+        if callable(fn):
+            try:
+                closed = bool(fn(epoch, release_ms, reason))
+            except TypeError:
+                # Older readers may expose only the epoch form.
+                try:
+                    closed = bool(fn(epoch))
+                except Exception as exc:
+                    logger.debug("notify_physical_shot_release failed: %s", exc)
+            except Exception as exc:
+                logger.debug("notify_physical_shot_release failed: %s", exc)
+        # _shot_gate_edge_pending is deliberately NOT touched: it is arm_pose's "did the native
+        # already wake the reader for THIS shot" latch, and clearing it here would let a
+        # late pose_arm re-notify the reader and erase the press's early trajectory.
+        #
+        # [ORION_SHOT_RECORDS 2026-09-16] The reader's release hook above is what flushes this
+        # press's PICKUP line, so its record is complete exactly HERE and nowhere earlier.
+        # Read it (never write it) and fold it into the shot record, then mark the release.
+        rec = getattr(self, '_shot_records', None)
+        if rec is not None and epoch > 0:
+            try:
+                pickup = self._read_pickup_record(epoch)
+                if pickup is not None:
+                    rec.note_pickup(epoch, pickup)
+                if reason == "release":
+                    rec.note_release(epoch, release_ms)
+                else:
+                    rec.note_disarm(epoch, reason)
+            except Exception as exc:
+                logger.debug('shot record close failed: %s', exc)
+        # [ORION_SHOT_RANGE 2026-09-17] Flush the range window if the press ended before it
+        # filled (a tap, an abort).  A window that already went to the worker is untouched.
+        _rng = getattr(self, '_shot_range', None)
+        if _rng is not None and epoch > 0:
+            try:
+                _rng.note_close(epoch)
+            except Exception as exc:
+                logger.debug('shot range note_close failed: %s', exc)
+        self.framedump_press_close(epoch)
+        label = "RELEASE" if reason == "release" else "DISARM"
+        try:
+            logger.warning(
+                "SHOT-GATE %s RECEIPT: epoch=%d reason=%s release_ms=%.1f closed=%d "
+                "frame_seq=%d",
+                label, epoch, str(reason)[:32].replace(" ", "_"),
+                float(release_ms) if release_ms is not None else -1.0,
+                int(closed), self._frame_seq)
+        except Exception:
+            pass
+        return True
+
+    # ------------------------------------------------------------------ #
+    #  SHOT RECORDS -- the three late instruments that do not arrive on the press edge.
+    # ------------------------------------------------------------------ #
+    def _read_pickup_record(self, epoch):
+        """READ (never write) the locator's PICKUP record for `epoch`.
+
+        This is the same dict `SimpleMeterReader._flush_pickup_line` logs -- first sight
+        of the meter and whether the player anchor is what found it. It lives on the CV
+        proposer: SimpleMeterReader._meter_detector -> AsyncMeterLocator._base.
+        A direct locator/legacy adapter may instead expose _base itself. These are the
+        only supported layouts; this is not a recursive search for another press's record.
+        Under a proposer that keeps no pickup record this
+        returns None and the shot record simply carries `pickup: null` and falls back to
+        the detect loop's own first-detection stamp for the onset.
+        """
+        try:
+            requested_epoch = _parse_pose_arm_token(epoch)
+            if requested_epoch <= 0:
+                return None
+            reader = getattr(self, '_meter_detector', None)
+            locator = getattr(reader, '_meter_detector', None)
+            base = getattr(locator if locator is not None else reader, '_base', None)
+            pickup = getattr(base, 'pickup', None)
+            if not isinstance(pickup, dict):
+                return None
+            out = dict(pickup)
+            if _parse_pose_arm_token(out.get('epoch', 0)) != requested_epoch:
+                return None                 # a record for a different press is not ours
+            stats = getattr(base, 'stats', None)
+            if isinstance(stats, dict):
+                out['patch_hits'] = int(stats.get('anchor_patch_hit', 0) or 0)
+            return out
+        except Exception:
+            return None
+
+    def _shot_record_oracle_sink(self, line):
+        """Tee the reader's `release_oracle` JSON line: shot record first, then the pipe.
+
+        The native's Shot Lead trim is the line's real consumer, so the forward to stdout
+        happens whatever the record does -- and it happens even if this method raises.
+        """
+        rec = getattr(self, '_shot_records', None)
+        if rec is not None:
+            try:
+                payload = json.loads(line)
+                rec.note_oracle(payload.get('release_seq', 0), payload)
+            except Exception as exc:
+                logger.debug('shot record oracle tee failed: %s', exc)
+        emit_stdout_jsonl(line)
+
+    def _shot_record_banner_sink(self, line):
+        """Tee the banner reader's `banner_verdict` JSON line the same way.
+
+        Only ATTRIBUTED verdicts reach an emit_line at all (banner_verdict_live refuses to
+        forward a panel nobody shot), so every line here already carries the release_seq
+        the record is keyed on.
+        """
+        rec = getattr(self, '_shot_records', None)
+        if rec is not None:
+            try:
+                rec.note_banner(json.loads(line))
+            except Exception as exc:
+                logger.debug('shot record banner tee failed: %s', exc)
+        emit_stdout_jsonl(line)
+
+    def _shot_record_frame_hook(self, frame, result, now):
+        """Detect-thread half of the shot record.  READS ONLY FIELDS THIS FRAME ALREADY HAS.
+
+        Two things, both bounded:
+          * the FALLBACK meter onset -- the first frame of this press the reader called
+            detected.  Two attribute reads and a comparison (~0.5 us); the PICKUP record
+            still wins when it exists.
+          * the OPT-IN nameplate "3"-cell brightness sample at 10 Hz
+            (ORION_SHOT_RECORD_ICON=1), taken at the plate position player_anchor already
+            found on this frame.  0.026 ms per sample, measured; off by default.
+        """
+        rec = getattr(self, '_shot_records', None)
+        if rec is None:
+            return
+        epoch = int(getattr(self, '_shot_record_onset_epoch', 0) or 0)
+        if epoch <= 0:
+            return
+        detected = bool(getattr(result, 'detected', False)) if result is not None else False
+        if detected and not getattr(self, '_shot_record_onset_done', False):
+            self._shot_record_onset_done = True
+            try:
+                press_ms = self._shot_record_press_mono_ms(epoch)
+                if press_ms is not None:
+                    rec.note_onset(epoch, now * 1000.0 - press_ms,
+                                   fill=getattr(result, 'fill_pct', None),
+                                   source='detect_loop')
+            except Exception:
+                pass
+        if getattr(self, '_shot_record_icon', False)                 and now >= float(getattr(self, '_shot_record_icon_next', 0.0) or 0.0):
+            self._shot_record_icon_next = now + 0.1        # 10 Hz
+            try:
+                self._shot_record_icon_sample(rec, epoch, frame, now)
+            except Exception:
+                pass
+
+    def _shot_range_result(self, epoch, payload, cells):
+        """[ORION_SHOT_RANGE 2026-09-17] The range reader's own worker calls this once per
+        press, just before it emits the JSON line.  It only files the reading in the shot
+        record: the engine is told on the stdout channel, never from here."""
+        rec = getattr(self, '_shot_records', None)
+        if rec is None:
+            return
+        try:
+            rec.note_range(epoch, payload, cells)
+        except Exception as exc:
+            logger.debug('shot range record tee failed: %s', exc)
+
+    def _shot_record_press_mono_ms(self, epoch):
+        rec = getattr(self, '_shot_records', None)
+        if rec is None:
+            return None
+        try:
+            with rec._lock:                       # noqa: SLF001 -- same-process read
+                open_rec = rec._open.get(int(epoch))
+                return None if open_rec is None else open_rec.get('press_mono_ms')
+        except Exception:
+            return None
+
+    def _shot_record_icon_sample(self, rec, epoch, frame, now):
+        """One nameplate-"3"-cell brightness sample, derived offline into icon_off_ms.
+
+        GEOMETRY comes straight from tools/diagnostics/hud_3pt_icon.py: the "3" disc sits
+        one disc-pitch (25 px at scale 1.0) to the LEFT of the PlayStation-logo disc that
+        player_anchor already tracks.  The icon is a near-black disc with a bright glyph;
+        when the ball goes it is replaced by court wood, so the cell's MEAN jumps and its
+        dark fraction collapses -- which is the edge the offline pass reads.
+        """
+        import player_anchor as _pa
+        last = getattr(_pa.ANCHOR, '_last', None)
+        if not last or frame is None:
+            return
+        icon_x, icon_y, scale = float(last[0]), float(last[1]), float(last[2] or 1.0)
+        half = max(6.0, 11.0 * scale)
+        cx = icon_x - 25.0 * scale
+        h, w = frame.shape[:2]
+        x0, x1 = int(max(0, cx - half)), int(min(w, cx + half))
+        y0, y1 = int(max(0, icon_y - half)), int(min(h, icon_y + half))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return
+        cell = frame[y0:y1, x0:x1]
+        mean = float(cell.mean())
+        dark = float((cell.max(axis=2) < 75).mean()) if cell.ndim == 3 else float(
+            (cell < 75).mean())
+        press_ms = self._shot_record_press_mono_ms(epoch)
+        t_ms = (now * 1000.0 - press_ms) if press_ms is not None else -1.0
+        rec.note_icon_sample(epoch, t_ms, mean, dark)
+
+    @_with_shot_gate_lock
+    def _refresh_cv_shot_gate(self, frame_seq):
+        """Refresh merged acquisition only; CV never creates hardware authority."""
+        # MERGED deadline only. NEVER _shot_gate_hw_deadline_seq (plan
+        # B1 [fix]): a CV-armed window must not open colour training --
+        # a false lock training itself was the failure mode this kills.
+        if frame_seq > self._shot_gate_deadline_seq:
+            self._shot_gate_source = 'cv'   # never overwrites a live physical source
+        self._shot_gate_deadline_seq = frame_seq + self._shot_gate_arm_frames
+        self._shot_gate_deadline_monotonic = (
+            time.perf_counter() + self._shot_gate_max_seconds)
+
+    @_with_shot_gate_lock
+    def _push_reader_shot_gate(self, frame_seq):
+        """Snapshot and apply one gate state without losing a concurrent press."""
+        _sg = getattr(self._meter_detector, "set_shot_state", None)
+        if callable(_sg):
+            # Frame sequence intentionally freezes on dark/loading frames, so the
+            # monotonic cap is mandatory.  Both bounds must remain valid.
+            _armed_now, _armed_hw_now = self._shot_gate_state(frame_seq)
+            if _armed_now != self._shot_gate_armed_prev:
+                # CLEAR arm/disarm marker so a live log can confirm the shot-gate is
+                # firing (the missing signal in session_20260706_190737).
+                logger.warning("SHOT-GATE %s at frame_seq=%d (deadline=%d hw=%d src=%s)",
+                               "ARMED" if _armed_now else "DISARMED",
+                               frame_seq, self._shot_gate_deadline_seq,
+                               self._shot_gate_hw_deadline_seq,
+                               self._shot_gate_source or "-")
+                self._shot_gate_armed_prev = _armed_now
+            try:
+                _sg(_armed_now, 0.0, _armed_hw_now)
+            except TypeError:
+                # legacy 2-arg reader hook (guarded: chain readers differ)
+                try:
+                    _sg(_armed_now)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    @_with_shot_gate_lock
     def _shot_gate_state(self, frame_seq: int = None, monotonic_now: float = None):
         """Return (merged, hardware) gate state under BOTH frame and wall caps.
 
@@ -1880,6 +2523,7 @@ class RemotePlayOrchestrator:
                      and _now <= self._shot_gate_hw_deadline_monotonic)
         return _merged, _hardware
 
+    @_with_shot_gate_lock
     def _settle_shot_gate(self, source: str = "release"):
         """Bound post-release vision without cutting off detector diagnostics.
 
@@ -1898,6 +2542,7 @@ class RemotePlayOrchestrator:
                 self._shot_gate_hw_deadline_monotonic, _now + _tail)
         self._shot_gate_source = str(source)
 
+    @_with_shot_gate_lock
     def arm_pose(self, arm_token):
         """Arm the pose zero-cross release search at the current frame. Called from the native engine
         via the 'pose_arm' stdin command on shot-begin. The live virtual_controller=False path has NO
@@ -1961,62 +2606,108 @@ class RemotePlayOrchestrator:
             if color and color != "Red" and _park_owns_colour:
                 logger.warning('park: ignoring live meter_color change %s (pinned Red while park is on)', color)
                 color = ''
+            # Native sends the complete remap after EVERY settings save, including
+            # the previous shot's calibration save during a new shot. Those are
+            # not source/profile changes: reloading the same colour used to erase
+            # the live lock, session ruler and trained HSV on each such message.
+            # Keep applied identity separately from cfg: callers may mutate that
+            # shared object before notifying us. Reader-owned identity takes
+            # precedence so explicit reload_config calls are also observed.
+            prior = getattr(self, '_meter_applied_profile', None)
+            same_detector = prior is not None and prior[0] is det
+            applied_color = getattr(det, '_meter_color', None)
+            if applied_color is None:
+                applied_color = prior[1] if same_detector else getattr(cfg, 'meter_color', '')
+            applied_style = getattr(det, '_tracking_meter_style', None)
+            if applied_style is None:
+                applied_style = prior[2] if same_detector else getattr(det, '_active', None)
+            color_changed = bool(color) and color.casefold() != str(applied_color or '').strip().casefold()
+            style = str(meter_style).strip() if meter_style else ''
+            style_changed = bool(style) and style.casefold() != str(applied_style or '').strip().casefold()
             if color:
                 self.config.meter_color = color
                 if cfg is not None:
                     cfg.meter_color = color
+            if color_changed:
+                if cfg is not None:
                     # New color => the trained HSV ranges no longer apply.
                     cfg.meter_hsv_low = None
                     cfg.meter_hsv_high = None
                     if hasattr(det, 'reload_config'):
                         det.reload_config(cfg)
-            style = str(meter_style).strip() if meter_style else ''
             if style and hasattr(det, 'set_active_style'):
                 self.config.meter_style = style
-                det.set_active_style(style)
-            elif color and hasattr(det, 'reset_tracking'):
+                if cfg is not None and hasattr(cfg, 'meter_style'):
+                    cfg.meter_style = style
+                if style_changed:
+                    det.set_active_style(style)
+            if color_changed and not style_changed and hasattr(det, 'reset_tracking'):
                 # Color-only change: drop stale tracking so the next frame
                 # re-locks with the new mask instead of fighting old history.
                 det.reset_tracking()
-            logger.info('Meter detector updated live (style=%s, color=%s)', style or '-', color or '-')
+            self._meter_applied_profile = (
+                det, color if color else applied_color,
+                style if style else applied_style)
+            if color_changed or style_changed:
+                logger.info('Meter detector updated live (style=%s, color=%s)', style or '-', color or '-')
         except Exception as e:
             logger.error(f'update_meter failed: {e}')
 
+    def _client_state_lock(self):
+        # Initialized before runtime threads start. Lazy initialization also supports
+        # lightweight diagnostic/test instances constructed without __init__.
+        lock = getattr(self, '_client_lifecycle_lock', None)
+        if lock is None:
+            lock = self.__dict__.setdefault('_client_lifecycle_lock', threading.RLock())
+        return lock
+
     def _launch_remote_play_client(self, wait_timeout_s=None, console_wake_allowed=True):
-        """Launch (or reuse) the Chiaki client + input hook via the client manager.
+        """Single-flight bring-up; shutdown is terminal for this orchestrator instance.
 
-        This is the SHARED Chiaki/input bring-up used by both the cold-connect path
-        (``start()``, when ``auto_launch_client`` is set) and the warm-preview promotion
-        (``promote_to_stream()``). It is idempotent: once a client manager exists (Chiaki
-        already launched), it is a no-op so a second call never double-launches.
+        Never hold the publication lock across console discovery/readiness waits.
+        close_remote_play_client can revoke and close the exact in-flight manager.
+        """
+        with self._client_state_lock():
+            if (getattr(self, '_client_stop_requested', False)
+                    or getattr(self, '_client_launch_inflight', False)):
+                return False
+            self._client_launch_inflight = True
+        try:
+            return self._launch_remote_play_client_current(wait_timeout_s, console_wake_allowed)
+        finally:
+            with self._client_state_lock():
+                self._client_launch_inflight = False
 
-        In capture-card mode the card is the video source, so Chiaki is INPUT-ONLY. Its window
-        is irrelevant, but the current child must still prove that the PS5 stream handshake
-        completed; process or named-pipe liveness alone cannot authorize the bot.
-
-        Returns True only when the current console session is ready (or remains ready)."""
-        if self._client_manager is not None:
-            alive_fn = getattr(self._client_manager, 'is_running', None)
-            ready_fn = getattr(self._client_manager, 'is_session_ready', None)
-            # Missing readiness evidence is unready. This deliberately rejects
-            # legacy managers that only prove a local process is alive.
-            if (callable(alive_fn) and bool(alive_fn())
-                    and callable(ready_fn) and bool(ready_fn())):
-                self._input_link_ready = True
-                self._input_link_checked_at = time.monotonic()
-                logger.info('Remote Play console session already ready — skipping duplicate launch')
-                return True
-            self._input_link_ready = False
-            logger.warning('Remote Play client manager is stale/unready — relaunching input')
+    def _launch_remote_play_client_current(self, wait_timeout_s, console_wake_allowed):
+        with self._client_state_lock():
+            manager = self._client_manager
+        if manager is not None:
+            alive_fn = getattr(manager, 'is_running', None)
+            ready_fn = getattr(manager, 'is_session_ready', None)
+            ready = (callable(alive_fn) and bool(alive_fn())
+                     and callable(ready_fn) and bool(ready_fn()))
+            with self._client_state_lock():
+                if (getattr(self, '_client_stop_requested', False)
+                        or self._client_manager is not manager):
+                    return False
+                if ready:
+                    self._input_link_ready = True
+                    self._input_link_checked_at = time.monotonic()
+                    logger.info('Remote Play console session already ready; skipping duplicate launch')
+                    return True
+                self._client_manager = None
+                self._input_link_ready = False
             try:
-                self._client_manager.stop()
+                manager.stop()
             except Exception as exc:
                 logger.debug('Stale Remote Play client cleanup failed: %s', exc)
-            self._client_manager = None
         if not (CLIENT_AVAILABLE and RemotePlayClientConfig and RemotePlayClientManager):
-            logger.warning('Remote Play client manager unavailable — cannot launch Chiaki/input')
+            logger.warning('Remote Play client manager unavailable')
             return False
         client_cfg = RemotePlayClientConfig(
+            # Set by the sidecar's start_stream handler; lets a rest-mode wake extend the
+            # native promote deadline instead of failing at 20s (see _ensure_console_awake).
+            on_console_waking=getattr(self, "console_waking_callback", None),
             platform=self.config.platform,
             client_mode=self.config.client_mode,
             console_ip=self.config.console_ip,
@@ -2041,50 +2732,102 @@ class RemotePlayOrchestrator:
             # just rested deliberately.
             console_wake_allowed=bool(console_wake_allowed),
         )
-        self._client_manager = RemotePlayClientManager(client_cfg)
-        status = self._client_manager.ensure_running()
-        ready_fn = getattr(self._client_manager, 'is_session_ready', None)
-        session_ready = bool(status.ok and callable(ready_fn) and ready_fn())
-        self._input_link_ready = session_ready
-        self._input_link_checked_at = time.monotonic()
-        if session_ready:
-            if status.window_title:
-                self.config.window_title = status.window_title
-            if status.hwnd:
-                self._window_handle = status.hwnd
-            logger.info('Remote Play console input session ready: %s', status)
-            return True
-        logger.warning('Remote Play input session failed readiness: %s', status.message)
-        self._last_error_msg = status.message or (
-            'Remote Play client did not provide current console-session readiness proof.')
-        # Failed readiness is terminal for this launch generation.  Do not
-        # retain a manager whose child/session has ended: the live capture-card
-        # backend and detector remain untouched, while the input route is fully
-        # revoked and a later Connect creates a fresh manager/tracker baseline.
-        failed_manager = self._client_manager
-        self._client_manager = None
-        if (failed_manager is not None
-                and not bool(getattr(failed_manager, '_failed_start_reaped', False))):
+
+        with self._client_state_lock():
+            if getattr(self, '_client_stop_requested', False):
+                return False
+            manager = RemotePlayClientManager(client_cfg)
+            self._client_manager = manager
+        try:
+            status = manager.ensure_running()
+            ready_fn = getattr(manager, 'is_session_ready', None)
+            session_ready = bool(status.ok and callable(ready_fn) and ready_fn())
+        except Exception:
+            with self._client_state_lock():
+                own_cleanup = self._client_manager is manager
+                if own_cleanup:
+                    self._client_manager = None
+                    self._input_link_ready = False
+            if own_cleanup:
+                manager.stop()
+            raise
+        # The result and tracker belong to THIS manager, never whichever object
+        # happens to occupy the slot after a concurrent stop/replacement.
+        with self._client_state_lock():
+            if (getattr(self, '_client_stop_requested', False)
+                    or self._client_manager is not manager):
+                return False
             try:
-                failed_manager.stop()
+                summary_fn = getattr(manager, 'stage_summary', None)
+                self.last_promotion_stage_summary = str(summary_fn()) if callable(summary_fn) else ''
+            except Exception:
+                self.last_promotion_stage_summary = ''
+            self._input_link_ready = session_ready
+            self._input_link_checked_at = time.monotonic()
+            if session_ready:
+                if status.window_title:
+                    self.config.window_title = status.window_title
+                if status.hwnd:
+                    self._window_handle = status.hwnd
+                logger.info('Remote Play console input session ready: %s', status)
+                return True
+            self._last_error_msg = status.message or 'No current console-session readiness proof.'
+            logger.warning('Remote Play input session failed readiness: %s', self._last_error_msg)
+            self._client_manager = None
+        if not bool(getattr(manager, '_failed_start_reaped', False)):
+            try:
+                manager.stop()
             except Exception as exc:
                 logger.debug('Failed Remote Play input cleanup failed: %s', exc)
         return False
 
     def input_link_ready(self):
         """Continuously revocable console-route authority, cached for 250 ms."""
-        now = time.monotonic()
-        if now - self._input_link_checked_at < 0.25:
-            return bool(self._input_link_ready)
-        self._input_link_checked_at = now
-        manager = self._client_manager
+        if getattr(self, '_xbox_mode', False):
+            from xbox_remote_play import xbox_window_still_matches
+            backend = self._frame_backend
+            return bool(not getattr(self, '_client_stop_requested', False)
+                        and self._xbox_window is not None and backend is not None
+                        and backend.is_healthy() and xbox_window_still_matches(self._xbox_window))
+        with self._client_state_lock():
+            if getattr(self, '_client_stop_requested', False):
+                return False
+            now = time.monotonic()
+            if now - self._input_link_checked_at < 0.25:
+                return bool(self._input_link_ready)
+            self._input_link_checked_at = now
+            was_ready = bool(self._input_link_ready)
+            manager = self._client_manager
+        # Poll outside the lifecycle lock. A slow log read must not consume the
+        # graceful-close budget, and an old poll must not reauthorize a new slot.
         ready_fn = getattr(manager, 'is_session_ready', None) if manager is not None else None
         try:
-            self._input_link_ready = bool(callable(ready_fn) and ready_fn())
+            ready = bool(callable(ready_fn) and ready_fn())
         except Exception as exc:
             logger.warning('Remote Play input readiness check failed closed: %s', exc)
-            self._input_link_ready = False
-        return bool(self._input_link_ready)
+            ready = False
+        with self._client_state_lock():
+            if (getattr(self, '_client_stop_requested', False)
+                    or self._client_manager is not manager):
+                return False
+            self._input_link_ready = ready
+            if was_ready and not self._input_link_ready:
+                # Preserve the reason BEFORE recovery discards this manager. Never
+                # dump its config/status repr: they are not a diagnostic allowlist.
+                diagnostic = {}
+                try:
+                    health = getattr(manager, 'readiness_diagnostic', None)
+                    diagnostic = health() if callable(health) else {}
+                    if not isinstance(diagnostic, dict):
+                        diagnostic = {}
+                except Exception:
+                    pass  # evidence failure must not interrupt readiness revocation
+                logger.warning(
+                    'INPUT LINK LOST: reason=%s pid=%s exit_code=%s session_log=%s',
+                    str(diagnostic.get('reason', 'unavailable'))[:48],
+                    diagnostic.get('pid', 0), diagnostic.get('exit_code'),
+                    os.path.basename(str(diagnostic.get('session_log', '')))[:128])
+            return bool(self._input_link_ready)
 
     def _rekey_latency_route(self, reason: str = '') -> None:
         """Atomically bind timing state to the config's current exact route identity."""
@@ -2351,12 +3094,12 @@ class RemotePlayOrchestrator:
     def promote_to_stream(self, console_ip=None, console_identity=None):
         """Warm-preview -> full-stream promotion. Brings up the Chiaki client + input hook IN THE
         ALREADY-RUNNING preview sidecar, WITHOUT restarting the process and WITHOUT disturbing the
-        live capture-card feed + detector (both keep running on their own threads — the panel never
+        live capture-card feed + detector (both keep running on their own threads â€” the panel never
         blinks). Driven by the native ``start_stream`` stdin command on Connect when it reuses the
         warm preview sidecar instead of killing+rebuilding it (~5-6s saved).
 
         The capture card is INPUT-only for Chiaki here (video = the card), so this reuses the exact
-        same Chiaki/input bring-up the cold connect path uses (``_launch_remote_play_client``) — it
+        same Chiaki/input bring-up the cold connect path uses (``_launch_remote_play_client``) â€” it
         just invokes it in place. Idempotent: if Chiaki is already running it will not double-launch.
 
         Returns True once the Chiaki/input launch is established (or already was)."""
@@ -2368,7 +3111,7 @@ class RemotePlayOrchestrator:
             self.config.console_identity = identity
             self._rekey_latency_route('console_identity_transition')
         # Also (re)point the RTT ping target at the (possibly rediscovered) console IP so latency
-        # compensation tracks the promoted stream. Best-effort — never fail the promotion on it.
+        # compensation tracks the promoted stream. Best-effort â€” never fail the promotion on it.
         try:
             if ip and getattr(self, '_rtt_engine', None) is not None \
                     and hasattr(self._rtt_engine, 'set_ping_target'):
@@ -2378,11 +3121,68 @@ class RemotePlayOrchestrator:
         logger.info('promote_to_stream: bringing up Chiaki/input in place (console_ip=%s)', ip or '-')
         ok = self._launch_remote_play_client()
         if ok:
-            logger.info('promote_to_stream: Chiaki/input link kicked off — capture/detector untouched')
+            logger.info('promote_to_stream: Chiaki/input link kicked off â€” capture/detector untouched')
         else:
             logger.warning('promote_to_stream: Chiaki/input launch reported failure (%s)',
                            self._last_error_msg or 'unknown')
         return ok
+
+    def prewarm_standby_client(self):
+        """[ORION_STANDBY 2026-08-30] Pre-boot the Remote Play client during the warm
+        preview so Connect only pays the PS5 handshake, not the client's own boot.
+
+        Starts a daemon loop that keeps ONE standby client alive while this
+        orchestrator runs WITHOUT an active client manager (i.e. preview, or after a
+        failed promotion restored preview). The pool refuses to spawn beside any
+        other chiaki-family process and never spawns `--standby` at a binary that
+        lacks it (spawn-free marker sniff â€” a pre-standby client would raise a
+        visible modal parser-error dialog and linger, verified 2026-08-30), so
+        this is inert on a pre-standby install. Never raises; never blocks the
+        caller.
+        """
+        if get_standby_pool is None or standby_client_enabled is None:
+            return
+        if not standby_client_enabled():
+            logger.info('Standby prewarm disabled via ORION_STANDBY_CLIENT')
+            return
+        if getattr(self, '_standby_prewarm_thread', None) is not None \
+                and self._standby_prewarm_thread.is_alive():
+            return
+
+        def _loop():
+            first = True
+            while getattr(self, '_running', False):
+                try:
+                    # [ORION_CONNECT_LATENCY 2026-09-14] Console-address prewarm runs on EVERY
+                    # tick, not only while no client manager exists: a reconnect without a
+                    # preceding stop keeps the manager, and without this the first connect after
+                    # a DHCP drift paid the 2.4 s discovery inside its own start_stream budget.
+                    # Single-flight, TTL-cached, never blocks, never raises.
+                    if prewarm_console_host is not None and self.config.console_ip:
+                        prewarm_console_host(self.config.console_ip)
+                    if self._client_manager is None:
+                        state = get_standby_pool().ensure_spawned(
+                            chiaki_path=self.config.chiaki_path,
+                            console_ip=self.config.console_ip,
+                            disable_video=bool(self._cc_mode),
+                            identity_sha256=self.config.chiaki_identity_sha256,
+                            identity_size=self.config.chiaki_identity_size,
+                        )
+                        if first or state == 'spawned':
+                            logger.info('Standby prewarm pass: %s', state)
+                except Exception as exc:
+                    logger.warning('Standby prewarm pass failed: %s', exc)
+                first = False
+                # 1s ticks keep shutdown responsive; the spawn check itself is a
+                # ~1ms toolhelp probe when a standby is already present.
+                for _ in range(30):
+                    if not getattr(self, '_running', False):
+                        return
+                    time.sleep(1.0)
+
+        self._standby_prewarm_thread = threading.Thread(
+            target=_loop, name='standby-prewarm', daemon=True)
+        self._standby_prewarm_thread.start()
 
     def recover_input_link(self):
         """Restart only Chiaki/input, preserving capture and detector threads.
@@ -2393,10 +3193,14 @@ class RemotePlayOrchestrator:
         while ``_input_link_ready`` stays false until a newly launched child emits
         its own launch-scoped console readiness marker.
         """
-        manager = self._client_manager
-        self._client_manager = None
-        self._input_link_ready = False
-        self._input_link_checked_at = 0.0
+        with self._client_state_lock():
+            if not self._running or getattr(self, '_client_stop_requested', False):
+                self._input_link_ready = False
+                return False
+            manager = self._client_manager
+            self._client_manager = None
+            self._input_link_ready = False
+            self._input_link_checked_at = 0.0
         if manager is not None:
             try:
                 manager.stop()
@@ -2411,6 +3215,19 @@ class RemotePlayOrchestrator:
         plans = ((0.0, 3.0), (0.75, 9.0), (1.25, 3.0))
         attempts = 0
         for backoff_s, desired_wait_s in plans:
+            # [ORION_DISCONNECT_AUDIT 2026-09-19] A teardown makes this recovery moot,
+            # and continuing it actively hurts: _launch_remote_play_client() would spawn
+            # a fresh Remote Play client while close_remote_play_client() is closing the
+            # old one, so the console ends the teardown with a live session it was never
+            # told about. Checked at every attempt boundary (this loop is the only place
+            # that spends real time) rather than mid-launch, so an in-flight launch still
+            # completes and is cleaned up normally by stop().
+            if not self._running:
+                logger.warning(
+                    'Input-link recovery abandoned after %d attempt(s): the orchestrator '
+                    'is stopping', attempts)
+                self._input_link_ready = False
+                return False
             remaining_s = deadline - time.monotonic()
             if remaining_s < backoff_s + 3.0:
                 break
@@ -2420,6 +3237,9 @@ class RemotePlayOrchestrator:
                     'capture/detector remain live',
                     backoff_s, attempts + 1, len(plans))
                 time.sleep(backoff_s)
+            if not self._running or getattr(self, '_client_stop_requested', False):
+                self._input_link_ready = False
+                return False
             remaining_s = deadline - time.monotonic()
             if remaining_s < 3.0:
                 break
@@ -2455,6 +3275,16 @@ class RemotePlayOrchestrator:
             logger.warning('Orchestrator already running')
             return False
         logger.info(f'Starting Remote Play orchestrator with config: {self.config}')
+        if getattr(self, '_xbox_mode', False):
+            # External window attach is intentionally distinct from Chiaki's owned
+            # process/decoder/input-pipe handshake. No PS5 discovery or subprocess.
+            from xbox_remote_play import select_xbox_window
+            try:
+                self._xbox_window = select_xbox_window(self.config.window_title)
+                self._window_handle = self._xbox_window.hwnd
+            except Exception as exc:
+                self._last_error_msg = str(exc)
+                return False
         if self.config.virtual_controller:
             from virtual_controller import check_vigem_status
             ok, err_msg = check_vigem_status()
@@ -2492,7 +3322,7 @@ class RemotePlayOrchestrator:
                     pass
                 self._virtual_controller = None
             return False
-        if self.config.auto_launch_client:
+        if self.config.auto_launch_client and not getattr(self, '_xbox_mode', False):
             if not self._launch_remote_play_client():
                 # A decoder reader may already have been pre-attached. Tear the
                 # partial start down even though _running is still false.
@@ -2535,14 +3365,14 @@ class RemotePlayOrchestrator:
             # FIX B (HWND-decouple): chiaki's cold start can surface the window well after the
             # window-wait (~28s observed). If the decoder pipe is already pre-attached, the
             # detection feed reads \\.\pipe\orion_frames INDEPENDENT of the window HWND, and the
-            # capture loop tolerates a missing window in decoder mode — so a not-yet-visible window
+            # capture loop tolerates a missing window in decoder mode â€” so a not-yet-visible window
             # must NOT fail the connect or tear the pipe down (that teardown is what starved the C++
             # decoder-stall watchdog -> restart loop -> free-floating chiaki window). Only hard-fail
             # when there is no window AND no decoder pipe (genuinely nothing to capture from).
-            # Capture-card mode reads the HDMI device for video, so it needs NO chiaki window at all —
+            # Capture-card mode reads the HDMI device for video, so it needs NO chiaki window at all â€”
             # chiaki runs only for input. Never hard-fail on a missing window here; the capture-card
             # backend is brought up just below (_start_frame_backend). (Without this, a slow chiaki cold
-            # start fails the connect before the card backend is even started — FLAG A1.)
+            # start fails the connect before the card backend is even started â€” FLAG A1.)
             _cc_mode = (str(getattr(self.config, 'frame_source', '') or '').lower()
                         in ('capture_card', 'capturecard', 'card')
                         or os.environ.get('ORION_CAPTURE_CARD', '').strip().lower() in ('1', 'true', 'yes', 'on'))
@@ -2556,7 +3386,7 @@ class RemotePlayOrchestrator:
                 return False
             if _cc_mode:
                 logger.info('Capture-card mode: proceeding without a chiaki stream window (card is the video source).')
-            logger.warning('Stream window not up yet (chiaki cold start) — proceeding on the '
+            logger.warning('Stream window not up yet (chiaki cold start) â€” proceeding on the '
                            'pre-attached decoder pipe; the HWND is re-found opportunistically for '
                            'the window-capture fallback only.')
         self._running = True
@@ -2568,6 +3398,17 @@ class RemotePlayOrchestrator:
             backend_started = bool(self._start_frame_backend())
         except Exception as e:
             logger.warning('Frame backend init skipped: %s', e)
+        if getattr(self, '_xbox_mode', False):
+            # Thread creation is not readiness. Require an actual fresh WGC frame;
+            # normal black-frame/geometry/ownership gates still govern automation.
+            ready = backend_started and self._frame_backend_mode == 'wgc'
+            deadline = time.monotonic() + 3.0
+            while ready and not self._frame_backend.is_healthy() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not ready or not self.input_link_ready():
+                self._last_error_msg = 'Xbox capture is not ready. Keep the selected Remote Play window visible and unminimized; WGC capture is required.'
+                self.stop()
+                return False
         if (self._frame_pipe_required
                 and (not backend_started or self._frame_backend_mode != 'decoder')):
             self._last_error_msg = (
@@ -2597,6 +3438,11 @@ class RemotePlayOrchestrator:
                 logger.info(f'RTT sync engine started. Ping target IP: {gateway_ip} (court IP awaits detection)')
             except Exception as e:
                 logger.error(f'Failed to start RTT sync engine: {e}')
+        self._start_detcsv()
+        # Re-arm the frame dump for this capture generation.  stop() tears the writer down and the
+        # dump used to stay dead for the life of the process, silently, while DETCSV restarted here
+        # and made the session look fully instrumented.  No-op when the dump was never opted in.
+        self._start_framedump()
         try:
             self._capture_health_diagnostics.start()
         except Exception as exc:
@@ -2614,6 +3460,42 @@ class RemotePlayOrchestrator:
         logger.info('Remote Play orchestrator started')
         return True
 
+    def close_remote_play_client(self):
+        """The PS5 DISCONNECT handshake, on its own, callable before anything else.
+
+        [ORION_DISCONNECT_AUDIT 2026-09-19] stop() has always put this first *within
+        itself*, with an explicit comment about the native's ~5 s
+        kSidecarGracefulShutdownMs budget. That reasoning was defeated one level up:
+        autogreen_sidecar.py's ``finally:`` joins the preview worker (2.0 s) and the
+        preview-stats worker (1.0 s) BEFORE it ever calls stop(), so on a slow preview
+        join the WM_CLOSE only went out at t≈3 s and its own 3 s wait ran past the
+        native's force-kill at t=5 s. chiaki_session_stop() then never completed and
+        the console reported the transport simply vanishing -- the "LAN cable was
+        disconnected" error.
+
+        Exposing it separately lets the sidecar spend the FIRST part of the budget on
+        the only step with an external, non-recoverable consequence. Idempotent:
+        _client_manager is cleared, so stop()'s later call is a no-op.
+        """
+        # Publish the stopping intent BEFORE the close. recover_input_link() may be
+        # running on the session-command worker and would otherwise keep launching a
+        # replacement client underneath this teardown. stop() sets the same flag a
+        # moment later; setting it here makes the standalone call equally safe.
+        with self._client_state_lock():
+            self._client_stop_requested = True
+            self._running = False
+            self._input_link_ready = False
+            self._input_link_checked_at = 0.0
+            manager = self._client_manager
+            self._client_manager = None
+        # Detach BEFORE the blocking close: reentrant/parallel teardown must not
+        # stop twice or clear a newer object installed in the slot.
+        if manager is not None:
+            try:
+                manager.stop()
+            except Exception as exc:
+                logger.warning('Chiaki client stop failed: %s', exc)
+
     def stop(self):
         # A failed start can still own real resources.  In particular, the
         # decoded-frame reader is pre-attached and OrionStream is launched before
@@ -2627,32 +3509,45 @@ class RemotePlayOrchestrator:
             self._capture_thread is not None,
             self._thread is not None,
             self._input_router_thread is not None,
+            bool(getattr(self, '_framedump_writer', None)
+                 and self._framedump_writer.is_alive()),
+            bool(getattr(self, '_detcsv', None)
+                 and self._detcsv.is_running()),
             bool(getattr(self, '_capture_health_diagnostics', None)
                  and self._capture_health_diagnostics.is_running()),
             self._virtual_controller is not None,
             getattr(self, '_rtt_engine', None) is not None,
         ))
         if not self._running and not has_resources:
+            self.close_remote_play_client()
             return
         logger.info('Stopping Remote Play orchestrator%s',
                     '' if self._running else ' (partial start cleanup)')
         self._running = False
+        # Wake an idle detector before potentially slow client/backend teardown.
+        detector_event = getattr(self, '_detector_frame_ready_evt', None)
+        if detector_event is not None:
+            detector_event.set()
         self._input_link_ready = False
         self._input_link_checked_at = 0.0
         # GRACEFUL CHIAKI SHUTDOWN GOES FIRST. The client manager now posts WM_CLOSE to the
         # stream window, which runs chiaki_session_stop() -> the Remote Play DISCONNECT
         # handshake. That handshake needs a couple of seconds, and the NATIVE side only gives
-        # this whole stop() ~5s (kSidecarGracefulShutdownMs) before force-killing the sidecar —
+        # this whole stop() ~5s (kSidecarGracefulShutdownMs) before force-killing the sidecar â€”
         # so joining the capture/processing threads first (up to 2s each) used to eat the entire
         # budget and the handshake never ran. The console then only saw the transport vanish
         # mid-session: the user-reported "LAN cable was disconnected" error. The loops below
         # already exited on `self._running = False`, and neither touches _client_manager.
-        if self._client_manager:
+        self.close_remote_play_client()
+        # An unclaimed standby client (pre-booted, no session) must not outlive the
+        # orchestrator: ask it to quit cleanly, then kill. The broad image-name
+        # sweep in the client manager stop above and the native job object remain
+        # the backstops for anything this misses.
+        if get_standby_pool is not None:
             try:
-                self._client_manager.stop()
+                get_standby_pool().shutdown()
             except Exception as exc:
-                logger.warning('Chiaki client stop failed: %s', exc)
-            self._client_manager = None
+                logger.debug('Standby pool shutdown failed: %s', exc)
         # Joins are VERIFIED: a thread that outlived its join is still calling into the frame
         # backend / RTT engine, so tearing those down (and nulling them) underneath it is a
         # use-after-free-shaped race (cv2 release during a live read; RTT sampler on a stopped
@@ -2670,11 +3565,79 @@ class RemotePlayOrchestrator:
                 threads_stuck.append('processing')
             else:
                 self._thread = None
+        # CSV is independent diagnostic I/O. Drain normally, but do not delay
+        # teardown on a blocked disk; the worker alone owns/ultimately closes its file.
+        detcsv = getattr(self, '_detcsv', None)
+        if detcsv is not None:
+            # The old 500 ms budget was not "what the flush needs" -- it was a guess, and the
+            # message it printed ("pending rows discarded") is the last minute of a measurement
+            # session going missing.  Draining a bounded 256-row deque is sub-millisecond on a
+            # healthy disk, so the larger budget costs nothing in the normal case; it is bounded at
+            # 5 s because the native parent force-kills the sidecar after kSidecarGracefulShutdownMs
+            # and the Chiaki disconnect handshake (already done, above) must not be starved.
+            try:
+                close_budget = max(0.1, min(5.0, float(
+                    os.environ.get('ORION_DETCSV_CLOSE_MS', '2000')) / 1000.0))
+            except (TypeError, ValueError):
+                close_budget = 2.0
+            _snap = detcsv.snapshot()
+            if detcsv.close(timeout=close_budget):
+                self._detcsv = None
+                logger.error('DETCSV drained on shutdown: rows=%d queued_at_stop=%d '
+                             'drop_full=%d drop_stopped=%d bytes=%d parts=%d',
+                             _snap['accepted'], _snap['queued'], _snap['dropped_full'],
+                             _snap.get('dropped_stopped', 0), _snap.get('total_bytes', 0),
+                             _snap.get('parts', 1))
+            else:
+                _lost = detcsv.snapshot()
+                logger.error('DETCSV writer still exiting after %.0fms; pending rows discarded '
+                             '(rows=%d written=%d queued=%d drop_shutdown=%d)',
+                             close_budget * 1000.0, _lost['accepted'], _lost['written'],
+                             _lost['queued'], _lost['dropped_shutdown'])
+        # Framedump is diagnostic-only and must not drain queued PNG work during shutdown.  Stop it
+        # after the processing producer has exited, with a short independent bound.
+        if getattr(self, '_framedump_writer', None) is not None:
+            self._framedump_close_press_stats('session_end')
+            _ring = getattr(self, '_framedump_preroll', None)
+            if _ring is not None:
+                _ring.clear()       # do not hold this session's frames past its teardown
+            self._stop_framedump_writer(timeout=0.5)
+        # [ORION_SHOT_RECORDS] Close every open press and flush the corpus file.
+        #
+        # The recorder itself is deliberately KEPT: stop()/start() also run on an in-process
+        # capture restart (a warm-preview -> stream promotion, a reconnect), and retiring the
+        # writer here would end the session's corpus at the first promotion exactly the way
+        # the frame dump used to end its own -- silently. Its writer is a daemon with a
+        # per-record fsync, so an idle one costs nothing.
+        _sr = getattr(self, '_shot_records', None)
+        if _sr is not None:
+            try:
+                _sr.close_all('session_end')
+                _snap = _sr.snapshot()
+                logger.error('SHOT RECORDS: presses=%d written=%d dropped=%d errors=%d '
+                             'orphan_oracle=%d orphan_banner=%d -> %s',
+                             _snap['presses'], _snap['written'], _snap['dropped'],
+                             _snap['errors'], _snap['orphan_oracle'],
+                             _snap['orphan_banner'], _sr.path)
+            except Exception as exc:
+                logger.warning('shot records flush failed: %s', exc)
+        # [ORION_SHOT_RANGE 2026-09-17] Drain whatever window the last press left queued, so a
+        # session's final shot still gets its reading into the record.  The READER is kept for
+        # exactly the reason the recorder is: stop()/start() also run on an in-process capture
+        # restart, and retiring it here would silently end the session's range corpus.
+        _rng = getattr(self, '_shot_range', None)
+        if _rng is not None:
+            try:
+                _rng._worker_drain()              # noqa: SLF001 -- same-process synchronous drain
+                logger.error('SHOT RANGE: presses=%d emitted=%d dropped=%d',
+                             _rng.presses, _rng.emitted, _rng.dropped)
+            except Exception as exc:
+                logger.warning('shot range flush failed: %s', exc)
         if self._input_router_thread:
             self._input_router_thread.join(timeout=2.0)
             if self._input_router_thread.is_alive():
                 # Does not touch the frame backend / RTT engine, so it does not gate their
-                # teardown — but it is still worth knowing it outlived the join.
+                # teardown â€” but it is still worth knowing it outlived the join.
                 logger.warning('Orchestrator stop: input-router loop still running after join')
             else:
                 self._input_router_thread = None
@@ -2727,7 +3690,7 @@ class RemotePlayOrchestrator:
             return {}
 
     def _preattach_decoder_pipe(self):
-        r"""Start the decoder frame-pipe reader EARLY — before ensure_running() — so it attaches
+        r"""Start the decoder frame-pipe reader EARLY â€” before ensure_running() â€” so it attaches
         the instant chiaki creates \\.\pipe\orion_frames (~11s after launch, post Vulkan init)
         instead of after ensure_running()'s up-to-18s window poll.
 
@@ -2738,7 +3701,7 @@ class RemotePlayOrchestrator:
         so starting it first costs nothing and removes the gap. No-op unless the decoder pipe is
         the source and nothing is attached yet; capture-card/WGC sources still start later in
         _start_frame_backend() once the window is located (they need the HWND)."""
-        if self._frame_backend is not None:
+        if getattr(self, '_xbox_mode', False) or self._frame_backend is not None:
             return
         frame_pipe = os.environ.get('CHIAKI_ORION_FRAME_PIPE')
         if not frame_pipe and os.environ.get('ORION_FRAME_PIPE'):
@@ -2766,7 +3729,7 @@ class RemotePlayOrchestrator:
             if backend.start():
                 self._frame_backend = backend
                 self._frame_backend_mode = 'decoder'
-                logger.info('Decoder pipe pre-attached early (%s) — reader reconnecting in the '
+                logger.info('Decoder pipe pre-attached early (%s) â€” reader reconnecting in the '
                             'background so chiaki need not wait at "waiting for Orion"', frame_pipe)
             elif self._frame_pipe_required:
                 self._last_error_msg = (
@@ -2817,6 +3780,20 @@ class RemotePlayOrchestrator:
         # ensure_running) by _preattach_decoder_pipe() to beat the 15s connect watchdog.
         if self._frame_backend is not None:
             return True
+        if getattr(self, '_xbox_mode', False):
+            from wgc_backend import WGCCaptureBackend
+            from xbox_remote_play import xbox_window_still_matches
+            window = self._xbox_window
+            if window is None or not xbox_window_still_matches(window):
+                return False
+            backend = WGCCaptureBackend(window_hwnd=window.hwnd,
+                target_validator=lambda: xbox_window_still_matches(window))
+            if not backend.start():
+                return False  # never fall through to Chiaki, GDI, a monitor or another app
+            self._frame_backend = backend
+            self._frame_backend_mode = 'wgc'
+            logger.info('Xbox Remote Play: explicit window WGC capture; external client owns transport')
+            return True
         source = str(getattr(self.config, 'frame_source', 'auto') or 'auto').lower()
 
         # HDMI capture-card source (PS5 -> card -> PC, read as a cv2 video device).
@@ -2835,8 +3812,16 @@ class RemotePlayOrchestrator:
                 # (4:2:0). YUY2 preserves the thin meter's colour better per row (sharper fill-top/green
                 # tip) at the cost of USB bandwidth; MJPG is the safe 1080p60 default. A/B without rebuild.
                 _use_mjpg = os.environ.get('ORION_CAPTURE_MJPG', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+                # [ORION_CAPTURE_FPS 2026-09-14] Customer-selectable card refresh rate
+                # (native setting capture_card_fps -> ORION_CAPTURE_FPS). CaptureCardBackend
+                # derives its CadenceLock, its nominal frame period, its arrival/cadence
+                # window sizes and its health floor from this, so it must be the rate the
+                # card was actually asked for -- never a hard-coded 60.
+                _fps = requested_capture_fps()
+                self._requested_capture_fps = _fps
                 backend = CaptureCardBackend(
                     device_index=configured_idx,
+                    fps=_fps,
                     use_mjpg=_use_mjpg)
                 if backend.start():
                     # This check precedes backend publication, frame ingestion,
@@ -2845,12 +3830,12 @@ class RemotePlayOrchestrator:
                     self._guard_capture_latency_route(backend=backend)
                     self._frame_backend = backend
                     self._frame_backend_mode = 'capture_card'
-                    logger.info('Frame source: HDMI capture card')
+                    logger.info('Frame source: HDMI capture card (requested %dfps)', _fps)
                     return True
             except Exception as exc:
                 logger.warning('Capture-card backend error (%s)', exc)
             # EXCLUSIVE: the card is the only valid video source in capture-card mode. Do NOT fall back to
-            # WGC / the decoder pipe / window capture below — those render the REMOTE-PLAY video, which is
+            # WGC / the decoder pipe / window capture below â€” those render the REMOTE-PLAY video, which is
             # exactly the "reverts to remote play" bug. Return without a backend; the capture loop keeps
             # re-attempting the card (idle, never grabbing the chiaki window) until it comes up.
             logger.warning('Capture-card not up yet; staying on capture-card (NO remote-play fallback), '
@@ -2979,6 +3964,7 @@ class RemotePlayOrchestrator:
         sink = getattr(self, '_capture_health_diagnostics', None)
         if sink is None or not sink.is_running():
             return False
+
         try:
             snapshot = _CaptureHealthSnapshot(
                 backend=self._frame_backend,
@@ -2993,12 +3979,34 @@ class RemotePlayOrchestrator:
                 core_black_run=int(self._video_core_black_run),
                 core_static_run=int(self._video_core_static_run),
                 suspect=bool(suspect),
+                requested_fps=int(getattr(self, '_requested_capture_fps', CAPTURE_FPS_DEFAULT)
+                                  or CAPTURE_FPS_DEFAULT),
             )
             return sink.submit(snapshot)
         except Exception:
             # Diagnostics are observational.  A malformed counter or a worker
             # teardown race must never skip the display callback below this site.
             return False
+
+    def _capture_health_report_due(self, now, suspect):
+        """Bound health reports while preserving immediate state transitions.
+
+        A persistent suspect condition used to submit on every captured frame.
+        The latest-wins sink bounded memory, but the worker could still format
+        and emit warnings at its own throughput.  Emit the first SUSPECT and the
+        recovery transition immediately, then cap steady-state reports at 5 s.
+        """
+        current = bool(suspect)
+        previous = bool(getattr(self, '_capture_health_suspect', False))
+        self._capture_health_suspect = current
+        try:
+            elapsed = float(now) - float(self._last_capture_health_log)
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            elapsed = 5.0
+        if current != previous or elapsed >= 5.0:
+            self._last_capture_health_log = float(now)
+            return True
+        return False
 
     @staticmethod
     def _emit_capture_health_diagnostic(snapshot):
@@ -3020,6 +4028,13 @@ class RemotePlayOrchestrator:
                 raw_stats = cadence_stats(window_s=5.0) or {}
             except Exception:
                 raw_stats = {}
+        stage_kind = str(raw_stats.get('stage_kind', '') or '').strip().lower()
+        if stage_kind == 'capture':
+            stage_kind = 'cap'
+        elif stage_kind == 'decoder':
+            stage_kind = 'dec'
+        elif stage_kind not in ('cap', 'dec'):
+            stage_kind = '?'
 
         # What the DRIVER actually gave us, not what we asked for. capture_card_backend logs this
         # once at open time (logger.info "Capture-card negotiated"), but sidecar INFO is only
@@ -3044,28 +4059,50 @@ class RemotePlayOrchestrator:
         # SUSPECT is the degraded-feed marker -- the single most important token here -- and it has
         # never once been visible. Until the C++ cap is raised, anything worth reading must sit at
         # the FRONT, so the suspect flag and the negotiated mode lead the line.
+        # [ORION_STALL_ATTRIB 2026-09-15] gen-2 collections + the worst stall in this window,
+        # near the FRONT for the reason the block above gives: the relay trims the message to
+        # ~244 characters and this line already renders longer than that. A gen-2 sweep over
+        # the frame ring is the textbook cause of an isolated 200 ms consumer hitch, and
+        # `stall=` says whether the attributor saw one at all in the same window. The canonical
+        # home for gc2 is the sidecar's own `preview_stats` line (it owns callback_gap_ms);
+        # that tree is out of scope here, and stall_attributor.stats() exposes the field for
+        # a one-line addition there.
+        _sa = {}
+        if _stall is not None:
+            try:
+                _sa = _stall.get().stats() or {}
+            except Exception:
+                _sa = {}
         logger.warning(
-            'Capture health:%s cap_mode=%s tier=%s tiers=%s uniqfps=%d dup%%=%.0f '
+            'Capture health:%s cap_mode=%s gc2=%d gcms=%.0f stall=%d/%.0f '
+            'cap_req_fps=%d tier=%s tiers=%s uniqfps=%d dup%%=%.0f '
             'export_fps=%.0f gap_fps=%.0f cv_fps=%.0f detect_ms=%.1f '
             'raw_fps=%.1f raw_gap_max_ms=%.1f raw_late=%d '
+            'raw_stage=%s:%.2f/%.2f/%.2f '
             'source_skip=%d raw_gap_frame=%d raw_gap_event_ms=%.0f '
-            'raw_read_block_ms=%.2f raw_isolate_ms=%.2f raw_post_ms=%.2f '
             'preview_dup_refresh=%d '
             'core_black_run=%d core_static_run=%d',
             ' SUSPECT' if snapshot.suspect else '',
             cap_mode,
+            int(_sa.get('gc2', 0) or 0), float(_sa.get('gc_worst_ms', 0.0) or 0.0),
+            int(_sa.get('stalls', 0) or 0), float(_sa.get('worst_gap_ms', 0.0) or 0.0),
+            # [ORION_CAPTURE_FPS 2026-09-14] REQUESTED, next to the NEGOTIATED rate carried in
+            # cap_mode's `@<fps>` field. A customer who picks 120 on a card that only does 60
+            # is otherwise indistinguishable from one running a healthy 60.
+            int(snapshot.requested_fps or CAPTURE_FPS_DEFAULT),
             snapshot.tier, dict(snapshot.tier_counts),
             snapshot.unique_frame_fps, snapshot.duplicate_frame_pct,
             exp_fps, gap_fps, snapshot.cv_fps, snapshot.cv_detect_ms,
             float(raw_stats.get('fps', 0.0) or 0.0),
             float(raw_stats.get('max_gap_ms', 0.0) or 0.0),
             int(raw_stats.get('late_gaps', 0) or 0),
-            snapshot.source_sequence_skips,
-            int(raw_stats.get('worst_gap_frame_number', 0) or 0),
-            float(raw_stats.get('worst_gap_event_ns', 0) or 0) / 1e6,
+            stage_kind,
             float(raw_stats.get('read_block_ms', 0.0) or 0.0),
             float(raw_stats.get('isolate_ms', 0.0) or 0.0),
             float(raw_stats.get('post_ms', 0.0) or 0.0),
+            snapshot.source_sequence_skips,
+            int(raw_stats.get('worst_gap_frame_number', 0) or 0),
+            float(raw_stats.get('worst_gap_event_ns', 0) or 0) / 1e6,
             snapshot.preview_duplicate_refreshes,
             snapshot.core_black_run, snapshot.core_static_run)
 
@@ -3598,6 +4635,19 @@ class RemotePlayOrchestrator:
         except Exception:
             bbox = ()
 
+        # [ORION_PROOF_DETECTOR_BOX 2026-09-19] see _ProcessedFrameSnapshot.det_bbox. Rides the
+        # SAME atomic snapshot as `bbox` so the two rectangles can never come from different
+        # frames -- a proof that compared a fresh drawn box against a stale detector box would be
+        # exactly the failure this field exists to remove.
+        det_bbox = ()
+        try:
+            raw_det_bbox = getattr(self, '_last_meter_det_bbox', None)
+            if (raw_det_bbox is not None and len(raw_det_bbox) >= 4
+                    and int(raw_det_bbox[2]) > 0 and int(raw_det_bbox[3]) > 0):
+                det_bbox = tuple(int(raw_det_bbox[i]) for i in range(4))
+        except Exception:
+            det_bbox = ()
+
         bbox_wh = ()
         try:
             raw_bbox_wh = getattr(self, '_last_meter_bbox_wh', None)
@@ -3662,6 +4712,7 @@ class RemotePlayOrchestrator:
             'gameplay_structure_epoch': structure_epoch,
             'stage': str(getattr(self, '_last_meter_stage', '') or ''),
             'bbox': bbox,
+            'det_bbox': det_bbox,
             'bbox_wh': bbox_wh,
             'green': green,
             'tracking': _freeze_flat_payload(getattr(self, '_last_meter_track', None)),
@@ -3685,6 +4736,7 @@ class RemotePlayOrchestrator:
         self._last_meter_track = _MeterTrackPayload()
         self._last_release_fusion = None
         self._last_meter_bbox = None
+        self._last_meter_det_bbox = None
         self._last_meter_bbox_wh = None
         self._last_green_window = None
         self._last_tip_reg = None
@@ -4008,11 +5060,10 @@ class RemotePlayOrchestrator:
             self._pts_to_wall_offset = 0.0
             self._pts_to_epoch_ms = 0.0
         if self._pts_source_last > 0 and pts <= self._pts_source_last:
-            self._pts_source_last = pts
             return 'decoder_pts_regression'
-        self._pts_source_last = pts
         if int(epoch_ns or 0) <= 0:
             return 'decoder_pts_clock_missing'
+        self._pts_source_last = pts
         return ''
 
     def _backend_source_identity(self, backend, source_generation: int = 0) -> int:
@@ -4037,7 +5088,7 @@ class RemotePlayOrchestrator:
     @staticmethod
     def _backend_is_event_driven(mode: str, backend) -> bool:
         """Whether capture can wait directly for the producer's next frame."""
-        return (str(mode or '').lower() in ('capture_card', 'decoder')
+        return (str(mode or '').lower() in ('capture_card', 'decoder', 'wgc')
                 and callable(getattr(backend, 'get_frame', None)))
 
     @staticmethod
@@ -4073,7 +5124,7 @@ class RemotePlayOrchestrator:
         """Pull the latest decoded BGR frame from the decoder backend, or None.
         Returns (frame, pts, epoch_ns, mono_ns): pts is the decoder presentation timestamp
         (0 if unavailable); epoch_ns is the backend's capture-instant epoch stamp (0 if
-        unavailable) — the A0 unified timebase every timing consumer (reader velocity, tip-reg,
+        unavailable) â€” the A0 unified timebase every timing consumer (reader velocity, tip-reg,
         latency oracle) runs on; mono_ns is the backend's perf_counter_ns capture stamp
         (0 if unavailable). For the capture card that mono stamp is now cadence-locked (PTS-
         aligned), so using it for frame_age removes read-return jitter from release timing.
@@ -4173,12 +5224,12 @@ class RemotePlayOrchestrator:
 
     @staticmethod
     def _frame_keeps_pipeline_alive(img, from_backend, is_black):
-        """Liveness policy for one captured frame — does it PROVE the capture pipeline is alive?
+        """Liveness policy for one captured frame â€” does it PROVE the capture pipeline is alive?
 
         A frame DELIVERED by an active frame backend (capture card / decoder pipe / WGC) proves the
         pipeline is alive even when the content is fully black: the backend reader put a fresh frame
-        this instant, and black is a legitimate transient — a loading screen, a fade-to-black, or a
-        brief PS5-network / HDMI blip that makes the Elgato emit black — NOT a dead feed. Such a
+        this instant, and black is a legitimate transient â€” a loading screen, a fade-to-black, or a
+        brief PS5-network / HDMI blip that makes the Elgato emit black â€” NOT a dead feed. Such a
         frame MUST keep the freshness clock current, so a few seconds of black can't climb frame-age
         past the native 8s frame-stall watchdog and restart the whole sidecar mid-session (the
         "capture dies + respawns after a few shots" bug). A genuinely dead backend delivers NOTHING
@@ -4373,7 +5424,7 @@ class RemotePlayOrchestrator:
         capture-feeds-a-meterless-frame signature. The core is derived PROPORTIONALLY
         from the frame (not a hardcoded crop) so it tracks whatever size the capture
         is. Returns (core_black, core_hash). NOTE: a static core is NOT itself a
-        failure (an idle scene is legitimately static) — the caller only treats it as
+        failure (an idle scene is legitimately static) â€” the caller only treats it as
         suspicious when the WHOLE frame is changing while the core is not, or the core
         is black, or the detector has a sustained roi_not_found run in gameplay."""
         if frame is None or getattr(frame, 'size', 0) <= 0:
@@ -4469,6 +5520,15 @@ class RemotePlayOrchestrator:
             _winmm.timeBeginPeriod(1)
         except Exception:
             _winmm = None
+        # [ORION_STALL_ATTRIB 2026-09-15] Start the sampler HERE, right after the 1 ms timer
+        # resolution is raised: at Windows' default ~15.6 ms tick a 5 ms sampler period
+        # silently becomes 15.6 ms and the ring covers three times less than it claims.
+        # start() is a no-op when ORION_STALL_ATTRIB=0 and when it is already running.
+        if _stall is not None:
+            try:
+                _stall.get().start()
+            except Exception as _sa_exc:
+                logger.debug('stall attributor not started: %r', _sa_exc)
         last_refind = 0.0
         next_capture = time.perf_counter()
         while self._running:
@@ -4495,11 +5555,19 @@ class RemotePlayOrchestrator:
                 if self._frame_backend is not None:
                     img, _frame_pts, _frame_epoch_ns, _frame_mono_ns = self._capture_decoded_frame(
                         block=_event_driven_active)
+                    # [ORION_STALL_ATTRIB 2026-09-15] THE CONSUMER CALLBACK, timestamped.
+                    # This is the instant a frame is handed to the sidecar's consumer, i.e.
+                    # the cadence `preview_stats callback_gap_ms` measures one stage later.
+                    # Five operations; it never formats and never logs (the watchdog thread
+                    # does both). A gap wider than ORION_STALL_GAP_MS queues one STALL line
+                    # naming the thread that was running through it.
+                    if img is not None and _stall is not None:
+                        _stall.note_callback()
                 else:
                     img = None
                 _cap_tier = (self._frame_backend_mode if img is not None else None)
                 if (img is None and self._frame_backend is None
-                        and self._frame_pipe_required):
+                        and (self._frame_pipe_required or getattr(self, '_xbox_mode', False))):
                     if self._last_frame_reject_reason != 'decoder_frame_pipe_unavailable':
                         self._note_frame_reject('decoder_frame_pipe_unavailable')
                     time.sleep(0.02)
@@ -4566,7 +5634,7 @@ class RemotePlayOrchestrator:
                 _frame_for_preview = None
                 # Reject None / fully-black / partial-black grabs: do NOT feed them to detection.
                 # LIVENESS, though, is separate from CONTENT: a frame delivered by an active frame
-                # backend (capture card / decoder / WGC) — even a black one — proves the pipeline is
+                # backend (capture card / decoder / WGC) â€” even a black one â€” proves the pipeline is
                 # alive, so it keeps the freshness clock current (a legit loading screen / fade / brief
                 # HDMI blip must NOT climb frame-age into the native 8s frame-stall watchdog and restart
                 # the whole sidecar). A window-capture black grab (no backend) means the BitBlt failed,
@@ -4656,7 +5724,7 @@ class RemotePlayOrchestrator:
                     if _frame_pts > 0:
                         self._last_pts = _frame_pts
                         # PTS is in microseconds (AV_TIME_BASE). Calibrate offset so
-                        # pts_seconds + offset ≈ wall_clock. Slow EMA to track drift.
+                        # pts_seconds + offset â‰ˆ wall_clock. Slow EMA to track drift.
                         pts_s = _frame_pts / 1000000.0
                         # Connection-generation changes reset this mapping before
                         # calibration. Unexpected jumps retain the old mapping so
@@ -4672,6 +5740,15 @@ class RemotePlayOrchestrator:
                         self._last_frame = img
                         # Y plane rides ONLY with a backend-delivered frame (window/GDI
                         # grabs have none); committed together so they can never skew.
+                        # [ORION_DECODER_YPLANE 2026-09-14] The plane has exactly ONE consumer,
+                        # CompressedMeterReader.set_native_y, which no shipped route reaches
+                        # (ORION_SIMPLE_READER=1 everywhere). Normalising a 720p plane 60x/s for
+                        # a reader that discards it was pure waste on the decoder route, so it is
+                        # skipped unless the live reader can consume it. A missing reader keeps
+                        # the plane (diagnostics/tests inspect the commit); capture-card frames
+                        # carry no plane at all, so that route is untouched.
+                        _det = getattr(self, '_meter_detector', None)
+                        _wants_y = _det is None or callable(getattr(_det, 'set_native_y', None))
                         self._last_y_plane = (
                             _normalize_detector_y_plane(
                                 self._pending_y_plane,
@@ -4679,7 +5756,7 @@ class RemotePlayOrchestrator:
                                 source_height=_source_height,
                                 width=int(img.shape[1]),
                                 height=int(img.shape[0]),
-                            ) if self._frame_backend is not None else None
+                            ) if (self._frame_backend is not None and _wants_y) else None
                         )
                         self._last_frame_ts = _cap_ts
                         # A0 unified timebase: epoch stamp of THIS unique frame. Backend
@@ -4730,10 +5807,14 @@ class RemotePlayOrchestrator:
                                               _new_seq,
                                               int(self._pending_source_frame_number or 0),
                                               bool(self._pending_backend_frozen),
-                                              int(_publish_integrity_generation))
+                                              int(_publish_integrity_generation),
+                                              int(self._pending_source_identity or 0))
                         self._frame_count += 1
                         self._unique_count += 1
                         self._frame_seq = _new_seq
+                        detector_event = getattr(self, '_detector_frame_ready_evt', None)
+                        if detector_event is not None:
+                            detector_event.set()
                         new_unique_frame = True
                     # --- Capture-health diagnostics (no behavior change): which tier
                     # produced this frame, and whether the VIDEO CORE is live. A black
@@ -4767,11 +5848,22 @@ class RemotePlayOrchestrator:
                     self._last_fps_time = now
                 # Capture-health diagnostic: surface the tier mix + video-core liveness so
                 # a live/gameplay run self-explains roi_not_found dropouts. Logged every
-                # ~5s, or immediately when SUSPECT (black core, or a sustained run of
-                # whole-frame-changing-while-core-static = the meterless-feed signature).
-                _suspect = self._video_core_black_run >= 15 or self._video_core_static_run >= 30
-                if _suspect or (now - self._last_capture_health_log) >= 5.0:
-                    self._last_capture_health_log = now
+                # ~5s, or immediately on SUSPECT/recovery transitions (black core,
+                # or a sustained whole-frame-changing-while-core-static run).
+                # Persistent SUSPECT is still capped at 5s; otherwise the one-slot
+                # worker could write warnings at its own throughput indefinitely.
+                # [ORION_CAPTURE_FPS 2026-09-14] These two were FRAME counts hard-sized for a
+                # 60fps card: 15 frames = 0.25s of a black core, 30 = 0.5s of a frame that
+                # changes while its core does not. At 30fps they silently became 0.5s/1.0s and
+                # at 120fps 0.125s/0.25s -- the same warning meaning three different durations.
+                # Derive both from the requested rate so SUSPECT means the same WALL-CLOCK
+                # dropout at every supported rate; at 60 (the shipped default and the only rate
+                # any previous build ran) this is byte-identical to the old 15/30.
+                _black_run_frames, _static_run_frames = capture_suspect_run_frames(
+                    getattr(self, '_requested_capture_fps', CAPTURE_FPS_DEFAULT))
+                _suspect = (self._video_core_black_run >= _black_run_frames
+                            or self._video_core_static_run >= _static_run_frames)
+                if self._capture_health_report_due(now, _suspect):
                     # Delivery-vs-CV attribution is preserved exactly, but all
                     # backend queries, dict/log formatting, handlers, and stdout
                     # now execute on the bounded diagnostics worker.
@@ -4797,7 +5889,7 @@ class RemotePlayOrchestrator:
                             int(_frame_mono_ns or 0),
                         ))
                 # Capture-card is self-paced by the blocking get_frame() above (wakes on each new card
-                # frame) — skip the poll pacing entirely so we never add phase lag on top of it.
+                # frame) â€” skip the poll pacing entirely so we never add phase lag on top of it.
                 if _event_driven_active:
                     continue
                 # Clamp the polling rate to [30, 240]. The accumulating scheduler
@@ -4814,7 +5906,7 @@ class RemotePlayOrchestrator:
                     # stream rate: each grab is far more likely to be a fresh frame.
                     time.sleep(min(target_delay, sleep_for))
                 else:
-                    # At/past schedule (incl. a stall/GC drift) — rebase to now so we
+                    # At/past schedule (incl. a stall/GC drift) â€” rebase to now so we
                     # don't burst-capture to "catch up".
                     next_capture = time.perf_counter()
             except Exception as e:
@@ -4823,6 +5915,11 @@ class RemotePlayOrchestrator:
         if _winmm is not None:
             try:
                 _winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+        if _stall is not None:
+            try:
+                _stall.get().stop()
             except Exception:
                 pass
 
@@ -4862,6 +5959,7 @@ class RemotePlayOrchestrator:
     def _clear_meter_overlay_immediate(self):
         """Clear cached meter geometry for an authoritative non-gameplay rejection."""
         self._last_meter_bbox = None
+        self._last_meter_det_bbox = None
         self._last_meter_bbox_wh = None
         self._last_green_window = None
         self._green_show_streak = 0
@@ -4871,19 +5969,19 @@ class RemotePlayOrchestrator:
     def _should_feed_engine(result) -> bool:
         """Whether a detection result should be fed to the timing engine.
 
-        Feed ONLY VALIDATED detections — rejection_reason '' (accepted) or
+        Feed ONLY VALIDATED detections â€” rejection_reason '' (accepted) or
         'green_not_found' (meter found + confident + positionally STABLE, just no
         green window yet, which is the normal rising/contested phase). Everything
-        else is excluded: 'bbox_unstable' (jittery position → noisy fill that
+        else is excluded: 'bbox_unstable' (jittery position â†’ noisy fill that
         whipsaws the velocity/crossing prediction and causes wild early releases),
         'low_confidence', 'roi_not_found', and the idle 'meter_memory' echo. On the
         small embedded capture the bbox_unstable frames were the main source of
         noisy fill being fed; gating them out gives the predictor a clean signal.
 
-        SAMPLER TIER (plan B2 [fix — blocker]): 'fill_gated' (trajectory-gate hold)
-        and 'dead_reckoned' (template coast) ARE fed to the engine — the fill/box
-        keep flowing so the engine doesn't starve mid-shot — but they are EXCLUDED
-        from the raw tier below (raw_fed stays false → the native engine marks them
+        SAMPLER TIER (plan B2 [fix â€” blocker]): 'fill_gated' (trajectory-gate hold)
+        and 'dead_reckoned' (template coast) ARE fed to the engine â€” the fill/box
+        keep flowing so the engine doesn't starve mid-shot â€” but they are EXCLUDED
+        from the raw tier below (raw_fed stays false â†’ the native engine marks them
         stale_or_memory, so synthetic/held fill can never look fresh to a fire path),
         and they never reach the oracle/tip-reg/forecaster feeds.
         """
@@ -4900,7 +5998,7 @@ class RemotePlayOrchestrator:
         """RAW tier: THIS frame is a clean, fresh, accepted detection (feeds raw_fed, the
         latency oracle, tip registration, forecaster/kalman). Strictly narrower than
         _should_feed_engine: the sampler-tier reasons (fill_gated / dead_reckoned) are
-        deliberately excluded — a gated or synthetic sample must never teach a model or
+        deliberately excluded â€” a gated or synthetic sample must never teach a model or
         grant freshness trust downstream."""
         if not result or not getattr(result, 'detected', False):
             return False
@@ -4909,36 +6007,843 @@ class RemotePlayOrchestrator:
             return False
         return getattr(result, 'rejection_reason', '') in ('', 'green_not_found')
 
-    def _dump_frame(self, frame, result):
-        """ENQUEUE a frame for the async writer (opt-in, ORION_FRAMEDUMP=1). The capture thread does
-        only a throttle check + a frame.copy() + a NON-BLOCKING put, so PNG encoding can never stall
-        the stream. If the writer falls behind the queue fills and we DROP (count not consumed)."""
+    def _start_detcsv(self):
+        """Start one optional metadata sink; startup/restart never touches capture I/O."""
+        if not getattr(self, '_detcsv_enabled', False):
+            self._detcsv_start_status = 'off'
+            return
+        existing = getattr(self, '_detcsv', None)
+        if existing is not None and existing.is_running():
+            if not existing.snapshot()['accepting']:
+                # A previous bounded close timed out. That daemon still owns
+                # the file; do not spawn a second owner or silently call it active.
+                self._detcsv_start_status = 'disabled_previous_writer_closing'
+                logger.warning('DETCSV disabled_this_start reason=previous_writer_still_closing; '
+                               'no replacement writer started')
+            else:
+                self._detcsv_start_status = 'active_existing'
+            return
+        self._detcsv = None
+        self._detcsv_start_status = 'starting_async'
         try:
-            if self._framedump_count >= self._framedump_max or frame is None or self._framedump_q is None:
+            keep = max(1, int(os.environ.get('ORION_DETCSV_KEEP', '24')))
+            # PER-FILE budget, not a session cap: the sink now rotates into
+            # detframes_<ts>_partNN.csv and keeps recording (see AsyncDiagnosticCsv).  64 MiB is
+            # ~53 minutes at the -Detdiag row rate, which is how the 2026-09-14 session lost its
+            # last seven minutes; max_parts bounds the total the session may write.
+            max_bytes = max(1, int(os.environ.get('ORION_DETCSV_MAX_BYTES', str(64 * 1024 * 1024))))
+            max_parts = max(1, int(os.environ.get('ORION_DETCSV_MAX_PARTS', '16')))
+            flush_s = max(0.0, min(5.0, float(os.environ.get('ORION_DETCSV_FLUSH_MS', '2000')) / 1000.0))
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'logs', 'diagnostics', 'detframes.csv')
+            self._detcsv_t0 = time.perf_counter()
+            self._detcsv = AsyncDiagnosticCsv(path, _DETCSV_HEADER, keep=keep,
+                                             capacity=256, report=logger.warning,
+                                             report_critical=logger.error,
+                                             max_bytes=max_bytes, max_parts=max_parts,
+                                             flush_interval=flush_s)
+        except Exception as exc:
+            # No synchronous fallback: diagnostics are best-effort, capture is not.
+            self._detcsv_start_status = 'startup_failed'
+            logger.warning('DETCSV worker startup failed: %s', type(exc).__name__)
+
+    # ------------------------------------------------------------------ #
+    #  PRESS-WINDOW FRAME DUMP (ORION_FRAMEDUMP_PRESS_WINDOW=1)
+    #
+    #  THE FAILURE THIS REPLACES.  The 09-15 drill asked the writer for a frame every
+    #  0.1 s and got 826 of 1421: `dropped=595 skipped=119 state=stopped:idle`.  The
+    #  reason is arithmetic, not policy -- a 1080p PNG costs **49 ms** to encode and write
+    #  on this workstation (measured; level-1 PNG is worse at 94 ms because the file
+    #  triples).  One slot of queue plus a 25 % duty cooldown plus a 250 ms stall guard
+    #  cannot express 60 fps at 49 ms/frame, and nothing in the chain was ever going to.
+    #
+    #  For the animation anchor we do not want a thin 10 Hz sample of the whole session.
+    #  We want EVERY frame of the ~1 s around each press and nothing else at all.  That
+    #  changes the arithmetic completely:
+    #
+    #      1080p JPEG-90       4.27 ms    83 KiB   -> 26 % duty at 60 fps, 5.0 MB/shot
+    #      400x500 JPEG-90     0.57 ms   8.6 KiB   ->  3 % duty at 60 fps, 0.5 MB/shot
+    #      1080p PNG          49.18 ms  1108 KiB   -> IMPOSSIBLE (3x the frame budget)
+    #
+    #  so this mode writes JPEG by default, keeps the crop option for the shooter patch,
+    #  gives the writer a real queue for the burst, and drops the interval throttle and
+    #  the duty cooldown INSIDE a window (they are what thinned the drill dump).  Outside
+    #  a window it writes nothing whatsoever.
+    #
+    #  PRE-ROLL.  press-200 ms is in the past when the arm reaches the control thread, so
+    #  the detect thread keeps a ring of the last few frame REFERENCES.  No copy is made:
+    #  capture already hands out an isolated array per frame (ORION_CAPTURE_ISOLATE_COPY),
+    #  so retaining one costs a pointer, and the ring is bounded by the pre-roll length.
+    #
+    #  Everything the existing writer earned stays: the disk floor, the heartbeat, the
+    #  slow-write cooldown, the error streak, and the counted-never-silent drop policy.
+    # ------------------------------------------------------------------ #
+    def _init_framedump_press_window(self):
+        """Read the press-window knobs. Called from __init__ BEFORE the shared knobs,
+        because it changes their defaults (cap, queue depth, format)."""
+        def _on(name, default='0'):
+            return str(os.environ.get(name, default) or '').strip().lower() in (
+                '1', 'true', 'yes', 'on')
+
+        def _f(name, default, lo, hi):
+            try:
+                return max(lo, min(hi, float(os.environ.get(name, '') or default)))
+            except (TypeError, ValueError):
+                return float(default)
+
+        self._framedump_press_window = _on('ORION_FRAMEDUMP_PRESS_WINDOW', '0')
+        # ---------------------------------------------------------------- #
+        # PER-SESSION OUTPUT DIRECTORY (press-window mode only).
+        #
+        # THE FAILURE THIS FIXES.  Press-window filenames carry the SHOT-GATE EPOCH
+        # (`ep<epoch>_f<idx>_<det>_raw.jpg`) and the epoch restarts at 1 on every sidecar
+        # start, but the dump wrote into ONE shared `ORION_FRAMEDUMP_ROOT` for every session.
+        # On 2026-09-17 that produced `ep2_f000100_*` twice over (126 files for a 97-frame
+        # window) and a `frames.csv` with 6,649 rows of which only 4,339 belonged to the
+        # session being analysed -- so a join by epoch silently mixed two sessions' shots.
+        #
+        # The stamp is the SAME one the shot-record file uses (shot_records.default_session_
+        # name reads exactly these two variables), so `<session>.jsonl` and
+        # `<root>\session_<stamp>\` carry one label and join by (session, epoch).  An
+        # explicit ORION_FRAMEDUMP_DIR that already names a session folder is honoured
+        # untouched -- that is what the launcher composes -- and the legacy interval mode is
+        # not touched at all.
+        self._framedump_session = ''
+        _root = str(getattr(self, '_framedump_dir', '') or '')
+        if self._framedump_press_window and _root:
+            base = os.path.basename(_root.rstrip('\\/'))
+            if base.startswith('session_'):
+                self._framedump_session = base
+            else:
+                self._framedump_session = time.strftime('session_%Y%m%d_%H%M%S')
+                self._framedump_dir = os.path.join(_root, self._framedump_session)
+        self._framedump_press_pre_ms = _f('ORION_FRAMEDUMP_PRESS_PRE_MS', 200.0, 0.0, 2000.0)
+        # ---------------------------------------------------------------- #
+        # REACH THE BANNER (ORION_FRAMEDUMP_PRESS_BANNER=1, the default).
+        #
+        # THE FAILURE THIS FIXES.  The window closed at release+400 ms, and the game's
+        # `TIMING | DISTANCE` panel does not land until release+1.2..1.45 s -- so of the 53
+        # press windows dumped on 2026-09-17 03:07, only NINE contained a panel at all, and
+        # those nine were the PREVIOUS shot's.  Every offline study that needs the banner as
+        # its oracle (the timing verdict, and the free DISTANCE range label the shot-range
+        # classifier is calibrated against) was therefore reading a corpus that structurally
+        # could not contain its own answer.
+        #
+        # 1700 ms is release+1.45 s (the far end of the measured landing window) plus a
+        # ~250 ms margin for the panel's own rise, and it is the POST leg only: the window
+        # still ends POST_MS after the FIRST close, and the hard cap below still bounds a
+        # press nobody ever closed.  ORION_FRAMEDUMP_PRESS_BANNER=0 restores 400 ms
+        # exactly, and an explicit ORION_FRAMEDUMP_PRESS_POST_MS always wins over both.
+        # ---------------------------------------------------------------- #
+        self._framedump_press_banner = (self._framedump_press_window
+                                        and _on('ORION_FRAMEDUMP_PRESS_BANNER', '1'))
+        _post_default = 1700.0 if self._framedump_press_banner else 400.0
+        self._framedump_press_post_ms = _f('ORION_FRAMEDUMP_PRESS_POST_MS',
+                                           _post_default, 0.0, 5000.0)
+        # Hard stop so an unanswered press (the stuck-Square class) cannot dump forever.
+        # It has to clear the longest real shot plus the banner leg or it would silently
+        # truncate exactly the frames the change above is for: a Go-To releases ~2.1 s after
+        # the press (ep33 of session_20260917_030758), so 2100 + 1700 = 3800 ms is the bar.
+        _max_default = 4500.0 if self._framedump_press_banner else 3000.0
+        self._framedump_press_max_ms = _f('ORION_FRAMEDUMP_PRESS_MAX_MS',
+                                          _max_default, 200.0, 20000.0)
+        # 'shooter' = the player-anchor patch +- margin (~400x500). Anything else = full frame.
+        self._framedump_crop = str(os.environ.get('ORION_FRAMEDUMP_CROP', '') or '').strip().lower()
+        self._framedump_crop_w = int(_f('ORION_FRAMEDUMP_CROP_W', 400.0, 64.0, 1920.0))
+        self._framedump_crop_h = int(_f('ORION_FRAMEDUMP_CROP_H', 500.0, 64.0, 1080.0))
+        fmt = str(os.environ.get('ORION_FRAMEDUMP_FORMAT', '') or '').strip().lower()
+        if fmt not in ('jpg', 'jpeg', 'png'):
+            # Legacy dumps stay PNG byte-for-byte; only the new mode changes its default.
+            fmt = 'jpg' if self._framedump_press_window else 'png'
+        self._framedump_format = 'jpg' if fmt in ('jpg', 'jpeg') else 'png'
+        self._framedump_jpeg_quality = int(_f('ORION_FRAMEDUMP_JPEG_QUALITY', 90.0, 40.0, 100.0))
+        # Pre-roll ring: pre_ms of 60 fps frames + 2 slack, capped.
+        depth = int(self._framedump_press_pre_ms / (1000.0 / 60.0)) + 2
+        self._framedump_preroll_max = int(_f('ORION_FRAMEDUMP_PREROLL_MAX', float(depth), 0.0, 120.0))
+        self._framedump_preroll = collections.deque(maxlen=max(1, self._framedump_preroll_max))
+        # The ring and the writer both hold frames the detect thread has moved on from, so
+        # they depend on capture handing out an ISOLATED array per frame.  That is the
+        # default (ORION_CAPTURE_ISOLATE_COPY=1); with it switched off the only sound thing
+        # to do is copy on hand-off, which is what this flag makes the offer path do.
+        try:
+            import capture_card_backend as _ccb
+            self._framedump_press_copy = not bool(getattr(_ccb, '_ISOLATE_COPY', True))
+        except Exception:
+            self._framedump_press_copy = False
+        # QUEUE DEPTH lives here because press-window mode changes its default AND its cap.
+        _qd_default = '96' if self._framedump_press_window else '1'
+        _qd_cap = 512 if self._framedump_press_window else 4
+        try:
+            self._framedump_queue_depth = max(
+                1, min(_qd_cap, int(os.environ.get('ORION_FRAMEDUMP_QUEUE_DEPTH', _qd_default))))
+        except ValueError:
+            self._framedump_queue_depth = int(_qd_default)
+        self._framedump_press_epoch = 0
+        self._framedump_press_until = 0.0       # perf_counter deadline; 0 = no open window
+        self._framedump_press_hard_until = 0.0
+        self._framedump_press_stats = None
+        self._framedump_census_lock = threading.RLock()
+        self._framedump_press_windows = 0
+        self._framedump_press_frames = 0
+        self._framedump_press_dropped = 0
+
+    def framedump_press_open(self, epoch, mono_now=None):
+        """Open one bounded window; type upgrades do not replace the same epoch."""
+        if not getattr(self, '_framedump_press_window', False) \
+                or not getattr(self, '_framedump_env_enabled', False):
+            return False
+        try:
+            ep = _parse_pose_arm_token(epoch)
+            if ep <= 0:
+                return False
+            now = float(mono_now) if mono_now is not None else time.perf_counter()
+            with self._framedump_census_lock:
+                if ep == self._framedump_press_epoch and self._framedump_press_until > now:
+                    return True
+                old = self._framedump_detach_press_stats('superseded')
+                self._framedump_press_epoch = ep
+                self._framedump_press_hard_until = now + self._framedump_press_max_ms / 1000.0
+                self._framedump_press_until = self._framedump_press_hard_until
+                stats = self._framedump_press_stats = {
+                    'epoch': ep, 'first_idx': -1, 'last_idx': -1, 'frames': 0,
+                    'dropped': 0, 'skipped': 0, 'preroll': 0, 'preroll_ondisk': 0,
+                    'opened': now, 'saved': 0, 'indexed': 0, 'pending': 0,
+                    'discarded': 0, 'first_saved_idx': -1, 'last_saved_idx': -1,
+                    '_closed_reason': '', '_revision': 0,
+                    '_dir': str(getattr(self, '_framedump_dir', '')),
+                    '_session': str(getattr(self, '_framedump_session', '') or '')}
+                self._framedump_press_windows += 1
+                ring = getattr(self, '_framedump_preroll', None)
+                preroll = list(ring) if ring is not None else []
+                if ring is not None:
+                    ring.clear()
+            if old is not None:
+                self._framedump_publish_census(old, initial=True)
+            cutoff = now - self._framedump_press_pre_ms / 1000.0
+            for item in preroll:
+                if item[0] < cutoff:
+                    continue
+                if len(item) > 3 and item[3]:
+                    # Legacy name: this means accepted by the PREVIOUS window,
+                    # not proven saved. That window's saved/indexed census is the
+                    # completion evidence; never count this frame as saved here.
+                    with self._framedump_census_lock:
+                        if self._framedump_press_stats is not stats:
+                            break
+                        stats['preroll_ondisk'] += 1
+                    continue
+                self._framedump_offer(item[1], item[2], item[0], preroll=True,
+                                      expected_stats=stats)
+            return True
+        except Exception as exc:
+            logger.warning('framedump press window open failed: %s', exc)
+            return False
+
+    def framedump_press_close(self, epoch, mono_now=None):
+        """Shorten the matching window once; duplicate closes cannot extend it."""
+        if not getattr(self, '_framedump_press_window', False):
+            return False
+        try:
+            ep = _parse_pose_arm_token(epoch)
+            now = float(mono_now) if mono_now is not None else time.perf_counter()
+            with self._framedump_census_lock:
+                if ep <= 0 or ep != self._framedump_press_epoch:
+                    return False
+                self._framedump_press_until = min(
+                    self._framedump_press_until, self._framedump_press_hard_until,
+                    now + self._framedump_press_post_ms / 1000.0)
+            return True
+        except Exception:
+            return False
+
+    def _framedump_detach_press_stats(self, reason, expected_stats=None):
+        """Detach under the census lock; no logging, recorder calls or image I/O."""
+        stats = getattr(self, '_framedump_press_stats', None)
+        if expected_stats is not None and stats is not expected_stats:
+            return None
+        self._framedump_press_stats = None
+        self._framedump_press_epoch = 0
+        self._framedump_press_until = 0.0
+        self._framedump_press_hard_until = 0.0
+        if stats is not None:
+            stats['_closed_reason'] = str(reason)
+        return stats
+
+    def _framedump_close_press_stats(self, reason, expected_stats=None):
+        """Close capture immediately; finish its census when accepted work resolves."""
+        if getattr(self, '_framedump_press_stats', None) is None:
+            return
+        with self._framedump_census_lock:
+            stats = self._framedump_detach_press_stats(reason, expected_stats)
+        if stats is not None:
+            self._framedump_publish_census(stats, initial=True)
+
+    def _framedump_publish_census(self, stats, initial=False):
+        """Snapshot counters only; neither the lock nor capture waits on image I/O.
+
+        Closed-window state is held by its bounded queue items, not an ever-growing
+        epoch registry. A hung writer therefore retains at most queue_depth + 1
+        old windows. Monotonic revisions prevent delayed publishers from replacing
+        a newer snapshot in ShotRecorder.
+        """
+        with self._framedump_census_lock:
+            reason = stats.get('_closed_reason', '')
+            if not reason:
                 return
-            now = time.perf_counter()
+            stats['_revision'] = int(stats.get('_revision', 0)) + 1
+            fields = {key: int(stats.get(key, 0)) for key in
+                      ('frames', 'preroll', 'preroll_ondisk', 'dropped', 'skipped',
+                       'saved', 'indexed', 'pending', 'discarded')}
+            fields.update({key: int(stats.get(key, -1)) for key in
+                           ('first_idx', 'last_idx', 'first_saved_idx', 'last_saved_idx')})
+            fields.update(dir=stats.get('_dir', ''), session=stats.get('_session', ''),
+                          reason=reason, census_revision=stats['_revision'],
+                          census_complete=fields['pending'] == 0)
+            epoch = int(stats.get('epoch', 0))
+        # Keep frames/idx as ACCEPTED-work fields for existing readers. saved and
+        # its index bounds are raw files actually written; discarded is the
+        # accepted subset subsequently lost. frames = saved + discarded + pending.
+        if initial or fields['census_complete']:
+            try:
+                logger.error('FRAMEDUMP PRESS WINDOW: epoch=%d frames=%d preroll=%d dropped=%d '
+                             'skipped=%d idx=%d..%d reason=%s -> %s preroll_ondisk=%d '
+                             'saved=%d indexed=%d pending=%d discarded=%d census_complete=%d',
+                             epoch, fields['frames'], fields['preroll'], fields['dropped'],
+                             fields['skipped'], fields['first_idx'], fields['last_idx'],
+                             reason, fields['dir'], fields['preroll_ondisk'], fields['saved'],
+                             fields['indexed'], fields['pending'], fields['discarded'],
+                             int(fields['census_complete']))
+            except Exception:
+                pass
+        rec = getattr(self, '_shot_records', None)
+        if rec is not None:
+            try:
+                rec.note_frames(epoch, **fields)
+            except Exception:
+                pass
+
+    def _framedump_finish_item(self, item):
+        """A diagnostic accounting failure must not terminate the image worker."""
+        try:
+            self._framedump_account_item(item)
+        except Exception as exc:
+            try:
+                logger.error('FRAMEDUMP census accounting failed: %s', type(exc).__name__)
+            except Exception:
+                pass
+
+    def _framedump_account_item(self, item):
+        """Account one accepted item exactly once, against its originating window."""
+        try:
+            idx, _frame, info = item
+        except (TypeError, ValueError):
+            # Legacy diagnostic tests may seed sentinel objects in the queue.
+            self._framedump_dropped = int(getattr(self, '_framedump_dropped', 0)) + 1
+            return
+        stats = info.get('_framedump_stats')
+        if stats is None:
+            if not info.get('_framedump_raw_saved', False):
+                self._framedump_dropped = int(getattr(self, '_framedump_dropped', 0)) + 1
+            return
+        with self._framedump_census_lock:
+            if info.get('_framedump_accounted', False):
+                return
+            info['_framedump_accounted'] = True
+            stats['pending'] -= 1
+            if info.get('_framedump_raw_saved', False):
+                stats['saved'] += 1
+                stats['indexed'] += int(bool(info.get('_framedump_indexed', False)))
+                if stats['first_saved_idx'] < 0:
+                    stats['first_saved_idx'] = idx
+                stats['last_saved_idx'] = idx
+            else:
+                stats['discarded'] += 1
+                stats['dropped'] += 1
+                self._framedump_dropped += 1
+                self._framedump_press_dropped += 1
+            closed = bool(stats.get('_closed_reason'))
+        if closed:
+            self._framedump_publish_census(stats)
+
+    def _framedump_press_active(self, now):
+        """Expire only the observed window, never a replacement opened concurrently."""
+        with self._framedump_census_lock:
+            until = float(getattr(self, '_framedump_press_until', 0.0) or 0.0)
+            if until <= 0.0:
+                return False
+            if now <= until:
+                return True
+            expired = self._framedump_press_stats
+        self._framedump_close_press_stats('window_end', expected_stats=expired)
+        with self._framedump_census_lock:
+            return self._framedump_press_until >= now and self._framedump_press_until > 0.0
+
+    def _framedump_offer(self, frame, info, now, preroll=False, expected_stats=None):
+        """Bounded nonblocking handoff; reserve accounting before publishing work."""
+        with self._framedump_census_lock:
+            stats = getattr(self, '_framedump_press_stats', None)
+            q = getattr(self, '_framedump_q', None)
+            if q is None or stats is None or stats.get('_closed_reason'):
+                return False
+            if expected_stats is not None and stats is not expected_stats:
+                return False
+            # As in legacy mode, saturation must be tested BEFORE an optional
+            # capture-isolation copy. Never copy a full frame just to discard it.
+            if self._framedump_count >= self._framedump_max or q.full():
+                stats['dropped'] += 1
+                self._framedump_dropped += 1
+                self._framedump_press_dropped += 1
+                return False
+            idx = self._framedump_count
+            info = dict(info)
+            info['epoch'] = int(stats.get('epoch', 0))
+            info['preroll'] = 1 if preroll else 0
+            info['_framedump_stats'] = stats
+            if getattr(self, '_framedump_press_copy', False) and frame is not None:
+                frame = frame.copy()
+            # The writer takes this same SHORT metadata lock after I/O. It must
+            # never finish an item before its pending reservation exists.
+            try:
+                q.put_nowait((idx, frame, info))
+            except queue.Full:
+                self._framedump_dropped += 1
+                self._framedump_press_dropped += 1
+                stats['dropped'] += 1
+                return False
+            self._framedump_count = idx + 1
+            self._framedump_press_frames += 1
+            stats['frames'] += 1
+            stats['pending'] += 1
+            if preroll:
+                stats['preroll'] += 1
+            if stats['first_idx'] < 0:
+                stats['first_idx'] = idx
+            stats['last_idx'] = idx
+            return True
+
+    def _framedump_crop_frame(self, frame):
+        """The shooter patch (player-anchor plate, +- margin), or the frame unchanged.
+
+        Runs on the WRITER thread.  The anchor is whatever ``player_anchor`` already
+        found on the detect thread; nothing is searched for here.
+        """
+        if str(getattr(self, '_framedump_crop', '')) != 'shooter':
+            return frame
+        try:
+            import player_anchor as _pa
+            last = getattr(_pa.ANCHOR, '_last', None)
+            if not last:
+                return frame
+            icon_x, icon_y = float(last[0]), float(last[1])
+            h, w = frame.shape[:2]
+            cw, ch = int(self._framedump_crop_w), int(self._framedump_crop_h)
+            # The shooter stands ABOVE his own nameplate, so the patch is centred on the
+            # plate in x and reaches upward from it in y (the same geometry the anchor
+            # uses to predict the meter box).
+            x0 = int(max(0, min(w - 1, icon_x - cw * 0.5)))
+            y0 = int(max(0, min(h - 1, icon_y - ch * 0.75)))
+            x1 = int(min(w, x0 + cw))
+            y1 = int(min(h, y0 + ch))
+            if x1 - x0 < 16 or y1 - y0 < 16:
+                return frame
+            return frame[y0:y1, x0:x1]
+        except Exception:
+            return frame
+
+    def _framedump_disk_status(self):
+        """Return ``(ok, free_bytes, floor_bytes, error)`` for the dump volume.
+
+        This runs only at initialization and on the diagnostic writer thread.  A failed query is
+        unsafe for a best-effort bulk writer, so it disables framedump rather than guessing that
+        storage is available.  Capture and automation remain live.
+        """
+        absolute_floor = int(getattr(self, '_framedump_min_free_bytes', 10 * (1024 ** 3)))
+        try:
+            usage = shutil.disk_usage(self._framedump_dir)
+            percent_floor = int(
+                int(usage.total) * float(getattr(self, '_framedump_min_free_pct', 2.0)) / 100.0)
+            floor_bytes = max(absolute_floor, percent_floor)
+            free_bytes = int(usage.free)
+            return free_bytes >= floor_bytes, free_bytes, floor_bytes, ''
+        except Exception as exc:
+            return False, None, absolute_floor, str(exc)
+
+    # THE FRAME DUMP'S LIFECYCLE LINES GO OUT AT **ERROR**, DELIBERATELY.
+    #
+    # They are logger.error only so they SURVIVE THE RELAY, not because anything is broken: the
+    # native parent relays sidecar stderr through RemotePlaySession::onSidecarStderr, where every
+    # WARNING line competes for ONE shared slot per second (kSidecarWarnThrottleMs = 1000 ms,
+    # RemotePlaySession.cpp:2883-2889) while ERROR / CRITICAL bypass the throttle outright
+    # (isError, :2798).  Under -Framedump the sidecar also emits DETDIAG at 25 lines/second, so a
+    # one-shot `logger.warning("FRAMEDUMP disabled ...")` has roughly a 1-in-25 chance of being the
+    # line that wins the slot -- which is precisely why session_20260914_204600 stopped dead at
+    # 20:51:57 with NO warning anywhere in logs/orion_native.log.  The same relay comment block
+    # (:2802-2841) already records two earlier instances of this exact loss (the probe diagnostics
+    # and the authority-death pair), and the remedy there was the same: bypass the throttle.
+    #
+    # These lines stay OUT of the customer Activity feed regardless: UiNotificationPolicy.h rule 3
+    # drops every raw `Sidecar:` line, and rule 4 classifies any 3+ `key=value` line as engineering
+    # telemetry.  They reach logs/orion_native.log and nothing else.
+    @staticmethod
+    def _framedump_log(message, *args):
+        logger.error(message, *args)
+
+    def _start_framedump(self):
+        """Create (or RE-create) the async frame-dump writer; idempotent and best-effort.
+
+        WHY THIS IS NOT INLINE IN __init__ ANY MORE.  stop() calls _stop_framedump_writer(), which
+        clears `_framedump_enabled`, nulls the queue and latches `_framedump_writer_stop` -- and
+        start() only ever restarted the DETCSV sink (`self._start_detcsv()`), never this one.  So
+        any in-process capture restart (a stream re-promotion, a reconnect) ended the frame dump
+        for good, WITHOUT A SINGLE LOG LINE, while DETDIAG/DETCSV carried on and made the session
+        look instrumented.  start() now re-arms the dump through this method.
+
+        Permanent faults (missing/unwritable directory, disk below the floor) are NOT retried: they
+        latch `_framedump_permanent_stop` so a re-arm cannot turn one bad target into a per-restart
+        log storm.
+        """
+        if not getattr(self, '_framedump_env_enabled', False):
+            return False
+        if getattr(self, '_framedump_permanent_stop', ''):
+            return False
+        writer = getattr(self, '_framedump_writer', None)
+        if writer is not None and writer.is_alive():
+            return True
+        # Generation 0 is the constructor's first arm; anything after that is a capture restart and
+        # is worth a line, because "the dump came back" is exactly what was missing before.
+        restarting = int(getattr(self, '_framedump_generation', 0)) > 0
+        self._framedump_enabled = True
+        self._framedump_disabled_reason = ''
+        try:
+            os.makedirs(self._framedump_dir, exist_ok=True)
+        except Exception as exc:
+            self._framedump_disable('output_directory_unavailable', detail=str(exc))
+            return False
+        space_ok, free_bytes, floor_bytes, space_error = self._framedump_disk_status()
+        if not space_ok:
+            self._framedump_disable(
+                'low_disk' if not space_error else 'disk_check_failed',
+                free_bytes=free_bytes, floor_bytes=floor_bytes, detail=space_error)
+            return False
+        stop_evt = getattr(self, '_framedump_writer_stop', None)
+        if stop_evt is None:
+            stop_evt = threading.Event()
+            self._framedump_writer_stop = stop_evt
+        # The event is LATCHED by the previous generation's teardown; a fresh writer that inherits
+        # it set would return from its very first cooldown and die silently.
+        stop_evt.clear()
+        self._framedump_backoff_until = 0.0
+        self._framedump_backoff_s = 0.0
+        self._framedump_slow_streak = 0
+        self._framedump_error_streak = 0
+        self._framedump_index_failed = False
+        self._framedump_generation = int(getattr(self, '_framedump_generation', 0)) + 1
+        # ASYNC writer: PNG encoding is heavy; doing it inline on the capture thread
+        # stalls the stream.  The one-slot DROP queue bounds both memory and stale work.
+        self._framedump_q = queue.Queue(maxsize=self._framedump_queue_depth)
+        self._framedump_writer = threading.Thread(
+            target=self._framedump_writer_loop,
+            name='framedump-writer-%d' % self._framedump_generation, daemon=True)
+        self._framedump_writer.start()
+        if restarting:
+            self._framedump_log(
+                'FRAMEDUMP: writer re-armed generation=%d frames=%d skipped=%d dir=%s',
+                self._framedump_generation, int(getattr(self, '_framedump_count', 0)),
+                int(getattr(self, '_framedump_skipped', 0)),
+                getattr(self, '_framedump_dir', '?'))
+        if getattr(self, '_framedump_press_window', False):
+            self._framedump_log(
+                'FRAMEDUMP PRESS WINDOW armed: press-%.0fms..release+%.0fms (hard cap %.0fms) '
+                'full rate, format=%s q=%d crop=%s preroll=%d max=%d -> %s banner=%d',
+                self._framedump_press_pre_ms, self._framedump_press_post_ms,
+                self._framedump_press_max_ms, self._framedump_format,
+                self._framedump_queue_depth, self._framedump_crop or 'none',
+                self._framedump_preroll.maxlen if self._framedump_preroll is not None else 0,
+                self._framedump_max, self._framedump_dir,
+                int(getattr(self, '_framedump_press_banner', False)))
+        return True
+
+    def _framedump_state(self):
+        """One word for the heartbeat/teardown lines: what the dump is doing right now."""
+        if getattr(self, '_framedump_permanent_stop', ''):
+            return 'disabled:' + str(self._framedump_permanent_stop)
+        if not getattr(self, '_framedump_enabled', False):
+            return 'stopped:' + (str(getattr(self, '_framedump_disabled_reason', '')) or 'idle')
+        if float(getattr(self, '_framedump_backoff_until', 0.0) or 0.0) > time.perf_counter():
+            return 'backoff'
+        if getattr(self, '_framedump_press_window', False):
+            # "idle" here is the HEALTHY state between shots, not a stall -- say which,
+            # or the next reader of a heartbeat repeats the 09-15 stopped:idle scare.
+            return ('press_window' if float(getattr(self, '_framedump_press_until', 0.0) or 0.0)
+                    > time.perf_counter() else 'armed:between_presses')
+        return 'active'
+
+    def _framedump_heartbeat(self, now):
+        """Emit `FRAMEDUMP: ...` once a minute so a STALLED dump is visible within a minute.
+
+        The old instrument was one-shot by construction: it announced itself on frame 0, announced
+        its cap, and otherwise spoke only when it died -- into a throttled relay.  A session could
+        therefore be six minutes of frames followed by an hour of silence that reads EXACTLY like a
+        healthy dump.  `last_write_age_s` is the field that distinguishes them.
+        """
+        interval = float(getattr(self, '_framedump_heartbeat_s', 60.0) or 0.0)
+        if interval <= 0.0:
+            return
+        last = float(getattr(self, '_framedump_heartbeat_ts', 0.0) or 0.0)
+        if last <= 0.0:
+            self._framedump_heartbeat_ts = now
+            return
+        if (now - last) < interval:
+            return
+        self._framedump_heartbeat_ts = now
+        write_ts = float(getattr(self, '_framedump_last_write_ts', 0.0) or 0.0)
+        age = (now - write_ts) if write_ts > 0.0 else -1.0
+        self._framedump_log(
+            'FRAMEDUMP: frames=%d last_write_ms=%.0f last_write_age_s=%.1f dropped=%d skipped=%d '
+            'backoff_s=%.1f state=%s windows=%d window_frames=%d window_dropped=%d dir=%s',
+            int(getattr(self, '_framedump_count', 0)),
+            float(getattr(self, '_framedump_last_write_ms', 0.0) or 0.0), age,
+            int(getattr(self, '_framedump_dropped', 0)),
+            int(getattr(self, '_framedump_skipped', 0)),
+            float(getattr(self, '_framedump_backoff_s', 0.0) or 0.0),
+            self._framedump_state(),
+            int(getattr(self, '_framedump_press_windows', 0)),
+            int(getattr(self, '_framedump_press_frames', 0)),
+            int(getattr(self, '_framedump_press_dropped', 0)),
+            getattr(self, '_framedump_dir', '?'))
+
+    def _framedump_back_off(self, reason, detail=''):
+        """Pause the dump for a bounded, doubling cooldown instead of killing it.
+
+        Returns the cooldown in seconds.  The producer consults `_framedump_backoff_until` and
+        SKIPS frames (without consuming an index) until it expires; the first fast write after that
+        clears the streak.  Nothing here disables capture, detection, automation -- or the dump.
+        """
+        streak = int(getattr(self, '_framedump_slow_streak', 0)) + 1
+        self._framedump_slow_streak = streak
+        previous = float(getattr(self, '_framedump_backoff_s', 0.0) or 0.0)
+        cap = float(getattr(self, '_framedump_backoff_max_s', 15.0) or 15.0)
+        cooldown = min(cap, previous * 2.0 if previous > 0.0 else 1.0)
+        self._framedump_backoff_s = cooldown
+        self._framedump_backoff_until = time.perf_counter() + cooldown
+        self._framedump_log(
+            'FRAMEDUMP: backing off %.1fs (%s%s) streak=%d frames=%d skipped=%d dir=%s; '
+            'the dump RESUMES on its own when writes are fast again',
+            cooldown, reason, (': ' + detail) if detail else '', streak,
+            int(getattr(self, '_framedump_count', 0)),
+            int(getattr(self, '_framedump_skipped', 0)),
+            getattr(self, '_framedump_dir', '?'))
+        return cooldown
+
+    def _framedump_note_healthy_write(self, elapsed_s):
+        """Record a fast write; announce the recovery exactly once per back-off episode."""
+        self._framedump_last_write_ms = float(elapsed_s) * 1000.0
+        self._framedump_last_write_ts = time.perf_counter()
+        self._framedump_error_streak = 0
+        if int(getattr(self, '_framedump_slow_streak', 0)) <= 0:
+            return
+        self._framedump_log(
+            'FRAMEDUMP: writes are fast again (%.0fms) after %d slow write(s); resuming '
+            'frames=%d skipped=%d dir=%s',
+            self._framedump_last_write_ms, int(self._framedump_slow_streak),
+            int(getattr(self, '_framedump_count', 0)),
+            int(getattr(self, '_framedump_skipped', 0)),
+            getattr(self, '_framedump_dir', '?'))
+        self._framedump_slow_streak = 0
+        self._framedump_backoff_s = 0.0
+        self._framedump_backoff_until = 0.0
+
+    def _framedump_disable(self, reason, free_bytes=None, floor_bytes=None, detail=''):
+        """Permanently silence this diagnostic writer for the process generation.
+
+        Reserved for faults the dump cannot write its way out of: an unusable output directory, a
+        volume under the free-space floor, a failed disk query, a PNG write the imaging library
+        REFUSED (disk full / bad path), or repeated hard writer exceptions.  A merely SLOW write is
+        handled by _framedump_back_off() instead and never reaches here.
+
+        The disable flag is set before logging so an in-flight producer stops enqueueing even if a
+        log handler is slow.  This method never disables capture, detection, or automation.
+        """
+        was_enabled = bool(getattr(self, '_framedump_enabled', False))
+        self._framedump_enabled = False
+        self._framedump_disabled_reason = str(reason or 'unknown')
+        self._framedump_permanent_stop = self._framedump_disabled_reason
+        stop_evt = getattr(self, '_framedump_writer_stop', None)
+        if stop_evt is not None:
+            stop_evt.set()
+        if not was_enabled:
+            return
+        if free_bytes is not None and floor_bytes is not None:
+            self._framedump_log(
+                'FRAMEDUMP disabled (%s): target=%s free=%.2f GiB required=%.2f GiB frames=%d; '
+                'live capture remains active',
+                self._framedump_disabled_reason,
+                getattr(self, '_framedump_dir', '?'),
+                float(free_bytes) / float(1024 ** 3),
+                float(floor_bytes) / float(1024 ** 3),
+                int(getattr(self, '_framedump_count', 0)))
+        elif detail:
+            self._framedump_log(
+                'FRAMEDUMP disabled (%s): target=%s error=%s frames=%d; live capture remains active',
+                self._framedump_disabled_reason,
+                getattr(self, '_framedump_dir', '?'), detail,
+                int(getattr(self, '_framedump_count', 0)))
+        else:
+            self._framedump_log(
+                'FRAMEDUMP disabled (%s): frames=%d; live capture remains active',
+                self._framedump_disabled_reason, int(getattr(self, '_framedump_count', 0)))
+
+    @staticmethod
+    def _framedump_cooldown_s(write_elapsed_s, max_duty):
+        """Writer-only yield needed to keep average diagnostic encode/write duty bounded."""
+        try:
+            elapsed = max(0.0, float(write_elapsed_s))
+            duty = max(0.01, min(1.0, float(max_duty)))
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, (elapsed / duty) - elapsed)
+
+    def _framedump_encoding(self):
+        """(extension, imwrite params) for this dump.
+
+        MEASURED on this workstation, 1080p BGR: PNG default 49.2 ms / 1108 KiB, PNG
+        level-1 93.6 ms / 1357 KiB, JPEG-90 4.27 ms / 83 KiB; a 400x500 crop is 11.5 ms
+        PNG vs 0.57 ms / 8.6 KiB JPEG-90.  Only JPEG fits a 60 fps window, which is why
+        press-window mode defaults to it; legacy dumps keep PNG byte-for-byte.
+        """
+        if str(getattr(self, '_framedump_format', 'png')) == 'jpg':
+            return '.jpg', [cv2.IMWRITE_JPEG_QUALITY,
+                            int(getattr(self, '_framedump_jpeg_quality', 90))]
+        return '.png', []
+
+    def _framedump_discard_pending(self):
+        """Release queued full-resolution arrays without writing them; never waits."""
+        q = getattr(self, '_framedump_q', None)
+        if q is None:
+            return 0
+        discarded = 0
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            if item is not None:
+                discarded += 1
+                self._framedump_finish_item(item)
+        return discarded
+
+    def _framedump_info(self, frame, result, now):
+        """The per-frame index row this dump carries alongside the pixels.
+
+        WALL-CLOCK OF THE FRAME, not of the write. Without this the dump is index-only,
+        and index*interval is NOT a time axis: the throttle jitters against the capture
+        cadence, and on a full queue we DROP without consuming the index, so consecutive
+        indices can be one frame apart or ten. Any offline rate measurement (meter fill
+        ms, appear->tip) read off the index is therefore silently wrong -- and looks
+        perfectly plausible.
+        """
+        return {
+            't': now,
+            'wall': time.time(),
+            'det': bool(getattr(result, 'detected', False)) if result else False,
+            'fill': float(getattr(result, 'fill_pct', 0.0) or 0.0) if result else 0.0,
+            'conf': float(getattr(result, 'confidence', 0.0) or 0.0) if result else 0.0,
+            'rej': (getattr(result, 'rejection_reason', '') if result else 'no_result') or '',
+            'gc': float(getattr(result, 'green_window_center_pct', -1.0) or -1.0) if result else -1.0,
+            'gconf': float(getattr(result, 'green_window_confidence', 0.0) or 0.0) if result else 0.0,
+            'bbox': getattr(result, 'bbox', None) if result else None,
+            'gs': int(getattr(result, 'green_window_start_row', -1) or -1) if result else -1,
+            'ge': int(getattr(result, 'green_window_end_row', -1) or -1) if result else -1,
+            'park': bool(getattr(self._meter_detector, 'last_debug', {}).get('park', False)) if self._meter_detector else False,
+        }
+
+    def _dump_frame(self, frame, result, now=None):
+        """ENQUEUE a frame for the async writer (opt-in, ORION_FRAMEDUMP=1). The capture thread does
+        only a throttle check plus a NON-BLOCKING one-slot handoff.  Queue saturation is tested
+        before ``frame.copy()`` so backpressure does not even copy a 1080p array.  If the writer is
+        behind we DROP (count not consumed).
+
+        `now` is the producer's monotonic clock; tests drive a synthetic feed through it so a
+        press-window run does not have to take 30 real seconds."""
+        try:
+            now = time.perf_counter() if now is None else float(now)
+            # The heartbeat runs FIRST and unconditionally: a dump that has stopped (capped,
+            # disabled, backing off, or waiting for the gameplay gate) is exactly the case the
+            # owner needs to see in the log, and the old code returned before saying anything.
+            self._framedump_heartbeat(now)
+            if not getattr(self, '_framedump_enabled', False) \
+                    or self._framedump_count >= self._framedump_max \
+                    or frame is None or self._framedump_q is None:
+                return
+            # SKIP, don't die: the writer asked for a cooldown after a slow write.  Frames missed
+            # here do not consume an index, so the dump simply thins out and then recovers.
+            backoff_until = float(getattr(self, '_framedump_backoff_until', 0.0) or 0.0)
+            if backoff_until > 0.0:
+                if now < backoff_until:
+                    self._framedump_skipped = int(getattr(self, '_framedump_skipped', 0)) + 1
+                    stats = getattr(self, '_framedump_press_stats', None)
+                    if stats is not None:
+                        stats['skipped'] = int(stats.get('skipped', 0)) + 1
+                    return
+                self._framedump_backoff_until = 0.0
+            # ---------------------------------------------------------------- #
+            # PRESS-WINDOW MODE: every frame inside a window, nothing outside one.
+            # No interval throttle (the throttle is what thinned the 09-15 drill to
+            # 826/1421) and no gameplay gate (a press IS gameplay).
+            # ---------------------------------------------------------------- #
+            if getattr(self, '_framedump_press_window', False):
+                info = self._framedump_info(frame, result, now)
+                written = False
+                if self._framedump_press_active(now):
+                    written = bool(self._framedump_offer(frame, info, now))
+                ring = getattr(self, '_framedump_preroll', None)
+                if ring is not None and ring.maxlen:
+                    # REFERENCE ONLY -- capture already isolates each frame, so the ring
+                    # costs a pointer, never a 1080p copy on this thread.
+                    #
+                    # [ORION_FRAMEDUMP_PREROLL_CONTINUOUS 2026-09-17] Fed on EVERY frame,
+                    # inside a window as well as between them, so a press that lands while
+                    # the previous window is still draining still has its press-200 ms
+                    # context.  The legacy `written` flag means accepted and keeps a frame from being queued
+                    # twice; see framedump_press_open.
+                    with self._framedump_census_lock:
+                        ring.append((now, frame, info, written))
+                return
+            # GAMEPLAY GATE (2026-08-31). The dump used to start at launch, so connect + warmup ate
+            # the whole budget: the 2026-08-30_201954 dump spent all 9000 frames before the owner
+            # took a single shot (13 detections in 9000 rows) and the session's six failures had NO
+            # pixels at all. Arm the dump on the first frame the reader calls gameplay-eligible and
+            # keep dumping from then on -- that still captures the PREVIOUS shot's leftover meter and
+            # the inter-shot idle (both load-bearing for ghost/onset analysis), while skipping the
+            # menu/preview/warmup that carries no meter. ORION_FRAMEDUMP_GATE=0 restores dumping
+            # from launch. Fail-open: any error arms the dump rather than losing the capture.
+            if not self._framedump_armed:
+                try:
+                    eligible = bool(getattr(result, "gameplay_eligible", None)
+                                    if result is not None and hasattr(result, "gameplay_eligible")
+                                    else (result is not None and bool(getattr(result, "detected", False))))
+                except Exception:
+                    eligible = True
+                if not eligible:
+                    return
+                self._framedump_armed = True
             if now - self._framedump_last_ts < self._framedump_interval:
                 return
+            # Most importantly this check precedes frame.copy().  The old put_nowait-only guard
+            # copied every full-resolution frame while a 64-frame queue was already saturated.
+            if self._framedump_q.full():
+                self._framedump_dropped += 1
+                return
+            # Capture the epoch clock on the producer/capture thread.  The async
+            # PNG writer can trail this point by hundreds of milliseconds (and,
+            # under a full queue, more than a second), so stamping time.time() in
+            # the writer makes outcome-banner joins look precise while pairing
+            # them with the wrong shot.  Keep both clocks in frames.csv: t_wall is
+            # this handoff instant; write_wall is writer/queue observability only.
             idx = self._framedump_count
-            info = {
-                # WALL-CLOCK OF THE FRAME, not of the PNG write. Without this the dump is
-                # index-only, and index*interval is NOT a time axis: the throttle jitters
-                # against the capture cadence, and on a full queue we DROP without consuming
-                # the index (below), so consecutive indices can be one frame apart or ten.
-                # Any offline rate measurement (meter fill ms, appear->tip) read off the index
-                # is therefore silently wrong -- and looks perfectly plausible.
-                't': now,
-                'det': bool(getattr(result, 'detected', False)) if result else False,
-                'fill': float(getattr(result, 'fill_pct', 0.0) or 0.0) if result else 0.0,
-                'conf': float(getattr(result, 'confidence', 0.0) or 0.0) if result else 0.0,
-                'rej': (getattr(result, 'rejection_reason', '') if result else 'no_result') or '',
-                'gc': float(getattr(result, 'green_window_center_pct', -1.0) or -1.0) if result else -1.0,
-                'gconf': float(getattr(result, 'green_window_confidence', 0.0) or 0.0) if result else 0.0,
-                'bbox': getattr(result, 'bbox', None) if result else None,
-                'gs': int(getattr(result, 'green_window_start_row', -1) or -1) if result else -1,
-                'ge': int(getattr(result, 'green_window_end_row', -1) or -1) if result else -1,
-                'park': bool(getattr(self._meter_detector, 'last_debug', {}).get('park', False)) if self._meter_detector else False,
-            }
+            info = self._framedump_info(frame, result, now)
             try:
                 self._framedump_q.put_nowait((idx, frame.copy(), info))
             except queue.Full:
@@ -4947,12 +6852,19 @@ class RemotePlayOrchestrator:
             self._framedump_last_ts = now
             self._framedump_count += 1
             if idx == 0:
-                logger.warning("FRAMEDUMP active -> %s (every %ss, max %d, raw_only=%s, async)",
-                               self._framedump_dir, self._framedump_interval, self._framedump_max,
-                               self._framedump_raw_only)
+                self._framedump_log("FRAMEDUMP active -> %s (every %ss, max %d, raw_only=%s, "
+                                    "async queue=%d duty<=%.0f%% min_free>=%.1fGiB)",
+                                    self._framedump_dir, self._framedump_interval,
+                                    self._framedump_max, self._framedump_raw_only,
+                                    self._framedump_queue_depth,
+                                    self._framedump_max_duty * 100.0,
+                                    self._framedump_min_free_bytes / float(1024 ** 3))
             if self._framedump_count == self._framedump_max:
-                logger.warning("FRAMEDUMP queued %d frames -> %s (dropped=%d)",
-                               self._framedump_max, self._framedump_dir, self._framedump_dropped)
+                self._framedump_log("FRAMEDUMP queued %d frames -> %s (dropped=%d skipped=%d); "
+                                    "the cap is reached and no further frames will be written",
+                                    self._framedump_max, self._framedump_dir,
+                                    self._framedump_dropped,
+                                    int(getattr(self, '_framedump_skipped', 0)))
         except Exception as exc:
             logger.warning("frame dump enqueue error: %s", exc)
 
@@ -5031,7 +6943,7 @@ class RemotePlayOrchestrator:
         x-axis for fill-rate work without needing to know the session start.
         """
         if getattr(self, '_framedump_index_failed', False):
-            return
+            return False
         try:
             fh = getattr(self, '_framedump_index_fh', None)
             if fh is None:
@@ -5041,14 +6953,25 @@ class RemotePlayOrchestrator:
                 # frame index at 0. Opening 'w' silently erased the previous
                 # generation's rows -- observed 2026-08-26, where the generation
                 # that captured the route mismatch was lost. t_wall disambiguates
-                # generations that both restart t_ms at 0.
+                # generations that both restart t_ms at 0.  New files also carry
+                # write_wall: its presence identifies the capture-clock schema.
+                # If an old process generation already created this path, retain
+                # its legacy row width rather than corrupting the CSV mid-file.
                 _pth = os.path.join(self._framedump_dir, 'frames.csv')
                 _new = not os.path.exists(_pth) or os.path.getsize(_pth) == 0
+                _capture_clock_schema = _new
+                if not _new:
+                    try:
+                        with open(_pth, 'r', encoding='utf-8', errors='replace') as _rfh:
+                            _capture_clock_schema = 'write_wall' in _rfh.readline().strip().split(',')
+                    except OSError:
+                        _capture_clock_schema = False
                 fh = open(_pth, 'a', encoding='utf-8', newline='')
                 if _new:
                     fh.write('idx,t_ms,t_wall,detected,fill_pct,conf,green_center_pct,'
-                             'bbox_x,bbox_y,bbox_w,bbox_h,rejection\n')
+                             'bbox_x,bbox_y,bbox_w,bbox_h,rejection,write_wall\n')
                 self._framedump_index_fh = fh
+                self._framedump_index_capture_clock_schema = _capture_clock_schema
                 self._framedump_index_t0 = float(info.get('t', 0.0))
             t0 = getattr(self, '_framedump_index_t0', 0.0)
             t_ms = (float(info.get('t', 0.0)) - t0) * 1000.0
@@ -5058,48 +6981,496 @@ class RemotePlayOrchestrator:
             except (TypeError, ValueError):
                 bx = by = bw = bh = 0
             rej = str(info.get('rej', '') or '').replace(',', ';')
-            fh.write(f"{idx},{t_ms:.2f},{time.time():.3f},"
-                     f"{int(bool(info['det']))},{info['fill']:.2f},{info['conf']:.3f},"
-                     f"{info['gc']:.2f},{bx},{by},{bw},{bh},{rej}\n")
+            write_wall = time.time()
+            if getattr(self, '_framedump_index_capture_clock_schema', False):
+                capture_wall = info.get('wall')
+                if capture_wall is None:
+                    # Defensive compatibility for direct/unit callers.  The live
+                    # producer always supplies wall at enqueue time.
+                    capture_wall = write_wall
+                fh.write(f"{idx},{t_ms:.2f},{float(capture_wall):.6f},"
+                         f"{int(bool(info['det']))},{info['fill']:.2f},{info['conf']:.3f},"
+                         f"{info['gc']:.2f},{bx},{by},{bw},{bh},{rej},{write_wall:.6f}\n")
+            else:
+                # Legacy append: t_wall historically meant writer time.  Keeping
+                # the old width is safer than producing a malformed mixed-schema
+                # CSV; timestamped launcher sessions always start with v2 above.
+                fh.write(f"{idx},{t_ms:.2f},{write_wall:.3f},"
+                         f"{int(bool(info['det']))},{info['fill']:.2f},{info['conf']:.3f},"
+                         f"{info['gc']:.2f},{bx},{by},{bw},{bh},{rej}\n")
             fh.flush()
+            return True
         except Exception as exc:
             self._framedump_index_failed = True
             logger.warning("frame dump index disabled (%s); PNG stream continues", exc)
+            return False
+
+    def _framedump_write_item(self, item):
+        try:
+            return self._framedump_write_item_impl(item)
+        finally:
+            self._framedump_finish_item(item)
+
+    def _framedump_write_item_impl(self, item):
+        """Write one accepted diagnostic item; return whether the worker may continue.
+
+        All potentially blocking work in this method runs on ``framedump-writer``.  A disk-query
+        failure or a REFUSED image write disables only framedump, so a bad diagnostic target cannot
+        keep applying pressure to the live pipeline; a merely SLOW write -- or a transient
+        exception -- costs a bounded cooldown (_framedump_back_off) and nothing else.  Capture,
+        detection and automation are never touched by either path.
+        """
+        if not getattr(self, '_framedump_enabled', False):
+            return False
+        space_ok, free_bytes, floor_bytes, space_error = self._framedump_disk_status()
+        if not space_ok:
+            self._framedump_disable(
+                'low_disk' if not space_error else 'disk_check_failed',
+                free_bytes=free_bytes, floor_bytes=floor_bytes, detail=space_error)
+            return False
+        started = time.perf_counter()
+        try:
+            idx, frame, info = item
+            # PRESS-WINDOW naming carries the SHOT-GATE EPOCH, which is the join key every
+            # shot record, banner verdict and release oracle already uses -- so a frame file
+            # names its own shot without a second index.
+            epoch = int(info.get('epoch', 0) or 0)
+            if epoch > 0:
+                base = os.path.join(self._framedump_dir,
+                                    f"ep{epoch}_f{idx:06d}_{int(bool(info['det']))}")
+                frame = self._framedump_crop_frame(frame)
+            else:
+                base = os.path.join(self._framedump_dir, f"f{idx:05d}_{int(bool(info['det']))}")
+            ext, params = self._framedump_encoding()
+            # raw = exactly what the detector received. cv2 reports disk/full/path failures by
+            # returning False on several builds, so an unchecked call can create an index row for a
+            # file that does not exist.
+            if not cv2.imwrite(base + '_raw' + ext, frame, params):
+                self._framedump_disable('raw_png_write_failed')
+                return False
+            info['_framedump_raw_saved'] = True
+            info['_framedump_indexed'] = bool(self._framedump_write_index(idx, info))
+            if not self._framedump_raw_only:
+                ann = frame.copy()
+                bbox = info.get('bbox')
+                if info['det'] and bbox:
+                    x, y, w, h = (int(v) for v in bbox)
+                    cv2.rectangle(ann, (x, y), (x + w, y + h), (255, 0, 255), 2)
+                    cv2.line(ann, (x - 6, y), (x + w + 6, y), (0, 255, 255), 1)
+                    gs, ge = info.get('gs', -1), info.get('ge', -1)
+                    if gs >= 0 and ge >= 0:
+                        top, bot = sorted((gs, ge))
+                        cv2.rectangle(ann, (x - 4, top), (x + w + 4, bot), (0, 255, 0), 2)
+                label = (f"det={int(bool(info['det']))} PARK={int(bool(info.get('park')))} "
+                         f"fill={info['fill']:.0f}% conf={info['conf']:.2f} "
+                         f"g={info['gc']:.0f}/{info['gconf']:.2f} rej={info['rej']} "
+                         f"{frame.shape[1]}x{frame.shape[0]}")
+                cv2.putText(ann, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(ann, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+                if not cv2.imwrite(base + '_overlay' + ext, ann, params):
+                    self._framedump_disable('overlay_png_write_failed')
+                    return False
+        except Exception as exc:
+            # A hard exception may still be transient (a locked path, a momentary I/O error), so
+            # back off and retry; only a persistent run of them gives the dump up.
+            streak = int(getattr(self, '_framedump_error_streak', 0)) + 1
+            self._framedump_error_streak = streak
+            if streak >= int(getattr(self, '_framedump_max_error_streak', 5)):
+                self._framedump_disable('writer_error', detail='%s (x%d)' % (exc, streak))
+                return False
+            self._framedump_back_off('writer_error', detail=str(exc))
+            return bool(getattr(self, '_framedump_enabled', False))
+
+        elapsed = time.perf_counter() - started
+        if elapsed > float(getattr(self, '_framedump_max_write_s', 0.250)):
+            # NOT a disable.  See _framedump_back_off: one slow write is a cooldown, not the end of
+            # the instrument.  The frame just written is KEPT -- it completed.
+            self._framedump_last_write_ms = elapsed * 1000.0
+            self._framedump_last_write_ts = time.perf_counter()
+            self._framedump_error_streak = 0
+            self._framedump_back_off(
+                'slow_write', detail='%.0fms > %.0fms limit'
+                % (elapsed * 1000.0, float(getattr(self, '_framedump_max_write_s', 0.250)) * 1000.0))
+            # Drop whatever the producer queued during the stall rather than writing stale frames
+            # back-to-back the moment the cooldown starts.
+            self._framedump_discard_pending()
+            return bool(getattr(self, '_framedump_enabled', False))
+        self._framedump_note_healthy_write(elapsed)
+
+        dropped = int(getattr(self, '_framedump_dropped', 0))
+        reported = int(getattr(self, '_framedump_reported_dropped', 0))
+        if dropped != reported:
+            self._framedump_reported_dropped = dropped
+            logger.warning('FRAMEDUMP backpressure: dropped=%d (+%d); capture thread was not blocked',
+                           dropped, max(0, dropped - reported))
+
+        # THE DUTY COOLDOWN IS THE WRONG TOOL INSIDE A PRESS WINDOW.  It exists to keep an
+        # UNBOUNDED session-long dump from competing with capture; a press window is bounded
+        # (~60 frames, ~1 s, then silence until the next press), so sleeping 3x the encode
+        # time between frames does not bound anything -- it just loses the frames the window
+        # was opened to get.  Average duty in this mode is governed by the shot rate.
+        cooldown = 0.0 if getattr(self, '_framedump_press_window', False) \
+            else self._framedump_cooldown_s(
+                elapsed, getattr(self, '_framedump_max_duty', 0.25))
+        stop_evt = getattr(self, '_framedump_writer_stop', None)
+        if cooldown > 0.0:
+            if stop_evt is not None:
+                if stop_evt.wait(cooldown):
+                    return False
+            else:
+                time.sleep(cooldown)
+        return bool(getattr(self, '_framedump_enabled', False))
 
     def _framedump_writer_loop(self):
-        """Daemon: pop (idx, frame, info) and write the PNG(s) off the capture thread."""
-        while True:
+        """Daemon: pop and write diagnostics off-thread at low scheduling priority."""
+        if os.name == 'nt':
             try:
-                item = self._framedump_q.get()
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                # THREAD_PRIORITY_LOWEST. Failure is non-fatal; queue/duty guards remain active.
+                kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -2)
             except Exception:
+                pass
+        q = self._framedump_q
+        while q is not None:
+            try:
+                item = q.get()
+            except Exception as exc:
+                self._framedump_disable('queue_read_failed', detail=str(exc))
                 return
             if item is None:
                 return
+            if not self._framedump_write_item(item):
+                self._framedump_discard_pending()
+                return
+
+    def _stop_framedump_writer(self, timeout=0.5):
+        """Stop the diagnostic worker without draining queued PNG work.
+
+        This used to be the quietest way a session lost its pixels: stop() called it, start() never
+        re-armed the dump (only DETCSV), and NOTHING was logged -- so a mid-session capture restart
+        produced a session that looked instrumented and had no frames after the restart.  Say so,
+        and let _start_framedump() bring the writer back on the next start().
+        """
+        was_running = bool(getattr(self, '_framedump_enabled', False)
+                           or (getattr(self, '_framedump_writer', None) is not None
+                               and self._framedump_writer.is_alive()))
+        self._framedump_enabled = False
+        stop_evt = getattr(self, '_framedump_writer_stop', None)
+        if stop_evt is not None:
+            stop_evt.set()
+        q = getattr(self, '_framedump_q', None)
+        if q is not None:
+            self._framedump_discard_pending()
             try:
-                idx, frame, info = item
-                base = os.path.join(self._framedump_dir, f"f{idx:05d}_{int(bool(info['det']))}")
-                cv2.imwrite(base + '_raw.png', frame)   # raw = what the detector receives
-                self._framedump_write_index(idx, info)
-                if not self._framedump_raw_only:
-                    ann = frame.copy()
-                    bbox = info.get('bbox')
-                    if info['det'] and bbox:
-                        x, y, w, h = (int(v) for v in bbox)
-                        cv2.rectangle(ann, (x, y), (x + w, y + h), (255, 0, 255), 2)
-                        cv2.line(ann, (x - 6, y), (x + w + 6, y), (0, 255, 255), 1)
-                        gs, ge = info.get('gs', -1), info.get('ge', -1)
-                        if gs >= 0 and ge >= 0:
-                            top, bot = sorted((gs, ge))
-                            cv2.rectangle(ann, (x - 4, top), (x + w + 4, bot), (0, 255, 0), 2)
-                    label = (f"det={int(bool(info['det']))} PARK={int(bool(info.get('park')))} "
-                             f"fill={info['fill']:.0f}% conf={info['conf']:.2f} "
-                             f"g={info['gc']:.0f}/{info['gconf']:.2f} rej={info['rej']} "
-                             f"{frame.shape[1]}x{frame.shape[0]}")
-                    cv2.putText(ann, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-                    cv2.putText(ann, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                    cv2.imwrite(base + '_overlay.png', ann)
-            except Exception as exc:
-                logger.warning("frame dump write error: %s", exc)
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+            except Exception:
+                pass
+        writer = getattr(self, '_framedump_writer', None)
+        if writer is not None and writer is not threading.current_thread():
+            writer.join(timeout=max(0.0, float(timeout)))
+        if writer is not None and writer.is_alive():
+            self._framedump_log(
+                'FRAMEDUMP writer still exiting after %.0fms; daemon teardown deferred '
+                '(frames=%d dropped=%d skipped=%d dir=%s)',
+                max(0.0, float(timeout)) * 1000.0,
+                int(getattr(self, '_framedump_count', 0)),
+                int(getattr(self, '_framedump_dropped', 0)),
+                int(getattr(self, '_framedump_skipped', 0)),
+                getattr(self, '_framedump_dir', '?'))
+            return False
+        if was_running:
+            self._framedump_log(
+                'FRAMEDUMP: writer stopped frames=%d dropped=%d skipped=%d state=%s dir=%s',
+                int(getattr(self, '_framedump_count', 0)),
+                int(getattr(self, '_framedump_dropped', 0)),
+                int(getattr(self, '_framedump_skipped', 0)),
+                self._framedump_state(), getattr(self, '_framedump_dir', '?'))
+        self._framedump_writer = None
+        self._framedump_q = None
+        fh = getattr(self, '_framedump_index_fh', None)
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            self._framedump_index_fh = None
+        return True
+
+    def _record_detection_diagnostics(self, frame, result, *, _frame_wall_ms,
+                                      _snap_source_frame_number, _snap_frame_pts,
+                                      _snap_latency_estimator, _snap_integrity_generation,
+                                      _snap_seq, _snap_frame_epoch_ms,
+                                      _snap_source_identity, _snap_backend_frozen):
+        """Best-effort diagnostics after publication, using the same captured frame.
+
+        CSV formatting, frame-dump copies and optional animation analysis must
+        never hold this frame's meter update behind display/research work, or
+        revoke an already published measurement when a diagnostic fails.
+        """
+        try:
+            # Full-rate per-frame row (direct file write, bypasses relay).
+            if self._detcsv is not None:
+                try:
+                    _bb2 = (getattr(result, 'bbox', (0, 0, 0, 0)) if result else (0, 0, 0, 0)) or (0, 0, 0, 0)
+                    _dbg = getattr(self._meter_detector, 'last_debug', None) or {}
+                    self._detcsv.write((_DETCSV_ROW_FMT + '\n') % (
+                        (time.perf_counter() - self._detcsv_t0) * 1000.0,
+                        1 if (result and getattr(result, 'detected', False)) else 0,
+                        float(getattr(result, 'fill_pct', 0.0) or 0.0) if result else 0.0,
+                        float(getattr(result, 'confidence', 0.0) or 0.0) if result else 0.0,
+                        int(_bb2[0]), int(_bb2[1]), int(_bb2[2]), int(_bb2[3]),
+                        (getattr(result, 'rejection_reason', '') if result else 'no_result') or 'none',
+                        float(getattr(result, 'green_window_center_pct', -1.0) or -1.0) if result else -1.0,
+                        float(getattr(result, 'green_window_confidence', 0.0) or 0.0) if result else 0.0,
+                        int(frame.shape[1]), int(frame.shape[0]),
+                        _frame_wall_ms,
+                        1 if self._should_feed_engine(result) else 0,
+                        int(_dbg.get('stab_streak', -1)),
+                        1 if _dbg.get('stab_tracking', False) else 0,
+                        float(_dbg.get('stab_jump_px', -1.0)),
+                        float(_dbg.get('acq_gate_px', -1.0)),
+                        str(_dbg.get('stab_event', '') or 'none'),
+                        str(_dbg.get('zone', '') or 'none'),
+                        int(_dbg.get('roi_miss', -1)),
+                        int(_dbg.get('cand_n', -1)),
+                        int(_dbg.get('cand_size_ok', -1)),
+                        int(_dbg.get('purity_rej', -1)),
+                        float(_dbg.get('med_h', -1.0)),
+                        float(_dbg.get('med_s', -1.0)),
+                        int(_dbg.get('mem_left', -1)),
+                        int(getattr(self, '_unique_frame_fps', 0) or 0),
+                        float(getattr(self, '_duplicate_frame_pct', 0.0) or 0.0),
+                        int(_dbg.get('anchor_found', 0)),
+                        float(_dbg.get('anchor_score', -1.0)),
+                        int(_dbg.get('anchor_x', -1)),
+                        int(_dbg.get('anchor_y', -1)),
+                        str(getattr(result, 'rise_state', '') or 'none') if result else 'none',
+                        # decoder/capture frame number: joins CSV rows to framedump
+                        # PNGs + exposes drop patterns (2026-07-04 forensics had NO
+                        # way to align the two artifacts).
+                        # Bind identity to the same pixels/wall_ms even when
+                        # capture publishes another frame during detection.
+                        int(_snap_source_frame_number or 0),
+                        # pts (decoder PTS us) + rel_seq (latest release id) + mtr_phase
+                        # (rise/frozen/plateau/none) -- the frozen-meter latency oracle keys.
+                        int(_snap_frame_pts or 0),
+                        int(_snap_latency_estimator.release_seq) if _snap_latency_estimator is not None else 0,
+                        (_snap_latency_estimator.phase if _snap_latency_estimator is not None else 'none'),
+                        # quality/staleness diagnostics (reader last_debug; -1/default
+                        # until the compressed-path producers land -- schema is stable
+                        # so offline tooling can be written against it now).
+                        float(_dbg.get('q_frame', -1.0)),
+                        float(_dbg.get('q_session', -1.0)),
+                        float(_dbg.get('edge_curv', -1.0)),
+                        float(_dbg.get('sig_width', -1.0)),
+                        float(_dbg.get('ncc_margin', -1.0)),
+                        float(_dbg.get('roi_sad', -1.0)),
+                        int(_dbg.get('stale', 0)),
+                        int(_dbg.get('valid', 1)),
+                        float(_dbg.get('R_used', -1.0)),
+                        int(getattr(self, '_last_frame_is_iframe', 0) or 0),
+                        # det_* = the DETECTOR's rectangle, before the display-only
+                        # ORION_READER_BOX_TIGHT reshape. x/y/w/h above are what is
+                        # DRAWN; with the flag armed those two differ, and every
+                        # box-stability statistic computed from x/y/w/h was measuring
+                        # the presentation transform instead of detection. The reader
+                        # publishes det_box only when it actually reshaped, so the
+                        # fallback to _bb2 keeps the columns equal in mode 0.
+                        *(int(v) for v in (_dbg.get('det_box') or _bb2)[:4]),
+                        # Fill-ruler provenance consumed by the native phase-anchor
+                        # fence.  Keep the raw coarse companion even when subpixel is
+                        # selected so the next batch can measure scale transitions
+                        # without reconstructing them from rounded fill_pct values.
+                        float(getattr(result, 'raw_fill_pct', 0.0) or 0.0)
+                            if result else 0.0,
+                        str(getattr(result, 'fill_estimator_mode', '') or 'none')
+                            if result else 'none',
+                        int(getattr(result, 'fill_estimator_generation', 0) or 0)
+                            if result else 0,
+                        int(_snap_integrity_generation or 0),
+                        # Authority diagnostics belong to this result and captured
+                        # frame locals, never mutable reader/next-frame globals.
+                        # raw_fed is eligibility,
+                        # not a claim that telemetry/native accepted the sample.
+                        int(getattr(result, 'gameplay_sample_epoch', 0) or 0)
+                            if result else 0,
+                        int(bool(getattr(result, 'gameplay_structure_verified', False)))
+                            if result else 0,
+                        int(getattr(result, 'gameplay_structure_epoch', 0) or 0)
+                            if result else 0,
+                        int(bool(self._is_raw_accepted(result))),
+                        str(_dbg.get('stage', '') or 'none'),
+                        int(_snap_seq or 0),
+                        float(_snap_frame_epoch_ms or 0.0),
+                        int(_snap_source_identity or 0),
+                        int(bool(_snap_backend_frozen)),
+                    ))
+                except Exception:
+                    pass
+            # --- Detection diagnostic (opt-in via ORION_DETDIAG=1, throttled
+            #     ~1/s). Surfaces the sidecar's REAL per-frame detection so a
+            #     detection failure (fill stays 0 -> engine starves ->
+            #     max_hold_safety) is distinguishable from a delivery failure.
+            #     Logged at WARNING so it reaches orion_native.log via the
+            #     (now WARNING-aware) stderr relay; gated so normal runs stay
+            #     quiet. Includes the detector's rejection_reason + green band. ---
+            if self._detdiag_enabled:
+                _now_dbg = time.perf_counter()
+                if _now_dbg - getattr(self, '_last_detect_log_ts', 0.0) >= self._detdiag_interval:
+                    self._last_detect_log_ts = _now_dbg
+                    try:
+                        _det = bool(getattr(result, 'detected', False)) if result else False
+                        _f = getattr(result, 'fill_pct', None) if result else None
+                        _c = getattr(result, 'confidence', None) if result else None
+                        _bb = getattr(result, 'bbox', None) if result else None
+                        _rej = getattr(result, 'rejection_reason', '') if result else 'no_result'
+                        _gc = getattr(result, 'green_window_center_pct', None) if result else None
+                        _gconf = getattr(result, 'green_window_confidence', None) if result else None
+                        _fh, _fw = frame.shape[0], frame.shape[1]
+                        logger.warning(
+                            'DETDIAG detected=%s fill=%s conf=%s bbox=%s green_c=%s green_conf=%s '
+                            'reject=%r frame=%dx%d color=%r style=%r uniqfps=%s',
+                            _det, _f, _c, _bb, _gc, _gconf, _rej, _fw, _fh,
+                            self.config.meter_color, self.config.meter_style,
+                            self._unique_frame_fps,
+                        )
+                    except Exception:
+                        pass
+            # Gated on the ENV opt-in, not the live flag: _dump_frame owns the heartbeat, and a
+            # dump that has stopped is exactly the state that has to keep reporting itself.
+            if getattr(self, '_framedump_env_enabled', False):
+                self._dump_frame(frame, result)
+            # [ORION_SHOT_RECORDS 2026-09-16] Fallback onset + the opt-in nameplate cell.
+            # Guarded on the recorder existing, so a session with ORION_SHOT_RECORDS=0 runs
+            # exactly one attribute read more than before.
+            if getattr(self, '_shot_records', None) is not None:
+                try:
+                    self._shot_record_frame_hook(frame, result, time.perf_counter())
+                except Exception:
+                    pass
+            # [ORION_SHOT_RANGE 2026-09-17] The press+40..120 ms range window.  Two attribute
+            # reads and (inside the window, at most three times per press) one list append of
+            # a frame REFERENCE -- measured below 0.005 ms/frame.  Everything else is on the
+            # reader's worker.
+            _rng = getattr(self, '_shot_range', None)
+            if _rng is not None:
+                try:
+                    _rng.note_frame(frame, time.perf_counter(),
+                                    measurement_epoch_s=float(_frame_wall_ms or 0.0) / 1000.0)
+                except Exception:
+                    pass
+            # Shadow-only animation anchor: compute + LOG a candidate motion/pose release
+            # landmark; NEVER controls release. meterFill at the anchor is the correlation
+            # signal (a consistent fill-at-anchor across shots => a usable phase anchor).
+            # Reset between shots (meter gone a few frames). Fully guarded + flag-OFF.
+            if self._anim_anchor is not None:
+                try:
+                    _adet = bool(result and getattr(result, 'detected', False))
+                    if _adet:
+                        self._anim_miss = 0
+                    else:
+                        self._anim_miss += 1
+                        if self._anim_miss == 6:
+                            self._anim_anchor.reset()
+                    _ares = self._anim_anchor.update(frame)
+                    if _ares.found:
+                        _afill = float(getattr(result, 'fill_pct', -1.0) or -1.0) if result else -1.0
+                        logger.info('AnimAnchor: tMs=%.1f kind=%s conf=%.2f motion=%.3f meterDet=%d meterFill=%.1f'
+                                    % (time.perf_counter() * 1000.0, _ares.kind, _ares.confidence,
+                                       _ares.motion, 1 if _adet else 0, _afill))
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug('post-publication detection diagnostic skipped', exc_info=True)
+
+    def _reset_prediction_history(self):
+        """Drop source/ruler-dependent state on the detector thread only."""
+        self._last_tip_reg = None
+        self._last_fill_forecast = None
+        self._last_fill_kalman = None
+        self._last_posthoc = None
+        self._prediction_sample_identity = None
+        for name, method in (('_tip_reg', 'reset_tracking'),
+                             ('_fill_forecaster', 'reset'),
+                             ('_fill_kalman', 'reset')):
+            reset = getattr(getattr(self, name, None), method, None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:
+                    # One optional model must not prevent the other histories
+                    # resetting or leave its old trajectory active on a new ruler.
+                    setattr(self, name, None)
+                    if name == '_tip_reg':
+                        set_provider = getattr(self._meter_detector, 'set_fit_provider', None)
+                        if callable(set_provider):
+                            set_provider(None)
+                    logger.warning('Disabled %s after trajectory reset failed', name)
+
+    def _sync_prediction_sample_identity(self, result, source_identity):
+        """Reset only on a genuine sample's source/ruler boundary, never on coast.
+
+        Called on the detector thread before any predictor consumes this result.
+        Missing ruler metadata stays an explicit legacy identity rather than
+        borrowing a previous known ruler. A later known ruler starts clean.
+        """
+        if not self._is_raw_accepted(result):
+            return
+        try:
+            source = max(0, int(source_identity or 0))
+        except (TypeError, ValueError, OverflowError):
+            source = 0
+        try:
+            mode = str(getattr(result, 'fill_estimator_mode', '') or '').strip().lower()
+            generation = int(getattr(result, 'fill_estimator_generation', 0) or 0)
+            if mode not in ('coarse', 'subpixel') or generation <= 0:
+                mode, generation = '', 0
+            identity = (source, mode, generation)
+        except (TypeError, ValueError, OverflowError):
+            identity = (source, '', 0)
+        previous = getattr(self, '_prediction_sample_identity', None)
+        if previous == identity:
+            return
+        if previous is not None:
+            self._reset_prediction_history()
+        self._prediction_sample_identity = identity
+
+    def _wait_for_detector_frame(self, last_seq):
+        """Return one latest committed bundle, or None on watchdog/stop wake.
+
+        Clear BEFORE checking the immutable bundle. A commit racing with clear
+        is visible in that check; a later commit latches the event before wait.
+        Recheck after wake because an event is a hint, never frame authority.
+        There is no frame queue and no additional timestamp/identity assignment.
+        """
+        event = getattr(self, '_detector_frame_ready_evt', None)
+        if event is None:
+            # Compatibility for lightweight __new__ fixtures; real construction
+            # creates the event before the capture/processing threads start.
+            event = threading.Event()
+            self._detector_frame_ready_evt = event
+        event.clear()
+        if not self._running:
+            return None
+        bundle = self._frame_bundle
+        if bundle[0] is not None and bundle[6] != last_seq:
+            return bundle
+        # Keep the existing frozen-meter watchdog deadline, not a fresh full
+        # interval on each idle call. No-meter idle wakes remain bounded so even
+        # legacy test producers that lack the event cannot strand the loop.
+        timeout = 0.25
+        if self._last_frame_ts > 0.0 and self._last_meter_present:
+            remaining = (self._stall_watchdog_ms / 1000.0
+                         - (time.perf_counter() - self._last_frame_ts))
+            timeout = max(0.0, min(timeout, remaining))
+        event.wait(timeout=timeout)
+        if not self._running:
+            return None
+        bundle = self._frame_bundle
+        return bundle if bundle[0] is not None and bundle[6] != last_seq else None
 
     def _processing_loop(self):
         # [ORION_RUNTIME_HYGIENE] Optional detect-thread priority raise
@@ -5109,7 +7480,7 @@ class RemotePlayOrchestrator:
         # is explicitly demoted and the native fire thread runs TIME_CRITICAL. Under live
         # contention (cv2 pool, telemetry, 1 kHz input router in the same process) a normal-
         # priority detect thread is the first to lose its core. Effect is only observable under
-        # live load — offline replay cannot validate it — so this stays opt-in until a counted
+        # live load â€” offline replay cannot validate it â€” so this stays opt-in until a counted
         # batch says otherwise.
         _prio = os.environ.get('ORION_DETECT_THREAD_PRIORITY', '').strip().lower()
         if _prio and os.name == 'nt':
@@ -5127,18 +7498,32 @@ class RemotePlayOrchestrator:
                 except Exception:
                     logger.warning('runtime hygiene: detect thread priority raise failed',
                                    exc_info=True)
+        # [ORION_BANNER_VERDICT_LIVE 2026-09-14] Arm the live shot-verdict reader for this
+        # session. create() returns None when ORION_BANNER_VERDICT_LIVE=0 or the offline
+        # grader (tools/timing/panel_grade.py + panel_templates.npz) is not importable, and
+        # never raises, so the detect loop below is byte-identical when it is off.
+        try:
+            from banner_verdict_live import BannerVerdictLive as _BannerVerdictLive
+            # [ORION_SHOT_RECORDS] Same tee as the release oracle: the record gets a copy of
+            # every ATTRIBUTED verdict, the native gets the identical bytes it always got.
+            self._banner_verdict = _BannerVerdictLive.create(
+                emit_line=(self._shot_record_banner_sink
+                           if getattr(self, '_shot_records', None) is not None
+                           else emit_stdout_jsonl))
+        except Exception as _bv_exc:
+            self._banner_verdict = None
+            logger.warning('banner verdict reader unavailable: %s', _bv_exc)
         last_seq = -1
         while self._running:
             try:
-                # Only run detection on a NEW captured frame. Reprocessing the
-                # same frame fed duplicate fill samples (velocity noise) and
-                # added latency; gating on the capture sequence removes the
-                # noise and picks up each frame within ~2 ms of arrival, which
-                # tightens release timing toward the physical limit.
-                if self._last_frame is None or self._frame_seq == last_seq:
+                # Wake on capture commit, not a timer-quantized polling sleep.
+                # The bundled sequence is the sole dedup key and the same tuple
+                # supplies every pixel, source identity and measurement below.
+                _snap_bundle = self._wait_for_detector_frame(last_seq)
+                if _snap_bundle is None:
                     # RC-2b STALL WATCHDOG. No NEW unique frame this poll. Duplicates keep frame_age~0
                     # (capture is "alive"), so nothing else would tell the native engine the meter is
-                    # gone — a pure stall never produces a fresh unique frame, so the meter_present:false
+                    # gone â€” a pure stall never produces a fresh unique frame, so the meter_present:false
                     # that fires only on a processed frame is defeated by exactly this condition. When
                     # the pixel age (since the last UNIQUE frame) crosses the watchdog threshold,
                     # synthesize a no-meter state so the native fresh gate stops coasting on a frozen
@@ -5153,10 +7538,6 @@ class RemotePlayOrchestrator:
                                 self._stall_active = True
                                 logger.warning('stall watchdog: no unique frame for %.0fms -> '
                                                'meter_present=false (was holding)', _stale_ms)
-                    # True-idle throttle (no new capture yet). Kept a short REAL sleep (not a
-                    # busy-spin); trimmed 0.8ms -> 0.5ms so a freshly-captured frame is picked
-                    # up ~0.15ms sooner on average with negligible extra idle CPU wakeups.
-                    time.sleep(0.0005)
                     continue
                 self._stall_active = False
                 # P1 fix: read the atomically-published frame tuple (see capture commit) so
@@ -5165,7 +7546,12 @@ class RemotePlayOrchestrator:
                 frame, _snap_frame_ts, _snap_y_plane, _snap_frame_pts, _snap_frame_epoch_ms, \
                     _snap_measurement_epoch_ms, _snap_seq, _snap_source_frame_number, \
                     _snap_backend_frozen, \
-                    _snap_integrity_generation = self._frame_bundle
+                    _snap_integrity_generation = _snap_bundle[:10]
+                # Source identity must describe these exact pixels, not the
+                # capture thread's potentially newer mutable source globals.
+                # Ten-field legacy test bundles carry no source attestation.
+                _snap_source_identity = int(_snap_bundle[10] or 0) \
+                    if len(_snap_bundle) > 10 else 0
                 _snap_latency_estimator = self._latency_estimator_for_frame(
                     _snap_integrity_generation)
                 # D5 fix: mark done the frame THIS iteration actually read, taken from the same
@@ -5189,6 +7575,15 @@ class RemotePlayOrchestrator:
                 # PTS mapping here could pair frame N with frame N+1's calibration.
                 # Raw _snap_frame_epoch_ms remains a separate identity stamp.
                 _frame_wall_ms = float(_snap_measurement_epoch_ms or 0.0)
+                # [ORION_BANNER_VERDICT_LIVE 2026-09-14] Read the GAME'S OWN shot-feedback
+                # banner off these exact pixels. Placed before the meter/pose split so it
+                # grades both modes. Cost on THIS thread is a 53 KB strip copy every 6th
+                # frame (~0.02 ms); the HSV/cell/NCC work runs on the reader's own worker
+                # thread. None unless the reader armed; never raises.
+                if self._banner_verdict is not None:
+                    self._banner_verdict.submit(
+                        frame, _snap_seq, frame_ts=_snap_frame_ts,
+                        epoch_ms=(_frame_wall_ms or _snap_frame_epoch_ms))
                 # No-meter mode: run pose timing detector instead of meter detector
                 if self._pose_timing is not None:
                     _pose_ok = False
@@ -5209,41 +7604,35 @@ class RemotePlayOrchestrator:
                     continue
                 if self._meter_detector and self._green_analyzer:
                     try:
+                        _processed_source = int(getattr(
+                            self, '_detector_processed_source_identity', 0) or 0)
+                        _prediction_identity = getattr(self, '_prediction_sample_identity', None)
+                        if (_prediction_identity is not None
+                                and _snap_source_identity != _prediction_identity[0]):
+                            # The reader can query the previous fit DURING detect().
+                            # Clear it before the new source's pixels reach that hook.
+                            self._reset_prediction_history()
+                        if (_snap_source_identity > 0 and _processed_source > 0
+                                and _snap_source_identity != _processed_source):
+                            # Normalization keeps both sources at 1280x720, so
+                            # image-shape checks cannot invalidate an old ruler
+                            # or outstanding locator result. Reset on THIS thread
+                            # before installing per-frame shot state/native Y.
+                            _reset = getattr(self._meter_detector, 'reset_tracking', None)
+                            if callable(_reset):
+                                _reset()
                         # Push the shot-gate armed state to a shot-gated reader BEFORE detect(): armed
                         # while a shot-start signal is within its window (bounded, auto-expiring).
                         # Guarded -> a no-op for the serving chain. Never suppresses detection; it only
                         # relaxes early-rise acquisition + extends the coast while the bot is shooting.
-                        _sg = getattr(self._meter_detector, "set_shot_state", None)
-                        if callable(_sg):
-                            # Frame sequence intentionally freezes on dark/loading frames, so the
-                            # monotonic cap is mandatory.  Both bounds must remain valid.
-                            _armed_now, _armed_hw_now = self._shot_gate_state(_snap_seq)
-                            if _armed_now != self._shot_gate_armed_prev:
-                                # CLEAR arm/disarm marker so a live log can confirm the shot-gate is
-                                # firing (the missing signal in session_20260706_190737).
-                                logger.warning("SHOT-GATE %s at frame_seq=%d (deadline=%d hw=%d src=%s)",
-                                               "ARMED" if _armed_now else "DISARMED",
-                                               _snap_seq, self._shot_gate_deadline_seq,
-                                               self._shot_gate_hw_deadline_seq,
-                                               self._shot_gate_source or "-")
-                                self._shot_gate_armed_prev = _armed_now
-                            try:
-                                _sg(_armed_now, 0.0, _armed_hw_now)
-                            except TypeError:
-                                # legacy 2-arg reader hook (guarded: chain readers differ)
-                                try:
-                                    _sg(_armed_now)
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
+                        self._push_reader_shot_gate(_snap_seq)
                         _cv_t0 = time.perf_counter()
                         # A0 unified timebase: every timing consumer below gets the FRAME's epoch
-                        # stamp (capture instant), not the loop's processing time — this removes
+                        # stamp (capture instant), not the loop's processing time â€” this removes
                         # dequeue/processing jitter from velocities and aligns the fill timeline
                         # with the epoch release markers.
                         # detect(ts=...) moves the reader's velocity clock onto capture time (the ts
-                        # param existed but was never wired — reader fell back to perf_counter at
+                        # param existed but was never wired â€” reader fell back to perf_counter at
                         # call time). Both SimpleMeterReader and MeterDetector accept ts (seconds).
                         # Native Y pass-through (compressed reader only, guarded no-op
                         # elsewhere): one-shot per frame -- the reader consumes it inside
@@ -5267,6 +7656,11 @@ class RemotePlayOrchestrator:
                         _detect_ts = ((_frame_wall_ms / 1000.0)
                                       if _frame_wall_ms > 0.0 else None)
                         result = self._meter_detector.detect(frame, ts=_detect_ts)
+                        self._sync_prediction_sample_identity(result, _snap_source_identity)
+                        # A failed initial detect does not establish a processed
+                        # source. Cold start and same-source drops retain state.
+                        if _snap_source_identity > 0:
+                            self._detector_processed_source_identity = _snap_source_identity
                         # Publish the reader's stage for the sidecar payload (coast vs fresh read).
                         try:
                             self._last_meter_stage = str((getattr(self._meter_detector, 'last_debug', None)
@@ -5278,21 +7672,14 @@ class RemotePlayOrchestrator:
                         # shot-gate here. This keeps the reader's coast extended + early-rise gate relaxed
                         # through the live shot even with no controller-side signal -- fulfilling the
                         # "a fresh detected meter refreshes the arm" contract. Rising-only (velocity gate)
-                        # so a static décor blob can never self-arm. Native pose_arm still provides the
+                        # so a static dÃ©cor blob can never self-arm. Native pose_arm still provides the
                         # earlier (pre-detection) arm when it is emitted.
                         try:
                             if result is not None and getattr(result, 'detected', False):
                                 _rs = str(getattr(result, 'rise_state', '') or '')
                                 _vel = float(getattr(result, 'fill_velocity_pct_s', 0.0) or 0.0)
                                 if _rs == 'rising' or _vel > 40.0:
-                                    # MERGED deadline only. NEVER _shot_gate_hw_deadline_seq (plan
-                                    # B1 [fix]): a CV-armed window must not open colour training --
-                                    # a false lock training itself was the failure mode this kills.
-                                    if _snap_seq > self._shot_gate_deadline_seq:
-                                        self._shot_gate_source = 'cv'   # never overwrites a live physical source
-                                    self._shot_gate_deadline_seq = _snap_seq + self._shot_gate_arm_frames
-                                    self._shot_gate_deadline_monotonic = (
-                                        time.perf_counter() + self._shot_gate_max_seconds)
+                                    self._refresh_cv_shot_gate(_snap_seq)
                         except Exception:
                             pass
                         # Fill-trajectory forecaster (flag-gated): feed the running fill curve, stash the
@@ -5353,9 +7740,15 @@ class RemotePlayOrchestrator:
                             try:
                                 _kfed = self._is_raw_accepted(result)   # raw tier: no gated/synthetic fill
                                 _kfill = float(getattr(result, 'fill_pct', 0.0) or 0.0)
-                                self._fill_kalman.update(_kfill, _frame_wall_ms / 1000.0)   # t in SECONDS (capture epoch)
+                                # Held/dead-reckoned fills are not measurements. Feeding
+                                # them here silently pulled velocity toward zero through
+                                # occlusion even though the published prediction was gated.
+                                if _kfed and _frame_wall_ms > 0.0:
+                                    self._fill_kalman.update(_kfill, _frame_wall_ms / 1000.0)
+                                elif not bool(getattr(result, 'detected', False)):
+                                    self._fill_kalman.reset()
                                 _ktip = None
-                                if _kfed and self._fill_kalman.ready:
+                                if _kfed and _frame_wall_ms > 0.0 and self._fill_kalman.ready:
                                     _ktgt = float(getattr(result, 'green_window_center_pct', 0.0) or 0.0)
                                     if _ktgt <= 0.0:
                                         _ktgt = 95.0    # fall back to the tip when no green window is read
@@ -5400,6 +7793,7 @@ class RemotePlayOrchestrator:
                         # Far-horizon tip registration + frozen-meter latency oracle. present/fed mirror
                         # the meter-present gate below so the detframes row + payload carry THIS frame's
                         # phase / reg prediction / pts. Telemetry only; never affects timing here.
+                        _csv_latency_label = None
                         try:
                             _mp = bool(result and getattr(result, 'detected', False) and getattr(result, 'bbox', None)
                                        and result.bbox[2] > 0 and result.bbox[3] > 0)
@@ -5415,13 +7809,20 @@ class RemotePlayOrchestrator:
                             if _snap_latency_estimator is not None:
                                 _snap_latency_estimator.update(
                                     _frame_wall_ms, _mfill, _mp, _mfed)
+                                if self._detcsv is not None:
+                                    # Freeze before _finish_processed_frame wakes native.
+                                    # A release prompted by this frame may mutate the
+                                    # estimator while post-publication CSV work runs.
+                                    _csv_latency_label = _DetectionLatencyLabel(
+                                        int(_snap_latency_estimator.release_seq),
+                                        str(_snap_latency_estimator.phase))
                             if self._tip_reg is not None:
                                 self._tip_reg.update(_frame_wall_ms, _mfill, _mp, _mfed)
                                 _details_fn = getattr(self._tip_reg, 'predict_details', None)
                                 _details = (_details_fn() if _mfed and callable(_details_fn)
                                             else None)
                                 _tp = (self._tip_reg.predict()
-                                       if _mfed and _details is None else None)
+                                       if _mfed and not callable(_details_fn) else None)
                                 _reg_ms = float(_details.get('ms_to_tip', -1.0)) \
                                     if _details is not None else float(
                                         _tp[0] if _tp is not None else -1.0)
@@ -5461,7 +7862,7 @@ class RemotePlayOrchestrator:
                                     't_ms': time.perf_counter() * 1000.0,
                                 }
                                 # POST-HOC full-shot refit label (once per archived shot): the
-                                # clock prior's EMA teacher — t0 + T*u_tip on capture-epoch ms,
+                                # clock prior's EMA teacher â€” t0 + T*u_tip on capture-epoch ms,
                                 # robust to the release-freeze censoring the observed peak.
                                 _an = int(getattr(self._tip_reg, 'shot_archive_n', 0) or 0)
                                 if _an != self._posthoc_seen_n:
@@ -5475,137 +7876,33 @@ class RemotePlayOrchestrator:
                                         }
                                         logger.info('posthocTip n=%d tip_epoch_ms=%.0f conf=%.2f',
                                                     _an, float(_ph[0]), float(_ph[1]))
-                                if _tp is not None:
+                                if _details is not None or _tp is not None:
                                     self._tip_reg_log_n += 1
                                     if self._tip_reg_log_n % 6 == 0:
                                         logger.info('tipReg seq=%d fill=%.1f regTipMs=%.0f conf=%.2f',
                                                     int(_snap_seq), _mfill, float(_reg_ms), float(_reg_conf))
                         except Exception as _trx:
                             logger.debug(f'tip reg / latency skip: {_trx}')
-                        # Full-rate per-frame row (direct file write, bypasses relay).
-                        if self._detcsv is not None:
-                            try:
-                                _bb2 = (getattr(result, 'bbox', (0, 0, 0, 0)) if result else (0, 0, 0, 0)) or (0, 0, 0, 0)
-                                _dbg = getattr(self._meter_detector, 'last_debug', None) or {}
-                                self._detcsv.write((_DETCSV_ROW_FMT + '\n') % (
-                                    (time.perf_counter() - self._detcsv_t0) * 1000.0,
-                                    1 if (result and getattr(result, 'detected', False)) else 0,
-                                    float(getattr(result, 'fill_pct', 0.0) or 0.0) if result else 0.0,
-                                    float(getattr(result, 'confidence', 0.0) or 0.0) if result else 0.0,
-                                    int(_bb2[0]), int(_bb2[1]), int(_bb2[2]), int(_bb2[3]),
-                                    (getattr(result, 'rejection_reason', '') if result else 'no_result') or 'none',
-                                    float(getattr(result, 'green_window_center_pct', -1.0) or -1.0) if result else -1.0,
-                                    float(getattr(result, 'green_window_confidence', 0.0) or 0.0) if result else 0.0,
-                                    int(frame.shape[1]), int(frame.shape[0]),
-                                    _frame_wall_ms,
-                                    1 if self._should_feed_engine(result) else 0,
-                                    int(_dbg.get('stab_streak', -1)),
-                                    1 if _dbg.get('stab_tracking', False) else 0,
-                                    float(_dbg.get('stab_jump_px', -1.0)),
-                                    float(_dbg.get('acq_gate_px', -1.0)),
-                                    str(_dbg.get('stab_event', '') or 'none'),
-                                    str(_dbg.get('zone', '') or 'none'),
-                                    int(_dbg.get('roi_miss', -1)),
-                                    int(_dbg.get('cand_n', -1)),
-                                    int(_dbg.get('cand_size_ok', -1)),
-                                    int(_dbg.get('purity_rej', -1)),
-                                    float(_dbg.get('med_h', -1.0)),
-                                    float(_dbg.get('med_s', -1.0)),
-                                    int(_dbg.get('mem_left', -1)),
-                                    int(getattr(self, '_unique_frame_fps', 0) or 0),
-                                    float(getattr(self, '_duplicate_frame_pct', 0.0) or 0.0),
-                                    int(_dbg.get('anchor_found', 0)),
-                                    float(_dbg.get('anchor_score', -1.0)),
-                                    int(_dbg.get('anchor_x', -1)),
-                                    int(_dbg.get('anchor_y', -1)),
-                                    str(getattr(result, 'rise_state', '') or 'none') if result else 'none',
-                                    # decoder/capture frame number: joins CSV rows to framedump
-                                    # PNGs + exposes drop patterns (2026-07-04 forensics had NO
-                                    # way to align the two artifacts).
-                                    int(getattr(self, '_last_decoded_frame_number', 0) or 0),
-                                    # pts (decoder PTS us) + rel_seq (latest release id) + mtr_phase
-                                    # (rise/frozen/plateau/none) -- the frozen-meter latency oracle keys.
-                                    int(getattr(self, '_last_pts', 0) or 0),
-                                    int(_snap_latency_estimator.release_seq) if _snap_latency_estimator is not None else 0,
-                                    (_snap_latency_estimator.phase if _snap_latency_estimator is not None else 'none'),
-                                    # quality/staleness diagnostics (reader last_debug; -1/default
-                                    # until the compressed-path producers land -- schema is stable
-                                    # so offline tooling can be written against it now).
-                                    float(_dbg.get('q_frame', -1.0)),
-                                    float(_dbg.get('q_session', -1.0)),
-                                    float(_dbg.get('edge_curv', -1.0)),
-                                    float(_dbg.get('sig_width', -1.0)),
-                                    float(_dbg.get('ncc_margin', -1.0)),
-                                    float(_dbg.get('roi_sad', -1.0)),
-                                    int(_dbg.get('stale', 0)),
-                                    int(_dbg.get('valid', 1)),
-                                    float(_dbg.get('R_used', -1.0)),
-                                    int(getattr(self, '_last_frame_is_iframe', 0) or 0),
-                                    # det_* = the DETECTOR's rectangle, before the display-only
-                                    # ORION_READER_BOX_TIGHT reshape. x/y/w/h above are what is
-                                    # DRAWN; with the flag armed those two differ, and every
-                                    # box-stability statistic computed from x/y/w/h was measuring
-                                    # the presentation transform instead of detection. The reader
-                                    # publishes det_box only when it actually reshaped, so the
-                                    # fallback to _bb2 keeps the columns equal in mode 0.
-                                    *(int(v) for v in (_dbg.get('det_box') or _bb2)[:4]),
-                                ))
-                            except Exception:
-                                pass
-                        # --- Detection diagnostic (opt-in via ORION_DETDIAG=1, throttled
-                        #     ~1/s). Surfaces the sidecar's REAL per-frame detection so a
-                        #     detection failure (fill stays 0 -> engine starves ->
-                        #     max_hold_safety) is distinguishable from a delivery failure.
-                        #     Logged at WARNING so it reaches orion_native.log via the
-                        #     (now WARNING-aware) stderr relay; gated so normal runs stay
-                        #     quiet. Includes the detector's rejection_reason + green band. ---
-                        if self._detdiag_enabled:
-                            _now_dbg = time.perf_counter()
-                            if _now_dbg - getattr(self, '_last_detect_log_ts', 0.0) >= self._detdiag_interval:
-                                self._last_detect_log_ts = _now_dbg
-                                try:
-                                    _det = bool(getattr(result, 'detected', False)) if result else False
-                                    _f = getattr(result, 'fill_pct', None) if result else None
-                                    _c = getattr(result, 'confidence', None) if result else None
-                                    _bb = getattr(result, 'bbox', None) if result else None
-                                    _rej = getattr(result, 'rejection_reason', '') if result else 'no_result'
-                                    _gc = getattr(result, 'green_window_center_pct', None) if result else None
-                                    _gconf = getattr(result, 'green_window_confidence', None) if result else None
-                                    _fh, _fw = frame.shape[0], frame.shape[1]
-                                    logger.warning(
-                                        'DETDIAG detected=%s fill=%s conf=%s bbox=%s green_c=%s green_conf=%s '
-                                        'reject=%r frame=%dx%d color=%r style=%r uniqfps=%s',
-                                        _det, _f, _c, _bb, _gc, _gconf, _rej, _fw, _fh,
-                                        self.config.meter_color, self.config.meter_style,
-                                        self._unique_frame_fps,
-                                    )
-                                except Exception:
-                                    pass
-                        if self._framedump_enabled:
-                            self._dump_frame(frame, result)
-                        # Shadow-only animation anchor: compute + LOG a candidate motion/pose release
-                        # landmark; NEVER controls release. meterFill at the anchor is the correlation
-                        # signal (a consistent fill-at-anchor across shots => a usable phase anchor).
-                        # Reset between shots (meter gone a few frames). Fully guarded + flag-OFF.
-                        if self._anim_anchor is not None:
-                            try:
-                                _adet = bool(result and getattr(result, 'detected', False))
-                                if _adet:
-                                    self._anim_miss = 0
-                                else:
-                                    self._anim_miss += 1
-                                    if self._anim_miss == 6:
-                                        self._anim_anchor.reset()
-                                _ares = self._anim_anchor.update(frame)
-                                if _ares.found:
-                                    _afill = float(getattr(result, 'fill_pct', -1.0) or -1.0) if result else -1.0
-                                    logger.info('AnimAnchor: tMs=%.1f kind=%s conf=%.2f motion=%.3f meterDet=%d meterFill=%.1f'
-                                                % (time.perf_counter() * 1000.0, _ares.kind, _ares.confidence,
-                                                   _ares.motion, 1 if _adet else 0, _afill))
-                            except Exception:
-                                pass
                         if result and result.detected and result.bbox and result.bbox[2] > 0 and result.bbox[3] > 0:
                             self._last_meter_bbox = result.bbox
+                            # [ORION_PROOF_DETECTOR_BOX 2026-09-19] The same frame's DETECTOR
+                            # rectangle, stamped by the reader at its production boundary on
+                            # every published frame (it equals result.bbox when the display hug
+                            # is off). Native's ownership proof judges shape continuity on it;
+                            # anything unreadable falls back to the drawn box, which is today's
+                            # behaviour exactly.
+                            _det_box = None
+                            try:
+                                _rdbg = getattr(self._meter_detector, 'last_debug', None)
+                                _cand = _rdbg.get('det_box') if isinstance(_rdbg, dict) else None
+                                if (_cand is not None and len(_cand) >= 4
+                                        and int(_cand[2]) > 0 and int(_cand[3]) > 0):
+                                    _det_box = tuple(int(_cand[i]) for i in range(4))
+                            except Exception:
+                                _det_box = None
+                            self._last_meter_det_bbox = (
+                                _det_box if _det_box is not None
+                                else tuple(int(v) for v in result.bbox[:4]))
                             # Publish the detector's LIVE velocity/accel/eta so it reaches the native
                             # engine (msg["tracking"]). The detector computes these every frame (healthy
                             # 250-650 %/s on a rise); they were 0 downstream only because this object was
@@ -5620,12 +7917,21 @@ class RemotePlayOrchestrator:
                             if _te is None or float(_te) < 0.0:
                                 _te = getattr(result, 'eta_ms', None)
                             _tf = float(getattr(result, 'fill_pct', 0.0) or 0.0)
+                            _tcf = float(getattr(result, 'raw_fill_pct', -1.0) or 0.0)
+                            _tem = str(getattr(result, 'fill_estimator_mode', '') or '').strip().lower()
+                            _teg = int(getattr(result, 'fill_estimator_generation', 0) or 0)
+                            if _tem not in ('coarse', 'subpixel') or _teg <= 0:
+                                _tem = ''
+                                _teg = 0
                             _tc = float(getattr(result, 'confidence', 0.0) or 0.0)
                             self._last_meter_track = _MeterTrackPayload(
                                 velocity_pct_s=float(_tv) if _tv is not None else 0.0,
                                 acceleration_pct_s2=float(_ta) if _ta is not None else 0.0,
                                 eta_to_target_ms=float(_te) if _te is not None else -1.0,
                                 fill_pct=_tf,
+                                coarse_fill_pct=_tcf,
+                                fill_estimator_mode=_tem,
+                                fill_estimator_generation=str(_teg),
                                 confidence=_tc,
                             )
                             # Stamp the frame WxH the bbox was computed in, so native maps it with the
@@ -5636,7 +7942,7 @@ class RemotePlayOrchestrator:
                             # FULL meter track, above the rising fill). The old
                             # green_analyzer.analyze(result.bbox) scanned INSIDE the fill bbox,
                             # so it missed the green at the top of the track and reported bogus
-                            # green at ~1-4% — never a usable release target.
+                            # green at ~1-4% â€” never a usable release target.
                             if getattr(result, 'green_window_confidence', 0.0) > 0.0 and float(getattr(result, 'green_window_center_pct', -1.0)) >= 0.0:
                                 start_pct = float(result.green_window_start_pct)
                                 end_pct = float(result.green_window_end_pct)
@@ -5656,7 +7962,7 @@ class RemotePlayOrchestrator:
                             #
                             # Gate: feed any REAL detection, excluding ONLY the idle "meter_memory"
                             # echo. A detected meter with no green window yet carries
-                            # rejection_reason="green_not_found" — that is the ENTIRE rising phase of
+                            # rejection_reason="green_not_found" â€” that is the ENTIRE rising phase of
                             # every shot (and all of a contested shot). It MUST reach the engine
                             # (green stays -1 until it appears) so the engine tracks fill/velocity and
                             # times the release. Requiring rejection_reason=="" here was the bug that
@@ -5665,7 +7971,7 @@ class RemotePlayOrchestrator:
                             # still keep idle false positives out.
                             # raw_fed = THIS frame had a clean RAW detection worth
                             # feeding (accepted / green_not_found), NOT a meter_memory
-                            # echo / roi_not_found / unstable — and NOT the sampler-tier
+                            # echo / roi_not_found / unstable â€” and NOT the sampler-tier
                             # fill_gated / dead_reckoned frames (plan B2 [fix]: those are
                             # FED below but must read as stale_or_memory natively, never
                             # as a fresh raw sample). Published so the native engine can
@@ -5688,7 +7994,7 @@ class RemotePlayOrchestrator:
                                     if self._rtt_engine:
                                         rtt_snap = self._rtt_engine.get_snapshot()
                                         # Feed the NETWORK one-way time (half-RTT) into the engine
-                                        # lead as soon as RTT has ANY samples (ready OR converging) —
+                                        # lead as soon as RTT has ANY samples (ready OR converging) â€”
                                         # not only when fully ready, which often never happened and
                                         # left offset=0. We feed ONLY the network half-RTT (not the
                                         # full effective_offset): the encode/decode/display pipeline
@@ -5779,6 +8085,15 @@ class RemotePlayOrchestrator:
                             measurement_epoch_ms=_frame_wall_ms,
                             pts=_snap_frame_pts, frame_wh=(frame.shape[1], frame.shape[0]),
                             integrity_generation=_snap_integrity_generation)
+                        self._record_detection_diagnostics(
+                            frame, result, _frame_wall_ms=_frame_wall_ms,
+                            _snap_source_frame_number=_snap_source_frame_number,
+                            _snap_frame_pts=_snap_frame_pts,
+                            _snap_latency_estimator=_csv_latency_label,
+                            _snap_integrity_generation=_snap_integrity_generation,
+                            _snap_seq=_snap_seq, _snap_frame_epoch_ms=_snap_frame_epoch_ms,
+                            _snap_source_identity=_snap_source_identity,
+                            _snap_backend_frozen=_snap_backend_frozen)
                     except Exception as e:
                         logger.error(f'CV processing error: {e}')
                         self._finish_processed_frame(
@@ -5796,15 +8111,20 @@ class RemotePlayOrchestrator:
                         measurement_epoch_ms=_frame_wall_ms,
                         pts=_snap_frame_pts, frame_wh=(frame.shape[1], frame.shape[0]),
                         integrity_generation=_snap_integrity_generation)
-                # (Trailing 1ms post-process sleep removed.) The idle branch at the top of the
-                # loop (short sleep while _frame_seq is unchanged) is the CPU throttle; this
-                # sleep only ADDED up to 1ms of pickup latency when the next frame was already
-                # waiting (backlog / faster-than-60fps capture). Dropping it lets the loop pick
-                # the next frame up immediately; a no-frame iteration still sleeps in the idle
-                # branch, so this never busy-spins a core.
+                # No post-process sleep: already-committed latest frames are
+                # immediately available; true idle blocks on the capture event.
             except Exception as e:
                 logger.error(f'Error in processing loop: {e}')
                 time.sleep(0.1)
+        # Session over: retire the banner reader's worker thread (daemon, so this is only
+        # about the closing stats line + a clean handoff to the next session).
+        _bv = self._banner_verdict
+        self._banner_verdict = None
+        if _bv is not None:
+            try:
+                _bv.stop()
+            except Exception:
+                pass
 
     def trigger_goto_shot(self):
         if not self._running or not self._virtual_controller:
@@ -5941,7 +8261,7 @@ class RemotePlayOrchestrator:
                 # completes, and a controller-delivery route transition revokes it again. A probe
                 # run started inside that window is silently discarded end to end.
                 logger.warning(
-                    'probe marker DROPPED: seq=%s reason=%s — the latency estimator is not '
+                    'probe marker DROPPED: seq=%s reason=%s â€” the latency estimator is not '
                     'available yet (capture warm-route not validated, or a route transition '
                     'revoked it). Wait for the timing route to settle, then rerun.',
                     str(seq),
@@ -5962,7 +8282,7 @@ class RemotePlayOrchestrator:
             return False
 
     def calibrate_meter(self, phase: str, count: int = 0) -> bool:
-        """Shoot-to-train colour calibration (plan B3 — implements the wired sidecar stub).
+        """Shoot-to-train colour calibration (plan B3 â€” implements the wired sidecar stub).
         start  = snapshot + reset + RELEARN with a 10-shot window (5 committed shots bake).
         finish = derive/clamp/persist + LOCKED (>=1 committed shot; envelope-clamped = safe).
         cancel = restore the pre-calibration snapshot.
@@ -6026,7 +8346,7 @@ class RemotePlayOrchestrator:
         """Epoch-ms measurement timestamp for the current frame's timing consumers (latency
         oracle, tip registration, forecaster/kalman, detect ts). Decoder path rides the PTS
         clock mapped onto the epoch axis (EMA-calibrated: same mean as the raw capture stamp,
-        but per-frame pipe/dequeue arrival jitter removed — the PTS-domain oracle feed).
+        but per-frame pipe/dequeue arrival jitter removed â€” the PTS-domain oracle feed).
         pts=0 sources use the raw capture-instant epoch stamp unchanged.
 
         This helper is called at capture publication, with an explicit offset snapshot,
@@ -6063,7 +8383,7 @@ class RemotePlayOrchestrator:
                 state = physical_reader.read_state()
                 if state is not None:
                     # Detect SQUARE rising edge to arm pose timing (controller-state arming)
-                    # This is the ground-truth "shot is starting" signal — 100% arm rate, 60ms IQR
+                    # This is the ground-truth "shot is starting" signal â€” 100% arm rate, 60ms IQR
                     square_now = bool(state.buttons & DS4Button.SQUARE)
                     if square_now and not self._prev_square_pressed:
                         self._arm_shot_gate("square")
