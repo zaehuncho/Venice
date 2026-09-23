@@ -1316,8 +1316,8 @@ void RemotePlaySession::openChiakiClient()
         return;
     }
     if (!reportRemotePlayExecutableIdentity(path, QStringLiteral("configuration-open"))) {
-        emit setupMessage(QStringLiteral("Orion Stream client was not opened because its build "
-                                         "identity could not be verified."));
+        emit setupMessage(QStringLiteral("Venice's Remote Play client was not opened because its "
+                                         "build identity could not be verified."));
         return;
     }
 

@@ -6,8 +6,8 @@
     "replaces_note": "#downloads is empty — nothing to replace. This is the first post.",
     "post_as": "Triton",
     "method": "POST /channels/1549499799861067876/messages",
-    "signing_status": "2026-09-23: installer/Output/VeniceSetup-1.0.0.exe is NOT Authenticode-signed (Get-AuthenticodeSignature = NotSigned). Field 1 now tells buyers about SmartScreen and the SHA-256 check. If an EV/OV-signed installer ships instead, replace the SmartScreen sentence with the publisher name. OWNER DECISION: blocked_by below still forbids posting an unsigned build.",
-    "blocked_by": "Launch blocker B5: no signed installer is published yet. Replace INSTALLER_URL and INSTALLER_SHA256 with the real values, and delete this note, before posting. Do not post a link to an unsigned build."
+    "signing_status": "2026-09-23 OWNER DECISION: the beta installer ships UNSIGNED (Get-AuthenticodeSignature = NotSigned) and MAY be posted. Field 1 tells buyers about SmartScreen (More info -> Run anyway) and how to check the published SHA-256. If a signed installer ships later, replace the SmartScreen sentence with the publisher name.",
+    "blocked_by": "Replace INSTALLER_URL (both places) and INSTALLER_SHA256 with the real values of the exact installer file being published, and delete this note, before posting. The unsigned beta installer is allowed (owner decision 2026-09-23); a URL/hash that does not match the uploaded file is not."
   },
   "message": {
     "embeds": [

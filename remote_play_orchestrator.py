@@ -825,6 +825,10 @@ def _latency_route_scope(config) -> str:
                 % (names[index][:48], classes[index]))
         if selected_id != stable_ids[index] and classes[index] != 'card':
             return _scope_reject('capture_device_not_explicitly_selected')
+        # [P-C RT-HIGH-06 2026-09-23] A Stream Setup pick is authoritative: a card-NAMED row
+        # that is not the picked stable ID never scopes timing (two-card rigs, busy pick).
+        if selected_id and selected_id != stable_ids[index]:
+            return _scope_reject('capture_device_is_not_the_selected_card')
         stable_name = ' '.join(names[index].casefold().split())
         parts.extend([
             str(index),
@@ -3891,10 +3895,15 @@ class RemotePlayOrchestrator:
                 # card was actually asked for -- never a hard-coded 60.
                 _fps = requested_capture_fps()
                 self._requested_capture_fps = _fps
+                # [P-C CL3-F5-008 2026-09-23] Only the FIRST open may trust native's launch
+                # inventory; every later (re)open enumerates live before and after the open.
+                _refresh_inv = bool(getattr(self, '_capture_inventory_spent', False))
+                self._capture_inventory_spent = True
                 backend = CaptureCardBackend(
                     device_index=configured_idx,
                     fps=_fps,
-                    use_mjpg=_use_mjpg)
+                    use_mjpg=_use_mjpg,
+                    refresh_inventory=_refresh_inv)
                 if backend.start():
                     # This check precedes backend publication, frame ingestion,
                     # and sidecar telemetry.  A DirectShow inventory identity
@@ -4472,15 +4481,28 @@ class RemotePlayOrchestrator:
                                                   if callable(resolved_route) else ('', -1))
                 except Exception:
                     backend_api, backend_index = '', -1
-                if (basis == 'card_name'
+                # [P-C RT-HIGH-06 / CL3-F5-002 2026-09-23] With a Stream Setup pick only the
+                # index carrying the SELECTED stable ID (basis 'configured', a reorder) may be
+                # adopted; a card-NAME resolution is adoptable only on an unselected install.
+                try:
+                    from capture_card_backend import (_explicit_device_matches as _sel_match,
+                                                      _selected_id as _sel_id)
+                    _has_pick = bool(_sel_id())
+                    _pick_here = bool(_sel_match(actual_index))
+                except Exception:
+                    _has_pick, _pick_here = True, False
+                basis_ok = ((basis == 'configured' and _has_pick and _pick_here)
+                            or (basis == 'card_name' and not _has_pick))
+                if (basis_ok
                         and str(backend_api or '').strip().upper() == 'DSHOW'
                         and int(backend_index) == actual_index):
                     logger.warning(
                         'Capture-card route ADOPTED: configured DirectShow index %d had no live '
-                        'feed; the backend resolved the capture card BY NAME at index %d and '
+                        'feed; the backend resolved the capture card BY %s at index %d and '
                         'timing continues with COLD calibration there (the persisted posterior '
                         'stays revoked). This replaces the former whole-session timing brick.',
-                        expected, actual_index)
+                        expected, 'SELECTED ID' if basis == 'configured' else 'NAME',
+                        actual_index)
                     self._capture_warm_cache_expected_index = actual_index
                     expected = actual_index
                     self._capture_warm_cache_revoked = True
@@ -7078,16 +7100,25 @@ class RemotePlayOrchestrator:
         except Exception:
             identified = False
         if not identified:
+            # [P-C RT-HIGH-06 2026-09-23] Say WHICH identity failure: the opened device is
+            # known NOT to be the customer's pick ("wrong_device"), or unprovable.
+            id_code = 'unidentified'
+            failure_fn = getattr(backend, 'identity_failure', None)
+            try:
+                if callable(failure_fn) and str(failure_fn() or '') == 'wrong_device':
+                    id_code = 'wrong_device'
+            except Exception:
+                id_code = 'unidentified'
             self._capture_feed_qualified = False
             self._capture_feed_pass_run = 0
-            if str(getattr(self, '_capture_feed_reason', '') or '') != 'unidentified':
-                logger.warning('Capture feed NOT qualified for timing: unidentified device')
-            self._capture_feed_reason = 'unidentified'
+            if str(getattr(self, '_capture_feed_reason', '') or '') != id_code:
+                logger.warning('Capture feed NOT qualified for timing: %s device', id_code)
+            self._capture_feed_reason = id_code
             try:
                 dev = self._capture_device_name(backend.active_route()[1])
             except Exception:
                 dev = ''
-            self._post_capture_notice('unidentified', device=dev)
+            self._post_capture_notice(id_code, device=dev)
             return
         stats_fn = getattr(backend, 'cadence_stats', None)
         try:
@@ -7105,6 +7136,21 @@ class RemotePlayOrchestrator:
                 samples=int(stats.get('samples', 0) or 0))
         except Exception as exc:
             ok, code, detail = False, 'no_frames', 'qualifier error: %s' % exc
+        # [P-C CL3-F5-003 2026-09-23] "duplicated" is ambiguous for a few seconds (game content
+        # repeats frames on a healthy 60 fps card). Until it persists for
+        # DUPLICATED_PERSIST_WINDOWS consecutive verdicts it neither revokes a QUALIFIED feed nor
+        # warns; an unqualified feed still cannot qualify on those windows (fail closed).
+        if code == 'duplicated':
+            self._capture_dup_run = int(getattr(self, '_capture_dup_run', 0) or 0) + 1
+            try:
+                from capture_card_backend import DUPLICATED_PERSIST_WINDOWS as _dup_need
+            except Exception:
+                _dup_need = 5
+            if self._capture_dup_run < int(_dup_need):
+                self._capture_feed_pass_run = 0
+                return
+        else:
+            self._capture_dup_run = 0
         if ok:
             self._capture_feed_pass_run = int(getattr(self, '_capture_feed_pass_run', 0)) + 1
             self._capture_feed_fail_run = 0

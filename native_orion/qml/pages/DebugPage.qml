@@ -365,7 +365,10 @@ ScrollView {
                     PrimaryButton { text: "Check Chiaki"; Layout.fillWidth: true; Layout.preferredHeight: Theme.controlHeight; onClicked: orion.checkBackend() }
                     PrimaryButton { text: "Open Chiaki"; Layout.fillWidth: true; Layout.preferredHeight: Theme.controlHeight; onClicked: orion.openChiaki() }
                     PrimaryButton { text: "Refresh Security"; Layout.fillWidth: true; Layout.preferredHeight: Theme.controlHeight; onClicked: orion.refreshSecurity() }
-                    PrimaryButton { text: "Sign Settings"; Layout.fillWidth: true; Layout.preferredHeight: Theme.controlHeight; onClicked: orion.signSettings() }
+                    // [RT-MED-09 2026-09-23] Unconditional re-sign is developer-only: it would launder a
+                    // hand-edited settings.json. Customers get the scoped Repair settings banner on the Live
+                    // page; signSettings() is also a no-op in production builds.
+                    PrimaryButton { text: "Sign Settings"; visible: orion.debugUiEnabled === true; Layout.fillWidth: true; Layout.preferredHeight: Theme.controlHeight; onClicked: orion.signSettings() }
                     DangerButton  { text: "Clear Log";       Layout.fillWidth: true; Layout.preferredHeight: Theme.controlHeight; onClicked: orion.clearLogs() }
                     Item { Layout.fillHeight: true }
                 }

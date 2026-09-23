@@ -234,6 +234,12 @@ private slots:
     void extendedLengthPathHandlesDriveAndUncForms();
     void extractRefusesTruncatedEntry();
     void restoreReplacesAFileSymlinkThatShadowsABackedUpFile();
+    // [P-B] exact signed stage, installed-file preflight and rollback under a
+    // foreign held handle. All paths are QTemporaryDir-owned test copies.
+    void exactStagedInventoryRejectsUnmanifestedPlugin();
+    void productionManifestOriginIsPinned();
+    void preflightRefusesHeldRetiredFile();
+    void restoreSkipsHeldIdenticalRetiredFile();
 };
 
 void OrionUpdaterTests::semanticVersionComparisonOrdersBuilds()
@@ -1735,6 +1741,93 @@ void OrionUpdaterTests::retiredManifestedFilesArePrunedButUserDataSurvivesRollba
     QFile executable(install + QStringLiteral("/OrionNative.exe"));
     QVERIFY(executable.open(QIODevice::ReadOnly));
     QCOMPARE(executable.readAll(), QByteArrayLiteral("old-exe"));
+}
+
+void OrionUpdaterTests::exactStagedInventoryRejectsUnmanifestedPlugin()
+{
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QString stage = tmp.filePath(QStringLiteral("stage"));
+    QVERIFY(QDir().mkpath(stage + QStringLiteral("/platforms")));
+    QVERIFY(writeTextFile(stage + QStringLiteral("/release_manifest.json"), QByteArrayLiteral("{}")));
+    QVERIFY(writeTextFile(stage + QStringLiteral("/release_manifest.sig"), QByteArrayLiteral("sig")));
+    QVERIFY(writeTextFile(stage + QStringLiteral("/OrionNative.exe"), QByteArrayLiteral("exe")));
+    QJsonObject files{{QStringLiteral("OrionNative.exe"), QStringLiteral("fixture-hash")}};
+    QString error;
+    QVERIFY2(verifyExactManifestInventory(stage, files, &error), qPrintable(error));
+    QVERIFY(writeTextFile(stage + QStringLiteral("/platforms/qinjected.dll"), QByteArrayLiteral("extra")));
+    QVERIFY(!verifyExactManifestInventory(stage, files, &error));
+    QVERIFY(error.contains(QStringLiteral("unmanifested")));
+}
+
+void OrionUpdaterTests::productionManifestOriginIsPinned()
+{
+    QVERIFY(productionManifestUrlAllowed(QUrl(QStringLiteral(
+        "https://api.zaeorion.com/api/update?channel=stable"))));
+    QVERIFY(!productionManifestUrlAllowed(QUrl(QStringLiteral(
+        "https://evil.example/api/update"))));
+    QVERIFY(!productionManifestUrlAllowed(QUrl(QStringLiteral(
+        "http://api.zaeorion.com/api/update"))));
+    QVERIFY(!productionManifestUrlAllowed(QUrl(QStringLiteral(
+        "https://api.zaeorion.com:444/api/update"))));
+    QVERIFY(!productionManifestUrlAllowed(QUrl(QStringLiteral(
+        "https://api.zaeorion.com.evil.example/api/update"))));
+}
+
+void OrionUpdaterTests::preflightRefusesHeldRetiredFile()
+{
+#if !defined(Q_OS_WIN)
+    QSKIP("Windows sharing-violation fixture");
+#else
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QString install = tmp.filePath(QStringLiteral("install"));
+    QVERIFY(QDir().mkpath(install));
+    const QString retired = install + QStringLiteral("/retired.dll");
+    QVERIFY(writeTextFile(retired, QByteArrayLiteral("old")));
+    QJsonObject oldFiles{{QStringLiteral("retired.dll"), QStringLiteral("old-hash")}};
+    QJsonObject newFiles{{QStringLiteral("OrionNative.exe"), QStringLiteral("new-hash")}};
+    const std::wstring native = QDir::toNativeSeparators(retired).toStdWString();
+    HANDLE held = CreateFileW(native.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    QVERIFY(held != INVALID_HANDLE_VALUE);
+    QString error;
+    QVERIFY(!preflightUpdateDestinations(install, oldFiles, newFiles, &error));
+    QVERIFY(error.contains(QStringLiteral("locked")));
+    CloseHandle(held);
+    error.clear();
+    QVERIFY2(preflightUpdateDestinations(install, oldFiles, newFiles, &error), qPrintable(error));
+#endif
+}
+
+void OrionUpdaterTests::restoreSkipsHeldIdenticalRetiredFile()
+{
+#if !defined(Q_OS_WIN)
+    QSKIP("Windows sharing-violation fixture");
+#else
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QString backup = tmp.filePath(QStringLiteral("backup"));
+    const QString install = tmp.filePath(QStringLiteral("install"));
+    QVERIFY(QDir().mkpath(backup));
+    QVERIFY(QDir().mkpath(install));
+    QVERIFY(writeTextFile(backup + QStringLiteral("/retired.dll"), QByteArrayLiteral("old")));
+    QVERIFY(writeTextFile(install + QStringLiteral("/retired.dll"), QByteArrayLiteral("old")));
+    QVERIFY(writeTextFile(backup + QStringLiteral("/OrionNative.exe"), QByteArrayLiteral("old-exe")));
+    QVERIFY(writeTextFile(install + QStringLiteral("/OrionNative.exe"), QByteArrayLiteral("new-exe")));
+    const std::wstring native = QDir::toNativeSeparators(
+        install + QStringLiteral("/retired.dll")).toStdWString();
+    HANDLE held = CreateFileW(native.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    QVERIFY(held != INVALID_HANDLE_VALUE);
+    QString error;
+    const bool restored = restoreTree(backup, install, &error);
+    CloseHandle(held);
+    QVERIFY2(restored, qPrintable(error));
+    QFile exe(install + QStringLiteral("/OrionNative.exe"));
+    QVERIFY(exe.open(QIODevice::ReadOnly));
+    QCOMPARE(exe.readAll(), QByteArrayLiteral("old-exe"));
+#endif
 }
 
 QTEST_MAIN(OrionUpdaterTests)

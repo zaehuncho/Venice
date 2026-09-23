@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <iterator>
 #include <limits>
 
 namespace orion {
@@ -116,10 +118,67 @@ ObjectReadStatus readObjectStatus(const QString& path, QJsonObject* out)
     return ObjectReadStatus::Ok;
 }
 
+// [RT-MED-03 / CL3-F4-006 2026-09-23] SEMANTIC bands for learning.json. The syntactic guard
+// (readObjectStatus) only proves the file is a JSON object; a finite but absurd value --
+// "bias_pct": -60, a negative clock, 1e300 -- used to load and then rotate into .bak as
+// "last good". Every numeric field now has a plausibility band, taken from the band the
+// engine's own learner or clamp enforces (widened a little so no value a shipped writer can
+// produce is refused). 0 stays legal wherever the engine reads 0 as "unarmed / not learned".
+// ONE table feeds both the per-field loader (an out-of-band value keeps the default) and the
+// whole-file validator (any violation quarantines the file and prefers the last-good copy).
+struct LearningBand {
+    const char* key;
+    double lo;
+    double hi;
+};
+
+// Scalars at the top level of learning.json.
+constexpr LearningBand kLearningScalarBands[] = {
+    {"version", 0.0, 1000.0},
+    {"ema_fill_per_frame", 0.0, 100.0},        // pct per frame; no shipped writer (0)
+    {"ema_green_ratio", 0.0, 1.0},             // a ratio
+    {"bias_pct", -10.0, 10.0},                 // aim target = clampPct(100 + bias); no writer (0)
+    {"global_appear_to_tip_ms", 0.0, 3000.0},  // learner band (80, 2000) + a 200 ms rebaseline
+    {"global_hold_to_release_ms", 0.0, 6000.0},// learner band (150, 5000) + rebaseline
+    {"learned_latency_ms", -130.0, 130.0},     // clamp +-globalLatencyClampMs (100; was 130)
+    {"probe_spawn_offset_ms", 0.0, 2000.0},    // press -> meter-appear game constant (178.2)
+    {"global_rise_velocity_pct_ms", 0.0, 2.0}, // learner band (0.05, 1.0); default 0.226
+};
+
+// Per-shot-type maps ({"<type>": number}).
+constexpr LearningBand kLearningMapBands[] = {
+    {"shot_type_learned_offset_ms", -120.0, 120.0},     // learnFromOutcome clamp +-120
+    {"shot_type_feedforward_ms", 0.0, 6000.0},          // seed band (150, 5000) + rebaseline
+    {"shot_type_meter_to_release_ms", 0.0, 6000.0},     // seed band (80, 5000) + rebaseline
+    {"shot_type_appear_to_tip_ms", 0.0, 3000.0},        // posthoc label band (150, 3000)
+    {"shot_type_latency_ms", -130.0, 130.0},            // clamp +-shotTypeLatencyClampMs
+    {"shot_type_velocity_prior_pct_ms", 0.0, 2.0},      // learner band (0.001, 2.0)
+    {"shot_type_rtt_baseline_ms", -100.0, 100.0},       // pendingNetworkOffsetMs_ clamp +-100
+    {"shot_type_cal_phase", 0.0, 2.0},                  // 0 = Acquire, 1 = Lock
+};
+
+constexpr double kLearningPhaseMinMs = 200.0;   // learned/measured phase + lead reference band
+constexpr double kLearningPhaseMaxMs = 500.0;
+constexpr double kNoMeterHoldMinMs = 200.0;     // no_meter_hold_by_type median band
+constexpr double kNoMeterHoldMaxMs = 4000.0;
+constexpr double kPerLevelNudgeAbsMax = 20.0;
+
+bool learningNumberInBand(const QJsonValue& v, double lo, double hi)
+{
+    if (!v.isDouble()) {
+        return false;
+    }
+    const double d = v.toDouble();
+    return std::isfinite(d) && d >= lo && d <= hi;
+}
+
 double perLevelNudge(const QJsonObject& perLevel, const QString& key)
 {
     const auto level = perLevel.value(key).toObject();
-    return level.value(QStringLiteral("nudge_pct")).toDouble(0.0);
+    // [RT-MED-03] An out-of-band nudge degrades to 0 (no nudge), never to an arbitrary aim.
+    const QJsonValue v = level.value(QStringLiteral("nudge_pct"));
+    return learningNumberInBand(v, -kPerLevelNudgeAbsMax, kPerLevelNudgeAbsMax) ? v.toDouble()
+                                                                                : 0.0;
 }
 
 QString defaultChiakiPath(const QString& rootDir)
@@ -267,6 +326,113 @@ QString AppConfig::learningBackupPath() const
     return learningPath() + QStringLiteral(".bak");
 }
 
+QStringList AppConfig::learningSemanticViolations(const QJsonObject& obj)
+{
+    // [RT-MED-03 / CL3-F4-006 2026-09-23] Every field that is PRESENT must be a finite number
+    // inside its band (see kLearningScalarBands / kLearningMapBands). Absent fields are fine:
+    // an older writer, or a value that was never learned. The result names each violation as
+    // "key" or "key[type]" so the quarantine note says what was wrong without printing values.
+    QStringList violations;
+    for (const LearningBand& band : kLearningScalarBands) {
+        const QString key = QString::fromLatin1(band.key);
+        if (obj.contains(key) && !learningNumberInBand(obj.value(key), band.lo, band.hi)) {
+            violations.append(key);
+        }
+    }
+    for (const LearningBand& band : kLearningMapBands) {
+        const QString key = QString::fromLatin1(band.key);
+        if (!obj.contains(key)) {
+            continue;
+        }
+        const QJsonValue mapValue = obj.value(key);
+        if (!mapValue.isObject()) {
+            violations.append(key);
+            continue;
+        }
+        const QJsonObject map = mapValue.toObject();
+        for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+            if (!learningNumberInBand(it.value(), band.lo, band.hi)) {
+                violations.append(QStringLiteral("%1[%2]").arg(key, it.key().left(48)));
+            }
+        }
+    }
+    if (obj.contains(QStringLiteral("lead_rebaselined"))
+        && !obj.value(QStringLiteral("lead_rebaselined")).isBool()) {
+        violations.append(QStringLiteral("lead_rebaselined"));
+    }
+    if (obj.contains(QStringLiteral("per_level"))) {
+        const QJsonValue perLevelValue = obj.value(QStringLiteral("per_level"));
+        if (!perLevelValue.isObject()) {
+            violations.append(QStringLiteral("per_level"));
+        } else {
+            const QJsonObject perLevel = perLevelValue.toObject();
+            for (auto it = perLevel.constBegin(); it != perLevel.constEnd(); ++it) {
+                const QJsonObject level = it.value().toObject();
+                if (!it.value().isObject()
+                    || (level.contains(QStringLiteral("nudge_pct"))
+                        && !learningNumberInBand(level.value(QStringLiteral("nudge_pct")),
+                                                 -kPerLevelNudgeAbsMax, kPerLevelNudgeAbsMax))) {
+                    violations.append(QStringLiteral("per_level[%1]").arg(it.key().left(48)));
+                }
+            }
+        }
+    }
+    for (const char* phaseKey : {"learned_phase_physical_ms", "measured_phase_physical_ms"}) {
+        const QString key = QString::fromLatin1(phaseKey);
+        if (obj.contains(key)
+            && !learningNumberInBand(obj.value(key), kLearningPhaseMinMs, kLearningPhaseMaxMs)) {
+            violations.append(key);
+        }
+    }
+    {
+        // The writer emits the lead-reference pair together or not at all.
+        const bool hasPhys = obj.contains(QStringLiteral("lead_reference_physical_ms"));
+        const bool hasLead = obj.contains(QStringLiteral("lead_reference_lead_ms"));
+        if (hasPhys != hasLead
+            || (hasPhys
+                && (!learningNumberInBand(obj.value(QStringLiteral("lead_reference_physical_ms")),
+                                          kLearningPhaseMinMs, kLearningPhaseMaxMs)
+                    || !learningNumberInBand(obj.value(QStringLiteral("lead_reference_lead_ms")),
+                                             1e-9, 1000.0)))) {
+            violations.append(QStringLiteral("lead_reference"));
+        }
+    }
+    if (obj.contains(QStringLiteral("no_meter_hold_by_type"))) {
+        const QJsonValue holdValue = obj.value(QStringLiteral("no_meter_hold_by_type"));
+        if (!holdValue.isObject()) {
+            violations.append(QStringLiteral("no_meter_hold_by_type"));
+        } else {
+            const QJsonObject holds = holdValue.toObject();
+            for (auto it = holds.constBegin(); it != holds.constEnd(); ++it) {
+                const QJsonObject rec = it.value().toObject();
+                if (!it.value().isObject()
+                    || !learningNumberInBand(rec.value(QStringLiteral("median_ms")),
+                                             kNoMeterHoldMinMs, kNoMeterHoldMaxMs)
+                    || !learningNumberInBand(rec.value(QStringLiteral("n")), 1.0, 1.0e6)) {
+                    violations.append(
+                        QStringLiteral("no_meter_hold_by_type[%1]").arg(it.key().left(48)));
+                }
+            }
+        }
+    }
+    if (obj.contains(QStringLiteral("banner_lead_trim_by_type"))) {
+        const QJsonValue trimValue = obj.value(QStringLiteral("banner_lead_trim_by_type"));
+        if (!trimValue.isObject()) {
+            violations.append(QStringLiteral("banner_lead_trim_by_type"));
+        } else {
+            const QJsonObject trims = trimValue.toObject();
+            for (auto it = trims.constBegin(); it != trims.constEnd(); ++it) {
+                if (!learningNumberInBand(it.value(), -BannerLeadTrim::kPersistCeilingMs,
+                                          BannerLeadTrim::kPersistCeilingMs)) {
+                    violations.append(
+                        QStringLiteral("banner_lead_trim_by_type[%1]").arg(it.key().left(48)));
+                }
+            }
+        }
+    }
+    return violations;
+}
+
 void AppConfig::reloadLearning()
 {
     learning_ = LearningData{};
@@ -274,9 +440,40 @@ void AppConfig::reloadLearning()
     QJsonObject learningJson;
     const ObjectReadStatus status = readObjectStatus(learningPath(), &learningJson);
     if (status == ObjectReadStatus::Ok) {
-        if (!learningJson.isEmpty()) {
-            loadLearningObject(learningJson);
+        const QStringList violations = learningSemanticViolations(learningJson);
+        if (violations.isEmpty()) {
+            if (!learningJson.isEmpty()) {
+                loadLearningObject(learningJson);
+            }
+            return;
         }
+        // [RT-MED-03 / CL3-F4-006 2026-09-23] Valid JSON, absurd values. Same fail-closed shape
+        // as the unreadable case below: keep the evidence, prefer the last-good copy -- but only
+        // a last-good copy that ALSO passes the semantic check. Without one, the in-band fields
+        // of the file still load (the loader drops every out-of-band value to its default), so
+        // one bad key cannot cost the customer every other thing this install has learned.
+        const QString quarantine = learningPath() + QStringLiteral(".invalid-")
+            + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+        QFile::rename(learningPath(), quarantine);
+        QJsonObject backup;
+        if (readObjectStatus(learningBackupPath(), &backup) == ObjectReadStatus::Ok
+            && !backup.isEmpty() && learningSemanticViolations(backup).isEmpty()) {
+            loadLearningObject(backup);
+            QFile::copy(learningBackupPath(), learningPath());
+            learningLoadNote_ = QStringLiteral(
+                "learning.json had out-of-range values (%1); restored the previous good copy from "
+                "learning.json.bak (the rejected file was kept as %2).")
+                .arg(violations.mid(0, 8).join(QStringLiteral(", ")),
+                     QFileInfo(quarantine).fileName());
+        } else {
+            loadLearningObject(learningJson);
+            learningLoadNote_ = QStringLiteral(
+                "learning.json had out-of-range values (%1) and no valid backup; those values were "
+                "reset to defaults and the rest was kept (the rejected file was kept as %2).")
+                .arg(violations.mid(0, 8).join(QStringLiteral(", ")),
+                     QFileInfo(quarantine).fileName());
+        }
+        qWarning().noquote() << learningLoadNote_;
         return;
     }
     if (status == ObjectReadStatus::Missing) {
@@ -288,7 +485,9 @@ void AppConfig::reloadLearning()
         + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss"));
     QFile::rename(learningPath(), quarantine);
     QJsonObject backup;
-    if (readObjectStatus(learningBackupPath(), &backup) == ObjectReadStatus::Ok && !backup.isEmpty()) {
+    // [RT-MED-03] A backup that is readable but out of band is no "last good" either.
+    if (readObjectStatus(learningBackupPath(), &backup) == ObjectReadStatus::Ok && !backup.isEmpty()
+        && learningSemanticViolations(backup).isEmpty()) {
         loadLearningObject(backup);
         QFile::copy(learningBackupPath(), learningPath());
         learningLoadNote_ = QStringLiteral(
@@ -1257,9 +1456,15 @@ bool AppConfig::saveLearning(const LearningData& data, QString* error)
     }
     // [2026-09-22 GM-002 / CX-001] Keep a last-good generation: only a VALID current file is
     // promoted to .bak, so a corrupt file can never overwrite a good backup.
-    if (readObjectStatus(learningPath(), nullptr) == ObjectReadStatus::Ok) {
-        QFile::remove(learningBackupPath());
-        QFile::copy(learningPath(), learningBackupPath());
+    // [RT-MED-03 / CL3-F4-006 2026-09-23] ...and "valid" now means SEMANTICALLY valid too: a
+    // syntactically fine file carrying out-of-band values must never displace the last-good copy.
+    {
+        QJsonObject current;
+        if (readObjectStatus(learningPath(), &current) == ObjectReadStatus::Ok
+            && learningSemanticViolations(current).isEmpty()) {
+            QFile::remove(learningBackupPath());
+            QFile::copy(learningPath(), learningBackupPath());
+        }
     }
     QSaveFile file(learningPath());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -1365,7 +1570,18 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         // does. The Pill -> yolo launch route stays compiled but unreachable.
         // The rule itself lives in normalizedMeterStyle() (AppConfig.h) -- shared
         // with save(), setMeterStyle() and switchProfile().
-        data_.meterStyle = normalizedMeterStyle(data_.meterStyle);
+        {
+            // [RT-LOW-06 2026-09-23] Unknown/legacy styles migrate to the offered set with a log
+            // line; save() then persists the canonical value.
+            const QString storedStyle = data_.meterStyle.trimmed().left(48);
+            data_.meterStyle = normalizedMeterStyle(storedStyle);
+            if (!storedStyle.isEmpty() && storedStyle != data_.meterStyle) {
+                qInfo().noquote()
+                    << QStringLiteral("METER STYLE MIGRATED: stored meter_style '%1' is not offered; "
+                                      "using %2.")
+                           .arg(storedStyle, data_.meterStyle);
+            }
+        }
         const QString color = data_.meterColor.trimmed().toLower();
         if (color != QLatin1String("purple")
             && color != QLatin1String("white")
@@ -2177,10 +2393,39 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
 
 void AppConfig::loadLearningObject(const QJsonObject& obj)
 {
-    learning_.version = obj.value(QStringLiteral("version")).toInt(learning_.version);
-    learning_.emaFillPerFrame = obj.value(QStringLiteral("ema_fill_per_frame")).toDouble(learning_.emaFillPerFrame);
-    learning_.emaGreenRatio = obj.value(QStringLiteral("ema_green_ratio")).toDouble(learning_.emaGreenRatio);
-    learning_.biasPct = obj.value(QStringLiteral("bias_pct")).toDouble(learning_.biasPct);
+    // [RT-MED-03 / CL3-F4-006 2026-09-23] Every numeric field goes through its semantic band
+    // (kLearningScalarBands / kLearningMapBands): an out-of-band or non-numeric value keeps the
+    // default instead of installing a number no learner could have produced.
+    const auto bandFor = [](const LearningBand* first, const LearningBand* last,
+                            const char* key) -> const LearningBand* {
+        for (const LearningBand* b = first; b != last; ++b) {
+            if (std::strcmp(b->key, key) == 0) {
+                return b;
+            }
+        }
+        return nullptr;
+    };
+    const auto scalar = [&](const char* key, double fallback) -> double {
+        const LearningBand* band = bandFor(std::begin(kLearningScalarBands),
+                                           std::end(kLearningScalarBands), key);
+        const QJsonValue v = obj.value(QString::fromLatin1(key));
+        return (band != nullptr && learningNumberInBand(v, band->lo, band->hi)) ? v.toDouble()
+                                                                                 : fallback;
+    };
+    const auto mapInto = [&](const char* key, QMap<QString, double>& out) {
+        const LearningBand* band = bandFor(std::begin(kLearningMapBands),
+                                           std::end(kLearningMapBands), key);
+        const QJsonObject map = obj.value(QString::fromLatin1(key)).toObject();
+        for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+            if (band != nullptr && learningNumberInBand(it.value(), band->lo, band->hi)) {
+                out.insert(it.key(), it.value().toDouble());
+            }
+        }
+    };
+    learning_.version = static_cast<int>(scalar("version", learning_.version));
+    learning_.emaFillPerFrame = scalar("ema_fill_per_frame", learning_.emaFillPerFrame);
+    learning_.emaGreenRatio = scalar("ema_green_ratio", learning_.emaGreenRatio);
+    learning_.biasPct = scalar("bias_pct", learning_.biasPct);
 
     const auto perLevel = obj.value(QStringLiteral("per_level")).toObject();
     learning_.openNudgePct = perLevelNudge(perLevel, QStringLiteral("OPEN"));
@@ -2189,25 +2434,10 @@ void AppConfig::loadLearningObject(const QJsonObject& obj)
     learning_.heavyNudgePct = perLevelNudge(perLevel, QStringLiteral("HEAVY"));
     learning_.smotheredNudgePct = perLevelNudge(perLevel, QStringLiteral("SMOTHERED"));
 
-    const auto typeLearned = obj.value(QStringLiteral("shot_type_learned_offset_ms")).toObject();
-    for (auto it = typeLearned.constBegin(); it != typeLearned.constEnd(); ++it) {
-        learning_.shotTypeLearnedOffsetMs.insert(it.key(), it.value().toDouble());
-    }
-
-    const auto typeFeedforward = obj.value(QStringLiteral("shot_type_feedforward_ms")).toObject();
-    for (auto it = typeFeedforward.constBegin(); it != typeFeedforward.constEnd(); ++it) {
-        learning_.shotTypeFeedforwardMs.insert(it.key(), it.value().toDouble());
-    }
-
-    const auto typeMeterClock = obj.value(QStringLiteral("shot_type_meter_to_release_ms")).toObject();
-    for (auto it = typeMeterClock.constBegin(); it != typeMeterClock.constEnd(); ++it) {
-        learning_.shotTypeMeterToReleaseMs.insert(it.key(), it.value().toDouble());
-    }
-
-    const auto typeAppearTip = obj.value(QStringLiteral("shot_type_appear_to_tip_ms")).toObject();
-    for (auto it = typeAppearTip.constBegin(); it != typeAppearTip.constEnd(); ++it) {
-        learning_.shotTypeAppearToTipMs.insert(it.key(), it.value().toDouble());
-    }
+    mapInto("shot_type_learned_offset_ms", learning_.shotTypeLearnedOffsetMs);
+    mapInto("shot_type_feedforward_ms", learning_.shotTypeFeedforwardMs);
+    mapInto("shot_type_meter_to_release_ms", learning_.shotTypeMeterToReleaseMs);
+    mapInto("shot_type_appear_to_tip_ms", learning_.shotTypeAppearToTipMs);
     learning_.leadRebaselined = obj.value(QStringLiteral("lead_rebaselined")).toBool(learning_.leadRebaselined);
 
     // [ORION_PHASE_COLD_START] Bounded by the same plausibility band the learner itself
@@ -2231,31 +2461,23 @@ void AppConfig::loadLearningObject(const QJsonObject& obj)
         learning_.leadReferencePhysicalMs = ok ? v : -1.0;
         learning_.leadReferenceLeadMs = ok ? l : -1.0;
     }
-    const auto typeCalPhase = obj.value(QStringLiteral("shot_type_cal_phase")).toObject();
-    for (auto it = typeCalPhase.constBegin(); it != typeCalPhase.constEnd(); ++it) {
-        learning_.shotTypeCalPhase.insert(it.key(), it.value().toInt());
+    {
+        QMap<QString, double> calPhase;
+        mapInto("shot_type_cal_phase", calPhase);
+        for (auto it = calPhase.constBegin(); it != calPhase.constEnd(); ++it) {
+            learning_.shotTypeCalPhase.insert(it.key(), static_cast<int>(it.value()));
+        }
     }
-
-    const auto typeRttBaseline = obj.value(QStringLiteral("shot_type_rtt_baseline_ms")).toObject();
-    for (auto it = typeRttBaseline.constBegin(); it != typeRttBaseline.constEnd(); ++it) {
-        learning_.shotTypeRttBaselineMs.insert(it.key(), it.value().toDouble());
-    }
-
-    const auto typeVelocityPrior = obj.value(QStringLiteral("shot_type_velocity_prior_pct_ms")).toObject();
-    for (auto it = typeVelocityPrior.constBegin(); it != typeVelocityPrior.constEnd(); ++it) {
-        learning_.shotTypeVelocityPriorPctMs.insert(it.key(), it.value().toDouble());
-    }
+    mapInto("shot_type_rtt_baseline_ms", learning_.shotTypeRttBaselineMs);
+    mapInto("shot_type_velocity_prior_pct_ms", learning_.shotTypeVelocityPriorPctMs);
     // Hybrid global phase-clock self-learned globals (autonomous_vision path).
-    learning_.globalAppearToTipMs = obj.value(QStringLiteral("global_appear_to_tip_ms")).toDouble(learning_.globalAppearToTipMs);
-    learning_.globalHoldToReleaseMs = obj.value(QStringLiteral("global_hold_to_release_ms")).toDouble(learning_.globalHoldToReleaseMs);
-    learning_.learnedLatencyMs = obj.value(QStringLiteral("learned_latency_ms")).toDouble(learning_.learnedLatencyMs);
-    learning_.probeSpawnOffsetMs = obj.value(QStringLiteral("probe_spawn_offset_ms")).toDouble(learning_.probeSpawnOffsetMs);
-    learning_.globalRiseVelocityPctMs = obj.value(QStringLiteral("global_rise_velocity_pct_ms")).toDouble(learning_.globalRiseVelocityPctMs);
+    learning_.globalAppearToTipMs = scalar("global_appear_to_tip_ms", learning_.globalAppearToTipMs);
+    learning_.globalHoldToReleaseMs = scalar("global_hold_to_release_ms", learning_.globalHoldToReleaseMs);
+    learning_.learnedLatencyMs = scalar("learned_latency_ms", learning_.learnedLatencyMs);
+    learning_.probeSpawnOffsetMs = scalar("probe_spawn_offset_ms", learning_.probeSpawnOffsetMs);
+    learning_.globalRiseVelocityPctMs = scalar("global_rise_velocity_pct_ms", learning_.globalRiseVelocityPctMs);
     // Per-shot-type latency residual (autonomous vision)
-    const auto typeLatency = obj.value(QStringLiteral("shot_type_latency_ms")).toObject();
-    for (auto it = typeLatency.constBegin(); it != typeLatency.constEnd(); ++it) {
-        learning_.shotTypeLatencyMs.insert(it.key(), it.value().toDouble());
-    }
+    mapInto("shot_type_latency_ms", learning_.shotTypeLatencyMs);
     // [ORION_NO_METER_V2 2026-09-14] Per-type vision-path hold. A record whose median is outside
     // the plausible hold envelope, or whose count is non-positive, is dropped rather than
     // installed: it feeds a BLIND release, so a corrupt entry must degrade to the shipped table,

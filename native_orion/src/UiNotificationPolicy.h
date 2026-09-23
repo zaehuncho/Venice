@@ -175,6 +175,15 @@ private:
     const auto has = [&raw](const char* needle) {
         return raw.contains(QLatin1String(needle), Qt::CaseInsensitive);
     };
+    // [CL3-F8-004 / CL2-P8-009 2026-09-23] PS5 "Remote is already in use" (0x80108b10):
+    // another device (PS Remote Play app, another PC, a phone) holds the console's Remote
+    // Play slot. Reconnecting cannot fix that, so say what does. Checked FIRST: the raw text
+    // also carries engine words that would otherwise fall to the RP-09 catch-all.
+    if (has("RP_IN_USE") || has("80108b10") || has("already in use")
+        || has("remote is in use")) {
+        return QStringLiteral("Another device is using Remote Play on this PS5 (code RP-10). "
+                              "Close Remote Play there, then press Connect.");
+    }
     if (has("Production package is incomplete")) {
         return QStringLiteral("Part of Venice is missing from this install (code RP-05). "
                               "Reinstall Venice from the latest download.");
@@ -232,6 +241,15 @@ private:
                               "Disconnect and connect again; if it repeats, restart Venice.");
     }
     return raw;
+}
+
+// [RT-MED-09 / CL3-F8-006 2026-09-23] The one customer sentence for a settings-signature
+// lock. The Live page banner (RemotePlayPage.qml) shows the same words and the Repair
+// settings button; the raw "Settings signature missing or invalid" stays engineering-only.
+[[nodiscard]] inline QString settingsRepairCustomerText()
+{
+    return QStringLiteral("Venice's settings didn't save cleanly (code ST-01), so shots are off. "
+                          "Press Repair settings on the Live page to go back to default settings.");
 }
 
 // [COPY-FIX 2026-09-23 NEW-A7] Shot Lead ms -> the 1..100 number the Shot Lead card

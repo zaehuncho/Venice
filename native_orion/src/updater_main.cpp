@@ -36,6 +36,7 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QProcess>
+#include <QtCore/QRegularExpression>
 #include <QtCore/QStringList>
 #include <QtCore/QThread>
 #include <QtCore/QTemporaryDir>
@@ -57,6 +58,7 @@
 #ifdef Q_OS_WIN
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <winsvc.h>
 #endif
 
 using namespace orion;
@@ -164,7 +166,7 @@ bool writeBuildProfile(const QString& path)
     return f.commit();
 }
 
-QJsonObject verifiedReleaseFiles(const QString& root, QString* error)
+QJsonObject verifiedReleaseManifest(const QString& root, QString* error)
 {
     const QString manifestPath = QDir(root).absoluteFilePath(QStringLiteral("release_manifest.json"));
     if (!QFileInfo(manifestPath).isFile()) {
@@ -190,13 +192,73 @@ QJsonObject verifiedReleaseFiles(const QString& root, QString* error)
         if (error) *error = QStringLiteral("Release manifest changed during verification");
         return {};
     }
-    const QJsonObject files = QJsonDocument::fromJson(bytesAfter).object()
+    return QJsonDocument::fromJson(bytesAfter).object();
+}
+
+QJsonObject verifiedReleaseFiles(const QString& root, QString* error)
+{
+    const QJsonObject files = verifiedReleaseManifest(root, error)
                                   .value(QStringLiteral("files")).toObject();
     if (files.isEmpty() && error) *error = QStringLiteral("Verified release manifest has no files");
     return files;
 }
 
+QString verifiedInstalledVersion(const QString& root, QString* error)
+{
+    const QString version = verifiedReleaseManifest(root, error)
+                                .value(QStringLiteral("version")).toString().trimmed();
+    if (!QRegularExpression(QStringLiteral("^[0-9]+(?:\\.[0-9]+)*$")).match(version).hasMatch()) {
+        if (error) *error = QStringLiteral("Verified installed release manifest has no numeric version");
+        return {};
+    }
+    return version;
+}
+
 #ifdef Q_OS_WIN
+bool stopBridgeServiceForUpdate(QString* error)
+{
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) {
+        if (error) *error = QStringLiteral("Cannot open Service Control Manager (%1)").arg(GetLastError());
+        return false;
+    }
+    SC_HANDLE service = OpenServiceW(manager, L"VeniceNetSvc", SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (!service) {
+        const DWORD code = GetLastError();
+        CloseServiceHandle(manager);
+        if (code == ERROR_SERVICE_DOES_NOT_EXIST) return true;
+        if (error) *error = QStringLiteral("Cannot inspect VeniceNetSvc (%1)").arg(code);
+        return false;
+    }
+    SERVICE_STATUS_PROCESS state{};
+    DWORD needed = 0;
+    bool ok = QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                   reinterpret_cast<LPBYTE>(&state), sizeof(state), &needed) != FALSE;
+    if (ok && state.dwCurrentState != SERVICE_STOPPED && state.dwCurrentState != SERVICE_STOP_PENDING) {
+        SERVICE_STATUS ignored{};
+        ok = ControlService(service, SERVICE_CONTROL_STOP, &ignored) != FALSE;
+        if (!ok && GetLastError() == ERROR_SERVICE_NOT_ACTIVE) ok = true;
+    }
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while (ok && elapsed.elapsed() < kLauncherWaitMs) {
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                  reinterpret_cast<LPBYTE>(&state), sizeof(state), &needed)) {
+            ok = false;
+            break;
+        }
+        if (state.dwCurrentState == SERVICE_STOPPED) break;
+        QThread::msleep(200);
+    }
+    const bool stopped = ok && state.dwCurrentState == SERVICE_STOPPED;
+    if (!stopped && error) {
+        *error = QStringLiteral("VeniceNetSvc did not stop before update (%1)").arg(GetLastError());
+    }
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return stopped;
+}
+
 bool waitForPidExit(qint64 pid, QString* error)
 {
     if (pid <= 0) return true;
@@ -235,7 +297,7 @@ bool installOwnersGone(const QString& installDir, QString* error)
                     || name == QLatin1String("orionupdater.exe")
                     || name == QLatin1String("orionsidecar.exe")
                     || name == QLatin1String("orionstream.exe")
-                    || name == QLatin1String("venicenet.exe");
+                    || name == QLatin1String("venicenetsvc.exe");
                 HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                                              FALSE, entry.th32ProcessID);
                 if (!process) {
@@ -355,11 +417,18 @@ public:
 
     void run()
     {
-        log(QStringLiteral("Orion updater started (current=%1, install=%2)")
+        log(QStringLiteral("Orion updater started (launcher-hinted=%1, install=%2)")
                 .arg(cfg_.currentVersion, QDir::toNativeSeparators(cfg_.installDir)));
 
         if (cfg_.installDir.isEmpty() || !QFileInfo(cfg_.installDir).isDir()) {
             fail(QStringLiteral("Install directory is missing or invalid."));
+            return;
+        }
+        const QString recoveryPath = QDir(QFileInfo(cfg_.installDir).dir().absolutePath())
+                                         .absoluteFilePath(QStringLiteral(".orion_update_recovery.json"));
+        if (QFileInfo::exists(recoveryPath)) {
+            fail(QStringLiteral("A previous update left a recovery marker; preserve the backup and repair "
+                                "the install before another update."));
             return;
         }
 
@@ -369,6 +438,13 @@ public:
             fail(QStringLiteral("Install ownership barrier failed: %1").arg(err));
             return;
         }
+        const QString installedVersion = verifiedInstalledVersion(cfg_.installDir, &err);
+        if (installedVersion.isEmpty()) {
+            fail(QStringLiteral("Installed signed version could not be verified: %1").arg(err));
+            return;
+        }
+        log(QStringLiteral("Verified installed version: %1 (ignoring --current-version for policy)")
+                .arg(installedVersion));
 
         step(QStringLiteral("Fetching update manifest..."), 10);
         const QByteArray manifestBytes = fetchManifest(&err);
@@ -411,10 +487,10 @@ public:
         log(QStringLiteral("Manifest signature OK (ed25519, key %1). Offered version: %2")
                 .arg(manifest.publicKeyId, manifest.version));
 
-        const UpdateDecision decision = evaluateUpdate(cfg_.currentVersion, manifest);
+        const UpdateDecision decision = evaluateUpdate(installedVersion, manifest);
         if (decision == UpdateDecision::DowngradeBlocked) {
             fail(QStringLiteral("Manifest version %1 is older than installed %2 and rollback is not allowed.")
-                     .arg(manifest.version, cfg_.currentVersion));
+                     .arg(manifest.version, installedVersion));
             return;
         }
         if (decision == UpdateDecision::UpToDate) {
@@ -497,6 +573,10 @@ public:
             fail(QStringLiteral("Staged runtime integrity failed: %1").arg(err));
             return;
         }
+        if (!updater::verifyExactManifestInventory(stageDir, newFiles, &err)) {
+            fail(QStringLiteral("Staged runtime contains unmanifested or unsafe files: %1").arg(err));
+            return;
+        }
 
         if (cfg_.dryRun) {
             log(QStringLiteral("Dry run: skipping backup/replace/relaunch."));
@@ -510,6 +590,10 @@ public:
             return;
         }
 #endif
+        if (!updater::preflightUpdateDestinations(cfg_.installDir, oldFiles, newFiles, &err)) {
+            fail(QStringLiteral("Update preflight refused a locked or unsafe runtime file: %1").arg(err));
+            return;
+        }
 
         step(QStringLiteral("Backing up current install..."), 80);
         const QString backupDir = QDir::cleanPath(cfg_.installDir + QStringLiteral("/../.orion_update_backup"));
@@ -517,6 +601,42 @@ public:
             fail(QStringLiteral("Backup failed, aborting before any change: %1").arg(err));
             return;
         }
+        // Persist the recovery path BEFORE the first mutation. A power loss or
+        // foreign lock after this point must not permit a second update over a
+        // possibly mixed install; the signed old backup remains for owner repair.
+        QString backupIntegrity;
+        SecurityManager backupVerifier(backupDir);
+        if (!backupVerifier.verifyReleaseIntegrity(&backupIntegrity, /*exactRoot*/ true)) {
+            fail(QStringLiteral("Backup integrity failed before update: %1").arg(backupIntegrity));
+            return;
+        }
+        QJsonObject journal;
+        journal.insert(QStringLiteral("schema"), QStringLiteral("venice.update_recovery.v1"));
+        journal.insert(QStringLiteral("phase"), QStringLiteral("applying"));
+        journal.insert(QStringLiteral("install_dir"), cfg_.installDir);
+        journal.insert(QStringLiteral("backup_dir"), backupDir);
+        QSaveFile recoveryJournal(recoveryPath);
+        const QByteArray journalBytes = QJsonDocument(journal).toJson(QJsonDocument::Compact);
+        if (!recoveryJournal.open(QIODevice::WriteOnly)
+            || recoveryJournal.write(journalBytes) != journalBytes.size()
+            || !recoveryJournal.commit()) {
+            fail(QStringLiteral("Could not persist recovery journal; aborting before any update file changed."));
+            return;
+        }
+
+        const auto clearRestoredJournal = [&]() -> bool {
+            QString restoredIntegrity;
+            SecurityManager restoredVerifier(cfg_.installDir);
+            if (!restoredVerifier.verifyReleaseIntegrity(&restoredIntegrity, /*exactRoot*/ true)) {
+                log(QStringLiteral("Rollback did not restore signed old files: %1").arg(restoredIntegrity));
+                return false;
+            }
+            if (!QFile::remove(recoveryPath)) {
+                log(QStringLiteral("Rollback restored files, but recovery journal remains; owner must verify before retry."));
+                return false;
+            }
+            return true;
+        };
 
         step(QStringLiteral("Installing update..."), 90);
         QStringList applied;
@@ -524,7 +644,9 @@ public:
             log(QStringLiteral("Apply failed (%1). Rolling back...").arg(err));
             QString restoreErr;
             if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
-                fail(QStringLiteral("Update failed and was rolled back to the previous version."));
+                fail(clearRestoredJournal()
+                         ? QStringLiteral("Update failed and was rolled back to the previous version.")
+                         : QStringLiteral("Update failed AND rollback failed signed verification; recovery journal kept."));
             } else {
                 fail(QStringLiteral("Update failed AND rollback failed (%1). Reinstall may be required.")
                          .arg(restoreErr));
@@ -536,7 +658,9 @@ public:
             log(QStringLiteral("Retired-runtime prune failed (%1). Rolling back...").arg(err));
             QString restoreErr;
             if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
-                fail(QStringLiteral("Update failed and was rolled back to the previous version."));
+                fail(clearRestoredJournal()
+                         ? QStringLiteral("Update failed and was rolled back to the previous version.")
+                         : QStringLiteral("Update failed AND rollback failed signed verification; recovery journal kept."));
             } else {
                 fail(QStringLiteral("Update failed AND rollback failed (%1). Reinstall may be required.").arg(restoreErr));
             }
@@ -546,7 +670,9 @@ public:
         if (cfg_.injectFailureAfterPrune) {
             QString restoreErr;
             if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
-                fail(QStringLiteral("Injected development fault; exact rollback restored the previous version."));
+                fail(clearRestoredJournal()
+                         ? QStringLiteral("Injected development fault; exact rollback restored the previous version.")
+                         : QStringLiteral("Injected development fault AND rollback failed signed verification; recovery journal kept."));
             } else {
                 fail(QStringLiteral("Injected development fault AND rollback failed (%1).").arg(restoreErr));
             }
@@ -559,7 +685,9 @@ public:
             log(QStringLiteral("Post-update integrity failed (%1). Rolling back...").arg(installedIntegrity));
             QString restoreErr;
             if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
-                fail(QStringLiteral("Update failed integrity validation and was rolled back."));
+                fail(clearRestoredJournal()
+                         ? QStringLiteral("Update failed integrity validation and was rolled back.")
+                         : QStringLiteral("Update integrity failed AND rollback failed signed verification; recovery journal kept."));
             } else {
                 fail(QStringLiteral("Update integrity failed AND rollback failed (%1). Reinstall may be required.").arg(restoreErr));
             }
@@ -576,7 +704,9 @@ public:
             // [Codex r4] The rollback's own result is the truth here: a restore that failed
             // is reported as a failed update, never as a successful rollback.
             if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
-                fail(QStringLiteral("Update incomplete; rolled back to previous version."));
+                fail(clearRestoredJournal()
+                         ? QStringLiteral("Update incomplete; rolled back to previous version.")
+                         : QStringLiteral("Update incomplete AND rollback failed signed verification; recovery journal kept."));
             } else {
                 fail(QStringLiteral("Update incomplete AND rollback failed (%1). Reinstall may be required.")
                          .arg(restoreErr));
@@ -585,6 +715,11 @@ public:
         }
 
         log(QStringLiteral("Applied %1 files.").arg(applied.size()));
+        if (!QFile::remove(recoveryPath)) {
+            fail(QStringLiteral("Installed runtime verified, but recovery journal could not be cleared; "
+                                "owner inspection is required before relaunch."));
+            return;
+        }
         {
             QString cleanupErr;
             if (!updater::removeTreeSafely(backupDir, &cleanupErr)) {
@@ -654,6 +789,27 @@ private:
 
     void fail(const QString& message)
     {
+        if (message.contains(QStringLiteral("rollback failed"), Qt::CaseInsensitive)) {
+            // Do not erase the backup or silently retry over a mixed install.
+            // The owner/repair installer can use this durable recovery marker
+            // after a foreign sharing lock is released.
+            const QString parent = QFileInfo(cfg_.installDir).dir().absolutePath();
+            const QString markerPath = QDir(parent).absoluteFilePath(
+                QStringLiteral(".orion_update_recovery.json"));
+            const QString backupPath = QDir(parent).absoluteFilePath(
+                QStringLiteral(".orion_update_backup"));
+            QJsonObject marker;
+            marker.insert(QStringLiteral("schema"), QStringLiteral("venice.update_recovery.v1"));
+            marker.insert(QStringLiteral("install_dir"), cfg_.installDir);
+            marker.insert(QStringLiteral("backup_dir"), backupPath);
+            marker.insert(QStringLiteral("reason"), message);
+            QSaveFile out(markerPath);
+            const QByteArray encoded = QJsonDocument(marker).toJson(QJsonDocument::Compact);
+            if (!out.open(QIODevice::WriteOnly) || out.write(encoded) != encoded.size() || !out.commit()) {
+                log(QStringLiteral("ERROR: Could not persist update recovery marker; keep backup at %1")
+                        .arg(QDir::toNativeSeparators(backupPath)));
+            }
+        }
         if (window_) {
             window_->setStatus(QStringLiteral("Update failed"));
             window_->appendLog(message);
@@ -682,6 +838,7 @@ private:
 #ifdef Q_OS_WIN
         if (!waitForPidExit(cfg_.launcherPid, error)
             || !waitForPidExit(cfg_.bootstrapPid, error)) return false;
+        if (!stopBridgeServiceForUpdate(error)) return false;
         return installOwnersGone(cfg_.installDir, error);
 #else
         Q_UNUSED(cfg_);
@@ -704,11 +861,16 @@ private:
             }
             return f.readAll();
         }
-        if (!cfg_.manifestUrl.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
+        const QUrl url(cfg_.manifestUrl);
+        if (url.scheme().compare(QStringLiteral("https"), Qt::CaseInsensitive) != 0) {
             if (err) *err = QStringLiteral("manifest URL is not HTTPS");
             return {};
         }
-        return downloadBytes(QUrl(cfg_.manifestUrl), kManifestTimeoutMs, err, /*track*/ false);
+        if (kProductionBuild && !updater::productionManifestUrlAllowed(url)) {
+            if (err) *err = QStringLiteral("production manifest URL is not the pinned API endpoint");
+            return {};
+        }
+        return downloadBytes(url, kManifestTimeoutMs, err, /*track*/ false);
     }
 
     QByteArray downloadBytes(const QUrl& url, int timeoutMs, QString* err, bool track)
@@ -718,6 +880,12 @@ private:
             return {};
         }
         QNetworkRequest request(url);
+        if (!track) {
+            // Do not let a redirect turn the pinned manifest endpoint into an
+            // arbitrary HTTPS origin.
+            request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                                 QNetworkRequest::ManualRedirectPolicy);
+        }
         request.setRawHeader("Accept", "application/octet-stream, application/json");
         // Match the launcher's UA so the manifest fetch passes Cloudflare's bot filter.
         request.setRawHeader("User-Agent",
@@ -745,7 +913,12 @@ private:
         const QByteArray data = reply->readAll();
         const QNetworkReply::NetworkError netErr = reply->error();
         const QString netErrString = reply->errorString();
+        const bool redirected = !reply->attribute(QNetworkRequest::RedirectionTargetAttribute).isNull();
         reply->deleteLater();
+        if (!track && redirected) {
+            if (err) *err = QStringLiteral("manifest endpoint redirected; refusing");
+            return {};
+        }
         if (netErr != QNetworkReply::NoError) {
             if (err) *err = netErrString;
             return {};

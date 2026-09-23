@@ -42,6 +42,9 @@ Rectangle {
         // (it applies itself), Offline if the backend/license is unreachable.
         // [CL2-P8-002 2026-09-23] "Reconnecting" while the licence lease blocks shots
         // (the RemotePlay banner carries the full sentence), instead of a green Online.
+        // [CL3-F8-003 2026-09-23] NOTE: AppShell mounts this whole bar only while safe mode is
+        // on, so this pill is visible only then. The lease state's customer surface is the Live
+        // page's SHOTS PAUSED banner, not this pill.
         StatusPill {
             readonly property bool leaseBlocked: String(orion.leaseNotice || "").length > 0
             statusText: orion.updateAvailable ? "Update"
@@ -79,7 +82,9 @@ Rectangle {
                 color: Theme.textPrimary
                 font.family: "Segoe UI Variable"
                 font.pixelSize: 13
-                text: "Shot automation was disarmed after repeated failures and will stay off until you exit safe mode.\n\nReason: " + orion.safeModeReason
+                // [CL3-F8-003 2026-09-23] Must promise the same thing as the "SAFE MODE:" Activity
+                // line (OrionAppController::enterSafeMode): it auto-recovers on a steady stream.
+                text: "Shots are paused because something kept failing. Venice usually turns them back on by itself once the stream has been steady for 30 seconds, or press Exit safe mode.\n\nReason: " + orion.safeModeReason
             }
 
             RowLayout {

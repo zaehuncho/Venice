@@ -686,13 +686,123 @@ private slots:
         AppConfig reloaded(temp.path());
         QVERIFY(reloaded.load());
         QCOMPARE(reloaded.data().meterStyle, QStringLiteral("Arrow2"));
-        // The rule itself: accepted spellings survive, everything else is the default.
-        QCOMPARE(normalizedMeterStyle(QStringLiteral("  Straight ")), QStringLiteral("Straight"));
-        QCOMPARE(normalizedMeterStyle(QStringLiteral("pill")), QStringLiteral("Arrow2"));
-        QCOMPARE(normalizedMeterStyle(QStringLiteral("Mystery")), QStringLiteral("Arrow2"));
-        QCOMPARE(normalizedMeterStyle(QString()), QStringLiteral("Arrow2"));
+        // The rule itself. [RT-LOW-06 / CL3-F4-003 2026-09-23] The accepted set IS the offered
+        // set: the UI offers Arrow2 only, so every legacy 2K26 profile (Arrow, Dial, Straight,
+        // Sword), Pill, an unknown value and any spelling of arrow2 all land on "Arrow2".
+        // (Before the fix "  Straight " survived as "Straight" -- this row failed.)
+        for (const QString& legacy : {QStringLiteral("  Straight "), QStringLiteral("Straight"),
+                                      QStringLiteral("Arrow"), QStringLiteral("dial"),
+                                      QStringLiteral("SWORD"), QStringLiteral("pill"),
+                                      QStringLiteral("Mystery"), QString(),
+                                      QStringLiteral("arrow2"), QStringLiteral(" Arrow2 ")}) {
+            QCOMPARE(normalizedMeterStyle(legacy), QStringLiteral("Arrow2"));
+        }
+    }
+
+    // [RT-LOW-06 2026-09-23] A stored legacy style migrates on LOAD (not only on save), and the
+    // next save persists the canonical value.
+    void loadMigratesLegacyMeterStylesToArrow2()
+    {
+        for (const QString& legacy : {QStringLiteral("Straight"), QStringLiteral("Dial"),
+                                      QStringLiteral("Sword"), QStringLiteral("Arrow"),
+                                      QStringLiteral("Pill"), QStringLiteral("Mystery")}) {
+            QTemporaryDir temp;
+            QVERIFY(temp.isValid());
+            {
+                QFile file(QDir(temp.path()).filePath(QStringLiteral("settings.json")));
+                QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+                file.write(QJsonDocument(QJsonObject{{QStringLiteral("meter_style"), legacy}})
+                               .toJson(QJsonDocument::Compact));
+            }
+            AppConfig cfg(temp.path());
+            QVERIFY(cfg.load());
+            QCOMPARE(cfg.data().meterStyle, QStringLiteral("Arrow2"));
+            QVERIFY(cfg.save(cfg.data()));
+            QFile file(QDir(temp.path()).filePath(QStringLiteral("settings.json")));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            QCOMPARE(QJsonDocument::fromJson(file.readAll()).object()
+                         .value(QStringLiteral("meter_style")).toString(),
+                     QStringLiteral("Arrow2"));
+        }
     }
 #endif
+
+    // [RT-MED-01 / CL3-F4-009 2026-09-23] Calibration Cancel restores the EXACT pre-calibration
+    // tuple. Before the fix the controller restored through setActuationLeadMs(), which is what
+    // `stepLikeSetActuationLeadMs` models: an Auto install (0,false) came back as (150,true).
+    void leadCalibrationCancelRestoresExactProvenance()
+    {
+        const auto stepLikeSetActuationLeadMs = [](AppConfigData& d, double v) {
+            d.actuationLeadMs = qBound(AppConfigData::kActuationLeadMinMs, v,
+                                       AppConfigData::kActuationLeadMaxMs);
+            d.actuationLeadUserSet = true;
+            mirrorActuationLeadIntoSourceStash(d);
+        };
+        struct Case { const char* name; double lead; bool userSet; };
+        const Case cases[] = {
+            {"auto_zero", 0.0, false},         // fresh install: Auto
+            {"measured_seed", 270.0, false},   // measured seed, never touched
+            {"user_set", 280.0, true},         // the customer's own value
+        };
+        for (const Case& c : cases) {
+            AppConfigData data;
+            data.videoSource = QStringLiteral("capture_card");
+            data.actuationLeadMs = c.lead;
+            data.actuationLeadUserSet = c.userSet;
+            mirrorActuationLeadIntoSourceStash(data);
+            const AppConfigData before = data;
+            const ActuationLeadProvenance snap = captureActuationLeadProvenance(data);
+
+            // Two graded calibration steps persisted through the user setter (LATE then GOOD
+            // walking to 320), exactly like reportLeadCalibrationVerdict does.
+            stepLikeSetActuationLeadMs(data, 320.0);
+            QVERIFY(data.actuationLeadUserSet);
+
+            QCOMPARE(restoreActuationLeadProvenance(data, snap), ActuationLeadRestore::Restored);
+            QVERIFY2(data.actuationLeadMs == before.actuationLeadMs,
+                     qPrintable(QStringLiteral("%1: lead %2 != %3").arg(QLatin1String(c.name))
+                                    .arg(data.actuationLeadMs).arg(before.actuationLeadMs)));
+            QVERIFY2(data.actuationLeadUserSet == before.actuationLeadUserSet, c.name);
+            QCOMPARE(data.actuationLeadBySourceMs, before.actuationLeadBySourceMs);
+            QCOMPARE(data.actuationLeadUserSetBySource, before.actuationLeadUserSetBySource);
+            // A second Cancel-restore is a no-op.
+            QCOMPARE(restoreActuationLeadProvenance(data, snap), ActuationLeadRestore::Unchanged);
+        }
+        // Auto stays Auto: no stash entry for the route (absent == not configured) and the
+        // seeding rule still accepts a measured seed afterwards.
+        {
+            AppConfigData data;
+            const ActuationLeadProvenance snap = captureActuationLeadProvenance(data);
+            stepLikeSetActuationLeadMs(data, 0.0);   // clamped UP to 150, user_set latched
+            QCOMPARE(data.actuationLeadMs, AppConfigData::kActuationLeadMinMs);
+            QCOMPARE(restoreActuationLeadProvenance(data, snap), ActuationLeadRestore::Restored);
+            QCOMPARE(data.actuationLeadMs, 0.0);
+            QVERIFY(!data.actuationLeadUserSet);
+            QVERIFY(!data.actuationLeadBySourceMs.contains(actuationLeadRouteKey(data)));
+            QVERIFY(actuationLeadAcceptsMeasuredSeed(data));
+            QVERIFY(describeActuationLeadProvenance(snap).startsWith(QStringLiteral("Auto")));
+        }
+        // A route switch mid-calibration: nothing is written onto the other route.
+        {
+            AppConfigData data;
+            data.videoSource = QStringLiteral("capture_card");
+            data.actuationLeadMs = 280.0;
+            data.actuationLeadUserSet = true;
+            mirrorActuationLeadIntoSourceStash(data);
+            const ActuationLeadProvenance snap = captureActuationLeadProvenance(data);
+            data.videoSource = QStringLiteral("decoder");
+            data.actuationLeadMs = 310.0;
+            const AppConfigData switched = data;
+            QCOMPARE(restoreActuationLeadProvenance(data, snap),
+                     ActuationLeadRestore::RouteChanged);
+            QCOMPARE(data.actuationLeadMs, switched.actuationLeadMs);
+            QCOMPARE(data.actuationLeadUserSet, switched.actuationLeadUserSet);
+        }
+        QVERIFY(describeActuationLeadProvenance({270.0, false, QString()})
+                    .contains(QStringLiteral("measured")));
+        QVERIFY(describeActuationLeadProvenance({280.0, true, QString()})
+                    .contains(QStringLiteral("your value")));
+    }
 
 #ifndef ORION_PRODUCTION_BUILD
     void developmentConfigMigratesStalePathToActiveRepositoryImage()

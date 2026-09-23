@@ -243,6 +243,27 @@ def sign_lease(license_key, machine_id, lease_expires_at):
     sig = priv.sign(message)
     return base64.urlsafe_b64encode(sig).rstrip(b"=").decode("ascii")
 
+# [2026-09-23 rc1 RT-MED-12 / CSEC-06] v2 lease: binds the heartbeat response to the
+# client's per-request nonce and the server issue time. Distinct, newline-separated,
+# domain-tagged message so a v2 signature can never verify as a v1 lease (v1 messages
+# start with an UPPER-CASE key, never "orion-lease-v2").
+LEASE_NONCE_CHARS = frozenset(string.ascii_letters + string.digits + "-_")
+
+def valid_lease_nonce(nonce):
+    return (isinstance(nonce, str) and 16 <= len(nonce) <= 128
+            and all(c in LEASE_NONCE_CHARS for c in nonce))
+
+def lease_v2_message(license_key, machine_id, lease_expires_at, issued_at, nonce):
+    return (f"orion-lease-v2\n{license_key.strip().upper()}\n{machine_id.strip()}\n"
+            f"{int(lease_expires_at)}\n{int(issued_at)}\n{nonce}").encode("utf-8")
+
+def sign_lease_v2(license_key, machine_id, lease_expires_at, issued_at, nonce):
+    if not valid_lease_nonce(nonce) or "\n" in machine_id:
+        raise ValueError("invalid lease v2 input")
+    sig = load_lease_private_key().sign(
+        lease_v2_message(license_key, machine_id, lease_expires_at, issued_at, nonce))
+    return base64.urlsafe_b64encode(sig).rstrip(b"=").decode("ascii")
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 def decimal_default(obj):
     if isinstance(obj, Decimal):
@@ -415,15 +436,16 @@ class AuditUnavailable(Exception):
     """Raised only by audit(..., required=True): the audit table refused the row."""
 
 def audit(actor, action, target=None, target_type=None, reason="",
-          result="ok", details=None, ip="", flat=None, required=False):
+          result="ok", details=None, ip="", flat=None, required=False, event_id=None):
     """The one audit writer. By default never raises — an audit failure must not
     fail the operation, but it IS printed so CloudWatch keeps a copy.
     [2026-09-22 RED TEAM CX-014] With required=True (used BEFORE every destructive
     mutation) a failed write raises AuditUnavailable so the mutation is refused:
-    a revoke, kill or config change without a durable row is a release blocker."""
+    a revoke, kill or config change without a durable row is a release blocker.
+    `event_id` pins the row id (idempotent completion rows, see audit_complete)."""
     actor = actor or SYSTEM_ACTOR
     ts = now_ts()
-    aid = gen_ulid(ts * 1000)
+    aid = str(event_id) if event_id else gen_ulid(ts * 1000)
     item = {
         "event_id":    aid,               # live table partition key
         "audit_id":    aid,               # contract field name
@@ -472,6 +494,37 @@ def audit_attempt_or_refuse(actor, action, target, target_type, reason, ip="", d
                    message="The audit log is unavailable; destructive actions are refused until it recovers.")
     return None
 
+
+# [2026-09-23 rc1 RT-HIGH-07 / CSEC-10] Every destructive staff/admin mutation is
+# bracketed: audit_attempt() BEFORE the write (REQUIRED - raises AuditUnavailable,
+# which the router turns into 503 audit_unavailable with nothing mutated), then
+# audit_complete() AFTER it. The completion row's id is derived from the attempt
+# id, so a retried completion write REPLACES the row instead of duplicating it.
+AUDIT_UNAVAILABLE_MESSAGE = ("The audit log is unavailable; destructive actions are "
+                             "refused until it recovers.")
+
+def audit_attempt(actor, action, target=None, target_type=None, reason="", ip="", details=None):
+    """Durable '<action>.attempt' row before a destructive mutation. Raises
+    AuditUnavailable when the row cannot be written. Returns the attempt id."""
+    return audit(actor, f"{action}.attempt", target=target, target_type=target_type,
+                 reason=reason, result="attempt", details=details, ip=ip, required=True)
+
+def audit_complete(attempt_id, actor, action, target=None, target_type=None, reason="",
+                   ip="", details=None, result="ok"):
+    """Idempotent completion row `<attempt_id>-<result>`. Never raises: the mutation
+    has already happened and the attempt row is the durable record of it."""
+    eid = f"{attempt_id}-{result}" if attempt_id else None
+    for _ in range(2):
+        try:
+            return audit(actor, action, target=target, target_type=target_type,
+                         reason=reason, result=result, details=details, ip=ip,
+                         required=True, event_id=eid)
+        except AuditUnavailable:
+            continue
+    print(f"[ERROR] completion audit failed action={action} attempt={attempt_id}; "
+          f"the attempt row is the durable record")
+    return eid
+
 def audit_log(event_type, license_key=None, extra=None):
     """Legacy shim: unauthenticated/system-originated events. Keeps the old
     `license_suffix` attribute so existing readers/dashboards keep working."""
@@ -485,25 +538,39 @@ def audit_log(event_type, license_key=None, extra=None):
 
 # ── kill switch config ────────────────────────────────────────────────────────
 # [2026-09-22 RED TEAM CX-013] A config-table read failure used to return (False, "") - the
-# owner's emergency kill silently OFF for the duration of a DynamoDB blip. Now: the last value this
-# container read is remembered; on a read failure we return that, and if there is no last value we
-# FAIL CLOSED ("kill_state_unavailable"). A known-enabled kill can never become disabled by an
-# outage, and new/renewed authority is denied while the state is genuinely unknown.
-_LAST_GLOBAL_KILL = None   # (enabled, reason) from the most recent successful read
+# owner's emergency kill silently OFF for the duration of a DynamoDB blip.
+# [2026-09-23 rc1 RT-CRIT-02 / CSEC-13] The CX-013 fix then reused this container's LAST
+# successful read on a failure. A warm "kill off" therefore kept minting fresh signed leases
+# after the owner engaged the kill, for as long as the read kept failing. There is no cache any
+# more: every read is a strongly consistent GetItem, and ANY read failure means "unknown", which
+# denies new/renewed authority. Callers report it as the retriable code
+# `kill_state_unavailable` (503) - deliberately NOT `service_disabled`, which the launcher treats
+# as a kill verdict and signs out on (LicenseClient isLicenseKillCode). A launcher that gets the
+# retriable code keeps only its already-signed, bounded lease and fails closed when it expires.
+KILL_STATE_UNAVAILABLE = "kill_state_unavailable"
+_LAST_GLOBAL_KILL = None   # diagnostics only (last successful read); NEVER used for a decision
 
 def get_global_kill():
+    """(enabled, reason). A read failure returns (True, KILL_STATE_UNAVAILABLE)."""
     global _LAST_GLOBAL_KILL
     try:
-        r = config_table().get_item(Key={"config_key": "global_kill"})
+        r = config_table().get_item(Key={"config_key": "global_kill"}, ConsistentRead=True)
         item = r.get("Item", {})
         state = (bool(item.get("enabled", False)), item.get("reason", ""))
         _LAST_GLOBAL_KILL = state
         return state
     except Exception as e:
-        print(f"[ERROR] global_kill read failed: {e}")
-        if _LAST_GLOBAL_KILL is not None:
-            return _LAST_GLOBAL_KILL
-        return True, "kill_state_unavailable"
+        print(f"[ERROR] global_kill read failed (state unknown -> deny new authority): {e}")
+        return True, KILL_STATE_UNAVAILABLE
+
+def kill_denial(greason, message=None):
+    """The response for an engaged OR unknown global kill on a customer route."""
+    if greason == KILL_STATE_UNAVAILABLE:
+        return err(KILL_STATE_UNAVAILABLE, 503,
+                   message="Service status could not be confirmed just now. Retry shortly.",
+                   retryable=True)
+    return err("service_disabled", 503,
+               message=message or greason or "The service is temporarily disabled.")
 
 # ── /api/version ─────────────────────────────────────────────────────────────
 def handle_version(event):
@@ -631,6 +698,8 @@ def handle_activate(event):
 
     gkill, greason = get_global_kill()
     if gkill:
+        if greason == KILL_STATE_UNAVAILABLE:
+            return kill_denial(greason)
         return err("service_disabled: " + (greason or "temporarily disabled"), 503)
 
     # ── §5 version gate ──────────────────────────────────────────────────────
@@ -1030,6 +1099,13 @@ def handle_post_update(event):
         print(f"[ERROR] manifest signature verify failed: {e}")
         return err("signature_verify_error", 500)
 
+    # [rc1 RT-HIGH-07] publishing an update manifest is a fleet-wide mutation.
+    attempt_id = audit_attempt(make_actor("owner", "break-glass", ROLE_OWNER, _client_ip(event)),
+                               "update.publish", target=str(manifest_dict["latest_version"])[:40],
+                               target_type="update", reason="publish update manifest",
+                               ip=_client_ip(event),
+                               details={"sha256": str(manifest_dict["sha256"])[:64],
+                                        "mandatory": mandatory})
     # Store manifest in DynamoDB
     try:
         update_manifest_table().put_item(Item={
@@ -1051,6 +1127,9 @@ def handle_post_update(event):
         print(f"[ERROR] manifest store failed: {e}")
         return err("storage_error", 500)
 
+    audit_complete(attempt_id, make_actor("owner", "break-glass", ROLE_OWNER, _client_ip(event)),
+                   "update.publish", target=str(manifest_dict["latest_version"])[:40],
+                   target_type="update", reason="publish update manifest", ip=_client_ip(event))
     print(f"[INFO] AUDIT update manifest published: version={manifest_dict['latest_version']}")
 
     return ok({
@@ -1100,6 +1179,9 @@ def handle_provision(event):
         return err("invalid_count", 400, message=f"count must be 1..{LICENSE_CREATE_MAX}.")
     note = body.get("note", body.get("notes", ""))
     reason = str(body.get("reason") or "manual provision")[:REASON_MAX]
+    audit_attempt(actor, "license.create", target_type="license", reason=reason,
+                  ip=_client_ip(event), details={"plan": plan, "days": days, "count": count,
+                                                 "route": "provision"})
 
     keys = []
     for _ in range(count):
@@ -1136,9 +1218,14 @@ def handle_kill(event):
     target_id   = body.get("target_id", "")
     reason      = body.get("reason", "killed")
 
+    ip = _client_ip(event)
     if target_type == "license_key":
         if not target_id:
             return err("target_id required")
+        # [rc1 RT-HIGH-07] REQUIRED attempt row first; an audit outage -> 503, no revoke.
+        attempt_id = audit_attempt(actor, "license.revoke", target=target_id[-4:],
+                                   target_type="license", reason=reason, ip=ip,
+                                   details={"route": "kill"})
         licenses_table().update_item(
             Key={"license_key": target_id},
             UpdateExpression="SET #s = :s, revoked = :r, kill_reason = :k, killed_at = :t",
@@ -1150,22 +1237,26 @@ def handle_kill(event):
                 ":t": now_ts(),
             }
         )
-        audit(actor, "license.revoke", target=target_id[-4:], target_type="license",
-              reason=reason, ip=_client_ip(event), details={"route": "kill"})
+        audit_complete(attempt_id, actor, "license.revoke", target=target_id[-4:],
+                       target_type="license", reason=reason, ip=ip, details={"route": "kill"})
         owner_alert("license.revoke", actor, "License killed",
                     {"key": "..." + target_id[-4:], "reason": reason})
         print(f"[WARNING] AUDIT kill license: key ...{target_id[-4:]}, reason={reason}")
         return ok({"ok": True, "killed": target_id, "reason": reason})
 
     elif target_type == "global":
+        attempt_id = audit_attempt(actor, "config.set", target="global_kill",
+                                   target_type="config", reason=reason, ip=ip,
+                                   details={"enabled": True, "route": "kill"})
         config_table().put_item(Item={
             "config_key": "global_kill",
             "enabled":    True,
             "reason":     reason,
             "set_at":     now_ts(),
         })
-        audit(actor, "config.set", target="global_kill", target_type="config",
-              reason=reason, ip=_client_ip(event), details={"enabled": True})
+        audit_complete(attempt_id, actor, "config.set", target="global_kill",
+                       target_type="config", reason=reason, ip=ip,
+                       details={"enabled": True, "route": "kill"})
         owner_alert("config.set", actor, "GLOBAL KILL ENGAGED", {"reason": reason})
         print(f"[WARNING] AUDIT global kill activated: reason={reason}")
         return ok({"ok": True, "global_kill": True, "reason": reason})
@@ -1186,30 +1277,44 @@ def handle_unkill(event):
 
     target_type = body.get("target_type", "")
     target_id   = body.get("target_id", "")
+    ureason     = str(body.get("reason", "unkill") or "unkill")[:REASON_MAX]
+    ip          = _client_ip(event)
 
     if target_type == "license_key":
         if not target_id:
             return err("target_id required")
+        attempt_id = audit_attempt(actor, "license.unrevoke", target=target_id[-4:],
+                                   target_type="license", reason=ureason, ip=ip,
+                                   details={"route": "unkill"})
         licenses_table().update_item(
             Key={"license_key": target_id},
             UpdateExpression="SET #s = :s, revoked = :r REMOVE kill_reason",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":s": "active", ":r": False}
         )
-        audit(actor, "license.unrevoke", target=target_id[-4:], target_type="license",
-              reason=body.get("reason", "unkill"), ip=_client_ip(event))
+        audit_complete(attempt_id, actor, "license.unrevoke", target=target_id[-4:],
+                       target_type="license", reason=ureason, ip=ip,
+                       details={"route": "unkill"})
         return ok({"ok": True, "unkilled": target_id})
 
     elif target_type == "global":
+        # [rc1 RT-CRIT-01] RELEASING the kill re-enables every customer: owner step-up
+        # (fresh single-use TOTP; break-glass-only while TOTP is not enrolled).
+        attempt_id, denied = owner_step_up(event, actor, "config.set", body=body,
+                                           target="global_kill", target_type="config",
+                                           reason=ureason,
+                                           details={"enabled": False, "route": "unkill"})
+        if denied:
+            return denied
         config_table().put_item(Item={
             "config_key": "global_kill",
             "enabled":    False,
             "reason":     "",
             "set_at":     now_ts(),
         })
-        audit(actor, "config.set", target="global_kill", target_type="config",
-              reason=body.get("reason", "unkill"), ip=_client_ip(event),
-              details={"enabled": False})
+        audit_complete(attempt_id, actor, "config.set", target="global_kill",
+                       target_type="config", reason=ureason, ip=ip,
+                       details={"enabled": False, "route": "unkill"})
         owner_alert("config.set", actor, "Global kill released", {})
         return ok({"ok": True, "global_kill": False})
 
@@ -1408,8 +1513,11 @@ def check_nonce(nonce: str, window: int = ENROLL_NONCE_TTL) -> bool:
     if not nonce:
         return False
     try:
+        # `ttl` is the attribute docs/SERVER_HANDOFF.md names as the table's TTL key;
+        # `expires` is kept for existing readers.
         nonces_table().put_item(
-            Item={"nonce": nonce, "ts": now_ts(), "expires": now_ts() + window},
+            Item={"nonce": nonce, "ts": now_ts(), "expires": now_ts() + window,
+                  "ttl": now_ts() + window},
             ConditionExpression="attribute_not_exists(nonce)"
         )
         return True
@@ -1557,6 +1665,36 @@ def handle_staff_login(event):
         # enroll key is redeemed.
         return err("enrollment_pending", 403,
                    message="Redeem your one-time enrolment key first.")
+    # [rc1 RT-CRIT-01] staff_id + a CLAIMED machine_id is not a possession factor.
+    # An OWNER-role login therefore also needs a fresh, single-use owner TOTP code
+    # whenever owner TOTP is required (body `totp_code` or X-Orion-Admin-TOTP).
+    role_n = normalize_role(staff.get("role"))
+    if role_n == ROLE_OWNER and config_get_strict("owner_totp_required"):
+        ip = _client_ip(event)
+        login_actor = make_actor("staff", staff_id, role_n, ip)
+        secret = owner_totp_secret()
+        code = str(body.get("totp_code") or _headers(event).get("x-orion-admin-totp") or "").strip()
+        denial = None
+        counter = None
+        if not secret:
+            denial = "totp_not_provisioned"
+        elif not code:
+            denial = "totp_required"
+        else:
+            counter = totp_match_counter(secret, code)
+            if counter is None:
+                denial = "invalid_totp"
+        if denial is None:
+            try:
+                if not totp_consume(counter, secret):
+                    denial = "totp_replayed"
+            except Exception as e:
+                print(f"[STAFF] owner login replay store unavailable: {e}")
+                return err("step_up_unavailable", 503)
+        if denial:
+            audit(login_actor, "staff.login_denied", target=staff_id, target_type="staff",
+                  result=denial, ip=ip)
+            return err(denial, 403, message="Owner sign-in needs a fresh owner TOTP code.")
     token, token_id, expires = issue_staff_token(staff_id, machine_id)
     try:
         staff_table().update_item(
@@ -1775,13 +1913,17 @@ def handle_validate(event):
     client_version = str(body.get("client_version") or "").strip()
     if not license_key or not machine_id:
         return err("license_key and machine_id required", 400)
+    # [rc1 RT-MED-12] optional per-request nonce (v2 lease). Absent = v1 client.
+    lease_nonce = body.get("lease_nonce")
+    if lease_nonce is not None and not valid_lease_nonce(lease_nonce):
+        return err("invalid_lease_nonce", 400,
+                   message="lease_nonce must be 16-128 characters of [A-Za-z0-9_-].")
     # MED-1: rate-limit the heartbeat too (per key + per source IP).
     if not rate_limit_ok("check", license_key) or not rate_limit_ok("check_ip", _client_ip(event)):
         return err("rate_limited", 429)
     gkill, greason = get_global_kill()
     if gkill:
-        return err("service_disabled", 503,
-                   message=greason or "The service is temporarily disabled.")
+        return kill_denial(greason)
     blocked, vinfo = version_gate(client_version)
     if blocked:
         return err("version_blocked", 403,
@@ -1868,6 +2010,14 @@ def handle_validate(event):
     try:
         resp_body["lease_sig"] = sign_lease(license_key, machine_id, lease_expires_at)
         resp_body["public_key_id"] = LEASE_KEY_ID
+        if lease_nonce is not None:
+            # v2: the signature also covers the caller's nonce and the server issue
+            # time, so a captured response cannot be replayed to a later request.
+            resp_body["lease_nonce"] = lease_nonce
+            resp_body["lease_issued_at"] = now
+            resp_body["lease_sig_v2"] = sign_lease_v2(license_key, machine_id,
+                                                      lease_expires_at, now, lease_nonce)
+            resp_body["lease_sig_version"] = 2
     except Exception as e:
         print(f"[LEASE] signing unavailable (fail-soft): {e}")
     return ok(resp_body)
@@ -2662,6 +2812,13 @@ def handle_bot_deliver(event):
     if cap_err:
         return cap_err
 
+    # [rc1 RT-HIGH-07] staff key generation: REQUIRED attempt row before the order
+    # marker is spent or any key is minted.
+    audit_attempt(actor, "license.create", target_type="license", reason=reason,
+                  ip=_client_ip(event), details={"plan": plan, "days": days, "count": count,
+                                                 "discord_id": discord_id,
+                                                 "route": "bot_deliver"})
+
     # HIGH-3: /deliver is the admin manual-mint path (no order in the general
     # case), but when an order_id IS supplied it is spend-once, just like
     # /provision — a replayed deliver can't double-mint the same order.
@@ -2784,6 +2941,9 @@ def _reconcile_order_role(discord_id, key, order_id):
 
 
 def handle_bot_provision(event):
+    return with_stripe_event_dedup(event, _handle_bot_provision)
+
+def _handle_bot_provision(event):
     """POST /api/bot/provision — automated mint for the Gumroad webhook Lambda.
     Kept separate from /api/bot/deliver (admin-triggered,
     no order_id) so audit_log entries and future validation don't conflate the two
@@ -3023,6 +3183,9 @@ def handle_shard_store(event):
         return err("internal_error", 500)
     now = now_ts()
     expires_at = (now + ttl_hours * 3600) if ttl_hours > 0 else 0
+    audit_attempt(make_actor("owner", "break-glass", ROLE_OWNER, _client_ip(event)),
+                  "shard.store", target=build_id[:16], target_type="shard",
+                  reason="store release shard", ip=_client_ip(event))
     try:
         shards_table().put_item(Item={
             "build_id": build_id,
@@ -3120,8 +3283,8 @@ def handle_shard_retrieve(event):
     if global_kill:
         audit_log("shard_global_kill", license_key,
                   {"build_id": build_id[:16]})
-        return err("service_disabled", 503,
-                   message="Venice is temporarily unavailable. Check the server for updates.")
+        return kill_denial(_global_reason,
+                           message="Venice is temporarily unavailable. Check the server for updates.")
     try:
         r = shards_table().get_item(Key={"build_id": build_id})
     except Exception as e:
@@ -3210,6 +3373,9 @@ def handle_shard_revoke(event):
         return err("build_id required")
     if not _valid_shard_build_id(build_id):
         return err("build_id must be a 64-character hex digest", 400)
+    attempt_id = audit_attempt(actor, "shard.revoke", target=build_id[:16], target_type="shard",
+                               reason=str(body.get("reason") or "shard revoke")[:REASON_MAX],
+                               ip=_client_ip(event))
     try:
         shards_table().update_item(
             Key={"build_id": build_id},
@@ -3219,6 +3385,8 @@ def handle_shard_revoke(event):
         print(f"[SHARD] revoke failed: {e}")
         return err("internal_error", 500)
     audit_log("shard_revoked", extra={"build_id": build_id[:16]})
+    audit_complete(attempt_id, actor, "shard.revoke", target=build_id[:16], target_type="shard",
+                   ip=_client_ip(event))
     print(f"[WARNING] Shard revoked: build_id={build_id[:16]}...")
     return ok({"ok": True, "revoked": True})
 
@@ -3369,6 +3537,25 @@ def totp_verify(secret_b32, code, at=None, window=TOTP_WINDOW_STEPS):
 def gen_totp_secret():
     return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
 
+# [P-F follow-up] A re-enrolment is staged here and only replaces the ACTIVE
+# secret at totp_confirm, so the current factor (and a break-glass session code)
+# keeps working until the new authenticator has proven itself.
+OWNER_TOTP_PENDING_SSM = "/orion/owner_totp_pending_secret"
+
+def owner_totp_pending_secret():
+    try:
+        return ssm_get(OWNER_TOTP_PENDING_SSM, decrypt=True)
+    except Exception:
+        return ""
+
+def _clear_pending_totp():
+    try:
+        get_ssm().delete_parameter(Name=OWNER_TOTP_PENDING_SSM)
+    except Exception as e:
+        # ParameterNotFound is the normal case; anything else is only a stale stage.
+        if "ParameterNotFound" not in str(e):
+            print(f"[TOTP] pending secret cleanup failed: {type(e).__name__}")
+
 def owner_totp_secret():
     try:
         return ssm_get(OWNER_TOTP_SSM, decrypt=True)
@@ -3461,10 +3648,31 @@ def admin_secret_ok(event):
         return False
     return secrets.compare_digest(secret, expected)
 
+class ConfigUnavailable(Exception):
+    """A SECURITY config key could not be read. The router answers 503
+    config_unavailable: the owner surface must never fall back to the permissive
+    default (TOTP off / allow-all) because DynamoDB blipped."""
+
+def config_get_strict(key):
+    """[rc1 RT-CRIT-01] Uncached, strongly consistent read of a security config key
+    (owner_totp_required, owner_ip_allowlist). config_get() returns the permissive
+    DEFAULT on a read error and caches for 15 s; both are wrong for these keys."""
+    try:
+        item = config_table().get_item(Key={"config_key": key},
+                                       ConsistentRead=True).get("Item")
+    except Exception as e:
+        print(f"[CONFIG] security read failed key={key}: {e}")
+        raise ConfigUnavailable(key)
+    val = _from_ddb(item["value"]) if (item and "value" in item) else None
+    if val is None:
+        default = CONFIG_DEFAULTS.get(key)
+        return json.loads(json.dumps(default)) if isinstance(default, (dict, list)) else default
+    return val
+
 def owner_totp_ok(event):
     """(ok, error_code). When config owner_totp_required is false this is a no-op,
     which is the shipped default until the owner enrolls."""
-    if not config_get("owner_totp_required", False):
+    if not config_get_strict("owner_totp_required"):
         return True, None
     code = _headers(event).get("x-orion-admin-totp") or ""
     secret = owner_totp_secret()
@@ -3483,7 +3691,7 @@ def resolve_owner(event):
     role=owner presenting a machine-bound bearer token.
     Returns (actor, None) or (None, error_response)."""
     ip = _client_ip(event)
-    allow = config_get("owner_ip_allowlist", [])
+    allow = config_get_strict("owner_ip_allowlist") or []
     if not ip_allowed(ip, allow):
         audit(make_actor("owner", "unknown", ROLE_OWNER, ip), "owner.ip_denied",
               target_type="global", result="ip_not_allowed", ip=ip)
@@ -3510,6 +3718,107 @@ def resolve_owner(event):
             return None, err("forbidden", 403, message="Owner role required.")
         return make_actor("staff", staff.get("staff_id"), ROLE_OWNER, ip), None
     return None, err("forbidden", 403)
+
+# ── [2026-09-23 rc1 RT-CRIT-01 / CSEC-12] owner step-up ───────────────────────
+# resolve_owner() checks TOTP only on the break-glass path, so an owner-role STAFF
+# bearer (obtained with staff_id + a claimed machine_id) could disable TOTP, rotate
+# the break-glass secret, re-enroll TOTP, promote another owner or release the kill.
+# Every such action now needs a FRESH, SINGLE-USE owner TOTP code
+# (X-Orion-Admin-TOTP header or body `step_up_code`) regardless of which
+# authenticator resolved the actor. When owner TOTP is not required there is no
+# second factor to step up to: the break-glass secret (itself the possession factor)
+# may still act, a staff bearer may not (403 step_up_required).
+STEP_UP_CONFIG_KEYS = ("owner_totp_required", "owner_ip_allowlist", "alerts")
+TOTP_USED_TTL_S = TOTP_STEP_S * (2 * TOTP_WINDOW_STEPS + 2)
+
+def totp_match_counter(secret_b32, code, at=None, window=TOTP_WINDOW_STEPS):
+    """The time-step counter `code` matches (+/- window), or None."""
+    code = (str(code or "")).strip()
+    if not code or not code.isdigit() or len(code) != TOTP_DIGITS:
+        return None
+    base = int((at if at is not None else time.time()) // TOTP_STEP_S)
+    for drift in range(-window, window + 1):
+        try:
+            if secrets.compare_digest(code, totp_at(secret_b32, base + drift)):
+                return base + drift
+        except Exception:
+            return None
+    return None
+
+def _totp_tag(secret_b32):
+    """Short, non-reversible namespace for a secret's burned steps, so the step of
+    one secret (e.g. a pending re-enrolment) never collides with another's."""
+    return hashlib.sha256(("orion-totp-tag:" + str(secret_b32 or "")).encode()).hexdigest()[:16]
+
+def totp_consume(counter, secret_b32=None):
+    """Burn a matched TOTP step so the same code can never authorise a second
+    sensitive action (or a second owner login). True = fresh, False = replayed.
+    Raises on a store outage (callers answer 503, never 'allowed').
+    The key is namespaced by the secret the step was matched against."""
+    tag = _totp_tag(secret_b32 if secret_b32 is not None else owner_totp_secret())
+    key = f"owner_totp_used:{tag}:{int(counter)}"
+    now = now_ts()
+    try:
+        nonces_table().put_item(
+            Item={"nonce": key, "ts": now, "expires": now + TOTP_USED_TTL_S,
+                  "ttl": now + TOTP_USED_TTL_S},
+            ConditionExpression="attribute_not_exists(nonce)")
+        return True
+    except get_ddb().meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+
+def _step_up_code(event, body=None):
+    code = _headers(event).get("x-orion-admin-totp") or ""
+    if not code and isinstance(body, dict):
+        code = body.get("step_up_code") or body.get("totp_code") or ""
+    return str(code).strip()
+
+def is_break_glass(actor):
+    return (actor or {}).get("type") == "owner" and (actor or {}).get("id") == "break-glass"
+
+def owner_step_up(event, actor, action, body=None, target=None, target_type="config",
+                  reason="", details=None):
+    """Gate one owner-sensitive action. Order: verify the code (deny + audit on
+    failure) -> REQUIRED attempt audit (AuditUnavailable -> 503, nothing burned or
+    mutated) -> burn the code (replay -> deny + audit). Returns
+    (attempt_id, None) to proceed, or (None, error_response)."""
+    ip = _client_ip(event)
+
+    def deny(code, message):
+        audit(actor, "owner.step_up_denied", target=action, target_type=target_type,
+              result=code, ip=ip, details={"action": action})
+        return None, err(code, 403, message=message, step_up=True)
+
+    required = bool(config_get_strict("owner_totp_required"))
+    counter = None
+    if not required:
+        if not is_break_glass(actor):
+            return deny("step_up_required",
+                        "This action needs a second factor. Enable owner TOTP, or use "
+                        "the break-glass owner secret.")
+    else:
+        secret = owner_totp_secret()
+        if not secret:
+            return deny("totp_not_provisioned", "Owner TOTP is required but not provisioned.")
+        code = _step_up_code(event, body)
+        if not code:
+            return deny("totp_required", "A fresh owner TOTP code is required for this action.")
+        counter = totp_match_counter(secret, code)
+        if counter is None:
+            return deny("invalid_totp", "That owner TOTP code did not verify.")
+    attempt_id = audit_attempt(actor, action, target=target, target_type=target_type,
+                               reason=reason, ip=ip, details=details)
+    if counter is not None:
+        try:
+            fresh = totp_consume(counter, secret)
+        except Exception as e:
+            print(f"[STEP-UP] replay store unavailable: {e}")
+            return None, err("step_up_unavailable", 503,
+                             message="The step-up check is unavailable. Retry shortly.")
+        if not fresh:
+            return deny("totp_replayed",
+                        "That code was already used. Wait for the next code and retry.")
+    return attempt_id, None
 
 def admin_actor(event):
     """The owner actor the router's /api/admin/* gate resolved. Falls back to a
@@ -3939,6 +4248,11 @@ def apply_hwid_reset(item, actor, mode, reason, consume=None, expiry_delta=0):
         "machine_before_suffix": before[-6:] if before else "",
     })
     hist = hist[-RESET_HISTORY_MAX:]
+    # [rc1 RT-HIGH-07] every reset path (staff, owner, Discord self-service) writes a
+    # REQUIRED attempt row first; AuditUnavailable -> router 503, binding unchanged.
+    attempt_id = audit_attempt(actor, "license.reset_machine", target=key[-4:],
+                               target_type="license", reason=reason,
+                               details={"mode": mode, "machine_before_suffix": before[-6:]})
 
     expr = ("SET machine_id = :e, activations = :z, last_reset_at = :n, "
             "bot_reset_last_at = :n, reset_history = :h")
@@ -3960,9 +4274,10 @@ def apply_hwid_reset(item, actor, mode, reason, consume=None, expiry_delta=0):
     licenses_table().update_item(Key={"license_key": key},
                                  UpdateExpression=expr,
                                  ExpressionAttributeValues=vals)
-    audit(actor, "license.reset_machine", target=key[-4:], target_type="license",
-          reason=reason, details={"mode": mode, "machine_before_suffix": before[-6:],
-                                  "expiry_delta": expiry_delta})
+    audit_complete(attempt_id, actor, "license.reset_machine", target=key[-4:],
+                   target_type="license", reason=reason,
+                   details={"mode": mode, "machine_before_suffix": before[-6:],
+                            "expiry_delta": expiry_delta})
     try:
         new_item = licenses_table().get_item(Key={"license_key": key}).get("Item") or item
     except Exception:
@@ -4126,6 +4441,8 @@ def handle_license_action(event, actor, staff=None, surface="admin"):
             days = None if days in (None, "") else int(days)
         except (TypeError, ValueError):
             return err("invalid_days", 400)
+        audit_attempt(actor, "license.create", target_type="license", reason=reason, ip=ip,
+                      details={"plan": plan, "days": days, "count": count})
         keys = []
         for _ in range(count):
             row = mint_license(plan, days, actor,
@@ -4151,6 +4468,9 @@ def handle_license_action(event, actor, staff=None, surface="admin"):
             return e
         if not reason:
             return err("reason_required", 400, message="Every mutation needs a reason.")
+        audit_attempt(actor, f"license.{action}", target_type="global", reason=reason, ip=ip,
+                      details={"machine_suffix": str(body.get("machine_id", "") or "")[-6:],
+                               "discord_user_id": str(body.get("discord_user_id", "") or "")})
         return _blacklist_mutate(actor, body, reason, add=(action == "blacklist"))
 
     # ── every other action resolves a license first ───────────────────────────
@@ -4524,11 +4844,22 @@ def handle_admin_staff_post(event):
         for k, v in (body.get("caps") or {}).items():
             if k in DEFAULT_CAPS:
                 caps[k] = int(v)
+        # [rc1 RT-CRIT-01] minting another OWNER is an owner-takeover path: step-up.
+        # [rc1 RT-HIGH-07] every staff mutation writes a REQUIRED attempt row first.
+        if role == ROLE_OWNER:
+            attempt_id, denied = owner_step_up(event, actor, "staff.create", body=body,
+                                               target=staff_id, target_type="staff",
+                                               reason=reason, details={"role": role})
+            if denied:
+                return denied
+        else:
+            attempt_id = audit_attempt(actor, "staff.create", target=staff_id,
+                                       target_type="staff", reason=reason, ip=ip,
+                                       details={"role": role})
         enroll_key, salt, khash = _issue_enroll_key(staff_id)
-        staff_table().put_item(Item={
+        staff_item = {
             "staff_id": staff_id,
             "display_name": str(body.get("display_name", "") or staff_id)[:64],
-            "discord_user_id": discord_user_id,
             "role": role,
             "disabled": False,
             "machine_id": "",
@@ -4538,10 +4869,15 @@ def handle_admin_staff_post(event):
             "usage": {"day": day_str(), "keys": 0, "resets": 0},
             "created_by": f"{actor.get('type')}:{actor.get('id')}",
             "created_at": now_ts(),
-        })
-        audit(actor, "staff.create", target=staff_id, target_type="staff",
-              reason=reason, ip=ip, details={"role": role, "caps": caps,
-                                             "discord_user_id": discord_user_id})
+        }
+        # An EMPTY string is not a valid DynamoDB GSI key (discord_user_id-index):
+        # omit the attribute instead of failing the whole create.
+        if discord_user_id:
+            staff_item["discord_user_id"] = discord_user_id
+        staff_table().put_item(Item=staff_item)
+        audit_complete(attempt_id, actor, "staff.create", target=staff_id, target_type="staff",
+                       reason=reason, ip=ip, details={"role": role, "caps": caps,
+                                                      "discord_user_id": discord_user_id})
         owner_alert("staff.create", actor, "Staff member created",
                     {"staff_id": staff_id, "role": role, "reason": reason})
         # enroll_key is returned ONCE and never stored in the clear.
@@ -4559,6 +4895,25 @@ def handle_admin_staff_post(event):
         return err("staff_not_found", 404)
     if not reason:
         return err("reason_required", 400, message="Every mutation needs a reason.")
+    if action not in ("disable", "enable", "set_role", "set_caps", "reset_machine",
+                      "reissue_enrollment"):
+        return err("unknown_action", 400, message=f"Unknown action: {action}")
+    # [rc1 RT-CRIT-01] anything that touches an OWNER row, or grants the owner role,
+    # needs the owner step-up; [RT-HIGH-07] everything else a REQUIRED attempt row.
+    target_is_owner = normalize_role(target.get("role")) == ROLE_OWNER
+    grants_owner = (action == "set_role"
+                    and str(body.get("role", "")).strip().lower() == ROLE_OWNER)
+    if target_is_owner or grants_owner:
+        attempt_id, denied = owner_step_up(event, actor, f"staff.{action}", body=body,
+                                           target=staff_id, target_type="staff",
+                                           reason=reason,
+                                           details={"role": str(body.get("role", "") or "")})
+        if denied:
+            return denied
+    else:
+        attempt_id = audit_attempt(actor, f"staff.{action}", target=staff_id,
+                                   target_type="staff", reason=reason, ip=ip,
+                                   details={"role": str(body.get("role", "") or "")})
 
     if action in ("disable", "enable"):
         disabled = action == "disable"
@@ -4568,8 +4923,8 @@ def handle_admin_staff_post(event):
             ExpressionAttributeValues={":d": disabled})
         if disabled:
             _revoke_staff_tokens(staff_id)
-        audit(actor, f"staff.{action}", target=staff_id, target_type="staff",
-              reason=reason, ip=ip)
+        audit_complete(attempt_id, actor, f"staff.{action}", target=staff_id,
+                       target_type="staff", reason=reason, ip=ip)
         if disabled:
             owner_alert("staff.disable", actor, "Staff member disabled",
                         {"staff_id": staff_id, "reason": reason})
@@ -4578,14 +4933,16 @@ def handle_admin_staff_post(event):
     if action == "set_role":
         role_raw = str(body.get("role", "")).strip().lower()
         if role_raw not in (ROLE_OWNER, ROLE_ADMIN, ROLE_SUPPORT):
+            audit_complete(attempt_id, actor, "staff.set_role", target=staff_id,
+                           target_type="staff", reason=reason, ip=ip, result="invalid_role")
             return err("invalid_role", 400, message="role must be owner, admin or support.")
         staff_table().update_item(
             Key={"staff_id": staff_id},
             UpdateExpression="SET #r = :r",
             ExpressionAttributeNames={"#r": "role"},
             ExpressionAttributeValues={":r": role_raw})
-        audit(actor, "staff.set_role", target=staff_id, target_type="staff",
-              reason=reason, ip=ip, details={"role": role_raw})
+        audit_complete(attempt_id, actor, "staff.set_role", target=staff_id,
+                       target_type="staff", reason=reason, ip=ip, details={"role": role_raw})
         owner_alert("staff.set_role", actor, "Staff role changed",
                     {"staff_id": staff_id, "role": role_raw, "reason": reason})
         return ok({"ok": True, "staff_id": staff_id, "role": role_raw})
@@ -4602,8 +4959,8 @@ def handle_admin_staff_post(event):
             Key={"staff_id": staff_id},
             UpdateExpression="SET caps = :c",
             ExpressionAttributeValues={":c": caps})
-        audit(actor, "staff.set_caps", target=staff_id, target_type="staff",
-              reason=reason, ip=ip, details={"caps": caps})
+        audit_complete(attempt_id, actor, "staff.set_caps", target=staff_id,
+                       target_type="staff", reason=reason, ip=ip, details={"caps": caps})
         return ok({"ok": True, "staff_id": staff_id, "caps": caps})
 
     if action == "reset_machine":
@@ -4612,8 +4969,8 @@ def handle_admin_staff_post(event):
             Key={"staff_id": staff_id},
             UpdateExpression="SET machine_id = :e",
             ExpressionAttributeValues={":e": ""})
-        audit(actor, "staff.reset_machine", target=staff_id, target_type="staff",
-              reason=reason, ip=ip, details={"tokens_revoked": n})
+        audit_complete(attempt_id, actor, "staff.reset_machine", target=staff_id,
+                       target_type="staff", reason=reason, ip=ip, details={"tokens_revoked": n})
         return ok({"ok": True, "staff_id": staff_id, "tokens_revoked": n})
 
     if action == "reissue_enrollment":
@@ -4622,8 +4979,8 @@ def handle_admin_staff_post(event):
             Key={"staff_id": staff_id},
             UpdateExpression="SET enroll_key_hash = :h, enroll_salt = :s REMOVE enrolled_at",
             ExpressionAttributeValues={":h": khash, ":s": salt})
-        audit(actor, "staff.reissue_enrollment", target=staff_id, target_type="staff",
-              reason=reason, ip=ip)
+        audit_complete(attempt_id, actor, "staff.reissue_enrollment", target=staff_id,
+                       target_type="staff", reason=reason, ip=ip)
         return ok({"ok": True, "staff_id": staff_id, "enroll_key": enroll_key})
 
     return err("unknown_action", 400, message=f"Unknown action: {action}")
@@ -4762,6 +5119,7 @@ def _config_snapshot():
     for k in CONFIG_DEFAULTS:
         snap[k] = config_get(k)
     snap["owner_totp_enrolled"] = bool(owner_totp_secret())
+    snap["owner_totp_pending"] = bool(owner_totp_pending_secret())
     return snap
 
 def handle_admin_config(event):
@@ -4787,52 +5145,107 @@ def handle_admin_config(event):
     ip = _client_ip(event)
 
     if action == "totp_enroll":
+        # Re-enrolling OVERWRITES the secret: an attacker who could do this owns the
+        # second factor. Step-up with the CURRENT factor (or break-glass pre-TOTP).
+        attempt_id, denied = owner_step_up(event, actor, "config.totp_enroll", body=body,
+                                           target="owner_totp", reason=reason or "totp enrolment")
+        if denied:
+            return denied
         secret = gen_totp_secret()
         try:
-            get_ssm().put_parameter(Name=OWNER_TOTP_SSM, Value=secret,
+            # Staged, not active: see OWNER_TOTP_PENDING_SSM.
+            get_ssm().put_parameter(Name=OWNER_TOTP_PENDING_SSM, Value=secret,
                                     Type="SecureString", Overwrite=True)
         except Exception as e2:
             print(f"[TOTP] enroll write failed: {e2}")
+            audit_complete(attempt_id, actor, "config.totp_enroll", target="owner_totp",
+                           target_type="config", reason=reason, ip=ip, result="ssm_write_failed")
             return err("ssm_write_failed", 500)
-        audit(actor, "config.totp_enroll", target="owner_totp", target_type="config",
-              reason=reason or "totp enrolment", ip=ip)
+        audit_complete(attempt_id, actor, "config.totp_enroll", target="owner_totp",
+                       target_type="config", reason=reason or "totp enrolment", ip=ip)
         uri = (f"otpauth://totp/{TOTP_ISSUER}:owner?secret={secret}"
                f"&issuer={TOTP_ISSUER}&algorithm=SHA1&digits={TOTP_DIGITS}&period={TOTP_STEP_S}")
         # Returned ONCE — the secret is never readable through the API again.
-        return ok({"ok": True, "otpauth_uri": uri, "secret": secret,
-                   "required": bool(config_get("owner_totp_required", False))})
+        return ok({"ok": True, "otpauth_uri": uri, "secret": secret, "pending": True,
+                   "required": bool(config_get_strict("owner_totp_required"))})
 
     if action == "totp_confirm":
-        secret = owner_totp_secret()
-        if not secret:
+        # [P-F follow-up] The body code IS the proof for this action: it proves
+        # possession of the staged secret (whose enrolment already needed the
+        # current factor) or, with nothing staged, of the active secret itself.
+        # There is no separate step-up burn that could collide with it.
+        pending = owner_totp_pending_secret()
+        target = pending or owner_totp_secret()
+        if not target:
             return err("totp_not_enrolled", 400, message="Run totp_enroll first.")
-        if not totp_verify(secret, body.get("code")):
-            audit(actor, "config.totp_confirm", target="owner_totp", target_type="config",
-                  result="invalid_totp", ip=ip)
+        confirm_counter = totp_match_counter(target, body.get("code"))
+        if confirm_counter is None:
+            audit(actor, "owner.step_up_denied", target="config.totp_confirm",
+                  target_type="config", result="invalid_totp", ip=ip,
+                  details={"action": "config.totp_confirm", "pending": bool(pending)})
             return err("invalid_totp", 403, message="That code did not verify.")
+        attempt_id = audit_attempt(actor, "config.totp_confirm", target="owner_totp",
+                                   target_type="config", reason=reason or "totp enabled",
+                                   ip=ip, details={"pending": bool(pending)})
+        try:
+            fresh = totp_consume(confirm_counter, target)
+        except Exception as e2:
+            print(f"[TOTP] replay store unavailable: {e2}")
+            return err("step_up_unavailable", 503)
+        if not fresh:
+            audit(actor, "owner.step_up_denied", target="config.totp_confirm",
+                  target_type="config", result="totp_replayed", ip=ip)
+            return err("totp_replayed", 403, message="That code was already used.")
+        if pending:
+            try:
+                get_ssm().put_parameter(Name=OWNER_TOTP_SSM, Value=pending,
+                                        Type="SecureString", Overwrite=True)
+            except Exception as e2:
+                print(f"[TOTP] confirm promote failed: {type(e2).__name__}")
+                audit_complete(attempt_id, actor, "config.totp_confirm", target="owner_totp",
+                               target_type="config", reason=reason, ip=ip,
+                               result="ssm_write_failed")
+                return err("ssm_write_failed", 500)
+            _clear_pending_totp()
         config_set("owner_totp_required", True)
-        audit(actor, "config.totp_confirm", target="owner_totp", target_type="config",
-              reason=reason or "totp enabled", ip=ip)
-        owner_alert("config.set", actor, "Owner TOTP enabled", {"reason": reason})
+        audit_complete(attempt_id, actor, "config.totp_confirm", target="owner_totp",
+                       target_type="config", reason=reason or "totp enabled", ip=ip,
+                       details={"rotated": bool(pending)})
+        owner_alert("config.set", actor,
+                    "Owner TOTP switched to a new authenticator" if pending else "Owner TOTP enabled",
+                    {"reason": reason})
         return ok({"ok": True, "owner_totp_required": True})
 
     if action == "totp_disable":
+        attempt_id, denied = owner_step_up(event, actor, "config.totp_disable", body=body,
+                                           target="owner_totp", reason=reason or "totp disabled")
+        if denied:
+            return denied
         config_set("owner_totp_required", False)
-        audit(actor, "config.totp_disable", target="owner_totp", target_type="config",
-              reason=reason or "totp disabled", ip=ip)
+        _clear_pending_totp()
+        audit_complete(attempt_id, actor, "config.totp_disable", target="owner_totp",
+                       target_type="config", reason=reason or "totp disabled", ip=ip)
         owner_alert("config.set", actor, "Owner TOTP DISABLED", {"reason": reason})
         return ok({"ok": True, "owner_totp_required": False})
 
     if action == "rotate_admin_secret":
+        attempt_id, denied = owner_step_up(event, actor, "config.rotate_admin_secret",
+                                           body=body, target="admin_secret",
+                                           reason=reason or "secret rotation")
+        if denied:
+            return denied
         new_secret = secrets.token_urlsafe(32)
         try:
             get_ssm().put_parameter(Name=ADMIN_SECRET_SSM, Value=new_secret,
                                     Type="SecureString", Overwrite=True)
         except Exception as e2:
             print(f"[ADMIN] secret rotate failed: {e2}")
+            audit_complete(attempt_id, actor, "config.rotate_admin_secret",
+                           target="admin_secret", target_type="config", reason=reason,
+                           ip=ip, result="ssm_write_failed")
             return err("ssm_write_failed", 500)
-        audit(actor, "config.rotate_admin_secret", target="admin_secret",
-              target_type="config", reason=reason or "secret rotation", ip=ip)
+        audit_complete(attempt_id, actor, "config.rotate_admin_secret", target="admin_secret",
+                       target_type="config", reason=reason or "secret rotation", ip=ip)
         owner_alert("config.rotate_admin_secret", actor, "Admin secret rotated",
                     {"reason": reason})
         # Returned ONCE.
@@ -4849,30 +5262,42 @@ def handle_admin_config(event):
         return err("nothing_to_set", 400)
     if not reason:
         return err("reason_required", 400, message="Every mutation needs a reason.")
-    applied = {}
-    for key, value in updates.items():
+    for key in updates:
         if key not in CONFIG_KEYS:
             return err("unknown_config_key", 400, message=f"Unknown config key: {key}",
                        key=key)
+
+    def _kill_enabled(value):
+        return bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
+
+    # Security-weakening keys (the second factor, the IP allowlist, where owner
+    # alerts go) and RELEASING the global kill need the step-up; engaging the kill
+    # stays one step (the safe direction).
+    sensitive = [k for k in updates if k in STEP_UP_CONFIG_KEYS
+                 or (k == "global_kill" and not _kill_enabled(updates[k]))]
+    if sensitive:
+        _sid, denied = owner_step_up(event, actor, "config.set.sensitive", body=body,
+                                     target=",".join(sensitive), reason=reason,
+                                     details={"keys": sensitive})
+        if denied:
+            return denied
+    applied = {}
+    for key, value in updates.items():
         if key == "global_kill":
-            enabled = bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
+            enabled = _kill_enabled(value)
             kreason = (value.get("reason") if isinstance(value, dict) else "") or reason
-            refused = audit_attempt_or_refuse(actor, "config.set.attempt", key, "config", reason, ip=ip,
-                                              details={"enabled": enabled})
-            if refused:
-                return refused
+            attempt_id = audit_attempt(actor, "config.set", key, "config", reason, ip=ip,
+                                       details={"enabled": enabled})
             config_table().put_item(Item={"config_key": "global_kill",
                                           "enabled": enabled, "reason": kreason if enabled else "",
                                           "set_at": now_ts()})
             applied[key] = {"enabled": enabled, "reason": kreason if enabled else ""}
         else:
-            refused = audit_attempt_or_refuse(actor, "config.set.attempt", key, "config", reason, ip=ip)
-            if refused:
-                return refused
+            attempt_id = audit_attempt(actor, "config.set", key, "config", reason, ip=ip)
             config_set(key, value)
             applied[key] = value
-        audit(actor, "config.set", target=key, target_type="config", reason=reason,
-              ip=ip, details={"value": applied[key]})
+        audit_complete(attempt_id, actor, "config.set", target=key, target_type="config",
+                       reason=reason, ip=ip, details={"value": applied[key]})
     owner_alert("config.set", actor, "Config changed",
                 {"keys": ", ".join(applied.keys()), "reason": reason})
     return ok({"ok": True, "applied": applied, "config": _config_snapshot()})
@@ -5048,7 +5473,93 @@ def handle_bot_reset_credit(event):
     return ok({"ok": True, "license_key_suffix": key[-4:], "hwid_paid_credits": credits,
                "lookup_mode": mode})
 
+# ── [2026-09-23 rc1 RT-LOW-04 / CL3-F6-002] Stripe event.id dedup ─────────────
+# The website Worker forwards the verified Stripe `event.id` as `stripe_event_id`.
+# A marker `stripe_evt:<id>` in orion-nonces moves processing -> done; a replayed
+# delivery of a DONE event is a 200 no-op (no second revoke/audit/owner alert, no
+# second DM). A failed attempt DELETES its claim so Stripe's retry reprocesses; a
+# concurrent in-flight delivery gets a retriable 409. Entitlement idempotency
+# (ORDER# markers, revoke state) is unchanged underneath.
+STRIPE_EVENT_TTL_S = 30 * 86400          # Stripe retries for up to 3 days
+STRIPE_EVENT_LEASE_S = 120               # a crashed attempt's claim goes stale after this
+
+def _valid_stripe_event_id(value):
+    v = str(value or "")
+    return v.startswith("evt_") and 5 <= len(v) <= 255 and v[4:].replace("_", "").isalnum()
+
+def stripe_event_begin(event_id):
+    """None = claimed, proceed. Otherwise the response to return right away."""
+    key = "stripe_evt:" + event_id
+    now = now_ts()
+    try:
+        cur = nonces_table().get_item(Key={"nonce": key}, ConsistentRead=True).get("Item")
+    except Exception as e:
+        print(f"[STRIPE] event store unavailable: {e}")
+        return err("event_store_unavailable", 503)
+    if cur and cur.get("state") == "done":
+        return ok({"ok": True, "duplicate_event": True,
+                   "result": str(cur.get("result") or "")})
+    try:
+        nonces_table().put_item(
+            Item={"nonce": key, "state": "processing", "claimed_at": now,
+                  "expires": now + STRIPE_EVENT_TTL_S, "ttl": now + STRIPE_EVENT_TTL_S},
+            ConditionExpression="attribute_not_exists(nonce) OR "
+                                "(#st = :p AND claimed_at < :stale)",
+            ExpressionAttributeNames={"#st": "state"},
+            ExpressionAttributeValues={":p": "processing", ":stale": now - STRIPE_EVENT_LEASE_S})
+        return None
+    except get_ddb().meta.client.exceptions.ConditionalCheckFailedException:
+        return err("event_in_progress", 409,
+                   message="This Stripe event is already being processed. Retry later.")
+    except Exception as e:
+        print(f"[STRIPE] event claim failed: {e}")
+        return err("event_store_unavailable", 503)
+
+def stripe_event_finish(event_id, resp):
+    """Mark DONE on a 2xx, release the claim otherwise (so Stripe's retry runs)."""
+    key = "stripe_evt:" + event_id
+    status = int(resp.get("statusCode", 500))
+    try:
+        if 200 <= status < 300:
+            now = now_ts()
+            nonces_table().put_item(Item={"nonce": key, "state": "done", "done_at": now,
+                                          "result": str(status),
+                                          "expires": now + STRIPE_EVENT_TTL_S,
+                                          "ttl": now + STRIPE_EVENT_TTL_S})
+        else:
+            nonces_table().delete_item(Key={"nonce": key})
+    except Exception as e:
+        # Worst case: a later replay re-runs the (idempotent) handler once more.
+        print(f"[STRIPE] event marker update failed event={event_id}: {e}")
+    return resp
+
+def with_stripe_event_dedup(event, handler):
+    """Wrap a bot handler with event-id dedup when the Worker supplied one."""
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except Exception:
+        return handler(event)
+    event_id = body.get("stripe_event_id") if isinstance(body, dict) else None
+    if event_id in (None, ""):
+        return handler(event)
+    if require_bot(event) != WORKER_BOT_CONSUMER:
+        return err("forbidden", 403)
+    if not _valid_stripe_event_id(event_id):
+        return err("invalid_event_id", 400)
+    early = stripe_event_begin(event_id)
+    if early is not None:
+        return early
+    try:
+        resp = handler(event)
+    except Exception:
+        stripe_event_finish(event_id, {"statusCode": 500})
+        raise
+    return stripe_event_finish(event_id, resp)
+
 def handle_bot_chargeback(event):
+    return with_stripe_event_dedup(event, _handle_bot_chargeback)
+
+def _handle_bot_chargeback(event):
     """POST /api/bot/chargeback — §6: refunded / disputed / chargebacked revoke the
     key, audit `webhook.chargeback` and alert the owner."""
     consumer = require_bot(event)
@@ -5082,8 +5593,20 @@ def handle_bot_chargeback(event):
                      and (not subscription_id
                           or row.get("stripe_subscription_id") == subscription_id)]
         item = _newest_active(paid_rows)
+        if not item and subscription_id and any(
+                bool(r.get("revoked", False)) or r.get("status") == "revoked"
+                for r in paid_rows):
+            # [rc1 RT-LOW-04] a replay (or a second Stripe event for the same ended
+            # subscription) after the revoke already landed: same terminal state,
+            # so a quiet 200 - no second audit row, no second owner alert, and no
+            # 404 that would make Stripe retry for three days.
+            print(f"[INFO] chargeback replay: subscription already revoked kind={kind}")
+            return ok({"ok": True, "revoked": True, "already_revoked": True, "kind": kind})
     if item and subscription_id and item.get("stripe_subscription_id") != subscription_id:
         return err("subscription_mismatch", 403)
+    if item and key_in and (bool(item.get("revoked", False)) or item.get("status") == "revoked"):
+        return ok({"ok": True, "revoked": True, "already_revoked": True,
+                   "license_key_suffix": item["license_key"][-4:], "kind": kind})
     if not item:
         audit(actor, "webhook.chargeback", result="invalid_key", target_type="license",
               reason=reason, details={"kind": kind})
@@ -5120,6 +5643,22 @@ def handle_bot_chargeback(event):
 
 # ── router ────────────────────────────────────────────────────────────────────
 def lambda_handler(event, context):
+    """[rc1 RT-HIGH-07 / RT-CRIT-01] A REQUIRED audit write (audit_attempt) or a
+    security-config read (config_get_strict) that fails raises out of the handler
+    BEFORE any mutation; it is answered here as a retriable 503 so no route can
+    mutate state without its durable attempt row or fall back to a permissive
+    owner default."""
+    try:
+        return _lambda_route(event, context)
+    except AuditUnavailable as e:
+        print(f"[ERROR] destructive mutation refused, audit unavailable: {e}")
+        return err("audit_unavailable", 503, message=AUDIT_UNAVAILABLE_MESSAGE)
+    except ConfigUnavailable as e:
+        print(f"[ERROR] security config unavailable key={e}")
+        return err("config_unavailable", 503,
+                   message="Security settings could not be read. Retry shortly.")
+
+def _lambda_route(event, context):
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET").upper()
     path   = event.get("rawPath", "") or event.get("path", "")
 

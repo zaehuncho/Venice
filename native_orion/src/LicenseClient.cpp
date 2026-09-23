@@ -259,6 +259,15 @@ bool isLicenseKillCode(const QString& code)
 QString licenseErrorUserText(const LicenseResult& result, const QString& fallback)
 {
     const QString& code = result.error;
+    // [2026-09-23 RT-MED-10 / P-A] The owner's kill switch is a service pause, never a network
+    // problem; and an unreadable kill state / config is a retriable outage the launcher rides out
+    // on its existing bounded lease.
+    if (code == QLatin1String("service_disabled") || code.startsWith(QLatin1String("service_disabled:"))) {
+        return QStringLiteral("Venice is paused by the service right now. Nothing is wrong with your PC or internet.");
+    }
+    if (code == QLatin1String("kill_state_unavailable") || code == QLatin1String("config_unavailable")) {
+        return QStringLiteral("Venice's service can't confirm your access right now. Retrying automatically.");
+    }
     if (code == QLatin1String("frozen")) {
         return QStringLiteral("Your subscription is paused — contact support.");
     }
@@ -266,7 +275,7 @@ QString licenseErrorUserText(const LicenseResult& result, const QString& fallbac
         return QStringLiteral("This device is blocked.");
     }
     if (code == QLatin1String("subscription_required")) {
-        return QStringLiteral("An active Venice subscription tied to your Discord account is required. Run /purchase or open a ticket.");
+        return QStringLiteral("An active Venice subscription tied to your Discord account is required. Start your trial or subscribe at zaeorion.com, or open a ticket.");
     }
     if (code == QLatin1String("version_blocked")) {
         const QString minimum = result.minClientVersion.trimmed();

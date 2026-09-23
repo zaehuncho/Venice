@@ -32,10 +32,29 @@ Item {
     // the most specific rule wins. tests/test_venice_ui_contract.py runs this
     // function under node against every known message.
     // HINT-FN-BEGIN
+    // [RT-MED-10 / CL3-F8-008 2026-09-23] The owner's service pause (global kill switch)
+    // arrives at activation as the bare code "service_disabled: <reason>". It is NOT a
+    // network problem: say so, and never send the customer to reset their router.
+    function isServicePaused(m) {
+        return /service_disabled|paused by the service|service is paused|global_kill/.test(m)
+    }
+    // The error card's body text. Mapped copy and server prose pass through unchanged;
+    // only raw codes that would otherwise show verbatim are replaced.
+    function displayMessage(message) {
+        var raw = message || ""
+        var m = raw.toLowerCase()
+        if (isServicePaused(m))
+            return "Venice is paused by the service right now. Nothing is wrong with your PC or internet."
+        if (/^tls verification failed\.?$|^pinned server certificate did not match\.?$/.test(m))
+            return "Couldn't make a secure connection to Venice's servers."
+        return raw
+    }
     function hintFor(message) {
         var m = (message || "").toLowerCase()
         if (m.length === 0)
             return ""
+        if (isServicePaused(m))
+            return "Check #announcements in the Venice Discord for when it's back, then press Unlock again."
         // The message already says exactly what to do: no second line.
         if (/discord id is public|clock is off|timestamp_expired|paused|frozen|contact support/.test(m))
             return ""
@@ -55,7 +74,12 @@ Item {
             return "That one-time code is invalid, expired, or already used. Open Connect Discord again for a fresh code."
         if (/expire|trial_used|revoked/.test(m))
             return "Your trial or subscription has ended. Run /status in Discord or renew on the Venice website."
-        if (/timed out|timeout|network|could not connect|couldn't connect|connection (refused|closed|reset|failed)|host .*not found|offline|unreach|tls|ssl|certificate|could not be checked|entitlement_unavailable|internal_error|service_disabled/.test(m))
+        // [CL3-F8-012 2026-09-23] A PC clock that is days or years off breaks the secure
+        // connection before the server can say "clock is off" (timestamp_expired), so a TLS or
+        // certificate failure names the clock first.
+        if (/tls|ssl|certificate|secure connection/.test(m))
+            return "Check that your PC's date and time are correct (Windows Settings > Time & language > Set time automatically), then try again. If they are, check your internet connection."
+        if (/timed out|timeout|network|could not connect|couldn't connect|connection (refused|closed|reset|failed)|host .*not found|offline|unreach|could not be checked|entitlement_unavailable|internal_error/.test(m))
             return "Couldn't reach Venice's servers. Check your internet connection and try again in a moment."
         return ""
     }
@@ -344,7 +368,7 @@ Item {
                     }
                     Text {
                         Layout.fillWidth: true
-                        text: orion.authMessage
+                        text: root.displayMessage(orion.authMessage)
                         color: Theme.textSecondary
                         font.family: Theme.fontUi
                         font.pixelSize: Theme.fontSmall
@@ -366,7 +390,7 @@ Item {
 
             Text {
                 Layout.fillWidth: true
-                text: orion.authMessage
+                text: root.displayMessage(orion.authMessage)
                 visible: text.length > 0 && !cardCol.showErrorCard
                 color: orion.authBusy ? Theme.textSecondary : Theme.textMuted
                 font.family: Theme.fontUi

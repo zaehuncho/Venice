@@ -133,12 +133,14 @@ def _uninstall_delete_section() -> str:
     return m.group(1)
 
 
-def test_uninstall_purges_the_whole_install_tree():
+def test_uninstall_never_recursively_erases_the_install_tree():
+    # [RT-HIGH-01 / Codex P-B 2026-09-23] Uninstall must never recursively erase {app}: a
+    # pre-existing or reused folder can hold unrelated files. Inno removes every file it
+    # installed (including packet_bridge\ VeniceNetSvc.exe + WinDivert64.dll/.sys, which are
+    # [Files] entries), then {app} goes only if it is empty.
     section = _uninstall_delete_section()
-    assert r'Type: filesandordirs; Name: "{app}"' in section, (
-        "the {app} purge is what removes runtime-created files AND the "
-        "packet_bridge\\ sub-tree (VeniceNetSvc.exe + WinDivert64.dll/.sys)"
-    )
+    assert r'Type: filesandordirs; Name: "{app}"' not in section
+    assert r'Type: dirifempty; Name: "{app}"' in section
 
 
 def test_uninstall_removes_bridge_token_files():

@@ -10,6 +10,17 @@ Item {
 
     readonly property bool locked: admin.securityLockActive
 
+    // Owner-role staff rows need a fresh owner code at sign-in while owner TOTP is
+    // required (rc1 RT-CRIT-01). Blank for support/admin: nothing is sent. The
+    // field is wiped as soon as the controller has it.
+    function submitStaff() {
+        if (admin.busy || staffIdField.text.length === 0)
+            return
+        const code = ownerCodeField.text
+        ownerCodeField.text = ""
+        admin.staffLogin(staffIdField.text, code)
+    }
+
     function submitOwner() {
         if (admin.busy)
             return
@@ -137,7 +148,20 @@ Item {
                 label: "Staff ID"
                 iconText: "S"
                 placeholderText: "staff_xxxxxxxx (from the owner)"
-                onAccepted: admin.staffLogin(staffIdField.text)
+                onAccepted: root.submitStaff()
+            }
+
+            AdminField {
+                id: ownerCodeField
+                label: admin.staffLoginNeedsCode ? "Owner code (required for this account)" : "Owner code (owner accounts only)"
+                iconText: "#"
+                maximumLength: 8
+                inputMethodHints: Qt.ImhDigitsOnly
+                placeholderText: admin.staffLoginNeedsCode ? "fresh 6-digit code" : "leave blank unless you are an owner"
+                hint: admin.staffLoginNeedsCode
+                      ? "Enter the current code from the owner authenticator. Each code works once."
+                      : "Owner accounts need a fresh code from the owner authenticator. It is not saved."
+                onAccepted: root.submitStaff()
             }
 
             AdminField {
@@ -167,7 +191,7 @@ Item {
                     kind: "primary"
                     text: admin.busy ? "Signing in..." : "Sign in"
                     enabled: !admin.busy && !root.locked && staffIdField.text.length > 0
-                    onClicked: admin.staffLogin(staffIdField.text)
+                    onClicked: root.submitStaff()
                 }
             }
         }

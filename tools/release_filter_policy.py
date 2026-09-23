@@ -48,6 +48,12 @@ FORBIDDEN_PATH_COMPONENTS = frozenset(
         "redteam_sandbox",
         "settings.json",
         "settings.json.sig",
+        # [RT-MED-09 2026-09-23] the settings save/sign transaction's per-user files.
+        "settings.json.prev",
+        "settings.json.prev.sig",
+        "settings.json.txn",
+        "settings.signed-once",
+        "settings.rejected.json",
         "starzen re",
         "adaptive_delay_plan.md",
     }
@@ -322,6 +328,11 @@ _TRANSIENT_TEST_TRANSCRIPT_RE = re.compile(
     r"tempo_focused[a-z0-9_.-]*|test_output[a-z0-9_.-]*)\.txt$"
 )
 
+# [RT-LOW-02 / CL3-F1-001 2026-09-23] Internal deploy/build journals. rc1 shipped
+# chiaki-ng-Win/DEPLOY_LOG.txt (build hashes, backup file names, red-team finding IDs)
+# inside the recursive Chiaki copy. Never a runtime input, in any casing or extension.
+_DEPLOY_JOURNAL_RE = re.compile(r"^(?:deploy|build)_log(?:[._-][a-z0-9_.-]*)?\.(?:txt|md)$")
+
 
 def is_debug_dll(path: Path) -> bool:
     """Identify actual MSVC debug DLL twins without name-only false positives."""
@@ -346,6 +357,8 @@ def is_forbidden_file_name(name: str) -> bool:
     if any(lower.endswith(suffix) for suffix in FORBIDDEN_NAME_SUFFIXES):
         return True
     if _TRANSIENT_TEST_TRANSCRIPT_RE.fullmatch(lower):
+        return True
+    if _DEPLOY_JOURNAL_RE.fullmatch(lower):
         return True
     if lower.endswith("tests.exe"):
         return True

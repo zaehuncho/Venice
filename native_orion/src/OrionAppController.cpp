@@ -3,6 +3,7 @@
 #include "ReleasePathPolicy.h"
 #include "LeadCalibrationPolicy.h"
 #include "OrionPaths.h"
+#include "GuiFreezeWatchdogPolicy.h"
 #include "PacketBridgeAuthority.h"
 #include "PacketBridgeServiceNames.h"  // [task #64] VeniceNetSvc/NexusVisionSvc resolution
 
@@ -33,6 +34,7 @@
 #include <QtCore/QRegularExpression>
 #include <QtCore/QSaveFile>
 #include <QtCore/QStandardPaths>
+#include <QtCore/QTemporaryFile>
 #include <QtCore/private/qzipwriter_p.h>
 #include "Diagnostics.h"
 #include "SidecarWatchdog.h"  // isCaptureCardSource / sidecarRestartDelayMs for the capture preview handoff
@@ -1952,28 +1954,56 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // proof even when it fires immediately rather than through the worker.
     automation_.setControllerRouteBindingRequired(true);
 
+    // [RT-MED-09 2026-09-23] Settings save + sign is a crash-safe transaction (see
+    // SecurityManager::beginSettingsWrite). Order at startup:
+    //   1. Finish or roll back a save that a crash/reboot interrupted, BEFORE load() reads it,
+    //      so the customer comes back on the exact old pair or the exact new pair.
+    //   2. If the pair verifies, load() inside a transaction: a settings_version migration
+    //      rewrites settings.json from VERIFIED content, and used to leave it unsigned (a lock
+    //      after every update that bumped kSettingsVersion). It is re-signed here.
+    //   3. One-time bootstrap only while this profile never held a verified pair (no signature
+    //      AND no signed-once marker). Deleting settings.json.sig later no longer gets whatever
+    //      is on disk signed at the next start; the customer uses Repair settings instead.
+    {
+        QString recoveryDetail;
+        const auto recovery = security_.recoverInterruptedSettingsWrite(&recoveryDetail);
+        if (recovery == SecurityManager::SettingsWriteRecovery::RolledBack) {
+            appendLog(QStringLiteral("Venice restored your last saved settings after an interrupted save."));
+        }
+        if (recovery != SecurityManager::SettingsWriteRecovery::NoJournal) {
+            appendLog(QStringLiteral("Settings engine detail: %1").arg(recoveryDetail));
+        }
+    }
+    const bool settingsPairValidBeforeLoad = security_.verifySettingsSignature();
+    if (settingsPairValidBeforeLoad) {
+        QString gateDetail;
+        (void)security_.beginSettingsWrite(&gateDetail);
+        if (!gateDetail.isEmpty()) {
+            appendLog(QStringLiteral("Settings engine detail: %1").arg(gateDetail));
+        }
+    }
     config_.load();
-
-    // [ORION_FIRST_RUN_SIG_BOOTSTRAP 2026-08-07] On a genuine first-ever launch after a
-    // fresh install, %LOCALAPPDATA%\Orion\ contains no settings.json.sig -- AppConfig::load()
-    // with no existing file just seeds data_ with defaults and writes nothing. The next
-    // updateSecurityStatus() then rejects the missing signature and Remote Play is locked
-    // out permanently, with no path to a save because every UI action that would trigger
-    // one is gated on the security check.
-    //
-    // Break the deadlock the one place both AppConfig and SecurityManager are in scope:
-    // if the sig file is absent, save the current (default) config and sign it in the same
-    // atomic step every other save site uses (OrionAppController.cpp:10981/10999). This
-    // does NOT weaken tamper detection -- on any subsequent launch the sig exists, so this
-    // block is skipped; and even if an attacker deletes only the sig, the following save
-    // signs the CURRENT settings.json (which they might have tampered with) exactly ONCE
-    // per launch, matching the semantics of a fresh install. To defend against that vector
-    // we would need a persistent "bootstrap already ran" marker outside the settings
-    // itself; deferred to POST_LAUNCH_HARDENING.md.
-    if (!security_.hasSettingsSignature()) {
+    if (settingsPairValidBeforeLoad) {
+        const bool rewrittenByLoad = !security_.verifySettingsSignature();
+        QString commitErr;
+        if (!security_.commitSettingsWrite(&commitErr)) {
+            appendLog(QStringLiteral("Settings engine detail: re-sign after load failed: %1").arg(commitErr));
+        } else if (rewrittenByLoad) {
+            appendLog(QStringLiteral("Settings engine detail: settings upgraded for this version and re-signed"));
+        }
+    } else if (security_.settingsBootstrapAllowed()) {
+        // First-ever launch on this profile. In a production build an unsigned settings.json
+        // that is already on disk is NOT signed as-is: bootstrap writes defaults (the only
+        // content this start can vouch for) and keeps the unsigned file aside for support.
+        AppConfigData bootData = config_.data();
+        if (security_.releaseManifestRequired()
+            && QFile::exists(orionDataDir(rootDir_) + QStringLiteral("/settings.json"))) {
+            (void)security_.preserveRejectedSettings(nullptr);
+            AppConfig defaults(rootDir_);
+            bootData = defaults.data();
+        }
         QString bootErr;
-        if (config_.save(config_.data(), &bootErr)) {
-            security_.writeSettingsSignature(&bootErr);
+        if (config_.save(bootData, &bootErr) && security_.commitSettingsWrite(&bootErr)) {
             appendLog(QStringLiteral("First-run: signed default settings"));
         } else {
             appendLog(QStringLiteral("First-run: failed to seed settings signature: %1")
@@ -2338,6 +2368,12 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             // Contract §5: /api/activate answers with the same CODES as the heartbeat;
             // frozen / blacklisted / version_blocked get their own copy here too.
             authMessage_ = licenseErrorUserText(result, QStringLiteral("License verification failed."));
+            // [RT-MED-10 / CL3-F8-008 2026-09-23] The service pause (global kill switch) is
+            // not a network fault; activation sends it as "service_disabled: <reason>".
+            if (result.error.startsWith(QLatin1String("service_disabled"))
+                || result.message.startsWith(QLatin1String("service_disabled"))) {
+                authMessage_ = QStringLiteral("Venice is paused by the service right now. Nothing is wrong with your PC or internet.");
+            }
             appendLog(QStringLiteral("License activation failed: %1").arg(authMessage_));
         }
         // License authority/cache mutation is a synchronous checkpoint. This
@@ -2432,6 +2468,11 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // copy; the other codes show the server's `message` prose as before.
         authMessage_ = licenseErrorUserText(
             result, QStringLiteral("Venice has been disabled. Check the Discord for updates."));
+        if (e == QLatin1String("service_disabled")) {
+            // [RT-MED-10 / CL3-F8-008 2026-09-23] Mid-session service pause: one plain line;
+            // the server's reason stays in the engineering line below.
+            authMessage_ = QStringLiteral("Venice is paused by the service right now. Nothing is wrong with your PC or internet.");
+        }
         // [CL2-P8-006/008 2026-09-23] authMessage_ may now be mapped customer copy;
         // keep the raw server code in the engineering log for support (the
         // "session disabled" line above is the customer event).
@@ -2992,7 +3033,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // shot epoch is the CV-independent proof that a shot happened at all. Counting armed
         // epochs that produce neither is what catches a wrong bar colour -- no detector-health
         // field is consulted, because a colour-blind detector reports perfect health.
-        observeMeterBlindness(shot_.physicalShotEpoch, rawMeterVisible);
+        // [RT-MED-04 / CL3-F8-009 2026-09-23] The engine's ACTIVE press epoch (owned shot or the
+        // still-pending METER press), not shot_.physicalShotEpoch, which only beginShot assigns.
+        observeMeterBlindness(automation_.activePhysicalPressEpoch(), rawMeterVisible);
         if (userLog_.enabled()) {
             if (visibilityNotice == UserMeterVisibilityNotice::Detected) {
                 userLog_.append(QStringLiteral("Shot meter detected on screen."));
@@ -3686,6 +3729,12 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     connect(&automation_, &AutomationEngine::shotGateDisarm, this,
             [this](quint64 physicalShotEpoch, const QString& reason) {
         remotePlay_.sendShotGateDisarm(physicalShotEpoch, reason);
+    });
+    // [RT-MED-04 / CL3-F4-007 2026-09-23] A completed METER press the meter never answered: the
+    // CV-independent input to the meter-blind warning / DETECTION UNAVAILABLE latch.
+    connect(&automation_, &AutomationEngine::meterPressUnanswered, this,
+            [this](quint64 physicalShotEpoch, double holdMs) {
+        observeMeterPressUnanswered(physicalShotEpoch, holdMs);
     });
 
     // Stage each release's timing intent, but do not teach the sidecar yet.  The existing seq-paired
@@ -4989,21 +5038,43 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // GUI-freeze watchdog: a worker thread monitors this heartbeat. A frozen
     // render/main thread can't protect the user, so the worker neutral-submits
     // and disarms directly; the GUI escalates to safe mode when it thaws.
-    guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
+    // [RT-MED-10 2026-09-23] Steady clock + suspend awareness (GuiFreezeWatchdogPolicy.h):
+    // sleep/resume and wall-clock steps no longer read as a GUI freeze.
+    guiHeartbeatMs_.store(gui_freeze::monotonicMs(), std::memory_order_relaxed);
     guiFreezeThread_ = std::thread([this]() {
+        gui_freeze::LoopState loopState;
+        int awakeSuspendFlagPolls = 0;
         while (!watchdogThreadStop_.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const qint64 watchdogNowMs = QDateTime::currentMSecsSinceEpoch();
-            const qint64 age = watchdogNowMs - guiHeartbeatMs_.load(std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(gui_freeze::kPollIntervalMs));
+            // A PBT_APMSUSPEND with no resume message (aborted suspend) must not park the
+            // watchdog forever: 60 s of polls on time while "suspended" clears the flag.
+            if (systemSuspended_.load(std::memory_order_relaxed)) {
+                if (++awakeSuspendFlagPolls > 120) {
+                    guiHeartbeatMs_.store(gui_freeze::monotonicMs(), std::memory_order_relaxed);
+                    systemSuspended_.store(false, std::memory_order_relaxed);
+                    awakeSuspendFlagPolls = 0;
+                }
+            } else {
+                awakeSuspendFlagPolls = 0;
+            }
+            const qint64 watchdogNowMs = gui_freeze::monotonicMs();
+            const gui_freeze::Verdict verdict = gui_freeze::evaluate(
+                loopState, watchdogNowMs, guiHeartbeatMs_.load(std::memory_order_relaxed),
+                guiFreezeSuppressUntilMs_.load(std::memory_order_relaxed),
+                systemSuspended_.load(std::memory_order_relaxed));
+            if (verdict == gui_freeze::Verdict::Suspended) {
+                // The whole process was paused (sleep/hibernate/VM pause), not the GUI thread.
+                // Give the GUI a fresh 6 s from now instead of reading the pause as a freeze.
+                guiHeartbeatMs_.store(watchdogNowMs, std::memory_order_relaxed);
+                continue;
+            }
             // [SAFE MODE] Stand down inside a declared, bounded blocking section (the disconnect
             // teardown — see guiFreezeSuppressUntilMs_). Checked BEFORE the exchange so a normal
             // disconnect doesn't even latch guiFreezeTripped_, which is what onWatchdogTick
             // escalates into the manual-recovery safe-mode latch. Nothing to protect there anyway:
             // disconnectRemotePlay() disarms the fire thread and the teardown neutrals + unplugs
             // the pad itself.
-            const bool inKnownBlock =
-                watchdogNowMs < guiFreezeSuppressUntilMs_.load(std::memory_order_relaxed);
-            if (age > 6000 && !inKnownBlock && !guiFreezeTripped_.exchange(true)) {
+            if (verdict == gui_freeze::Verdict::Trip && !guiFreezeTripped_.exchange(true)) {
                 // Cross-thread by design: armed_ is a single bool gate and the
                 // virtual-pad submit is serialized by submitMutex_ (same pattern
                 // as the precise fire thread).
@@ -5326,9 +5397,25 @@ bool OrionAppController::nativeEventFilter(const QByteArray& eventType, void* me
     // codes, to every top-level window). Never consumed: falls through below.
     if (eventType == "windows_generic_MSG" && message) {
         const auto* powerMsg = static_cast<const MSG*>(message);
+        if (powerMsg->message == WM_POWERBROADCAST && powerMsg->wParam == PBT_APMSUSPEND) {
+            // [RT-MED-10 2026-09-23] Going to sleep: park the GUI-freeze watchdog and make the
+            // pad safe NOW (the queued GUI work may not run before the system suspends). Same
+            // cross-thread-safe calls the freeze worker itself uses.
+            systemSuspended_.store(true, std::memory_order_relaxed);
+            automation_.setArmed(false);
+            disarmPreciseFire();
+            neutralizeOwnedInput();
+        }
         if (powerMsg->message == WM_POWERBROADCAST
             && (powerMsg->wParam == PBT_APMRESUMEAUTOMATIC || powerMsg->wParam == PBT_APMRESUMESUSPEND)) {
-            QMetaObject::invokeMethod(this, [this]() {
+            // Re-seed the heartbeat BEFORE un-parking the watchdog.
+            guiHeartbeatMs_.store(gui_freeze::monotonicMs(), std::memory_order_relaxed);
+            const bool wasSuspended = systemSuspended_.exchange(false, std::memory_order_relaxed);
+            QMetaObject::invokeMethod(this, [this, wasSuspended]() {
+                if (wasSuspended && remoteRunning_) {
+                    appendLog(QStringLiteral("Venice resumed from sleep. If the picture or your controller doesn't come back, press Disconnect, then Connect."));
+                }
+                syncEngineArmed();
                 requestImmediateLicenseHeartbeat(QStringLiteral("resumed from sleep"));
             }, Qt::QueuedConnection);
         }
@@ -5863,16 +5950,17 @@ void OrionAppController::startUpdate()
     // produced an updater that could not copy anything, wrote its own diagnostic to that same
     // unwritable directory, and failed invisibly.
     //
-    // Ask for elevation when the install dir is not writable by this account. Not unconditional:
-    // a per-user install needs no prompt, and prompting for one we do not need trains people to
-    // click through UAC. If elevation is declined or unavailable we fall back to the plain launch
-    // rather than refusing -- combined with the no-lockout guard above, the worst case is
-    // "update did not apply, app keeps working" instead of "app is gone".
+    // Ask for elevation when a real create/delete probe cannot write both the install
+    // and its parent (the verified helper/backup live beside the install). Qt's
+    // QFileInfo::isWritable() does not consult NTFS ACLs by default on Windows.
+    // If UAC is declined, keep this launcher running and the old install untouched.
     bool launched = false;
-    // The verified helper and backup are siblings of the install, not children
-    // of it. A writable install with an unwritable parent still needs elevation.
-    const bool installDirWritable = QFileInfo(installDir).isWritable()
-        && QFileInfo(QFileInfo(installDir).dir().absolutePath()).isWritable();
+    const auto canCreateAndRemove = [](const QString& directory) {
+        QTemporaryFile probe(QDir(directory).filePath(QStringLiteral(".venice-update-write-XXXXXX")));
+        return probe.open() && probe.remove();
+    };
+    const bool installDirWritable = canCreateAndRemove(installDir)
+        && canCreateAndRemove(QFileInfo(installDir).dir().absolutePath());
 #ifdef Q_OS_WIN
     if (!installDirWritable) {
         appendLog(QStringLiteral(
@@ -5899,8 +5987,11 @@ void OrionAppController::startUpdate()
         launched = ShellExecuteExW(&info) != FALSE;
         if (!launched) {
             appendLog(QStringLiteral(
-                "Update: elevation was declined or unavailable; attempting the update without "
-                "it. If it does not apply, Venice will keep running the current version."));
+                "Update: elevation was declined or unavailable; Venice is keeping the current "
+                "version running and no update files were changed."));
+            updateState_ = QStringLiteral("Administrator approval required");
+            emit statusChanged();
+            return;
         }
     }
 #else
@@ -6425,10 +6516,14 @@ void OrionAppController::enterSafeMode(const QString& reason)
     safeModeRecovery_.configure(kSafeModeStabilityWindowMs_, kSafeModeAutoRecoverMax_);
     safeModeRecovery_.onEnterSafeMode();
     syncEngineArmed();
-    appendLog(QStringLiteral("SAFE MODE: %1 — automation disarmed. Auto-recovers after %2s of a "
-                             "healthy stream (max %3/session); or exit safe mode manually.")
+    // [CL3-F8-003 2026-09-23] Same promise as the SAFE MODE dialog (TopStatusBar.qml). The
+    // "SAFE MODE:" prefix stays: tools/diagnostics/session_report.py keys on it.
+    appendLog(QStringLiteral("SAFE MODE: %1. Shots are paused. Venice usually turns them back on by itself "
+                             "once the stream has been steady for %2 seconds, or click SAFE MODE "
+                             "at the top, then Exit safe mode.")
                   .arg(reason)
-                  .arg(kSafeModeStabilityWindowMs_ / 1000)
+                  .arg(kSafeModeStabilityWindowMs_ / 1000));
+    appendLog(QStringLiteral("Safe mode engine detail: auto-recover budget %1/session")
                   .arg(kSafeModeAutoRecoverMax_));
     emit statusChanged();
 }
@@ -6451,7 +6546,7 @@ void OrionAppController::exitSafeMode()
 void OrionAppController::onWatchdogTick()
 {
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    guiHeartbeatMs_.store(now, std::memory_order_relaxed);
+    guiHeartbeatMs_.store(gui_freeze::monotonicMs(), std::memory_order_relaxed);
 
     // [ORION_INPUT_DEAD_UX] Periodic re-evaluation of the dead-input overlay. The direct pipe
     // can drop without a dedicated NOTIFY, and the press latch expires on wall clock; this 2 s
@@ -6462,7 +6557,7 @@ void OrionAppController::onWatchdogTick()
     // The freeze worker tripped while the GUI was stuck — escalate now that we
     // are demonstrably alive again (the trip already neutraled + disarmed).
     if (guiFreezeTripped_.load(std::memory_order_relaxed) && !safeModeActive_) {
-        enterSafeMode(QStringLiteral("UI thread froze for over 6 seconds"));
+        enterSafeMode(QStringLiteral("Venice's window stopped responding for a few seconds"));
         return;
     }
     if (safeModeActive_) {
@@ -6530,8 +6625,9 @@ void OrionAppController::onWatchdogTick()
 #endif
         if (orionMinimized) {
             if (!occlusionPauseLogged_) {
-                appendLog(QStringLiteral("Feed paused: Orion is minimized — the stream present is stalled; "
-                                         "automation resumes when you bring Orion to the foreground (no safe mode)."));
+                // [RT-LOW-01 2026-09-23] Customer copy says Venice, never the internal codename.
+                appendLog(QStringLiteral("Feed paused: Venice is minimized, so shots are paused. "
+                                         "They resume when you bring the Venice window back."));
                 occlusionPauseLogged_ = true;
             }
             frameStallSinceMs_ = 0;   // don't accumulate toward a restart/safe-mode while minimized
@@ -6547,11 +6643,14 @@ void OrionAppController::onWatchdogTick()
                    && now - lastWatchdogRestartMs_ > 30'000) {
             lastWatchdogRestartMs_ = now;
             frameStallSinceMs_ = 0;
-            tripWatchdog(QStringLiteral("Capture transport failed (transport age %1 ms, backend frozen=%2; detector frame age %3 ms, pixel age %4 ms)")
-                             .arg(transportAge, 0, 'f', 0)
-                             .arg(backendFrozen ? 1 : 0)
-                             .arg(frameAge, 0, 'f', 0)
-                             .arg(pixelAge, 0, 'f', 0));
+            // [CL3-F8-001 2026-09-23] The trip reason is customer copy (Activity feed and the
+            // SAFE MODE dialog's "Reason:"); the numbers go to an engineering line (rule 0).
+            appendLog(QStringLiteral("Watchdog engine detail: capture transport failed (transport age %1 ms, backend frozen=%2; detector frame age %3 ms, pixel age %4 ms)")
+                          .arg(transportAge, 0, 'f', 0)
+                          .arg(backendFrozen ? 1 : 0)
+                          .arg(frameAge, 0, 'f', 0)
+                          .arg(pixelAge, 0, 'f', 0));
+            tripWatchdog(QStringLiteral("The capture card stopped sending video"));
             if (!safeModeActive_) {
                 appendLog(QStringLiteral("Watchdog: restarting detection sidecar (capture transport failure)."));
                 restartSidecarWithWindowContainment();
@@ -6838,14 +6937,14 @@ QString OrionAppController::exportDiagnostics()
         files.insert(QStringLiteral("crash_dumps.txt"),
                      dumps.isEmpty() ? QStringLiteral("none\n") : dumps);
         files.insert(QStringLiteral("README.txt"),
-                     QStringLiteral("Orion diagnostics bundle.\n"
+                     QStringLiteral("Venice diagnostics bundle.\n"
                                     "All text files are redacted (license keys, tokens, emails stripped).\n"
                                     "crash_dumps/ contains raw minidumps (binary memory snapshots that\n"
                                     "cannot be redacted) — include them only if support asks for them.\n"));
     }
 
     const QString desktop = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
-    const QString zipPath = desktop + QStringLiteral("/orion_diagnostics_")
+    const QString zipPath = desktop + QStringLiteral("/venice_diagnostics_")
                             + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss"))
                             + QStringLiteral(".zip");
     QZipWriter zip(zipPath);
@@ -7635,7 +7734,16 @@ void OrionAppController::connectRemotePlay()
             ? QStringLiteral("%1 (server lease required)").arg(leaseGate_.stateText())
             : securityLockReason_;
         backendMessage_ = QStringLiteral("Security lock active: %1").arg(reason);
-        appendLog(QStringLiteral("Remote Play blocked by security lock: %1").arg(reason));
+        // [CL3-F8-006 2026-09-23] Customer line first; the raw lock reason is engineering-only
+        // (rule 0 "engine detail:"), so lease text never reaches the feed through here.
+        if (settingsRepairAvailable_) {
+            appendLog(ui_notifications::settingsRepairCustomerText());
+        } else if (leaseGate_.enabled() && !leaseGate_.fireAllowed()) {
+            appendLog(QStringLiteral("Remote Play: reconnecting to Venice servers — shots are paused until your subscription is confirmed. Usually a few seconds."));
+        } else {
+            appendLog(QStringLiteral("Remote Play: Venice's safety check didn't pass, so Connect is blocked (code ST-03). Restart Venice; if it repeats, reinstall from #downloads."));
+        }
+        appendLog(QStringLiteral("Security engine detail: Remote Play blocked by security lock: %1").arg(reason));
         emit statusChanged();
         return;
     }
@@ -8259,10 +8367,10 @@ void OrionAppController::finishRemotePlayTeardown()
     }
     if (remotePlayTeardownSynchronous_) {
         // Retained only for application exit and explicit internal recovery callers.
-        guiFreezeSuppressUntilMs_.store(QDateTime::currentMSecsSinceEpoch() + 20000,
+        guiFreezeSuppressUntilMs_.store(gui_freeze::monotonicMs() + 20000,
                                         std::memory_order_relaxed);
         remotePlay_.waitForStopped();
-        guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
+        guiHeartbeatMs_.store(gui_freeze::monotonicMs(), std::memory_order_relaxed);
         guiFreezeSuppressUntilMs_.store(0, std::memory_order_relaxed);
         if (!remotePlayTeardownActive_) return; // completion may have finalized us
     }
@@ -8294,7 +8402,7 @@ void OrionAppController::finishRemotePlayTeardown()
     }
 
     // Normal user teardown has remained event-driven; resume with a current heartbeat.
-    guiHeartbeatMs_.store(QDateTime::currentMSecsSinceEpoch(), std::memory_order_relaxed);
+    guiHeartbeatMs_.store(gui_freeze::monotonicMs(), std::memory_order_relaxed);
     guiFreezeSuppressUntilMs_.store(0, std::memory_order_relaxed);
     remotePlayTeardownDeferred_ = false;
     remotePlayTeardownActive_ = false;
@@ -8744,12 +8852,18 @@ void OrionAppController::clearInvalidLocalEntitlement()
 
 void OrionAppController::signSettings()
 {
+#ifdef ORION_PRODUCTION_BUILD
+    // [RT-MED-09 2026-09-23] Never an unconditional re-sign in a customer build: that would
+    // launder a hand-edited settings.json. Customers get the scoped repairSettings() instead.
+    appendLog(QStringLiteral("Settings engine detail: signSettings is not available in this build"));
+#else
     QString error;
     if (security_.writeSettingsSignature(&error)) {
         appendLog(QStringLiteral("Settings signature refreshed."));
     } else {
         appendLog(QStringLiteral("Settings signature failed: %1").arg(error));
     }
+#endif
     updateSecurityStatus();
 }
 
@@ -9378,7 +9492,10 @@ void OrionAppController::beginLeadCalibration()
     constexpr double kCalibrationStartMs = 300.0;
     leadCal_ = LeadCalibrationPolicy::begin(
         actuationLeadMs() > 0.0 ? actuationLeadMs() : kCalibrationStartMs);
-    leadCalStartLeadMs_ = actuationLeadMs();
+    // [RT-MED-01 / CL3-F4-009 2026-09-23] Snapshot the WHOLE tuple, not just the number: an Auto
+    // install is (0, user_set=false) and must come back as exactly that on Cancel.
+    leadCalStartLead_ = captureActuationLeadProvenance(config_.data());
+    leadCalWroteLead_ = false;
     leadCalActive_ = true;
     appendLog(QStringLiteral("Lead calibration started at %1 ms.").arg(qRound(leadCal_.leadMs)));
     emit leadCalibrationChanged();
@@ -9395,17 +9512,38 @@ void OrionAppController::cancelLeadCalibration()
     if (leadCal_.locked) {
         appendLog(QStringLiteral("Lead calibration finished: %1 ms saved after %2 shots.")
                       .arg(qRound(leadCal_.leadMs)).arg(leadCal_.shots));
-    } else if (leadCal_.shots > 0) {
+    } else if (leadCalWroteLead_) {
         // [2026-09-22 GM-006 / CX-007] Cancel means cancel: every graded step persisted as it
         // happened, so restore the lead the customer walked in with.
-        const double restoreMs = leadCalStartLeadMs_ > 0.0 ? leadCalStartLeadMs_ : actuationLeadMs();
-        setActuationLeadMs(restoreMs);
-        appendLog(QStringLiteral(
-            "Lead calibration cancelled after %1 shots; the lead is back at %2 ms.")
-                      .arg(leadCal_.shots).arg(qRound(restoreMs)));
+        // [RT-MED-01 / CL3-F4-009 2026-09-23] ...EXACTLY: lead, user_set and the route's stash
+        // entry, written verbatim. Not setActuationLeadMs(), which clamps 0 up to 150 and latches
+        // user_set=true -- that turned an Auto install into a pinned, ~120 ms-short user lead.
+        const QString restored = describeActuationLeadProvenance(leadCalStartLead_);
+        auto data = config_.data();
+        const ActuationLeadRestore outcome = restoreActuationLeadProvenance(data, leadCalStartLead_);
+        if (outcome == ActuationLeadRestore::RouteChanged) {
+            appendLog(QStringLiteral(
+                "Lead calibration cancelled after %1 shots; the video route changed during "
+                "calibration, so the current route's lead was left as it is (%2 ms).")
+                          .arg(leadCal_.shots).arg(qRound(actuationLeadMs())));
+        } else if (outcome == ActuationLeadRestore::Restored && !saveConfigSilently(data)) {
+            appendLog(QStringLiteral(
+                "Lead calibration cancelled after %1 shots, but the previous lead (%2) could not "
+                "be saved.")
+                          .arg(leadCal_.shots).arg(restored));
+        } else {
+            appendLog(QStringLiteral(
+                "Lead calibration cancelled after %1 shots; restored the lead to %2.")
+                          .arg(leadCal_.shots).arg(restored));
+            if (outcome == ActuationLeadRestore::Restored) {
+                // The banners counted during calibration belong to the abandoned values.
+                resetBannerTally();
+            }
+        }
     } else {
         appendLog(QStringLiteral("Lead calibration cancelled; the lead is unchanged."));
     }
+    leadCalWroteLead_ = false;
     emit leadCalibrationChanged();
 }
 
@@ -9432,6 +9570,7 @@ void OrionAppController::reportLeadCalibrationVerdict(const QString& verdict)
         // Persist every step, not only the lock: a user who closes the app mid-calibration keeps
         // the progress they made rather than silently reverting to where they started.
         setActuationLeadMs(leadCal_.leadMs);
+        leadCalWroteLead_ = true;   // [RT-MED-01] Cancel now has something to undo
     }
     appendLog(QStringLiteral(
         "Lead calibration: verdict=%1 lead %2 -> %3 ms step=%4 shots=%5 locked=%6")
@@ -11719,70 +11858,71 @@ void OrionAppController::observeMeterBlindness(quint64 physicalShotEpoch,
     // back on the meter path inherits a streak earned while the detector was not being asked a
     // question, and the customer feed shows a detector warning for a mode with no detector.
     if (config_.data().inputTimedEnabled) {
-        meterBlindStreak_ = 0;
-        meterBlindEpoch_ = 0;
-        meterBlindEpochSawMeter_ = false;
+        meterBlindLatch_.reset();
         meterBlindWarning_ = false;
+        if (detectionUnavailable_) {
+            detectionUnavailable_ = false;
+            automation_.setDetectionUnavailable(false);
+        }
         if (was) {
             emit meterBlindChanged();
         }
         return;
     }
 
-    // A genuine raw detection is PROOF the configured colour can be seen. Clear everything
-    // immediately -- this warning must never outlive the condition it describes.
+    // [RT-MED-04 / CL3-F8-009 2026-09-23] A genuine raw detection is evidence about the SHOT meter
+    // only while a press is in flight (physicalShotEpoch = the engine's active press epoch, owned
+    // or still pending). An idle sighting between shots -- a false lock, a replay, a HUD element --
+    // used to reset the streak here and could starve the trip forever; it is now ignored. The
+    // STREAK is fed by observeMeterPressUnanswered(), not by frames: in METER mode a press the
+    // detector never sees never begins a shot, so no frame-side epoch ever moved (CL3-F4-007).
     if (genuineRawDetection) {
-        meterBlindEpochSawMeter_ = true;
-        meterBlindStreak_ = 0;
-        // [CL2-P9-001 r2 2026-09-23, Codex] While the engine gate is latched the customer must keep
-        // seeing why the bot is not timing shots: one raw blip (possibly a false lock) clears the
-        // STREAK but not the warning. The warning clears with the gate, after 2 owned shots.
-        meterBlindWarning_ = detectionUnavailable_;
+        meterBlindLatch_.observeRawDetection(physicalShotEpoch);
+        // While latched the customer keeps seeing why the bot is not timing shots: one in-press
+        // blip clears the STREAK but not the warning ([CL2-P9-001 r2, Codex]).
+        meterBlindWarning_ = meterBlindLatch_.warning();
         if (was != meterBlindWarning_) {
+            appendLog(QStringLiteral("Meter detection recovered."));
             emit meterBlindChanged();
         }
-        return;
     }
+}
 
-    // Epoch 0 means no physical shot has been taken. Idle frames must not accumulate blindness:
-    // there is nothing to detect when the user is not shooting.
-    if (physicalShotEpoch == 0) {
-        return;
+void OrionAppController::observeMeterPressUnanswered(quint64 physicalShotEpoch, double holdMs)
+{
+    if (config_.data().inputTimedEnabled) {
+        return;   // NO METER: the detector was never asked (see observeMeterBlindness)
     }
+    applyMeterBlindLatchEvent(meterBlindLatch_.observeUnansweredPress(physicalShotEpoch, holdMs));
+}
 
-    if (physicalShotEpoch != meterBlindEpoch_) {
-        // A new physical shot began. Close out the previous one: if it ran its whole length
-        // without a single genuine detection, it counts toward the streak. meterBlindEpoch_ == 0
-        // is the cold start (no previous epoch to judge).
-        if (meterBlindEpoch_ != 0 && !meterBlindEpochSawMeter_
-            && meterBlindStreak_ < kMeterBlindStreakTrip_) {
-            ++meterBlindStreak_;
-        }
-        meterBlindEpoch_ = physicalShotEpoch;
-        meterBlindEpochSawMeter_ = false;
-    }
-
-    const bool blindTripped = meterBlindStreak_ >= kMeterBlindStreakTrip_;
-    // [CL2-P9-001 2026-09-23] Latch the engine gate on the trip; only owned shots clear it
-    // (observeBotOwnership).
-    if (blindTripped && !detectionUnavailable_) {
+void OrionAppController::applyMeterBlindLatchEvent(MeterBlindnessLatch::Event event)
+{
+    const bool was = meterBlindWarning_;
+    if (event == MeterBlindnessLatch::Event::Tripped && !detectionUnavailable_) {
         detectionUnavailable_ = true;
-        detectionRecoveryOwnedShots_ = 0;
-        detectionRecoveryLastEpoch_ = physicalShotEpoch;
         automation_.setDetectionUnavailable(true);
-        appendLog(QStringLiteral("DETECTION UNAVAILABLE: %1 armed shots with no meter - blind timer "
-                                 "shots are OFF until %2 owned shots prove detection is back.")
-                      .arg(meterBlindStreak_)
-                      .arg(kDetectionRecoveryOwnedShots_));
+        // [RT-MED-04 2026-09-23] Reworded: in METER mode the blind backstop is already held off
+        // by greenWindowPriority, so "blind timer shots are OFF" described nothing that changed.
+        appendLog(QStringLiteral(
+            "DETECTION UNAVAILABLE: %1 shot presses in a row got no meter - Venice is not timing "
+            "shots until %2 shots with a visible meter prove detection is back.")
+                      .arg(meterBlindLatch_.streak())
+                      .arg(MeterBlindnessLatch::kRecoveryOwnedShots));
+    } else if (event == MeterBlindnessLatch::Event::Recovered && detectionUnavailable_) {
+        detectionUnavailable_ = false;
+        automation_.setDetectionUnavailable(false);
+        appendLog(QStringLiteral("DETECTION RESTORED: %1 shots with a visible meter.")
+                      .arg(MeterBlindnessLatch::kRecoveryOwnedShots));
     }
-    // [CL2-P9-001 r2] The customer warning follows the GATE, not just the streak.
-    meterBlindWarning_ = blindTripped || detectionUnavailable_;
+    // [CL2-P9-001 r2] The customer warning follows the LATCH, not just the streak.
+    meterBlindWarning_ = meterBlindLatch_.warning();
     if (was != meterBlindWarning_) {
         // [2026-09-14 owner] The prefix was "NO METER:", which is now the name of a whole timing
         // MODE and the engine's own blind-release log tag — one grep, two unrelated meanings.
         appendLog(meterBlindWarning_
                       ? QStringLiteral("METER BLIND: %1 shots with no meter detected — %2")
-                            .arg(meterBlindStreak_)
+                            .arg(meterBlindLatch_.streak())
                             .arg(meterBlindHint())
                       : QStringLiteral("Meter detection recovered."));
         emit meterBlindChanged();
@@ -11794,24 +11934,16 @@ void OrionAppController::observeBotOwnership(const ShotContext& context)
     const bool takeoverState = context.state == HoldState::Armed
         || context.state == HoldState::Holding
         || context.state == HoldState::GreenWindow;
-    // [CL2-P9-001 2026-09-23] Count distinct OWNED meter shots while detection is latched off; two
-    // of them prove the meter is readable again.
-    if (detectionUnavailable_ && !context.inputTimedShot
-        && (context.state == HoldState::Holding || context.state == HoldState::GreenWindow)
-        && context.physicalShotEpoch != 0
-        && context.physicalShotEpoch != detectionRecoveryLastEpoch_) {
-        detectionRecoveryLastEpoch_ = context.physicalShotEpoch;
-        if (++detectionRecoveryOwnedShots_ >= kDetectionRecoveryOwnedShots_) {
-            detectionUnavailable_ = false;
-            automation_.setDetectionUnavailable(false);
-            appendLog(QStringLiteral("DETECTION RESTORED: %1 owned shots - blind backstop re-enabled.")
-                          .arg(detectionRecoveryOwnedShots_));
-            if (meterBlindWarning_ && meterBlindStreak_ < kMeterBlindStreakTrip_) {
-                meterBlindWarning_ = false;
-                appendLog(QStringLiteral("Meter detection recovered."));
-                emit meterBlindChanged();
-            }
-        }
+    // [CL2-P9-001 2026-09-23] Count distinct OWNED meter shots; two of them prove the meter is
+    // readable again. [RT-MED-04 / CL3-F4-007 2026-09-23] "Owned" now means VISION-owned: the shot
+    // genuinely saw and accepted its meter (meterSeenThisShot). A bare Holding state is not proof --
+    // a Go-To push enters Holding with release_reason=await_meter and no meter at all, and two of
+    // those used to clear the latch.
+    if (!context.inputTimedShot && context.meterSeenThisShot
+        && (context.state == HoldState::Holding || context.state == HoldState::GreenWindow
+            || context.state == HoldState::Releasing)
+        && context.physicalShotEpoch != 0) {
+        applyMeterBlindLatchEvent(meterBlindLatch_.observeVisionOwnedShot(context.physicalShotEpoch));
     }
     bool changed = false;
 
@@ -14319,8 +14451,8 @@ void OrionAppController::pollPhysicalController()
                                 lastWatchdogRestartMs_ = QDateTime::currentMSecsSinceEpoch();
 
                                 const QString faultReason = captureFailed
-                                    ? QStringLiteral("Direct controller input route and capture transport failed")
-                                    : QStringLiteral("Direct controller input route remained unavailable after three input-only recoveries");
+                                    ? QStringLiteral("The controller link and the capture card both stopped")
+                                    : QStringLiteral("The controller link kept dropping");
                                 tripWatchdog(faultReason);
                                 setControllerLifecycle(
                                     ControllerLifecycleState::ControllerFault,
@@ -15308,15 +15440,76 @@ void OrionAppController::flushPendingLogs()
     }
 }
 
+// [RT-MED-09 2026-09-23] Gate for every customer settings save. Refused = the pair on disk is
+// already missing/invalid outside the one-time bootstrap (a damaged or hand-edited file). A
+// production save must not sign that content by writing a slider change on top of it: the
+// in-memory config was LOADED from the rejected file. Repair settings is the only way out.
+bool OrionAppController::beginSignedSettingsSave()
+{
+    QString detail;
+    const auto gate = security_.beginSettingsWrite(&detail);
+    if (gate == SecurityManager::SettingsWriteGate::Refused) {
+        if (!settingsSaveRefusedLogged_) {
+            settingsSaveRefusedLogged_ = true;
+            appendLog(ui_notifications::settingsRepairCustomerText());
+        }
+        appendLog(QStringLiteral("Settings engine detail: %1").arg(detail));
+        return false;
+    }
+    if (!detail.isEmpty()) {
+        appendLog(QStringLiteral("Settings engine detail: %1").arg(detail));
+    }
+    return true;
+}
+
+// [RT-MED-09 2026-09-23] Customer "Repair settings". Narrow on purpose:
+//  - only while the settings signature is missing/invalid (never a general re-sign button);
+//  - never signs the rejected file: it is copied aside (settings.rejected.json) for support and
+//    replaced by factory defaults, which are then saved + signed through the normal commit;
+//  - learning.json (the measured timing) is a separate file and is not touched.
+void OrionAppController::repairSettings()
+{
+    if (security_.verifySettingsSignature()) {
+        settingsRepairAvailable_ = false;
+        emit statusChanged();
+        return;
+    }
+    if (remoteRunning_) {
+        appendLog(QStringLiteral("Disconnect first, then press Repair settings."));
+        return;
+    }
+    QString keptAt;
+    (void)security_.preserveRejectedSettings(&keptAt);
+    AppConfig defaults(rootDir_);
+    QString error;
+    if (!config_.save(defaults.data(), &error) || !security_.commitSettingsWrite(&error)) {
+        appendLog(QStringLiteral("Repair settings didn't finish (code ST-02). Restart Venice and press Repair settings again; if it repeats, open a ticket in the Venice Discord."));
+        appendLog(QStringLiteral("Settings engine detail: repair failed: %1").arg(error));
+        updateSecurityStatus();
+        return;
+    }
+    settingsSaveRefusedLogged_ = false;
+    appendLog(QStringLiteral("Settings repaired: Venice is back on its default settings. Your shot timing history was kept. Check Shot Lead and your meter style, then press Connect."));
+    if (!keptAt.isEmpty()) {
+        appendLog(QStringLiteral("Settings engine detail: rejected settings kept at %1").arg(keptAt));
+    }
+    syncBackendConfig();
+    updateSecurityStatus();
+    emit settingsChanged();
+}
+
 bool OrionAppController::saveConfigSilently(const AppConfigData& data)
 {
+    if (!beginSignedSettingsSave()) {
+        return false;
+    }
     QString error;
     if (!config_.save(data, &error)) {
         appendLog(QStringLiteral("Settings save failed: %1").arg(error));
         return false;
     }
     QString signatureError;
-    if (!security_.writeSettingsSignature(&signatureError)) {
+    if (!security_.commitSettingsWrite(&signatureError)) {
         appendLog(QStringLiteral("Settings signature failed: %1").arg(signatureError));
     }
 
@@ -15332,13 +15525,16 @@ bool OrionAppController::saveConfigSilently(const AppConfigData& data)
 
 void OrionAppController::persistConfig(const AppConfigData& data, const QString& successMessage)
 {
+    if (!beginSignedSettingsSave()) {
+        return;
+    }
     QString error;
     if (!config_.save(data, &error)) {
         appendLog(QStringLiteral("Settings save failed: %1").arg(error));
         return;
     }
     QString signatureError;
-    if (!security_.writeSettingsSignature(&signatureError)) {
+    if (!security_.commitSettingsWrite(&signatureError)) {
         appendLog(QStringLiteral("Settings signature failed: %1").arg(signatureError));
     }
     syncBackendConfig();
@@ -15493,6 +15689,9 @@ void OrionAppController::applySecurityStatus(const SecurityStatus& status)
     lastSecurityAuditEvent_ = status.lastSecurityAuditEvent.isEmpty() ? lastSecurityAuditEvent_ : status.lastSecurityAuditEvent;
     securityLockActive_ = status.securityLockActive;
     securityLockReason_ = status.securityLockReason.isEmpty() ? QStringLiteral("-") : status.securityLockReason;
+    // [RT-MED-09] The repair banner is offered only when the settings signature is the lock.
+    settingsRepairAvailable_ = status.securityLockActive && !status.settingsSignatureValid
+        && status.securityLockReason == QLatin1String("Settings signature missing or invalid");
 #ifndef ORION_PRODUCTION_BUILD
     if (securityLockActive_ && licenseState_ == QLatin1String("Local Dev") && localDevAllowed()
         && status.evaluationComplete && !status.releaseManifestRequired) {

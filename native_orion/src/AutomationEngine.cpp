@@ -8638,6 +8638,12 @@ void AutomationEngine::processIdle(ControllerState& output, const ControllerStat
                                       .arg(backstopBlock.isEmpty()
                                                ? QStringLiteral("user_released")
                                                : backstopBlock));
+            // [RT-MED-04 / CL3-F4-007 2026-09-23] The same terminal, as a signal: the controller's
+            // meter-blind latch counts completed METER presses the meter never answered (this
+            // branch is the only one with no evidence of any kind). Observational; the physical
+            // release above/below is unchanged.
+            emit meterPressUnanswered(pendingSquarePhysicalEpoch_,
+                                      squareHoldStartMs_ >= 0.0 ? now - squareHoldStartMs_ : -1.0);
         }
         // [ORION_SHOT_GATE_RELEASE 2026-09-15] MANUAL CANCEL. The player let go before the bot
         // ever owned the press: a tap, a pump fake, or a shot the detector never saw. No release
@@ -13309,9 +13315,10 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
                                   .arg(shot_.armToken)
                                   .arg(shot_.physicalShotEpoch));
         lastReleaseOnsetFfMs_ = ffMs;
-    } else {
-        lastReleaseOnsetFfMs_ = 0.0;
     }
+    // [RT-MED-02 2026-09-23] No else-branch zeroing any more: lastReleaseOnsetFfMs_ was already
+    // normalised above to what THIS release carried, and with the configured gain at 0 a dev A/B
+    // arm can still have displaced it (CL2-P6-002). Zeroing it here unfenced every learner below.
     // Open the post-release meter capture: collect the bot's own settled meter for the next
     // ~1.2s and calibrate the per-type clock from where the release actually landed vs green.
     if (!latencyCalibrationRelease) {
@@ -13354,14 +13361,16 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     lastReleaseVisionConfident_ = visionTimed
         && shot_.visionFreshAtRelease
         && shot_.confidence >= config_.leadLearnVisionConfGate
-        && !devFireOffsetArmed_;
+        && !releaseLearningDisplaced();   // [RT-MED-02] dev sweep OR onset feedforward
     // [TIMING FINDING 3] Stamp the raw vision-vs-feedforward timing of this release so the
     // per-type calibrator (runs ~1.2s later, shot_ already reset) can attribute the outcome to
     // the ONE knob its fire path actually read (offset for vision, clock for feedforward).
     lastReleaseWasVisionTimed_ = visionTimed;
     // [ORION_DEV_FIRE_OFFSET] holdStart->release and meterSeen->release both RIDE the release
     // instant, so a commanded displacement would be seeded straight into the per-type clocks.
-    if (shot_.holdStartMs > 0.0 && visionTimed && !devFireOffsetArmed_) {
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] ...and an onset-feedforward displacement is the same
+    // commanded displacement for these clocks: fenced on releaseLearningDisplaced().
+    if (shot_.holdStartMs > 0.0 && visionTimed && !releaseLearningDisplaced()) {
         // Orion 13.1: use PTS-corrected times so variable pipe latency (2-5ms)
         // doesn't corrupt the learned clock. Both endpoints are corrected by
         // their respective frame ages, so the difference is the true animation
@@ -13401,7 +13410,8 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     // are sanity-banded against it in processHolding. Fenced with the other learners while
     // the dev fire-offset sweep is armed (a displaced release samples the rise at a
     // displaced instant).
-    if (visionTimed && !devFireOffsetArmed_) {
+    // [RT-MED-02] The rise is sampled at the (possibly feedforward-displaced) release instant.
+    if (visionTimed && !releaseLearningDisplaced()) {
         const double v = sampler_.velocityPctPerMs();
         if (v > 0.001 && v < 2.0) {
             double& prior = config_.shotTypeVelocityPriorPctMs[shot_.bucketKey];
@@ -13426,7 +13436,8 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
         // global appear->tip/hold->release/rise model). With ORION_FREEZE_CAL default-on (the
         // shipped live default) they now hold at their learning.json values; freeze OFF keeps
         // the self-learning exactly as before.
-        if (visionTimed && !isGotoRel && !config_.calibrationFrozen
+        // [RT-MED-02] The global clocks ride the release instant exactly like the per-type ones.
+        if (visionTimed && !isGotoRel && !config_.calibrationFrozen && !releaseLearningDisplaced()
                 && (config_.autonomousVision || config_.autonomousVisionShadow)) {
             bool changed = false;
             const double v = sampler_.velocityPctPerMs();
@@ -19203,6 +19214,10 @@ void AutomationEngine::startPostReleaseMeterCapture(double now)
     // and a sign error there walks the owner's aim on live shots. Losing a handful of samples is
     // strictly cheaper than that.
     meterCapLateFireMs_ = shot_.lateFireLatenessMs;
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] ...and the onset-feedforward displacement, sampled HERE
+    // (triggerRelease normalised it a moment ago to what this release carried) so the delayed
+    // press->tip / hold learners judge THIS release, not whichever one fired last.
+    meterCapOnsetFfMs_ = lastReleaseOnsetFfMs_;
     // [ORION_VISION_HOLD_BAND 2026-09-15] ...and whether the band displaced this release, in the
     // same sample-and-hold and for the same reason. The fence it buys is sharper than the
     // late-fire one: the press->release hold learner (no_meter_hold_by_type) is the source of the
@@ -22302,8 +22317,12 @@ void AutomationEngine::emitPressTipObservation(int seq, const QString& shotType,
         || !meterCapHoldBandKind_.isEmpty()) {
         return;
     }
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] The hold is press->release, and a feedforward-displaced
+    // release moved the release end by the displacement: fenced like the dev sweep. (Six of six
+    // FF-applied epochs in session_20260923_120043 were accepted here before this fence.)
     if (graded && meterCapPressWallMs_ >= 0.0 && meterCapReleaseWallMs_ >= 0.0
         && meterCapPhysicalEpoch_ != 0 && !devFireOffsetArmed_
+        && meterCapOnsetFfMs_ == 0.0
         && !(meterCapAppliedDelayMs_ > 0.0)) {
         recordNoMeterHoldObservation(shotType, meterCapReleaseWallMs_ - meterCapPressWallMs_);
     }
@@ -22369,7 +22388,10 @@ void AutomationEngine::emitPressTipObservation(int seq, const QString& shotType,
     // walk it by ~130 ms per delayed session and then fire delay-0 shots off the poisoned
     // value. Log it (the census wants it, and the observation is what a future delay-keyed
     // prior would be built from), never learn it.
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] ...and the same for an onset-feedforward displacement:
+    // the stop rides the displaced release. Logged (accepted=0), never learned.
     const bool accepted = weight > 0.0 && inBand && !devFireOffsetArmed_
+        && meterCapOnsetFfMs_ == 0.0
         && !(meterCapAppliedDelayMs_ > 0.0);
     // The shot-type label travels underscore-joined ("Left Fade" -> "Left_Fade") because this
     // schema places it mid-line; the space-bearing form is reserved for trailing shot= fields.

@@ -36,7 +36,7 @@ def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _sign_release(root: Path, key, *, listed: set[str]) -> None:
+def _sign_release(root: Path, key, *, listed: set[str], version: str) -> None:
     files = {}
     for rel in sorted(listed):
         path = root / rel
@@ -44,6 +44,9 @@ def _sign_release(root: Path, key, *, listed: set[str]) -> None:
     manifest = {
         "schema": "orion.release_manifest.v1", "signature_alg": "ed25519",
         "signature_required": True, "public_key_id": "orion-updater-fixture-v1",
+        # [RT-MED-08 2026-09-23] The updater takes the installed version from the VERIFIED
+        # installed manifest (never --current-version), exactly like a packaged release.
+        "version": version,
         "files": files,
     }
     raw = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
@@ -83,7 +86,7 @@ def test_staged_updater_full_copy_or_exact_rollback(tmp_path, inject_failure):
 
     key = Ed25519PrivateKey.from_private_bytes(hashlib.sha256(b"orion-a6-offline-fixture").digest())
     pub = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    _sign_release(install, key, listed=old_listed)
+    _sign_release(install, key, listed=old_listed, version="1.0.0")
     old_inventory = _inventory(install, old_listed)
     old_manifest_hashes = {name: _hash(install / name) for name in ("release_manifest.json", "release_manifest.sig")}
 
@@ -95,7 +98,7 @@ def test_staged_updater_full_copy_or_exact_rollback(tmp_path, inject_failure):
         with (new / rel).open("ab") as file:
             file.write(b"\nupdated-overlay\n")
     new_listed = old_listed - {"plugins/retired.dll"}
-    _sign_release(new, key, listed=new_listed)
+    _sign_release(new, key, listed=new_listed, version="1.0.1")
     expected_new = _inventory(new, new_listed)
 
     artifact = tmp_path / "artifact.zip"

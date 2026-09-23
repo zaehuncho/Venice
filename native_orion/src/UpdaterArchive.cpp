@@ -6,6 +6,7 @@
 #include <QtCore/QFileInfo>
 #include <QtCore/QCryptographicHash>
 #include <QtCore/QSet>
+#include <QtCore/QThread>
 
 #include <QtCore/private/qzipreader_p.h>
 
@@ -26,6 +27,18 @@ constexpr Qt::CaseSensitivity kPathCase = Qt::CaseSensitive;
 // The updater's own log lives inside the install dir and is appended to while an
 // apply/rollback is in flight; an exact restore must never delete it.
 const QLatin1String kUpdaterLogName("orion_updater.log");
+QString fileSha256(const QString& path);
+
+bool retrySharingViolation(const QString& path)
+{
+    // A scanner/backup handle may release shortly after the ownership barrier.
+    // Bounded retries also cover a lock that appears between preflight and apply.
+    for (int attempt = 0; attempt < 60; ++attempt) {
+        if (QFile::remove(path) || !QFileInfo::exists(path)) return true;
+        QThread::msleep(100);
+    }
+    return false;
+}
 
 QString normalizeSeparators(const QString& value)
 {
@@ -150,7 +163,8 @@ bool refuseReparse(const QString& destRoot, const QString& path, QString* error)
 // refusing: a link planted at apply time is tamper, and the rollback handles it.
 bool copyDirContents(const QString& srcDir, const QString& destDir, const QString& destRoot,
                      QStringList* relWritten, const QString& relPrefix, QString* error,
-                     bool skipTopLevelUpdaterLog = false, bool replacePlantedReparse = false)
+                     bool skipTopLevelUpdaterLog = false, bool replacePlantedReparse = false,
+                     bool skipIdenticalFiles = false)
 {
     QDir source(srcDir);
     if (!source.exists()) {
@@ -206,7 +220,7 @@ bool copyDirContents(const QString& srcDir, const QString& destDir, const QStrin
         }
         if (entry.isDir()) {
             if (!copyDirContents(entry.absoluteFilePath(), destPath, destRoot, relWritten, rel, error, false,
-                                 replacePlantedReparse)) {
+                                 replacePlantedReparse, skipIdenticalFiles)) {
                 return false;
             }
             continue;
@@ -219,9 +233,18 @@ bool copyDirContents(const QString& srcDir, const QString& destDir, const QStrin
         if (refuseReparse(destRoot, destPath, error)) {
             return false;
         }
+        // During restore a held retired file may already equal the backup.
+        // Do not demand delete access for a file that does not need replacing.
+        if (skipIdenticalFiles && QFileInfo::exists(destPath)
+            && entry.size() == QFileInfo(destPath).size()) {
+            const QString sourceHash = fileSha256(entry.absoluteFilePath());
+            if (!sourceHash.isEmpty() && sourceHash == fileSha256(destPath)) {
+                continue;
+            }
+        }
         // Removing an existing name first also detaches a hardlink: the copy below then
         // creates a fresh file, and the other link's data is untouched (pinned by test).
-        if (QFile::exists(destPath) && !QFile::remove(destPath)) {
+        if (QFile::exists(destPath) && !retrySharingViolation(destPath)) {
             if (error) {
                 *error = QStringLiteral("Could not overwrite: %1").arg(QDir::toNativeSeparators(destPath));
             }
@@ -592,7 +615,7 @@ bool restoreTree(const QString& backupDir, const QString& destDir, QString* erro
     // files before the entry that failed; leaving them behind would fail the release-
     // integrity manifest (unmanifested runtime files) or leave a loadable stale DLL.
     if (!copyDirContents(backupDir, destDir, destDir, nullptr, QString(), error, /*skipTopLevelUpdaterLog*/ true,
-                         /*replacePlantedReparse*/ true)) {
+                         /*replacePlantedReparse*/ true, /*skipIdenticalFiles*/ true)) {
         return false;
     }
     return pruneToBackup(QDir::cleanPath(QDir(backupDir).absolutePath()),
@@ -698,6 +721,114 @@ bool verifiedFileAt(const QString& root, const QString& rel, const QJsonValue& v
 }
 
 } // namespace
+
+bool verifyExactManifestInventory(const QString& stageDir, const QJsonObject& files, QString* error)
+{
+    if (files.isEmpty() || !QFileInfo(stageDir).isDir() || isReparsePointPath(stageDir)) {
+        if (error) *error = QStringLiteral("Exact staged inventory has no verified plain root/files");
+        return false;
+    }
+    QSet<QString> expected;
+    for (auto it = files.constBegin(); it != files.constEnd(); ++it) {
+        const QString rel = it.key();
+        if (!safeManifestRelativeFile(rel)) {
+            if (error) *error = QStringLiteral("Unsafe signed staged path: %1").arg(rel);
+            return false;
+        }
+        const QString folded = rel.toCaseFolded();
+        if (expected.contains(folded)) {
+            if (error) *error = QStringLiteral("Case-colliding signed staged path: %1").arg(rel);
+            return false;
+        }
+        expected.insert(folded);
+        bool safe = false;
+        const QString path = safeJoinWithinRoot(stageDir, rel, &safe);
+        if (!safe || pathCrossesReparsePoint(stageDir, path) || !QFileInfo(path).isFile()) {
+            if (error) *error = QStringLiteral("Signed staged file missing or unsafe: %1").arg(rel);
+            return false;
+        }
+    }
+    expected.insert(QStringLiteral("release_manifest.json"));
+    expected.insert(QStringLiteral("release_manifest.sig"));
+    QSet<QString> seen;
+    QDirIterator it(stageDir, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        const QString path = it.next();
+        if (isReparsePointPath(path)) {
+            if (error) *error = QStringLiteral("Staged inventory contains a reparse point");
+            return false;
+        }
+        if (it.fileInfo().isFile()) {
+            const QString rel = QDir::fromNativeSeparators(QDir(stageDir).relativeFilePath(path));
+            const QString folded = rel.toCaseFolded();
+            if (seen.contains(folded)) {
+                if (error) *error = QStringLiteral("Staged inventory has case-colliding files: %1").arg(rel);
+                return false;
+            }
+            seen.insert(folded);
+            if (!expected.contains(folded)) {
+                if (error) *error = QStringLiteral("Staged inventory contains an unmanifested file: %1").arg(rel);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool preflightUpdateDestinations(const QString& installDir, const QJsonObject& oldFiles,
+                                 const QJsonObject& newFiles, QString* error)
+{
+    if (oldFiles.isEmpty() || newFiles.isEmpty() || isReparsePointPath(installDir)) {
+        if (error) *error = QStringLiteral("Cannot preflight an unverified or reparse install root");
+        return false;
+    }
+    QSet<QString> names;
+    for (const QJsonObject& set : {oldFiles, newFiles}) {
+        for (auto it = set.constBegin(); it != set.constEnd(); ++it) {
+            if (!safeManifestRelativeFile(it.key())) {
+                if (error) *error = QStringLiteral("Unsafe runtime preflight path: %1").arg(it.key());
+                return false;
+            }
+            names.insert(it.key());
+        }
+    }
+    names.insert(QStringLiteral("release_manifest.json"));
+    names.insert(QStringLiteral("release_manifest.sig"));
+    for (const QString& rel : names) {
+        bool safe = false;
+        const QString path = safeJoinWithinRoot(installDir, rel, &safe);
+        if (!safe || pathCrossesReparsePoint(installDir, path)) {
+            if (error) *error = QStringLiteral("Unsafe runtime preflight destination: %1").arg(rel);
+            return false;
+        }
+        if (!QFileInfo::exists(path)) continue; // new file, not a replacement
+        if (!QFileInfo(path).isFile()) {
+            if (error) *error = QStringLiteral("Runtime preflight destination is not a file: %1").arg(rel);
+            return false;
+        }
+#if defined(Q_OS_WIN)
+        const QString native = toExtendedLengthPath(path);
+        HANDLE handle = CreateFileW(reinterpret_cast<LPCWSTR>(native.utf16()),
+                                    DELETE | FILE_WRITE_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            if (error) *error = QStringLiteral("Runtime file is locked or not replaceable: %1 (Windows %2)")
+                                    .arg(rel).arg(GetLastError());
+            return false;
+        }
+        CloseHandle(handle);
+#else
+        QFile probe(path);
+        if (!probe.open(QIODevice::ReadWrite)) {
+            if (error) *error = QStringLiteral("Runtime file is not replaceable: %1").arg(rel);
+            return false;
+        }
+#endif
+    }
+    return true;
+}
 
 bool stageUpdaterRuntime(const QString& installDir, const QString& stageDir,
                          const QJsonObject& files, QString* error)

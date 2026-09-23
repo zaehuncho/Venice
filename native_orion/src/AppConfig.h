@@ -69,20 +69,18 @@ inline QString normalizedMeterProposer(const QString& value)
 // persisted or selected. "pill" is deliberately absent: Pill (beta) was withdrawn on
 // 2026-09-21 and a stored Pill migrates to the certified default. Accepted values keep
 // the caller's spelling (the profile table and tests compare case-insensitively).
+//
+// [RT-LOW-06 / CL3-F4-003 2026-09-23] THE OFFERED SET IS THE ACCEPTED SET. The UI offers Arrow2
+// only (MeterConfigPanel.qml), and Arrow2 is the only style with reader evidence on 2K27 footage.
+// The 2K26-era Arrow / Dial / Straight / Sword profiles were still accepted here, so a hand-edited
+// settings.json or an old saved profile could route an uncertified style to the sidecar. Every
+// value -- any spelling of arrow2 included -- now normalizes to the canonical "Arrow2"; callers
+// that compare against their input (switchProfile, setMeterStyle, AppConfig load) log the
+// migration. [ORION_PILL_REMOVED 2026-09-21, re-withdrawn 2026-09-23 owner] Pill stays out: a
+// persisted "pill" loads as Arrow2 like every other legacy style.
 inline QString normalizedMeterStyle(const QString& value)
 {
-    const QString cleaned = value.trimmed().left(48);
-    const QString lower = cleaned.toLower();
-    if (lower == QLatin1String("arrow")
-        || lower == QLatin1String("arrow2")
-        || lower == QLatin1String("dial")
-        // [ORION_PILL_REMOVED 2026-09-21, re-withdrawn 2026-09-23 owner] Pill (beta) was re-offered
-        // for one live test on 09-22 (12/20 standstills in a drill) and "performed terribly in a
-        // real game": withdrawn again. A persisted "pill" loads as Arrow2.
-        || lower == QLatin1String("straight")
-        || lower == QLatin1String("sword")) {
-        return cleaned;
-    }
+    Q_UNUSED(value);
     return QStringLiteral("Arrow2");
 }
 
@@ -1971,6 +1969,63 @@ inline void mirrorActuationLeadIntoSourceStash(AppConfigData& data)
     data.actuationLeadUserSetBySource.insert(key, data.actuationLeadUserSet);
 }
 
+// [RT-MED-01 / CL3-F4-009 2026-09-23] The EXACT Shot Lead tuple a guided calibration started
+// from, so Cancel can put it back. Cancel used to go through setActuationLeadMs(), which clamps to
+// [150, 800] and latches user_set=true: an Auto install (0, user_set=false) came back as a
+// user-set 150 ms lead (about 120 ms short on a typical rig, so every live-tip shot fired late)
+// and a measured seed (270, false) lost its seed status for good. The route key is part of the
+// tuple: a calibration that straddles a video-route switch must not write one route's lead onto
+// the other.
+struct ActuationLeadProvenance
+{
+    double leadMs = 0.0;
+    bool userSet = false;
+    QString routeKey;
+};
+
+inline ActuationLeadProvenance captureActuationLeadProvenance(const AppConfigData& data)
+{
+    ActuationLeadProvenance p;
+    p.leadMs = data.actuationLeadMs;
+    p.userSet = data.actuationLeadUserSet;
+    p.routeKey = actuationLeadRouteKey(data);
+    return p;
+}
+
+enum class ActuationLeadRestore {
+    Restored,       // the live pair (and its route's stash entry) now equals the snapshot
+    Unchanged,      // it already did; nothing to write
+    RouteChanged,   // the route moved since the snapshot; nothing was written
+};
+
+// Writes the snapshot back VERBATIM -- no clamp, no user_set latch -- and re-mirrors the stash, so
+// "absent == not configured" holds again for an Auto snapshot. Pure: the caller persists.
+inline ActuationLeadRestore restoreActuationLeadProvenance(AppConfigData& data,
+                                                           const ActuationLeadProvenance& snap)
+{
+    if (actuationLeadRouteKey(data) != snap.routeKey) {
+        return ActuationLeadRestore::RouteChanged;
+    }
+    if (data.actuationLeadMs == snap.leadMs && data.actuationLeadUserSet == snap.userSet) {
+        return ActuationLeadRestore::Unchanged;
+    }
+    data.actuationLeadMs = snap.leadMs;
+    data.actuationLeadUserSet = snap.userSet;
+    mirrorActuationLeadIntoSourceStash(data);
+    return ActuationLeadRestore::Restored;
+}
+
+// One wording for the Cancel log line, so the log says what was restored, not what was wished.
+inline QString describeActuationLeadProvenance(const ActuationLeadProvenance& p)
+{
+    if (!actuationLeadIsConfigured(p.leadMs, p.userSet)) {
+        return QStringLiteral("Auto (not set; it will be measured from your shots)");
+    }
+    return QStringLiteral("%1 ms (%2)")
+        .arg(p.leadMs, 0, 'f', 0)
+        .arg(p.userSet ? QStringLiteral("your value") : QStringLiteral("measured on this setup"));
+}
+
 // What one route switch did, so the caller can log it without re-deriving anything.
 struct ActuationLeadSourceSwitch
 {
@@ -2103,6 +2158,11 @@ public:
     [[nodiscard]] QString learningBackupPath() const;
     // Non-empty after reloadLearning() had to recover or quarantine: the launcher logs it once.
     [[nodiscard]] QString learningLoadNote() const { return learningLoadNote_; }
+    // [RT-MED-03 / CL3-F4-006 2026-09-23] Semantic check of a parsed learning.json object: every
+    // PRESENT numeric field must be finite and inside the band its learner/clamp enforces. Empty
+    // = valid. A non-empty result quarantines the file on load (the last-good .bak is preferred
+    // only when it passes this same check) and blocks rotating the file into .bak on save.
+    [[nodiscard]] static QStringList learningSemanticViolations(const QJsonObject& obj);
     [[nodiscard]] static QString profileLearningSlug(const QString& profileName);
 
     // === Settings-file schema versioning + migration (2026-08-08) ==================

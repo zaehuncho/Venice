@@ -127,3 +127,23 @@ def test_verifier_builds_every_registered_native_test_executable():
             assert target in build_line, (
                 f"{gate} verifier registers but does not build {target}"
             )
+
+
+def test_deploy_logs_and_build_journals_never_ship():
+    """[RT-LOW-02 / CL3-F1-001 P-E 2026-09-23] rc1 shipped chiaki-ng-Win/DEPLOY_LOG.txt: an
+    internal deploy journal with build hashes, backup names and red-team finding IDs. It is not
+    a runtime input. Denylisted in every casing; third-party notices still ship."""
+
+    for name in ("DEPLOY_LOG.txt", "deploy_log.txt", "Deploy_Log.TXT",
+                 "DEPLOY_LOG.md", "BUILD_LOG.txt", "build_log.txt"):
+        assert is_forbidden_file_name(name), name
+    assert not is_forbidden_file_name("THIRD_PARTY_NOTICES.txt")
+    assert not is_forbidden_file_name("LICENSE.txt")
+
+
+def test_settings_transaction_files_never_ship():
+    """[RT-MED-09 / P-E 2026-09-23] Per-user settings transaction files are never package files."""
+
+    for name in ("settings.json.prev", "settings.json.prev.sig", "settings.json.txn",
+                 "settings.signed-once", "settings.rejected.json"):
+        assert is_forbidden_file_name(name), name

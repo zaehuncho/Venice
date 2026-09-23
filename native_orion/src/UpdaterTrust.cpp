@@ -103,6 +103,17 @@ bool localManifestAllowed(bool productionBuild)
     return !productionBuild;
 }
 
+bool productionManifestUrlAllowed(const QUrl& url)
+{
+    return url.isValid() && !url.isRelative()
+        && url.scheme().compare(QLatin1String("https"), Qt::CaseInsensitive) == 0
+        && url.host().compare(QLatin1String("api.zaeorion.com"), Qt::CaseInsensitive) == 0
+        && url.port(443) == 443
+        && url.path() == QLatin1String("/api/update")
+        && url.userName().isEmpty() && url.password().isEmpty()
+        && !url.hasFragment();
+}
+
 QString buildProfileOutputPath(const QString& requestedPath,
                                const QString& tempRoot,
                                QString* error)

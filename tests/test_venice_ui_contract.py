@@ -384,7 +384,13 @@ def test_meter_blind_advisor_is_generic_and_silent_in_no_meter_mode() -> None:
     blind = controller_cpp[controller_cpp.index("void OrionAppController::observeMeterBlindness") :]
     blind = blind[: blind.index("void OrionAppController::observeBotOwnership")]
     assert "if (config_.data().inputTimedEnabled) {" in blind
-    assert "meterBlindStreak_ = 0;" in blind
+    # [RT-MED-04 2026-09-23] The streak lives in MeterBlindnessLatch; NO METER resets it whole.
+    assert "meterBlindLatch_.reset();" in blind
+    # ...and the streak is fed by the engine's unanswered-press terminal, with the raw-detection
+    # input keyed on the ACTIVE press epoch (idle sightings no longer reset it).
+    assert "&AutomationEngine::meterPressUnanswered" in controller_cpp
+    assert "observeMeterBlindness(automation_.activePhysicalPressEpoch(), rawMeterVisible);" in controller_cpp
+    assert "observeMeterBlindness(shot_.physicalShotEpoch, rawMeterVisible);" not in controller_cpp
 
     # The log prefix no longer collides with the NO METER timing mode / the engine's blind-release
     # tag, and it says "no meter detected" rather than "no detection".
@@ -645,15 +651,16 @@ def test_capture_refresh_rate_is_a_customer_control_on_the_capture_card_path() -
     form = source("native_orion/qml/components/StreamSetupForm.qml")
     assert 'objectName: "captureFpsCombo"' in form
     assert "orion.captureCardFps" in form
-    assert 'model: ["30 Hz", "60 Hz (recommended)"]' in form
-    for label in ('"30 Hz"', '"60 Hz (recommended)"'):
+    # [RT-MED-05 / P-E 2026-09-23] 30 Hz is preview only (no timing authority below 60 fps).
+    assert 'model: ["30 Hz (preview only)", "60 Hz (recommended)"]' in form
+    for label in ('"30 Hz (preview only)"', '"60 Hz (recommended)"'):
         assert label in form
     assert '"120 Hz"' not in form
     # Any non-30 value, persisted or env-set, reads as the recommended 60.
-    assert 'return fps === 30 ? "30 Hz" : "60 Hz (recommended)"' in form
+    assert 'return fps === 30 ? "30 Hz (preview only)" : "60 Hz (recommended)"' in form
     assert (
-        "60 Hz is the meter's native cadence. "
-        "Only choose 30 Hz if your capture card cannot hold 60." in form
+        "Shot timing needs 60 Hz. "
+        "At 30 Hz Venice shows the picture but does not time shots." in form
     )
     # It must sit inside the capture-card branch, after the device row.
     assert form.index('visible: !form.xboxMode && orion.videoSource === "capture_card"') \
@@ -978,9 +985,32 @@ def test_shot_verdict_tally_is_one_component_under_both_tuning_sliders() -> None
                    "setNoMeterVisionAssist"):
         body = controller[controller.index("OrionAppController::" + setter + "("):][:2600]
         assert "resetBannerTally();" in body, setter
-    assert controller.count("    resetBannerTally();") == 4
+    # [RT-MED-01 2026-09-23] +1: calibration Cancel restores the pre-calibration lead WITHOUT
+    # setActuationLeadMs (whose clamp/user-set latch was the bug) and so resets the tally itself.
+    assert controller.count("    resetBannerTally();") == 5
     assert controller.count("resetBannerTallyForSession();") >= 2
 
     # And the Activity ring allow-lists it, so no future deny-list entry can swallow the
     # most customer-meaningful line the app writes.
     assert 'QStringLiteral("shot: ")' in source("native_orion/src/UiNotificationPolicy.h")
+
+
+def test_lead_calibration_cancel_restores_exact_provenance() -> None:
+    """[RT-MED-01 / CL3-F4-009 2026-09-23] Cancel restores the exact pre-calibration tuple.
+
+    The old Cancel went through setActuationLeadMs(), which clamps to [150, 800] and latches
+    user_set=true, so an Auto install came back as a pinned 150 ms user lead. The native half is
+    RemotePlayExecutablePolicyTests::leadCalibrationCancelRestoresExactProvenance; this pins the
+    controller wiring (the controller has no native test harness).
+    """
+    controller = source("native_orion/src/OrionAppController.cpp")
+    begin = controller[controller.index("void OrionAppController::beginLeadCalibration()") :]
+    begin = begin[: begin.index("void OrionAppController::cancelLeadCalibration()")]
+    assert "leadCalStartLead_ = captureActuationLeadProvenance(config_.data());" in begin
+    cancel = controller[controller.index("void OrionAppController::cancelLeadCalibration()") :]
+    cancel = cancel[: cancel.index("void OrionAppController::reportLeadCalibrationVerdict")]
+    assert "restoreActuationLeadProvenance(data, leadCalStartLead_)" in cancel
+    assert "setActuationLeadMs(restoreMs)" not in cancel
+    assert " setActuationLeadMs(" not in cancel.replace("Not setActuationLeadMs()", "")
+    assert "restored the lead to %2." in cancel
+    assert "leadCalStartLeadMs_" not in controller

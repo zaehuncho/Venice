@@ -1,0 +1,52 @@
+P-B TOOL TRANSACTION — 2026-09-23
+Working directory: C:\Users\aaron\Desktop\NexusVision
+Branch: fix/timing-input-and-remoteplay-blockers
+Changed branch/field: installer/orion.iss fixed protected install path, foreign-file-preserving uninstall, and OrionStream owner closure. Updater source also changes exact staged inventory, pinned trust/version, preflight/rollback journal, SCM stop, and real elevation decision. This fixture copy tests the installer branch; the product-source and native/Python tests are recorded in P-B_codex_install_update.md.
+
+Four required real artifact paths:
+MODIFIED_FILE = C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\patches\P-B_transaction\MODIFIED_FILE
+DIFF_FILE = C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\patches\P-B_transaction\DIFF_FILE
+VERIFICATION.txt = C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\patches\P-B_transaction\VERIFICATION.txt
+ROLLBACK.sh = C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\patches\P-B_transaction\ROLLBACK.sh
+Additional fixture paths: ORIGINAL_FILE, CHECK.py, ROLLBACK_TEST_COPY in the same directory.
+
+Original input: ORIGINAL_FILE, reconstructed pre-P-B installer copy retaining dark-style/art/copy edits.
+Original SHA-256: 35ad1e5bda1404c25b33a9104c0d404c1c5fc5e5f9539869db59c08a3fe0129d
+Modified input: MODIFIED_FILE, separate copy of active patched installer/orion.iss.
+Modified SHA-256: 7f67ba9c2395ea6eb9ec0350dbaf555b88b68c0aafa1c87c096c936bbac4e91e
+DIFF_FILE contains 69 lines of unified diff; it changes only this lane's installer hunks, not the existing appearance edits.
+
+BASELINE command (PowerShell, cwd above):
+$p='docs/redteam/2026-09-23-final/patches/P-B_transaction'; .\.venv\Scripts\python.exe -B "$p/CHECK.py" "$p/ORIGINAL_FILE"; 'BASELINE_EXIT='+$LASTEXITCODE
+BASELINE input: ORIGINAL_FILE
+BASELINE literal output:
+FIXED_INSTALL_BRANCH=FAIL
+DARK_STYLE_PRESERVED=PASS
+BASELINE_EXIT=1
+BASELINE exit status: 1 (expected fail-first)
+
+MODIFIED command (PowerShell, cwd above):
+$p='docs/redteam/2026-09-23-final/patches/P-B_transaction'; .\.venv\Scripts\python.exe -B "$p/CHECK.py" "$p/MODIFIED_FILE"; 'MODIFIED_EXIT='+$LASTEXITCODE
+MODIFIED input: MODIFIED_FILE
+MODIFIED literal output:
+FIXED_INSTALL_BRANCH=PASS
+DARK_STYLE_PRESERVED=PASS
+MODIFIED_EXIT=0
+MODIFIED exit status: 0
+
+ROLLBACK command (PowerShell, cwd above; rollback is on ANOTHER COPY):
+$p='docs/redteam/2026-09-23-final/patches/P-B_transaction'; Copy-Item -LiteralPath "$p/MODIFIED_FILE" -Destination "$p/ROLLBACK_TEST_COPY" -Force; & 'C:\Program Files\Git\bin\bash.exe' "$p/ROLLBACK.sh" "$p/ORIGINAL_FILE" "$p/ROLLBACK_TEST_COPY"; 'ROLLBACK_SCRIPT_EXIT='+$LASTEXITCODE; .\.venv\Scripts\python.exe -B "$p/CHECK.py" "$p/ROLLBACK_TEST_COPY"; 'ROLLBACK_TEST_EXIT='+$LASTEXITCODE; 'RESTORED_HASH_MATCH='+((Get-FileHash "$p/ORIGINAL_FILE" -Algorithm SHA256).Hash -eq (Get-FileHash "$p/ROLLBACK_TEST_COPY" -Algorithm SHA256).Hash); .\.venv\Scripts\python.exe -B "$p/CHECK.py" "$p/MODIFIED_FILE"; 'MODIFIED_REMAINS_EXIT='+$LASTEXITCODE
+ROLLBACK inputs: ORIGINAL_FILE and ROLLBACK_TEST_COPY (copied from MODIFIED_FILE).
+ROLLBACK literal output:
+RESTORED=1
+ROLLBACK_SCRIPT_EXIT=0
+FIXED_INSTALL_BRANCH=FAIL
+DARK_STYLE_PRESERVED=PASS
+ROLLBACK_TEST_EXIT=1
+RESTORED_HASH_MATCH=True
+FIXED_INSTALL_BRANCH=PASS
+DARK_STYLE_PRESERVED=PASS
+MODIFIED_REMAINS_EXIT=0
+ROLLBACK script exit status: 0; restored baseline check exit status: 1 (expected baseline behavior); MODIFIED_FILE remains patched and passes, exit 0.
+
+Additional observed product tests: initial fail-first Python suite 6 failed (exit 1); final focused Python suite 78 passed (exit 0); isolated production native targets OrionUpdaterTests, OrionUpdater, OrionNative built (exit 0); OrionUpdaterTests 65 passed/0 failed/1 skipped (exit 0); git diff --check exited 0. No installer, product launcher, or live service ran.

@@ -113,8 +113,35 @@ int runFakeSidecar(int argc, char** argv)
 struct ScopedCompiledSidecar {
     QByteArray old = qgetenv("ORION_COMPILED_SIDECAR");
     bool had = qEnvironmentVariableIsSet("ORION_COMPILED_SIDECAR");
-    ScopedCompiledSidecar() { qputenv("ORION_COMPILED_SIDECAR", "1"); }
-    ~ScopedCompiledSidecar() { had ? qputenv("ORION_COMPILED_SIDECAR", old) : qunsetenv("ORION_COMPILED_SIDECAR"); }
+    // [CL3-F2-001 / CL3-F3-004 2026-09-23] The production start gate (correctly) refuses to spawn a
+    // sidecar unless models/orion_meter_detector.onnx sits beside the executable. The fake sidecar
+    // never loads it, so the production-profile fixture stages a placeholder for the duration of
+    // the test and removes only what it created. Dev builds resolve the model elsewhere.
+    QString stagedModel;
+    ScopedCompiledSidecar()
+    {
+        qputenv("ORION_COMPILED_SIDECAR", "1");
+#ifdef ORION_PRODUCTION_BUILD
+        const QString model = QDir(QCoreApplication::applicationDirPath())
+                                  .filePath(QStringLiteral("models/orion_meter_detector.onnx"));
+        if (!QFileInfo::exists(model)) {
+            QDir().mkpath(QFileInfo(model).absolutePath());
+            QFile placeholder(model);
+            if (placeholder.open(QIODevice::WriteOnly)) {
+                placeholder.write("route-transition-fixture-placeholder");
+                placeholder.close();
+                stagedModel = model;
+            }
+        }
+#endif
+    }
+    ~ScopedCompiledSidecar()
+    {
+        had ? qputenv("ORION_COMPILED_SIDECAR", old) : qunsetenv("ORION_COMPILED_SIDECAR");
+        if (!stagedModel.isEmpty()) {
+            QFile::remove(stagedModel);
+        }
+    }
 };
 
 AppConfigData captureConfig(int index, const QString& id, const QString& fakeClient)
@@ -192,6 +219,22 @@ private slots:
         QElapsedTimer releaseBeat;
         releaseBeat.start();
         session.start();
+#ifdef ORION_PRODUCTION_BUILD
+        // [CL3-F2-001 2026-09-23] The customer build never launches a Remote Play client it cannot
+        // verify as the packaged image (RP-01/RP-02); this fixture's fake client is exactly that.
+        // Assert the refusal (fail closed, no producer) and leave the A->B transition itself to the
+        // dev profile of this same test and the packaged hardware session.
+        QCOMPARE(session.state(), RemotePlayState::Error);
+        QVERIFY2(session.statusText().contains(QStringLiteral("(code RP-0")),
+                 qPrintable(session.statusText()));
+        // The refused Connect spawns no NEW producer; the only live sidecar is still warm-preview A
+        // (this fixture drives the session directly - the controller's setCaptureCardIndex retires
+        // A on selection, AUD-A2-002 - and the session stays in Error, so nothing is armed).
+        QCOMPARE(session.sidecarPid(), producerA);
+        session.stop(QStringLiteral("fixture_end"));
+        QTRY_VERIFY_WITH_TIMEOUT(!session.stopping(), 3000);
+        QSKIP("production refuses the fixture's unverified Remote Play client (asserted above)");
+#endif
         QCOMPARE(session.state(), RemotePlayState::Connecting);
         QCOMPARE(session.sidecarPid(), qint64(0));
         QVERIFY(!RemotePlaySessionTestAccess::promotionPending(session));
@@ -244,6 +287,15 @@ private slots:
                 session.startCapturePreview();
             } else {
                 session.start();
+#ifdef ORION_PRODUCTION_BUILD
+                // [CL3-F2-001] Decoder route needs the Remote Play client: refused in production
+                // for the fixture's unverified image. Assert the fail-closed refusal instead.
+                QCOMPARE(session.state(), RemotePlayState::Error);
+                QVERIFY2(session.statusText().contains(QStringLiteral("(code RP-0")),
+                         qPrintable(session.statusText()));
+                QCOMPARE(session.sidecarPid(), qint64(0));
+                continue;
+#endif
             }
             QTRY_VERIFY_WITH_TIMEOUT(session.sidecarPid() > 0, 3000);
             const qint64 producer = session.sidecarPid();

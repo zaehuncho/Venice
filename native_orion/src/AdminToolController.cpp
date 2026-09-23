@@ -382,7 +382,7 @@ void AdminToolController::staffEnroll(const QString& staffId, const QString& enr
     sendRequest(QStringLiteral("staff_enroll"), "POST", QStringLiteral("/api/staff/enroll"), {}, body, AuthKind::None, context);
 }
 
-void AdminToolController::staffLogin(const QString& staffId)
+void AdminToolController::staffLogin(const QString& staffId, const QString& ownerCode)
 {
     appendAdminDiagnostic(rootDir_, QStringLiteral("staff_login_clicked"));
     if (ownerMode()) {
@@ -397,12 +397,120 @@ void AdminToolController::staffLogin(const QString& staffId)
         setStatus(QStringLiteral("Staff ID is required."), true);
         return;
     }
+    // [rc1 RT-CRIT-01] An owner-role row needs a fresh single-use owner TOTP code at
+    // sign-in while owner TOTP is required. It is sent (body `totp_code`) only when
+    // the owner typed one; support/admin rows leave the field blank and send nothing.
+    QString code = admin_step_up::sanitizeCode(ownerCode);
+    if (!code.isEmpty() && !admin_step_up::codeWellFormed(code)) {
+        code.fill(QLatin1Char('0'));
+        setStatus(QStringLiteral("Enter the 6-digit owner code, or leave it blank."), true);
+        return;
+    }
     QJsonObject body = freshnessFields();
     body.insert(QStringLiteral("staff_id"), id);
     body.insert(QStringLiteral("machine_id"), machineId());
+    if (!code.isEmpty()) {
+        body.insert(QStringLiteral("totp_code"), code);
+    }
+    code.fill(QLatin1Char('0'));
+    code.clear();
     QJsonObject context;
     context.insert(QStringLiteral("staff_id"), id);
     sendRequest(QStringLiteral("staff_login"), "POST", QStringLiteral("/api/staff/login"), {}, body, AuthKind::None, context);
+    // The request owns its serialized copy now; drop ours.
+    body.remove(QStringLiteral("totp_code"));
+}
+
+// ---------------------------------------------------------------------------
+// Owner step-up (rc1 RT-CRIT-01)
+// ---------------------------------------------------------------------------
+
+bool AdminToolController::stepUpPromptNeeded() const
+{
+    if (!ownerRoutes()) {
+        return false;
+    }
+    const QVariant configured = config_.value(QStringLiteral("owner_totp_required"));
+    const int configState = configured.isValid() ? (configured.toBool() ? 1 : 0) : -1;
+    return admin_step_up::shouldPromptForCode(!ownerSecret_.isEmpty(), totpRequired_, configState);
+}
+
+QString AdminToolController::staffRoleFor(const QString& staffId) const
+{
+    for (const QVariant& row : staffList_) {
+        const QVariantMap map = row.toMap();
+        if (map.value(QStringLiteral("staff_id")).toString() == staffId) {
+            return map.value(QStringLiteral("role")).toString();
+        }
+    }
+    return {};
+}
+
+void AdminToolController::armStepUp(const QString& tag, const QString& path, const QJsonObject& body,
+                                    const QJsonObject& context, const QString& prompt, const QString& error)
+{
+    stepUp_.armed = true;
+    stepUp_.tag = tag;
+    stepUp_.path = path;
+    stepUp_.body = body;
+    stepUp_.context = context;
+    stepUp_.prompt = prompt;
+    stepUpError_ = error;
+    appendAdminDiagnostic(rootDir_, QStringLiteral("step_up_prompted"), QStringLiteral("tag=%1").arg(tag));
+    emit stepUpChanged();
+}
+
+void AdminToolController::clearStepUp()
+{
+    const bool was = stepUp_.armed || !stepUpError_.isEmpty();
+    stepUp_ = StepUpCall{};
+    stepUpError_.clear();
+    if (was) {
+        emit stepUpChanged();
+    }
+}
+
+void AdminToolController::sendOwnerAction(const QString& tag, const QString& path, const QJsonObject& body,
+                                          const QJsonObject& context, bool sensitive, const QString& prompt)
+{
+    if (!sensitive || !stepUpPromptNeeded()) {
+        sendRequest(tag, "POST", path, {}, body, AuthKind::Owner, context);
+        return;
+    }
+    armStepUp(tag, path, body, context, prompt, QString());
+    setStatus(QStringLiteral("Enter a fresh owner code to continue."));
+}
+
+void AdminToolController::submitStepUp(const QString& code)
+{
+    if (!stepUp_.armed) {
+        return;
+    }
+    QString digits = admin_step_up::sanitizeCode(code);
+    if (!admin_step_up::codeWellFormed(digits)) {
+        digits.fill(QLatin1Char('0'));
+        stepUpError_ = QStringLiteral("Enter the 6-digit code from the authenticator.");
+        emit stepUpChanged();
+        return;
+    }
+    const StepUpCall call = stepUp_;
+    clearStepUp();
+    QJsonObject context = call.context;
+    context.insert(QStringLiteral("step_up"), true); // a flag only, never the code
+    appendAdminDiagnostic(rootDir_, QStringLiteral("step_up_submitted"), QStringLiteral("tag=%1").arg(call.tag));
+    sendRequest(call.tag, "POST", call.path, {}, call.body, AuthKind::Owner, context, digits);
+    // Single use: the header copy lives only inside the in-flight request.
+    digits.fill(QLatin1Char('0'));
+    digits.clear();
+}
+
+void AdminToolController::cancelStepUp()
+{
+    if (!stepUp_.armed) {
+        return;
+    }
+    clearStepUp();
+    setStatus(QStringLiteral("Cancelled. Nothing was changed."));
 }
 
 void AdminToolController::refreshWhoami()
@@ -427,6 +535,7 @@ void AdminToolController::logout()
     role_.clear();
     staffName_.clear();
     authenticated_ = false;
+    staffLoginNeedsCode_ = false;
     resetSessionData();
     setResult(QString());
     setStatus(QStringLiteral("Signed out."));
@@ -450,6 +559,7 @@ void AdminToolController::resetSessionData()
     rotatedSecret_.clear();
     caps_.clear();
     usage_.clear();
+    clearStepUp();
 }
 
 // ---------------------------------------------------------------------------
@@ -651,7 +761,9 @@ void AdminToolController::createStaff(const QString& discordUserId, const QStrin
     if (!caps.isEmpty()) {
         body.insert(QStringLiteral("caps"), QJsonObject::fromVariantMap(caps));
     }
-    sendRequest(QStringLiteral("staff_create"), "POST", QStringLiteral("/api/admin/staff"), {}, body, AuthKind::Owner);
+    sendOwnerAction(QStringLiteral("staff_create"), QStringLiteral("/api/admin/staff"), body, {},
+                    admin_step_up::staffCreateNeedsStepUp(normalizedRole),
+                    QStringLiteral("Creating another owner needs a fresh owner code."));
 }
 
 void AdminToolController::staffAction(const QString& action, const QString& staffId, const QString& reason,
@@ -684,7 +796,9 @@ void AdminToolController::staffAction(const QString& action, const QString& staf
     QJsonObject context;
     context.insert(QStringLiteral("action"), act);
     context.insert(QStringLiteral("staff_id"), id);
-    sendRequest(QStringLiteral("staff_action"), "POST", QStringLiteral("/api/admin/staff"), {}, body, AuthKind::Owner, context);
+    sendOwnerAction(QStringLiteral("staff_action"), QStringLiteral("/api/admin/staff"), body, context,
+                    admin_step_up::staffActionNeedsStepUp(act, staffRoleFor(id), extra),
+                    QStringLiteral("Changing an owner account (or granting owner) needs a fresh owner code."));
 }
 
 void AdminToolController::clearEnrollSecret()
@@ -760,7 +874,10 @@ void AdminToolController::updateConfig(const QVariantMap& patch, const QString& 
     body.insert(QStringLiteral("reason"), reason.trimmed());
     QJsonObject context;
     context.insert(QStringLiteral("keys"), QJsonArray::fromStringList(patch.keys()));
-    sendRequest(QStringLiteral("config_update"), "POST", QStringLiteral("/api/admin/config"), {}, body, AuthKind::Owner, context);
+    sendOwnerAction(QStringLiteral("config_update"), QStringLiteral("/api/admin/config"), body, context,
+                    admin_step_up::configPatchNeedsStepUp(patch),
+                    QStringLiteral("Changing owner TOTP, the IP allowlist or alerts, or releasing the kill switch, "
+                                   "needs a fresh owner code."));
 }
 
 void AdminToolController::setGlobalKill(bool engaged, const QString& reason)
@@ -778,7 +895,9 @@ void AdminToolController::totpEnroll(const QString& reason)
     QJsonObject body;
     body.insert(QStringLiteral("action"), QStringLiteral("totp_enroll"));
     body.insert(QStringLiteral("reason"), reason.trimmed());
-    sendRequest(QStringLiteral("totp_enroll"), "POST", QStringLiteral("/api/admin/config"), {}, body, AuthKind::Owner);
+    sendOwnerAction(QStringLiteral("totp_enroll"), QStringLiteral("/api/admin/config"), body, {},
+                    admin_step_up::configActionNeedsStepUp(QStringLiteral("totp_enroll")),
+                    QStringLiteral("Re-enrolling TOTP needs a fresh code from the CURRENT authenticator entry."));
 }
 
 void AdminToolController::totpConfirm(const QString& code, const QString& reason)
@@ -797,7 +916,10 @@ void AdminToolController::totpConfirm(const QString& code, const QString& reason
     body.insert(QStringLiteral("reason"), reason.trimmed());
     QJsonObject context;
     context.insert(QStringLiteral("code"), digits);
-    sendRequest(QStringLiteral("totp_confirm"), "POST", QStringLiteral("/api/admin/config"), {}, body, AuthKind::Owner, context);
+    sendOwnerAction(QStringLiteral("totp_confirm"), QStringLiteral("/api/admin/config"), body, context,
+                    admin_step_up::configActionNeedsStepUp(QStringLiteral("totp_confirm")),
+                    QStringLiteral("Confirming TOTP while it is required needs a second, fresh code "
+                                   "(not the one being confirmed): wait for the next code."));
 }
 
 void AdminToolController::rotateAdminSecret(const QString& reason)
@@ -808,7 +930,9 @@ void AdminToolController::rotateAdminSecret(const QString& reason)
     QJsonObject body;
     body.insert(QStringLiteral("action"), QStringLiteral("rotate_admin_secret"));
     body.insert(QStringLiteral("reason"), reason.trimmed());
-    sendRequest(QStringLiteral("rotate_secret"), "POST", QStringLiteral("/api/admin/config"), {}, body, AuthKind::Owner);
+    sendOwnerAction(QStringLiteral("rotate_secret"), QStringLiteral("/api/admin/config"), body, {},
+                    admin_step_up::configActionNeedsStepUp(QStringLiteral("rotate_admin_secret")),
+                    QStringLiteral("Rotating the admin secret needs a fresh owner code."));
 }
 
 void AdminToolController::clearTotpEnrollment()
@@ -933,7 +1057,7 @@ bool AdminToolController::requireReason(const QString& reason)
     return true;
 }
 
-void AdminToolController::applyAuth(QNetworkRequest& request, AuthKind authKind) const
+void AdminToolController::applyAuth(QNetworkRequest& request, AuthKind authKind, const QString& stepUpCode) const
 {
     const auto staffHeaders = [this, &request]() {
         request.setRawHeader("Authorization", QByteArrayLiteral("Bearer ") + staffToken_.toUtf8());
@@ -950,14 +1074,22 @@ void AdminToolController::applyAuth(QNetworkRequest& request, AuthKind authKind)
     case AuthKind::Owner:
         if (!ownerSecret_.isEmpty()) {
             request.setRawHeader("X-Orion-Admin-Secret", ownerSecret_.toUtf8());
-            if (!ownerTotp_.isEmpty()) {
-                request.setRawHeader("X-Orion-Admin-TOTP", ownerTotp_.toUtf8());
+            // Break-glass (unchanged): the session code rides every owner request.
+            // A step-up request carries the owner's fresh code in its place.
+            const QString& code = stepUpCode.isEmpty() ? ownerTotp_ : stepUpCode;
+            if (!code.isEmpty()) {
+                request.setRawHeader("X-Orion-Admin-TOTP", code.toUtf8());
             }
         } else if (!staffToken_.isEmpty()) {
             staffHeaders();
+            // Owner-role bearer: the header is sent ONLY on a step-up request.
+            if (!stepUpCode.isEmpty()) {
+                request.setRawHeader("X-Orion-Admin-TOTP", stepUpCode.toUtf8());
+            }
         }
         break;
     case AuthKind::Staff:
+        // Staff routes never carry an owner code.
         staffHeaders();
         break;
     }
@@ -965,7 +1097,7 @@ void AdminToolController::applyAuth(QNetworkRequest& request, AuthKind authKind)
 
 void AdminToolController::sendRequest(const QString& tag, const QByteArray& method, const QString& path,
                                       const QJsonObject& query, const QJsonObject& body, AuthKind authKind,
-                                      const QJsonObject& context)
+                                      const QJsonObject& context, const QString& stepUpCode)
 {
     if (!requireUsableSecurity()) {
         return;
@@ -985,7 +1117,7 @@ void AdminToolController::sendRequest(const QString& tag, const QByteArray& meth
     request.setRawHeader("User-Agent", userAgent());
     request.setTransferTimeout(20'000);
     applyStrictTls(request);
-    applyAuth(request, authKind);
+    applyAuth(request, authKind, stepUpCode);
 
     QNetworkReply* reply = nullptr;
     if (method == "GET") {
@@ -999,6 +1131,9 @@ void AdminToolController::sendRequest(const QString& tag, const QByteArray& meth
     pending.tag = tag;
     pending.path = path;
     pending.body = body;
+    // The login code never outlives the send: the response handlers only need
+    // the non-secret fields.
+    pending.body.remove(QStringLiteral("totp_code"));
     pending.context = context;
 
     connect(reply, &QNetworkReply::encrypted, this, [this, reply, path]() {
@@ -1048,8 +1183,30 @@ void AdminToolController::handleResponse(const PendingRequest& pending, const QB
         const bool loginTag = pending.tag == QLatin1String("owner_login")
             || pending.tag == QLatin1String("staff_login")
             || pending.tag == QLatin1String("staff_enroll");
+        const bool staffLoginTag = pending.tag == QLatin1String("staff_login");
+        const bool ownerSensitive = pending.context.value(QStringLiteral("step_up")).toBool()
+            || (parsed && obj.value(QStringLiteral("step_up")).toBool());
+        const QString plain = admin_step_up::plainMessage(code);
 
-        if (code == QLatin1String("totp_required") || code == QLatin1String("invalid_totp")
+        if ((ownerSensitive || staffLoginTag) && !plain.isEmpty()) {
+            // [rc1 RT-CRIT-01] step-up / owner sign-in refusals get a plain message.
+            // The code the owner typed is already gone; nothing here holds it.
+            message = plain;
+            const bool retryable = admin_step_up::codeRetryable(code);
+            if (retryable) {
+                totpRequired_ = true;
+            }
+            if (staffLoginTag) {
+                staffLoginNeedsCode_ = retryable;
+            } else if (retryable && pending.path.startsWith(QLatin1String("/api/admin/"))) {
+                // Re-open the prompt for the SAME action so the owner can enter the
+                // next code without rebuilding the form.
+                QJsonObject context = pending.context;
+                context.remove(QStringLiteral("step_up"));
+                armStepUp(pending.tag, pending.path, pending.body, context,
+                          QStringLiteral("Enter the next owner code to retry."), plain);
+            }
+        } else if (code == QLatin1String("totp_required") || code == QLatin1String("invalid_totp")
             || code == QLatin1String("totp_invalid") || code == QLatin1String("bad_totp")) {
             totpRequired_ = true;
             if (message.isEmpty()) {
@@ -1081,7 +1238,9 @@ void AdminToolController::handleResponse(const PendingRequest& pending, const QB
                 message = QStringLiteral("This tool version is blocked. Update required.");
             }
         } else if (message.isEmpty()) {
-            if (!code.isEmpty()) {
+            if (!plain.isEmpty()) {
+                message = plain; // config_unavailable / audit_unavailable / step_up_* etc.
+            } else if (!code.isEmpty()) {
                 message = QStringLiteral("Request rejected: %1").arg(code);
             } else if (pending.tag == QLatin1String("owner_login") && (httpStatus == 401 || httpStatus == 403)) {
                 message = QStringLiteral("Owner secret rejected by server.");
@@ -1122,13 +1281,17 @@ void AdminToolController::handleSuccess(const PendingRequest& pending, const QJs
         authenticated_ = true;
         role_ = QStringLiteral("owner");
         staffName_ = QStringLiteral("Owner");
-        totpRequired_ = obj.value(QStringLiteral("totp_required")).toBool(totpRequired_);
+        // /api/admin/whoami answers `owner_totp_required`; `totp_required` is the
+        // legacy spelling. The step-up prompt decision for break-glass reads this.
+        totpRequired_ = obj.value(QStringLiteral("owner_totp_required"))
+                            .toBool(obj.value(QStringLiteral("totp_required")).toBool(totpRequired_));
         setStatus(tag == QLatin1String("owner_login") ? QStringLiteral("Owner authenticated.") : QStringLiteral("Session verified."));
         return;
     }
 
     if (tag == QLatin1String("staff_enroll") || tag == QLatin1String("staff_login")) {
         authenticated_ = true;
+        staffLoginNeedsCode_ = false;
         staffToken_ = obj.value(QStringLiteral("token")).toString();
         const QJsonObject staff = obj.value(QStringLiteral("staff")).toObject();
         role_ = firstString(staff, { "role" });

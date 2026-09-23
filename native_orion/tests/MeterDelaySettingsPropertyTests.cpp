@@ -782,12 +782,18 @@ void MeterDelaySettingsPropertyTests::measuredPhaseMedianPersistsCanonically()
     QVERIFY(reader.load());
     QCOMPARE(reader.learning().measuredPhasePhysicalMs, 310.2);
 
-    // Wrong frame (e.g. an error-ms magnitude): saved, but the canonical-range validation on
-    // load must return it to "never measured" rather than arming a bogus divergence warning.
+    // Wrong frame (e.g. an error-ms magnitude): saved, but the value is never applied.
+    // [RT-MED-03 2026-09-23] A semantically out-of-range learning.json is now quarantined as a
+    // whole and the last validated backup is restored, so the reader gets the last GOOD median
+    // (310.2) rather than "never measured" - and never the bogus 66.
     orion::persistMeasuredPhaseMedian(writer, 66.0);
     AppConfig reader2(dir.path());
     QVERIFY(reader2.load());
-    QCOMPARE(reader2.learning().measuredPhasePhysicalMs, -1.0);
+    QVERIFY(reader2.learning().measuredPhasePhysicalMs != 66.0);
+    QVERIFY2(reader2.learning().measuredPhasePhysicalMs == 310.2
+                 || reader2.learning().measuredPhasePhysicalMs == -1.0,
+             qPrintable(QString::number(reader2.learning().measuredPhasePhysicalMs)));
+    QVERIFY(!QDir(dir.path()).entryList({QStringLiteral("learning.json.invalid-*")}, QDir::Files).isEmpty());
 }
 
 // [ORION_BANNER_VERDICT_LIVE 2026-09-14] The meta-object half of the live tally contract.

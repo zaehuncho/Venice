@@ -22,6 +22,13 @@ Security model
   (``require_staff`` refuses a bound token without it) and ``X-Orion-Discord-Id``.
 * Owner requests send ``X-Orion-Admin-Secret`` plus ``X-Orion-Admin-TOTP`` when a
   code is available (mandatory once ``owner_totp_required`` is on, contract §5).
+* Owner step-up (rc1 RT-CRIT-01): owner-sensitive actions (TOTP enrol/confirm,
+  secret rotation, config set of owner_totp_required / owner_ip_allowlist / alerts,
+  releasing the kill switch, creating an owner, touching an owner staff row, or
+  promoting to owner) need a FRESH single-use owner TOTP code. With an owner-role
+  staff token the code is asked for (or read from ORION_ADMIN_TOTP) for that one
+  request only and sent in ``X-Orion-Admin-TOTP``; it is never saved or printed.
+  An owner-role ``staff-login --owner`` sends it as body ``totp_code``.
 * Full license keys are shown only when a key is first created (``license create``)
   or explicitly requested with ``--reveal``. Everywhere else keys are masked.
 * Every mutation requires ``--reason`` (≤200 chars); destructive ones additionally
@@ -161,22 +168,76 @@ def validate_reason(reason: str) -> str:
     return text
 
 
-def build_auth_headers(config: "AdminConfig") -> dict:
+STEP_UP_CONFIG_KEYS = ("owner_totp_required", "owner_ip_allowlist", "alerts")
+STEP_UP_CONFIG_ACTIONS = ("totp_enroll", "totp_confirm", "totp_disable", "rotate_admin_secret")
+TOTP_DIGITS = 6
+
+# rc1 RT-CRIT-01: plain wording for the step-up / owner sign-in refusals.
+REPLAYED_OR_WRONG = "That code was already used or is wrong \u2014 wait for the next code."
+STEP_UP_MESSAGES = {
+    "invalid_totp": REPLAYED_OR_WRONG,
+    "totp_replayed": REPLAYED_OR_WRONG,
+    "totp_required": "This needs a fresh owner TOTP code. Enter the current 6-digit code.",
+    "step_up_required": "This action needs owner TOTP. Turn TOTP on with the break-glass owner secret first.",
+    "step_up_unavailable": "The code check is unavailable right now. Nothing changed; try again shortly.",
+    "totp_not_provisioned": "Owner TOTP is required but not set up on the server. Use the owner recovery runbook.",
+    "config_unavailable": "Security settings could not be read. Nothing changed; try again shortly.",
+    "audit_unavailable": "The audit log is unavailable, so nothing was changed. Try again shortly.",
+}
+
+
+def config_body_needs_step_up(body: dict) -> bool:
+    """Mirror of the backend's owner_step_up() callers on /api/admin/config."""
+    action = str(body.get("action") or "").strip().lower()
+    if action in STEP_UP_CONFIG_ACTIONS:
+        return True
+    if any(key in body for key in STEP_UP_CONFIG_KEYS):
+        return True
+    if "global_kill" in body:
+        value = body["global_kill"]
+        enabled = bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
+        return not enabled  # releasing the kill; engaging stays one step
+    return False
+
+
+def staff_body_needs_step_up(body: dict, target_role: Optional[str]) -> bool:
+    """Owner staff rows, owner creation and promotion to owner need the step-up.
+    target_role None = unknown -> treated as possibly owner."""
+    action = str(body.get("action") or "").strip().lower()
+    wanted = str(body.get("role") or "").strip().lower()
+    if action == "create":
+        return wanted == "owner"
+    if target_role is None or str(target_role).strip().lower() == "owner":
+        return True
+    return action == "set_role" and wanted == "owner"
+
+
+def sanitize_code(code: str) -> str:
+    return "".join(ch for ch in str(code or "") if ch.isdigit())
+
+
+def build_auth_headers(config: "AdminConfig", step_up_code: str = "") -> dict:
     """Auth headers for an admin request (contract §1).
 
     Owner: the admin secret, plus the TOTP code when one is configured.
     Staff: a bearer token, the machine it is bound to (``X-Machine-Id`` - the
     Lambda's ``require_staff`` refuses a bound token without it), and the Discord
     identity used for the audit actor.
+    step_up_code: a fresh owner code for THIS request only. Break-glass sends it in
+    place of the session code; an owner-role bearer sends X-Orion-Admin-TOTP ONLY
+    when it is given (never on ordinary requests).
     """
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if config.admin_secret:
         headers["X-Orion-Admin-Secret"] = config.admin_secret
-        if config.admin_totp:
-            headers["X-Orion-Admin-TOTP"] = config.admin_totp
+        code = step_up_code or config.admin_totp
+        if code:
+            headers["X-Orion-Admin-TOTP"] = code
     if config.staff_token:
         headers["Authorization"] = "Bearer " + config.staff_token
         headers["X-Machine-Id"] = config.machine_id
+        if step_up_code and not config.admin_secret:
+            headers["X-Orion-Admin-TOTP"] = step_up_code
     if config.discord_user_id:
         headers["X-Orion-Discord-Id"] = config.discord_user_id
     return headers
@@ -412,11 +473,43 @@ class UrllibTransport(Transport):
 
 
 class OrionAdminClient:
-    """Thin contract-shaped wrapper. One method per endpoint in §2-§6."""
+    """Thin contract-shaped wrapper. One method per endpoint in §2-§6.
 
-    def __init__(self, config: AdminConfig, transport: Transport) -> None:
+    code_prompter: asks the owner for a fresh TOTP code (getpass on a tty). It is
+    only called for an owner-sensitive request made with an owner-role staff token
+    (and for ``staff-login --owner``); the answer is used for one request."""
+
+    def __init__(self, config: AdminConfig, transport: Transport,
+                 code_prompter: Optional[Callable[[str], str]] = None) -> None:
         self.config = config
         self.transport = transport
+        self.code_prompter = code_prompter
+
+    # -- owner step-up -----------------------------------------------------
+    @property
+    def bearer_owner(self) -> bool:
+        """Owner routes reached with a staff token (no break-glass secret)."""
+        return bool(self.config.staff_token) and not self.config.admin_secret
+
+    def fresh_owner_code(self, why: str) -> str:
+        """One fresh owner code for one request. ORION_ADMIN_TOTP (set for this one
+        command) wins, else the prompter. Never stored on the config."""
+        code = sanitize_code(self.config.admin_totp)
+        if not code and self.code_prompter is not None:
+            code = sanitize_code(self.code_prompter(f"{why}\nFresh owner TOTP code: "))
+        if not code:
+            raise CommandError(f"{why} Run it interactively, or set ORION_ADMIN_TOTP for this one command.")
+        if len(code) != TOTP_DIGITS:
+            raise CommandError("Enter the 6-digit code from the authenticator.")
+        return code
+
+    def _post_step_up(self, path: str, body: dict, why: str) -> ApiResult:
+        if not self.bearer_owner:
+            # Break-glass (unchanged): the session code already rides every request.
+            return self._post(path, body)
+        code = self.fresh_owner_code(why)
+        return self.transport.request("POST", self._url(path),
+                                      build_auth_headers(self.config, step_up_code=code), body)
 
     # -- plumbing ----------------------------------------------------------
     def _url(self, path: str, query: Optional[dict] = None) -> str:
@@ -462,7 +555,24 @@ class OrionAdminClient:
         return self._get("/api/admin/staff")
 
     def staff(self, body: dict) -> ApiResult:
+        if self.bearer_owner:
+            target_role = None
+            if str(body.get("action") or "").lower() != "create":
+                target_role = self._staff_role(str(body.get("staff_id") or ""))
+            if staff_body_needs_step_up(body, target_role):
+                return self._post_step_up("/api/admin/staff", body,
+                                          "Changing an owner account (or granting owner) needs a fresh owner code.")
         return self._post("/api/admin/staff", body)
+
+    def _staff_role(self, staff_id: str) -> Optional[str]:
+        """The target row's role (None when it cannot be read)."""
+        result = self.staff_list()
+        if not (result.ok and isinstance(result.data, dict)):
+            return None
+        for row in result.data.get("staff") or []:
+            if isinstance(row, dict) and row.get("staff_id") == staff_id:
+                return str(row.get("role") or "")
+        return None
 
     def audit(self, query: dict) -> ApiResult:
         return self._get(self.audit_path, query)
@@ -471,6 +581,9 @@ class OrionAdminClient:
         return self._get("/api/admin/config")
 
     def server_config_update(self, body: dict) -> ApiResult:
+        if self.bearer_owner and config_body_needs_step_up(body):
+            return self._post_step_up("/api/admin/config", body,
+                                      "This owner-sensitive change needs a fresh owner code.")
         return self._post("/api/admin/config", body)
 
     def staff_enroll(self, staff_id: str, enroll_key: str) -> ApiResult:
@@ -484,12 +597,15 @@ class OrionAdminClient:
         return self.transport.request("POST", self._url("/api/staff/enroll"),
                                       {"Content-Type": "application/json", "Accept": "application/json"}, body)
 
-    def staff_login(self, staff_id: str) -> ApiResult:
+    def staff_login(self, staff_id: str, totp_code: str = "") -> ApiResult:
         body = {
             "staff_id": staff_id,
             "machine_id": self.config.machine_id,
             **request_freshness_fields(),
         }
+        # Owner-role rows only (rc1 RT-CRIT-01): sent only when a code was given.
+        if totp_code:
+            body["totp_code"] = totp_code
         return self.transport.request("POST", self._url("/api/staff/login"),
                                       {"Content-Type": "application/json", "Accept": "application/json"}, body)
 
@@ -516,6 +632,8 @@ def _unwrap(result: ApiResult, not_deployed_hint: str = "") -> dict:
         raise CommandError(not_deployed_hint)
     error = result.data.get("error") if isinstance(result.data, dict) else ""
     message = result.data.get("message") if isinstance(result.data, dict) else ""
+    if error in STEP_UP_MESSAGES:
+        raise CommandError(STEP_UP_MESSAGES[error])
     detail = " - ".join([part for part in (error, message) if part])
     raise CommandError(detail or result.error or f"request failed (status {result.status})")
 
@@ -805,7 +923,14 @@ def cmd_staff_enroll(client: OrionAdminClient, args, out, confirmer) -> dict:
 
 
 def cmd_staff_login(client: OrionAdminClient, args, out, confirmer) -> dict:
-    data = _unwrap(client.staff_login(args.staff_id))
+    owner = bool(getattr(args, "owner", False))
+    code = client.fresh_owner_code("Owner-role sign-in needs a fresh owner code.") if owner else ""
+    result = client.staff_login(args.staff_id, totp_code=code)
+    code = ""
+    if (not owner and not result.ok and isinstance(result.data, dict)
+            and result.data.get("error") == "totp_required"):
+        raise CommandError("This is an owner account: run 'staff-login --owner' and enter a fresh owner code.")
+    data = _unwrap(result)
     token = data.get("token", "")
     if not token:
         raise CommandError("Login succeeded but backend did not return a staff token.")
@@ -986,6 +1111,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("staff-login", help="Refresh a staff bearer token for this machine.")
     p.add_argument("--staff-id", required=True, help="Staff id issued by the owner.")
+    p.add_argument("--owner", action="store_true",
+                   help="Owner-role account: ask for a fresh owner TOTP code (sent once, never saved).")
 
     # ---- licenses ------------------------------------------------------
     lic = sub.add_parser("license", help="License operations (contract §2).")
@@ -1283,7 +1410,12 @@ def main(argv: Optional[list] = None) -> int:
         # ORION_ADMIN_TOTP instead.
         code = input("TOTP code (blank if not enrolled): ").strip()
         config.admin_totp = "".join(ch for ch in code if ch.isdigit())
-    client = OrionAdminClient(config, UrllibTransport())
+    def prompt_code(prompt: str) -> str:
+        # Hidden input; the code is used for one request and never stored.
+        return getpass.getpass(prompt)
+
+    client = OrionAdminClient(config, UrllibTransport(),
+                              code_prompter=prompt_code if sys.stdin.isatty() else None)
 
     def interactive_confirm(prompt: str) -> bool:
         try:

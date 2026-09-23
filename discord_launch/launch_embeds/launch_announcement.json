@@ -10,7 +10,7 @@
       "command": "/announce",
       "kind": "update",
       "title": "Venice is live",
-      "body": "Venice is open for NBA 2K27 on PS5. Start with the free 7-day trial: no card, one per Discord account and one per PC — claim it on the website or with /claim_trial here. After the trial it is 20 dollars a month, cancel any time from the billing portal, and you keep access to the end of the period you already paid for. To buy, sign in with Discord on the website and stay in this server. There is no licence key: your access lives on your Discord account and you unlock the app with a one-time code from the connect page, locked to one PC, with 3 free PC resets. You need a PS5 with a 60 Hz capture card or PS5 Remote Play. Xbox is not supported yet. Install from the downloads channel, follow the setup guide, and open a ticket if anything is missing."
+      "body": "Venice is open for NBA 2K27 on PS5. Start with the free 7-day trial: no card, one per Discord account and one per PC — start it on the website home page. After the trial it is 20 dollars a month, cancel any time from the billing portal, and you keep access to the end of the period you already paid for. To buy, sign in with Discord on the website and stay in this server. There is no licence key: your access lives on your Discord account and you unlock the app with a one-time code from the connect page, locked to one PC, with 3 free PC resets. You need a PS5 with a 60 Hz capture card or PS5 Remote Play; both are fully supported. Xbox is experimental and untested. Install from the downloads channel, follow the setup guide, and open a ticket if anything is missing."
     }
   },
   "message": {
@@ -23,7 +23,7 @@
         "fields": [
           {
             "name": "Start free",
-            "value": "A **7-day trial**, no card. One per Discord account and one per PC — claim it on [zaeorion.com](https://zaeorion.com/) or with `/claim_trial`.",
+            "value": "A **7-day trial**, no card. One per Discord account and one per PC — start it on the [zaeorion.com](https://zaeorion.com/) home page.",
             "inline": false
           },
           {
@@ -38,7 +38,7 @@
           },
           {
             "name": "What you need",
-            "value": "A PS5 with a **60 Hz capture card** or **PS5 Remote Play**, and a Windows PC. Xbox is not supported yet.",
+            "value": "A PS5 with a **60 Hz capture card** or **PS5 Remote Play**, and a Windows PC. Both are fully supported. Xbox is experimental and untested.",
             "inline": false
           },
           {

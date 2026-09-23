@@ -369,31 +369,11 @@ SecurityStatus SecurityManager::evaluate()
             auditSecurityEvent(QStringLiteral("settings_signature_autoresigned"), settingsPath());
         }
     }
-    // [ORION_FIRST_RUN_BOOTSTRAP 2026-08-07] Production-safe first-launch fallback. On the
-    // very first launch after a fresh install, %LOCALAPPDATA%\Orion\ contains NEITHER
-    // settings.json NOR settings.json.sig -- nothing has ever run here. The tamper-detection
-    // invariant is meaningless in that state (there's nothing to tamper with), yet the check
-    // above would keep failing until the user triggered a save via the UI, which they cannot
-    // do because Remote Play is locked out. The result is a customer with a fresh install
-    // who sees "Settings signature missing or invalid" and cannot proceed.
-    //
-    // This ONLY triggers when BOTH files are absent -- if either exists we're not first-
-    // launch, and auto-signing would defeat tamper detection. AppConfig::save() elsewhere in
-    // the app writes both files atomically thereafter (OrionAppController.cpp:10981/10999),
-    // so this bootstrap runs exactly once in the product's lifetime on this machine.
-    if (!status.settingsSignatureValid && status.releaseManifestRequired
-        && !QFile::exists(settingsPath()) && !QFile::exists(settingsSigPath())) {
-        QString _bootErr;
-        // AppConfig::save() will have already written settings.json with defaults during
-        // startup; if it hasn't yet (evaluate() ran first), skip -- next tick will catch it.
-        // We only sign what already exists on disk; we do not fabricate content.
-        if (QFile::exists(settingsPath()) && writeSettingsSignature(&_bootErr)
-            && verifySettingsSignature()) {
-            status.settingsSignatureValid = true;
-            auditSecurityEvent(QStringLiteral("settings_signature_first_run_bootstrap"),
-                               settingsPath());
-        }
-    }
+    // [RT-LOW-07 / RT-MED-09 2026-09-23] The old [ORION_FIRST_RUN_BOOTSTRAP] branch that lived
+    // here required settings.json to be absent AND present in nested checks, so it could never
+    // run. The one-time first-run signing now lives in OrionAppController's startup, gated by
+    // settingsBootstrapAllowed() (no signature AND no signed-once marker), and a periodic
+    // evaluation never signs anything in a production build.
     QString integrityDetail;
     status.releaseManifestValid = verifyReleaseIntegrity(&integrityDetail);
     status.integrityState = integrityDetail.isEmpty() ? QStringLiteral("Unchecked") : integrityDetail;
@@ -819,6 +799,144 @@ bool SecurityManager::writeSettingsSignature(QString* error) const
     return true;
 }
 
+namespace {
+
+// Whole-file atomic replace (QSaveFile: temp file + rename). Returns false with the error.
+bool atomicWriteBytes(const QString& path, const QByteArray& bytes, QString* error)
+{
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    if (file.write(bytes) != bytes.size() || !file.commit()) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+SecurityManager::SettingsWriteGate SecurityManager::beginSettingsWrite(QString* detail) const
+{
+    // DEV builds keep their legacy behaviour byte-for-byte: every save re-signs, and
+    // evaluate() auto-resigns an out-of-band edit. No snapshot/journal/marker files are
+    // written into a developer's source tree.
+    if (!releaseManifestRequired()) {
+        return SettingsWriteGate::Bootstrap;
+    }
+    if (verifySettingsSignature()) {
+        const QByteArray bytes = readFileLimited(settingsPath(), 512 * 1024);
+        const QByteArray sig = readFileLimited(settingsSigPath(), 512).trimmed().toLower();
+        QString err;
+        // Snapshot first, journal LAST: a journal on disk always names a complete snapshot.
+        QFile::remove(settingsJournalPath());
+        if (!atomicWriteBytes(settingsPrevPath(), bytes, &err)
+            || !atomicWriteBytes(settingsPrevSigPath(), sig + "\n", &err)
+            || !atomicWriteBytes(settingsJournalPath(), sig + "\n", &err)) {
+            // The save itself can still go ahead (commit signs it); only the crash window
+            // between the two writes is unprotected for this one save.
+            if (detail) *detail = QStringLiteral("settings snapshot failed: %1").arg(err);
+        }
+        return SettingsWriteGate::Signed;
+    }
+    if (settingsBootstrapAllowed()) {
+        return SettingsWriteGate::Bootstrap;
+    }
+    if (detail) {
+        *detail = QStringLiteral("settings signature missing or invalid; save refused until repair");
+    }
+    return SettingsWriteGate::Refused;
+}
+
+bool SecurityManager::commitSettingsWrite(QString* error) const
+{
+    if (!writeSettingsSignature(error)) {
+        // Journal stays: the next start restores the snapshotted old pair.
+        return false;
+    }
+    if (!verifySettingsSignature()) {
+        if (error) *error = QStringLiteral("signature did not verify after writing");
+        return false;
+    }
+    if (releaseManifestRequired()) {
+        QString markErr;
+        (void)markSettingsSignedOnce(&markErr);
+        QFile::remove(settingsJournalPath());
+    }
+    return true;
+}
+
+SecurityManager::SettingsWriteRecovery
+SecurityManager::recoverInterruptedSettingsWrite(QString* detail)
+{
+    if (!QFile::exists(settingsJournalPath())) {
+        return SettingsWriteRecovery::NoJournal;
+    }
+    if (verifySettingsSignature()) {
+        // Crashed after the new signature landed (or before the new settings did): the live
+        // pair is already a complete old-or-new pair.
+        QFile::remove(settingsJournalPath());
+        (void)markSettingsSignedOnce(nullptr);
+        if (detail) *detail = QStringLiteral("settings write had completed; journal cleared");
+        return SettingsWriteRecovery::CompletedEarlier;
+    }
+    const QByteArray journal = readFileLimited(settingsJournalPath(), 512).trimmed().toLower();
+    const QByteArray prevBytes = readFileLimited(settingsPrevPath(), 512 * 1024);
+    const QByteArray prevSig = readFileLimited(settingsPrevSigPath(), 512).trimmed().toLower();
+    const QByteArray prevDigest = settingsDigestForBytes(prevBytes).toHex();
+    if (!journal.isEmpty() && !prevBytes.isEmpty() && prevSig == journal && prevDigest == prevSig) {
+        QString err;
+        if (atomicWriteBytes(settingsPath(), prevBytes, &err)
+            && atomicWriteBytes(settingsSigPath(), prevSig + "\n", &err)
+            && verifySettingsSignature()) {
+            QFile::remove(settingsJournalPath());
+            if (detail) *detail = QStringLiteral("interrupted settings write rolled back to the last signed settings");
+            auditSecurityEvent(QStringLiteral("settings_write_rolled_back"), settingsPath());
+            return SettingsWriteRecovery::RolledBack;
+        }
+        if (detail) *detail = QStringLiteral("settings rollback failed: %1").arg(err);
+        return SettingsWriteRecovery::Unrecoverable;
+    }
+    // The snapshot does not prove itself: do not trust or sign anything. Drop the journal so
+    // it is not retried every start; the security lock + Repair settings takes over.
+    QFile::remove(settingsJournalPath());
+    if (detail) *detail = QStringLiteral("settings journal present but snapshot did not verify");
+    auditSecurityEvent(QStringLiteral("settings_write_unrecoverable"), settingsPath());
+    return SettingsWriteRecovery::Unrecoverable;
+}
+
+bool SecurityManager::settingsBootstrapAllowed() const
+{
+    return !QFile::exists(settingsSigPath()) && !QFile::exists(settingsSignedOnceMarkerPath());
+}
+
+bool SecurityManager::markSettingsSignedOnce(QString* error) const
+{
+    if (QFile::exists(settingsSignedOnceMarkerPath())) {
+        return true;
+    }
+    return atomicWriteBytes(settingsSignedOnceMarkerPath(),
+                            QByteArrayLiteral("venice settings signed once; delete only with settings.json and settings.json.sig\n"),
+                            error);
+}
+
+bool SecurityManager::preserveRejectedSettings(QString* savedPath) const
+{
+    const QByteArray bytes = readFileLimited(settingsPath(), 512 * 1024);
+    if (bytes.isEmpty()) {
+        return false;
+    }
+    const QString target = orionDataDir(rootDir_) + QStringLiteral("/settings.rejected.json");
+    QString err;
+    if (!atomicWriteBytes(target, bytes, &err)) {
+        return false;
+    }
+    if (savedPath) *savedPath = target;
+    return true;
+}
+
 bool SecurityManager::cacheLocalEntitlement(const QJsonObject& entitlement, QString* error) const
 {
     QJsonObject payload = entitlement;
@@ -916,7 +1034,11 @@ bool SecurityManager::clearLocalEntitlement(QString* error) const
 
 QByteArray SecurityManager::settingsDigest() const
 {
-    const auto data = readFileLimited(settingsPath(), 512 * 1024);
+    return settingsDigestForBytes(readFileLimited(settingsPath(), 512 * 1024));
+}
+
+QByteArray SecurityManager::settingsDigestForBytes(const QByteArray& data) const
+{
     if (data.isEmpty()) {
         return {};
     }
@@ -959,6 +1081,26 @@ QString SecurityManager::settingsPath() const
 QString SecurityManager::settingsSigPath() const
 {
     return orionDataDir(rootDir_) + QStringLiteral("/settings.json.sig");
+}
+
+QString SecurityManager::settingsPrevPath() const
+{
+    return orionDataDir(rootDir_) + QStringLiteral("/settings.json.prev");
+}
+
+QString SecurityManager::settingsPrevSigPath() const
+{
+    return orionDataDir(rootDir_) + QStringLiteral("/settings.json.prev.sig");
+}
+
+QString SecurityManager::settingsJournalPath() const
+{
+    return orionDataDir(rootDir_) + QStringLiteral("/settings.json.txn");
+}
+
+QString SecurityManager::settingsSignedOnceMarkerPath() const
+{
+    return orionDataDir(rootDir_) + QStringLiteral("/settings.signed-once");
 }
 
 QString SecurityManager::localEntitlementPath() const

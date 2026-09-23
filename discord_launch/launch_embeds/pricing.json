@@ -17,7 +17,7 @@
         "fields": [
           {
             "name": "Free 7-day trial",
-            "value": "No card needed. One per Discord account and one per PC. Claim it on the website, or run `/claim_trial` here.",
+            "value": "No card needed. One per Discord account and one per PC. Start it on the [zaeorion.com](https://zaeorion.com/) home page.",
             "inline": false
           },
           {
@@ -37,7 +37,7 @@
           },
           {
             "name": "What you need",
-            "value": "A PS5 with a **60 Hz capture card** or **PS5 Remote Play**, plus a Windows PC. Xbox is not supported yet.",
+            "value": "A PS5 with a **60 Hz capture card** or **PS5 Remote Play**, plus a Windows PC. Both are fully supported. Xbox is experimental and untested.",
             "inline": false
           },
           {

@@ -45,11 +45,21 @@ logger = logging.getLogger(__name__)
 # "pretty frequently". Without names (pre-rebuild), the brute scan is allowed ONCE per
 # process, and the resolved index is persisted so later launches/retries go straight to the
 # card without scanning at all.
+# [P-C CL3-F5-007 2026-09-23] "capture" is matched as a WHOLE WORD only (see _classify_name),
+# and screen/desktop-capture filters, virtual cameras and vendor WEBCAMS from card vendors
+# ("AVerMedia Live Streamer CAM 313", "AVerMedia PW313") are on the deny list: webcam hints win.
 _CARD_NAME_HINTS = ("elgato", "cam link", "camlink", "hd60", "avermedia", "live gamer",
-                    "game capture", "capture", "magewell", "ezcap")
+                    "game capture", "magewell", "ezcap")
+_CARD_WORD_HINTS = ("capture",)
 _WEBCAM_NAME_HINTS = ("webcam", "web cam", "facecam", "integrated camera", "hd camera",
                       "facetime", "streamcam", "brio", "c920", "c922", "c930", "kiyo",
-                      "virtual camera", "obs virtual", "droidcam", "ivcam", "snap camera")
+                      "virtual camera", "obs virtual", "droidcam", "ivcam", "snap camera",
+                      # screen / desktop capture DirectShow filters and virtual cameras
+                      "screen-capture", "screen capture", "screencapture", "desktop capture",
+                      "desktop-capture", "window capture", "unity video capture", "vcam",
+                      "manycam", "splitcam", "virtual", "nvidia broadcast",
+                      # AVerMedia's WEBCAM lines (the vendor name alone is a card hint)
+                      "live streamer cam", "avermedia pw", "avermedia cam", " pw3", " pw5")
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _INDEX_CACHE = os.path.join(_MODULE_DIR, "logs", "capture_card_resolved.json")
 _BRUTE_SCANNED = False   # once per process — never again on the ~2s retry cadence
@@ -457,6 +467,219 @@ def _device_ids() -> Optional[List[str]]:
     return [value.strip().lower() for value in raw.split("|")]
 
 
+_ID_PREFIX = "dshow-moniker-sha256-v1:"
+
+
+def _well_formed_id(value: str) -> bool:
+    return (isinstance(value, str) and value.startswith(_ID_PREFIX)
+            and len(value) == len(_ID_PREFIX) + 64
+            and all(ch in "0123456789abcdef" for ch in value[len(_ID_PREFIX):]))
+
+
+def _selected_id() -> str:
+    """The customer's Stream Setup pick (stable moniker ID), or "" when none/malformed."""
+    selected = os.environ.get("ORION_CAPTURE_SELECTED_ID", "").strip().lower()
+    return selected if _well_formed_id(selected) else ""
+
+
+def _stable_inventory():
+    """``(names, ids)`` when the current inventory is aligned with valid unique IDs, else None."""
+    names = _device_names()
+    ids = _device_ids()
+    if (names is None or ids is None or len(ids) != len(names)
+            or len(set(ids)) != len(ids) or not all(_well_formed_id(v) for v in ids)):
+        return None
+    return names, ids
+
+
+def stable_video_device_id(moniker_display_name: str) -> str:
+    """Python twin of native ``stableVideoInputDeviceId`` (VideoInputDeviceEnumeration.cpp).
+
+    sha256("orion-dshow-moniker-v1" NUL + NFC(casefold(trim(display name)))). For the ASCII
+    device paths DirectShow reports this is byte-identical to Qt's toCaseFolded(); a non-ASCII
+    path that folded differently would only produce a MISMATCH, which denies authority.
+    """
+    import hashlib
+    import unicodedata
+    normalized = unicodedata.normalize("NFC", str(moniker_display_name or "").strip().casefold())
+    if not normalized:
+        return ""
+    digest = hashlib.sha256(b"orion-dshow-moniker-v1\0" + normalized.encode("utf-8")).hexdigest()
+    return _ID_PREFIX + digest
+
+
+def _enumerate_dshow_inventory_com():
+    """Enumerate DirectShow video-input monikers in cv2 CAP_DSHOW index order.
+
+    Same walk as native ``enumerateVideoInputDevices`` (ICreateDevEnum ->
+    CLSID_VideoInputDeviceCategory -> GetDisplayName + FriendlyName). Reads the property bag
+    only: no filter is bound, no graph is built, no device is opened. Returns
+    ``(names, ids)`` or None on any failure.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import POINTER, byref, c_long, c_ulong, c_void_p, c_wchar_p
+    import uuid
+
+    ole32 = ctypes.windll.ole32
+    oleaut32 = ctypes.windll.oleaut32
+    HRESULT = c_long
+
+    def guid(text):
+        return (ctypes.c_byte * 16).from_buffer_copy(uuid.UUID(text).bytes_le)
+
+    def method(ptr, index, *argtypes):
+        vtbl = ctypes.cast(ptr, POINTER(c_void_p))[0]
+        fn_addr = ctypes.cast(vtbl, POINTER(c_void_p))[index]
+        proto = ctypes.WINFUNCTYPE(HRESULT, c_void_p, *argtypes)(fn_addr)
+        return lambda *args: proto(ptr, *args)
+
+    def release(ptr):
+        if ptr:
+            ctypes.WINFUNCTYPE(c_ulong, c_void_p)(
+                ctypes.cast(ctypes.cast(ptr, POINTER(c_void_p))[0], POINTER(c_void_p))[2])(ptr)
+
+    clsid_sys_dev_enum = guid("62BE5D10-60EB-11d0-BD3B-00A0C911CE86")
+    iid_create_dev_enum = guid("29840822-5B84-11D0-BD3B-00A0C911CE86")
+    clsid_video_input = guid("860BB310-5D01-11d0-BD3B-00A0C911CE86")
+    iid_property_bag = guid("55272A00-42CB-11CE-8135-00AA004BB851")
+
+    co_init = ole32.CoInitializeEx(None, 0x2)   # COINIT_APARTMENTTHREADED, as native
+    co_init = ctypes.c_long(co_init).value
+    if co_init < 0 and (co_init & 0xFFFFFFFF) != 0x80010106:   # RPC_E_CHANGED_MODE is usable
+        return None
+    names: List[str] = []
+    ids: List[str] = []
+    bind_ctx = c_void_p()
+    dev_enum = c_void_p()
+    mon_enum = c_void_p()
+    try:
+        ole32.CreateBindCtx(0, byref(bind_ctx))
+        hr = ole32.CoCreateInstance(byref(clsid_sys_dev_enum), None, 1,
+                                    byref(iid_create_dev_enum), byref(dev_enum))
+        if ctypes.c_long(hr).value < 0 or not dev_enum:
+            return None
+        hr = method(dev_enum, 3, c_void_p, c_void_p, c_ulong)(
+            byref(clsid_video_input), byref(mon_enum), 0)
+        if hr == 1:            # S_FALSE: the category is empty -> a valid, EMPTY inventory
+            return names, ids
+        if hr != 0 or not mon_enum:
+            return None
+        next_fn = method(mon_enum, 3, c_ulong, c_void_p, c_void_p)
+        while True:
+            moniker = c_void_p()
+            if next_fn(1, byref(moniker), None) != 0 or not moniker:
+                break
+            try:
+                display = ""
+                raw = c_wchar_p()
+                if method(moniker, 20, c_void_p, c_void_p, c_void_p)(
+                        bind_ctx, None, byref(raw)) >= 0 and raw.value is not None:
+                    display = raw.value
+                if raw:
+                    ole32.CoTaskMemFree(ctypes.cast(raw, c_void_p))
+                friendly = ""
+                bag = c_void_p()
+                if method(moniker, 9, c_void_p, c_void_p, c_void_p, c_void_p)(
+                        None, None, byref(iid_property_bag), byref(bag)) >= 0 and bag:
+                    try:
+                        variant = (ctypes.c_byte * 24)()       # VARIANT (x64 size)
+                        oleaut32.VariantInit(byref(variant))
+                        if method(bag, 3, c_wchar_p, c_void_p, c_void_p)(
+                                "FriendlyName", byref(variant), None) >= 0:
+                            vt = ctypes.c_ushort.from_buffer(variant, 0).value
+                            if vt == 8:                         # VT_BSTR
+                                bstr = ctypes.c_void_p.from_buffer(variant, 8).value
+                                if bstr:
+                                    friendly = ctypes.wstring_at(bstr)
+                        oleaut32.VariantClear(byref(variant))
+                    finally:
+                        release(bag)
+                # Keep the index even when the name read failed (native does the same).
+                names.append((friendly.strip() or "Unknown device").replace("|", "/"))
+                ids.append(stable_video_device_id(display))
+            finally:
+                release(moniker)
+        return names, ids
+    except Exception as exc:
+        logger.debug("DirectShow inventory enumeration failed: %s", exc)
+        return None
+    finally:
+        release(mon_enum.value if mon_enum else None)
+        release(dev_enum.value if dev_enum else None)
+        release(bind_ctx.value if bind_ctx else None)
+        if co_init >= 0:
+            ole32.CoUninitialize()
+
+
+_INVENTORY_TIMEOUT_S = 1.5          # native kVideoEnumTimeoutMs
+_INVENTORY_LOCK = threading.Lock()
+_INVENTORY_WORKER: Optional[threading.Thread] = None
+
+
+def _enumerate_video_inventory():
+    """Bounded live enumeration: ``(names, ids)`` or None (failed, timed out, or busy).
+
+    A wedged driver can hang ICreateDevEnum; the walk runs on a daemon thread and a caller
+    never waits longer than native's 1.5 s budget. While a wedged walk is still running a
+    second one is not started (None -> the caller fails closed).
+    """
+    global _INVENTORY_WORKER
+    result = {}
+
+    def work():
+        try:
+            result["inv"] = _enumerate_dshow_inventory_com()
+        except Exception:
+            result["inv"] = None
+
+    with _INVENTORY_LOCK:
+        if _INVENTORY_WORKER is not None and _INVENTORY_WORKER.is_alive():
+            return None
+        worker = threading.Thread(target=work, name="CaptureInventory", daemon=True)
+        _INVENTORY_WORKER = worker
+        worker.start()
+    worker.join(_INVENTORY_TIMEOUT_S)
+    if worker.is_alive():
+        logger.warning("Capture-card inventory refresh timed out after %.1fs", _INVENTORY_TIMEOUT_S)
+        return None
+    return result.get("inv")
+
+
+def refresh_device_inventory() -> bool:
+    """[P-C CL3-F5-008 2026-09-23] Replace the process inventory with a live enumeration.
+
+    The launch inventory in ORION_VIDEO_DEVICE_NAMES/IDS is only true at sidecar spawn. Every
+    reopen after the first open calls this: success publishes the fresh (names, ids) into the
+    same env keys every reader uses (backend, route scope, notices); failure REMOVES both keys,
+    so nothing can inherit the stale identity (identity_verified() and the route scope then
+    fail closed and the device runs preview-only).
+    """
+    inv = _enumerate_video_inventory()
+    ok = False
+    if inv is not None:
+        names, ids = inv
+        ok = (isinstance(names, (list, tuple)) and isinstance(ids, (list, tuple))
+              and len(names) == len(ids))
+    if not ok:
+        os.environ.pop("ORION_VIDEO_DEVICE_NAMES", None)
+        os.environ.pop("ORION_VIDEO_DEVICE_IDS", None)
+        logger.warning("Capture-card inventory refresh FAILED; the reopened device runs "
+                       "preview-only until an identity can be proven")
+        return False
+    names = [str(n or "").replace("|", "/").strip() for n in names]
+    ids = [str(v or "").strip().lower() for v in ids]
+    if names:
+        os.environ["ORION_VIDEO_DEVICE_NAMES"] = "|".join(names)
+        os.environ["ORION_VIDEO_DEVICE_IDS"] = "|".join(ids)
+    else:
+        os.environ.pop("ORION_VIDEO_DEVICE_NAMES", None)
+        os.environ.pop("ORION_VIDEO_DEVICE_IDS", None)
+    logger.info("Capture-card inventory refreshed: %d video device(s)", len(names))
+    return True
+
+
 def _explicit_device_matches(index: int, names: Optional[List[str]] = None) -> bool:
     """An index is a choice only with a matching current moniker identity."""
     if names is None:
@@ -478,6 +701,10 @@ def _classify_name(name: str) -> str:
         return "webcam"
     if any(h in low for h in _CARD_NAME_HINTS):
         return "card"
+    import re
+    if any(re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(h), low)
+           for h in _CARD_WORD_HINTS):
+        return "card"
     return "unknown"
 
 
@@ -498,6 +725,12 @@ def _classify_name(name: str) -> str:
 _QUALIFY_MIN_FPS_RATIO = 0.85
 _QUALIFY_MAX_GAP_P95_MS = 40.0
 _QUALIFY_DUP_BAND = (25.0, 70.0)
+_VALIDATED_TIMING_FPS = 60
+# [P-C CL3-F5-003 2026-09-23] Consecutive 1 s "duplicated" verdicts required before the
+# orchestrator acts on them. Game content (menus, replays, transitions) repeats frames for a few
+# seconds on a perfectly healthy 60 fps card (live 09-23: dup 40 %, unique 36, raw 60, cleared
+# in ~3 s); a card that really pads 30 fps to 60 does it for the whole session.
+DUPLICATED_PERSIST_WINDOWS = 5
 
 
 def qualify_capture_feed(raw_fps: float, gap_p95_ms: float, dup_pct: float,
@@ -528,6 +761,13 @@ def qualify_capture_feed(raw_fps: float, gap_p95_ms: float, dup_pct: float,
                                  _QUALIFY_MAX_GAP_P95_MS))
     ratio = _QUALIFY_MIN_FPS_RATIO if ratio is None else ratio
     gap_cfg = _QUALIFY_MAX_GAP_P95_MS if gap_cfg is None else gap_cfg
+    # [P-C RT-MED-05 / CL3-F5-006 2026-09-23] Every timing constant (lead, extrapolation,
+    # onset feedforward, green-window aim) was fitted and graded at 60 fps. Any other REQUESTED
+    # rate (30 Hz, or a 120 request) is preview-only: it can never qualify, however steady.
+    # Deliberately not env-tunable -- a validated second rate needs a graded session first.
+    if int(round(rate)) != _VALIDATED_TIMING_FPS:
+        return False, "preview_only", "requested_fps=%d (timing validated at %d only)" % (
+            int(round(rate)), _VALIDATED_TIMING_FPS)
     min_fps = rate * max(0.1, min(1.0, ratio))
     max_gap = max(gap_cfg, 2.4 * 1000.0 / rate)
     metrics = {"raw_fps": _finite(raw_fps), "gap_p95_ms": _finite(gap_p95_ms),
@@ -595,6 +835,16 @@ def capture_notice_text(code: str, *, fps: float = 0.0, requested_fps: float = 6
         return ("Capture: Venice cannot measure your capture feed right now, so the bot will "
                 "not shoot. Reconnect, and if this keeps happening set the card to 1080p60 "
                 "or 720p60 on a USB 3.0 port.")
+    if code == "wrong_device":
+        # [P-C RT-HIGH-06 2026-09-23]
+        return ("Capture: The device Venice opened%s is not the capture card you picked, so "
+                "the bot will not shoot. Check the card's USB cable, then pick your card in "
+                "Stream Setup and press Refresh." % dev)
+    if code == "preview_only":
+        # [P-C RT-MED-05 2026-09-23]
+        return ("Capture: Your capture card is set to %d Hz. Shot timing is only tested at "
+                "60 Hz, so this is preview only and the bot will not shoot. Set Refresh rate "
+                "to 60 Hz in Stream Setup and reconnect." % want)
     if code == "busy":
         return ("Capture: Your capture card%s is busy or has no picture. Close OBS or other "
                 "apps using it, and check that the console is awake. Venice keeps retrying "
@@ -647,8 +897,15 @@ class CaptureCardBackend:
         height: int = 1080,
         fps: int = 60,
         use_mjpg: bool = True,
+        refresh_inventory: bool = False,
     ) -> None:
         self._device_index = int(device_index)
+        # [P-C CL3-F5-008 2026-09-23] True for every open after the first in this sidecar: the
+        # launch inventory is stale by then, so start() enumerates live before AND after the
+        # open, and authority needs the selected ID on the opened index in both snapshots.
+        self._refresh_inventory = bool(refresh_inventory)
+        # "" | "wrong_device" (opened device is not the selected card) | "unidentified"
+        self._identity_mismatch = ""
         self._width = int(width)
         self._height = int(height)
         self._fps = int(fps)
@@ -870,26 +1127,41 @@ class CaptureCardBackend:
         card-NAMED resolution, and its name must not be a webcam. A names-only timeout fallback,
         cached/scan hit ("uncertain"), or webcam name -> False.
         """
-        names = _device_names()
-        if names is None:
-            return False
-        ids = _device_ids()
-        prefix = "dshow-moniker-sha256-v1:"
-        if (ids is None or len(ids) != len(names) or len(set(ids)) != len(ids)
-                or any(not value.startswith(prefix)
-                       or len(value) != len(prefix) + 64
-                       or any(ch not in "0123456789abcdef" for ch in value[len(prefix):])
-                       for value in ids)):
-            return False
+        return self.identity_failure() == ""
+
+    def identity_failure(self) -> str:
+        """Why identity_verified() is False: "" (verified) | "wrong_device" | "unidentified".
+
+        [P-C RT-HIGH-06 2026-09-23] With a Stream Setup pick (ORION_CAPTURE_SELECTED_ID) the
+        ONLY device that can be identified is the one whose CURRENT moniker ID equals it, on
+        the index actually opened; route basis and name hints cannot override that. A
+        card-named fallback is identity only on an unselected install with exactly one
+        card-named device. "wrong_device" = we know the opened device is not the pick.
+        """
+        if self._identity_mismatch:
+            return self._identity_mismatch
+        inv = _stable_inventory()
+        if inv is None:
+            return "unidentified"
+        names, ids = inv
         idx = int(self._device_index)
         if not (0 <= idx < len(names)) or not names[idx]:
-            return False
+            return "unidentified"
         name_class = _classify_name(names[idx])
-        if name_class == "webcam":
-            return False
         basis = str(self._route_basis or "")
-        return ((basis == "configured" and _explicit_device_matches(idx, names))
-                or (basis == "card_name" and name_class == "card"))
+        selected = _selected_id()
+        if selected:
+            if ids[idx] != selected:
+                return "wrong_device"
+            if name_class == "webcam":
+                return "unidentified"      # a webcam pick: the not_card notice covers it
+            return "" if basis == "configured" else "unidentified"
+        if name_class == "webcam":
+            return "unidentified"
+        if (basis == "card_name" and name_class == "card"
+                and sum(1 for n in names if _classify_name(n) == "card") == 1):
+            return ""
+        return "unidentified"
 
     def last_start_failure(self):
         """``(code, device_name, detail)`` of the last failed start(); code "" after success.
@@ -1184,10 +1456,11 @@ class CaptureCardBackend:
         return -1
 
     def _candidate_indices(self) -> List[int]:
-        """Ordered candidate device indices with webcam-named entries EXCLUDED. Configured index
-        first only after a stable-ID picker choice, then the persisted last-good index,
-        then name-matched capture cards. Never a webcam name, and never an unknown-named
-        device the customer did not pick [CL2-P3-001 2026-09-23]."""
+        """Candidate device indices, webcam-named entries EXCLUDED [CL2-P3-001 2026-09-23].
+
+        [P-C 2026-09-23] With a Stream Setup pick: exactly the index carrying the selected
+        stable ID (never another device). Unselected: the single card-named device, if there
+        is exactly one. The persisted last-good index no longer selects anything."""
         names = _device_names()
         cand: List[int] = []
 
@@ -1198,27 +1471,30 @@ class CaptureCardBackend:
                     return
                 cand.append(i)
 
-        # The compiled index default is zero, not an explicit pick. A generic name
-        # is eligible only when this launch's stable ID matches the saved choice.
-        # Without enumeration, retaining the old index permits preview only; it
-        # cannot earn identity/fire authority.
-        if names is None or _explicit_device_matches(self._device_index, names):
+        # [P-C RT-HIGH-06 / CL3-F5-002/007 2026-09-23] A Stream Setup pick is AUTHORITATIVE.
+        # With a selected stable ID the only candidate is the index whose CURRENT moniker ID
+        # equals it (so a between-session reorder re-finds the same card), and nothing else is
+        # ever opened: a busy/asleep pick fails closed with "busy" instead of falling through
+        # to another device, however card-like its name. Without a stable inventory the
+        # configured index is opened for preview only (identity_verified() stays False).
+        selected = _selected_id()
+        if selected:
+            inv = _stable_inventory()
+            if inv is None:
+                if names is None or self._device_index < len(names):
+                    add(self._device_index)
+                return cand
+            hits = [i for i, value in enumerate(inv[1]) if value == selected]
+            if len(hits) == 1:
+                add(hits[0])
+            return cand
+        # Unselected install: only an UNAMBIGUOUS card-named device (exactly one) is eligible.
+        if names is None:
             add(self._device_index)
-        # [CL2-P3-001 2026-09-23] Automatic fallbacks never include an unknown-named device.
-        # "Microsoft Camera Front", "Insta360 Link", "NVIDIA Broadcast" all classify unknown;
-        # the old walk opened them whenever the real card was busy/asleep, accepted the
-        # camera's 1080p picture and stayed on it for the whole session (webcam LED on, bot
-        # benched, and the only message wrongly blamed OBS). The cached index is only a
-        # fallback when its CURRENT name still looks like a card (or no names are known).
-        # [CL2-P3-001 2026-09-23 r2] With NO enumeration (names is None) nothing but the
-        # configured index is ever opened: a cached index then carries no identity at all.
-        cached = _load_cached_index()
-        if names is not None and 0 <= cached < len(names) and _classify_name(names[cached]) == "card":
-            add(cached)
-        if names is not None:
-            for i, n in enumerate(names):
-                if _classify_name(n) == "card":
-                    add(i)
+            return cand
+        cards = [i for i, n in enumerate(names) if _classify_name(n) == "card"]
+        if len(cards) == 1:
+            add(cards[0])
         return cand
 
     def start(self) -> bool:
@@ -1235,8 +1511,16 @@ class CaptureCardBackend:
         # exists (pre-rebuild launcher), and only ONCE per process — it opens every video device
         # including the webcam, and riding the ~2s retry loop was the "camera turns on" bug.
         global _BRUTE_SCANNED
+        # [P-C CL3-F5-008 2026-09-23] Reopen after the first open: the launch inventory is
+        # stale (unplug/replug, hub reset, a webcam now at the card's old index). Enumerate
+        # live BEFORE choosing an index; a failed refresh strips the inventory (fail closed).
+        self._identity_mismatch = ""
+        if self._refresh_inventory:
+            refresh_device_inventory()
         names = _device_names()
+        pre_open_ids = _device_ids()
         cap, api_name = None, ""
+        fail_idx = -1
         # A BUSY candidate is the informative one, so remember it across the whole sweep: a later
         # "absent" index must not overwrite the fact that the real card opened-but-would-not-stream.
         any_busy = False
@@ -1244,6 +1528,7 @@ class CaptureCardBackend:
         self._open_diag = ""   # [CL2-P3-001 2026-09-23 r2] no stale diag from a prior start()
         for idx in self._candidate_indices():
             self._open_diag = ""
+            fail_idx = idx
             cap, api_name = self._open(idx)
             if cap is not None:
                 if idx != self._device_index:
@@ -1254,7 +1539,9 @@ class CaptureCardBackend:
                 # Only a name-verified CARD earns "card_name": the walk may also have reached
                 # this index from the persisted cache or as an unknown-named candidate, and
                 # neither is evidence about WHAT is on the index.
-                if idx == configured_index and _explicit_device_matches(idx, names):
+                # [P-C CL3-F5-002 2026-09-23] "configured" = the index carrying the SELECTED
+                # stable ID, wherever enumeration put it (a reorder is the same card).
+                if _explicit_device_matches(idx, names):
                     self._route_basis = "configured"
                 elif (names is not None and 0 <= idx < len(names)
                       and _classify_name(names[idx]) == "card"):
@@ -1283,8 +1570,17 @@ class CaptureCardBackend:
                 cap, api_name = self._open(best)
         if cap is None:
             # [CL2-P3-005 2026-09-23] Remember the failure class for a plain-language notice.
-            _fail_dev = (names[self._device_index]
-                         if names is not None and 0 <= self._device_index < len(names) else "")
+            # [P-C CL3-F5-002 2026-09-23] Name the device that was actually tried. With a
+            # Stream Setup pick that is absent, name nothing: the device now at the saved index
+            # is somebody else, and calling it "your card" was the misleading notice.
+            if fail_idx >= 0:
+                _fail_idx = fail_idx
+            elif _selected_id():
+                _fail_idx = -1
+            else:
+                _fail_idx = self._device_index
+            _fail_dev = (names[_fail_idx]
+                         if names is not None and 0 <= _fail_idx < len(names) else "")
             if _fail_dev and _classify_name(_fail_dev) == "webcam" and not any_busy                     and not str(self._open_diag):
                 # [CL2-P3-001 2026-09-23 r2] The PICKED device is a webcam and no card answered:
                 # say so instead of "cannot find your card".
@@ -1330,6 +1626,27 @@ class CaptureCardBackend:
                                "fallback; caller will retry", self._device_index)
             return False
         self._last_start_failure = ("", "", "")   # [CL2-P3-005 2026-09-23]
+        if self._refresh_inventory:
+            # [P-C RT-HIGH-06 2026-09-23] Enumerate -> open -> enumerate. The opened index must
+            # carry the same stable ID in both snapshots (and, with a pick, the SELECTED one);
+            # otherwise the device moved under the open and this handle is not attested.
+            if not refresh_device_inventory():
+                self._identity_mismatch = "unidentified"
+            else:
+                post_ids = _device_ids()
+                idx = int(self._device_index)
+                before = (pre_open_ids[idx]
+                          if pre_open_ids is not None and 0 <= idx < len(pre_open_ids) else "")
+                after = post_ids[idx] if post_ids is not None and 0 <= idx < len(post_ids) else ""
+                selected = _selected_id()
+                if not before:
+                    self._identity_mismatch = "unidentified"   # nothing attested pre-open
+                elif before != after or (selected and after != selected):
+                    self._identity_mismatch = "wrong_device"
+                    logger.error(
+                        "Capture-card identity CHANGED across the open at index %d; the device "
+                        "runs preview-only (no fire authority)", idx)
+            names = _device_names()
         _save_cached_index(self._device_index,
                            (names[self._device_index]
                             if names is not None and self._device_index < len(names) else ""))

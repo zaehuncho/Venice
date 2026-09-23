@@ -161,8 +161,9 @@ def verify(package_dir: Path, public_key_b64: str = "",
         if actual != expected:
             errors.append(f"Hash mismatch: {rel}")
 
-    # Advisory (native does NOT check this, so it's a warning, not a lock): files present in the
-    # package but absent from the manifest — a file that slipped past packaging is unverified.
+    # A release package must be an exact signed inventory. The native runtime may
+    # tolerate local diagnostics, but a *distribution* with extra loadable files
+    # must never pass this pre-ship gate.
     for path in package_dir.rglob("*"):
         if not path.is_file():
             continue
@@ -170,7 +171,7 @@ def verify(package_dir: Path, public_key_b64: str = "",
         if rel in ("release_manifest.json", "release_manifest.sig"):
             continue
         if rel not in listed:
-            warnings.append(f"Unlisted (unverified) file in package: {rel}")
+            errors.append(f"Unlisted (unverified) file in package: {rel}")
 
     # Forbidden-file scan — the same guard packaging uses; a secret/key/dev artifact here is a HARD fail.
     for finding in _pkg.scan_forbidden(package_dir):
@@ -185,7 +186,8 @@ def verify(package_dir: Path, public_key_b64: str = "",
 
 
 def verify_update_manifest(manifest_path: Path, artifact_path: Path | None = None,
-                           public_key_b64: str = "") -> dict:
+                           public_key_b64: str = "",
+                           *, trusted_keys: dict[str, str] | None = None) -> dict:
     """Replicates the NATIVE updater's acceptance test (UpdateManifest.cpp
     verifyManifestSignature + verifyArtifactSha256): Ed25519 over the canonical
     MANIFEST_SIGN_FIELDS payload, then the artifact hash. A pass here means a shipped
@@ -216,9 +218,22 @@ def verify_update_manifest(manifest_path: Path, artifact_path: Path | None = Non
     if not sig:
         errors.append("Update manifest signature missing/undecodable (unsigned manifests never ship)")
 
-    pub_raw = _pkg.decode_ed25519_public_key(public_key_b64 or str(manifest.get("public_key_b64", "")))
+    # Production has one pinned key ID/key pair. The manifest's public_key_b64 is
+    # untrusted metadata, never a trust root. Explicit fixture keys are accepted
+    # only by direct test callers, not by the release CLI below.
+    pins = trusted_keys if trusted_keys is not None else {
+        _pkg.ED25519_KEY_ID: _pkg.ED25519_PUBLIC_KEY_B64,
+    }
+    key_id = str(manifest.get("public_key_id", "")).strip()
+    selected = pins.get(key_id, "")
+    if not selected:
+        errors.append(f"Update manifest public_key_id is not trusted: {key_id!r}")
+    pinned_raw = _pkg.decode_ed25519_public_key(_pkg.ED25519_PUBLIC_KEY_B64)
+    if public_key_b64 and _pkg.decode_ed25519_public_key(public_key_b64) != pinned_raw:
+        errors.append("Update manifest public-key override is not the pinned production key")
+    pub_raw = _pkg.decode_ed25519_public_key(selected)
     if not pub_raw:
-        errors.append("No usable Ed25519 public key (pass --public-key or embed public_key_b64)")
+        errors.append("No usable pinned Ed25519 public key for update manifest")
 
     if sig and pub_raw:
         from cryptography.exceptions import InvalidSignature
@@ -247,7 +262,8 @@ def main() -> int:
     ap.add_argument("--strict-warnings", action="store_true", help="Treat unlisted-file warnings as failures")
     ap.add_argument("--update-manifest", default="", help="Signed /api/update manifest JSON to verify (Ed25519)")
     ap.add_argument("--artifact", default="", help="Zip artifact to check against the update manifest sha256")
-    ap.add_argument("--public-key", default="", help="Ed25519 public key (b64/hex) overriding public_key_b64")
+    ap.add_argument("--public-key", default="",
+                    help="Optional confirmation of the pinned update key; any different key is refused")
     ap.add_argument("--release-public-key", default="",
                     help="Trusted release-manifest Ed25519 public key override (tests/key rotation)")
     ap.add_argument("--release-key-id", default=_pkg.ED25519_KEY_ID,

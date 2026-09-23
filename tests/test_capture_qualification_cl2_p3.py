@@ -83,9 +83,11 @@ def test_static_menu_does_not_disqualify_a_good_card():
     assert ok and code == ""
 
 
-def test_explicit_30hz_pick_is_judged_on_its_own_grid():
-    ok, _, _ = qualify_capture_feed(29.9, 34.0, 0.0, 30, 30, samples=60)
-    assert ok
+def test_explicit_30hz_pick_is_preview_only():
+    # [P-C RT-MED-05 2026-09-23] was "judged on its own grid" (self-qualifying 30 Hz). Timing
+    # is validated at 60 fps only; a 30 Hz pick streams but never earns fire authority.
+    ok, code, _ = qualify_capture_feed(29.9, 34.0, 0.0, 30, 30, samples=60)
+    assert not ok and code == "preview_only"
 
 
 def test_no_samples_fails_closed():
@@ -415,7 +417,9 @@ def test_webcam_as_the_only_live_device_is_never_opened(monkeypatch):
 @pytest.mark.parametrize("names,index,basis,expected", [
     ("Game Capture HD60 X", 0, "configured", True),
     ("Webcam|USB Video", 1, "configured", True),         # explicit pick, no hint word
-    ("Game Capture HD60 X|Elgato Cam Link", 1, "card_name", True),
+    # [P-C CL3-F5-007 2026-09-23] name identity needs exactly ONE card-named device
+    ("Game Capture HD60 X|Elgato Cam Link", 1, "card_name", False),
+    ("Integrated Webcam|Elgato Cam Link", 1, "card_name", True),
     ("Game Capture HD60 X|USB Video", 1, "uncertain", False),
     ("Integrated Webcam", 0, "configured", False),
     ("", 0, "configured", False),                           # enumeration empty
@@ -500,6 +504,8 @@ def test_capture_notice_wire_matches_the_native_relay_contract(capsys):
                      ("low_fps", {"fps": 30.0, "requested_fps": 60}),
                      ("bad_measurement", {}),
                      ("unidentified", {"device": "USB Video"}),
+                     ("wrong_device", {"device": "Integrated Webcam"}),   # [P-C 2026-09-23]
+                     ("preview_only", {"requested_fps": 30}),
                      ("ok", {"fps": 60.0})):
         orch = SimpleNamespace(_capture_notice=(1, code, capture_notice_text(code, **kw)))
         wire = sidecar._capture_notice_wire(orch, {"seq": 0})
@@ -530,6 +536,7 @@ def test_capture_notice_wire_matches_the_native_relay_contract(capsys):
     deny = re.findall(r'QStringLiteral\("([^"]+)"\)', body)
     assert deny
     for code in ("busy", "absent", "invalid", "low_fps", "gappy", "duplicated", "no_frames",
-                 "not_card", "unidentified", "bad_measurement", "ok"):
+                 "not_card", "unidentified", "bad_measurement", "ok",
+                 "wrong_device", "preview_only"):   # [P-C 2026-09-23]
         text = capture_notice_text(code).lower()
         assert not any(marker.lower() in text for marker in deny), code

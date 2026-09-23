@@ -473,7 +473,7 @@ function allowedOrigins(url) {
 async function claimTrial(request, env, url) {
   if (!trialConfigured(env)) {
     return json({ ok: false, code: "unavailable",
-      message: "The website trial isn't available right now. Run /claim_trial in the Venice Discord instead." }, 503);
+      message: "The free trial can't be started right now. Please try again in a few minutes, or open a ticket in the Venice Discord." }, 503);
   }
   // Belt and braces on top of SameSite=Lax: same-origin JSON requests only.
   if (!allowedOrigins(url).has(request.headers.get("Origin") || "")) {
@@ -623,7 +623,7 @@ async function connectLauncher(request, env, url) {
   // confirmed. The signed paid cookie affects copy, never backend authority.
   // [COPY-FIX 2026-09-23 CW-1] A customer who paid in ANOTHER browser has no paid cookie and
   // lands here while the webhook is still provisioning; tell them to refresh.
-  const ENTITLEMENT_MESSAGE = 'Your Discord account needs an active trial or subscription. Claim the trial in Discord, then try again. Just paid? Activation can take up to a minute — refresh this page.';
+  const ENTITLEMENT_MESSAGE = 'Your Discord account needs an active trial or subscription. Start the free trial on the Venice home page, then try again. Just paid? Activation can take up to a minute — refresh this page.';
   const OUTAGE_MESSAGE = "Venice's servers didn't respond just now. Nothing is wrong with your account — wait a minute and try again. If it keeps happening, open a ticket in the Venice Discord.";
   const paid = await recentPaidCheckout(request, env, session);
   const attempt = activatingAttempt(url);
@@ -715,8 +715,18 @@ async function paidSubscriptionDiscordId(env, id, expectedId = "") {
   return discordId;
 }
 
+// [2026-09-23 rc1 RT-LOW-04 / CL3-F6-002] The verified Stripe event id rides every backend
+// call as `stripe_event_id`; the backend keeps a processed-event marker so a replayed delivery
+// is a 200 no-op (no second revoke audit / owner alert / DM). A 409 (same event still in flight)
+// makes callOrion throw -> 500 -> Stripe retries later.
+function stripeEventRef(event) {
+  const id = String(event?.id || "");
+  return /^evt_[A-Za-z0-9_]{1,250}$/u.test(id) ? { stripe_event_id: id } : {};
+}
+
 async function processStripeEvent(env, event) {
   const object = event?.data?.object || {};
+  const eventRef = stripeEventRef(event);
   const liveKeys = /^(?:sk|rk)_live_/u.test(String(env.STRIPE_SECRET_KEY || ""))
     && String(env.STRIPE_PUBLISHABLE_KEY || "").startsWith("pk_live_");
   if (!liveKeys || event?.livemode !== true || object.livemode !== true) return "non_live_ignored";
@@ -735,6 +745,7 @@ async function processStripeEvent(env, event) {
       renew: false,
       notify: true,
       subscription_id: paidSubscriptionId,
+      ...eventRef,
     });
     return "provisioned";
   }
@@ -757,6 +768,7 @@ async function processStripeEvent(env, event) {
       renew: true,
       notify: true,
       subscription_id: paidSubscriptionId,
+      ...eventRef,
     });
     return "renewed";
   }
@@ -771,6 +783,7 @@ async function processStripeEvent(env, event) {
       kind: "refunded",
       reason: `Stripe subscription ${String(object.status || "deleted").slice(0, 40)}`,
       subscription_id: object.id,
+      ...eventRef,
     });
     return "revoked";
   }
@@ -801,6 +814,7 @@ async function processStripeEvent(env, event) {
       kind: event.type === "charge.refunded" ? "refunded" : "disputed",
       reason: `Stripe ${event.type} ${String(charge.id || "").slice(0, 40)}`,
       subscription_id: subId,
+      ...eventRef,
     });
     return event.type === "charge.refunded" ? "refund_revoked" : "dispute_revoked";
   }

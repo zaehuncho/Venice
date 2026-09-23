@@ -9,6 +9,8 @@ Give this same sheet to all four reviewers (Codex Security, Codex Reliability, G
 | `C:\Users\aaron\Desktop\NexusVision` | `59129e5` (branch `fix/timing-input-and-remoteplay-blockers`, pushed to the private origin) | clean except `learning.json` (owner's runtime timing data, deliberately uncommitted) |
 | `C:\Users\aaron\Desktop\chiaki-ng-src` | `67eec725` (branch `orion`, local commit only) | all product source committed; untracked scratch scripts, logs and build dirs remain (not product source) |
 
+**Post-freeze note:** after rc1 was frozen, the working tree gained installer-look changes: `installer/orion.iss` dark style and copy, new `installer/assets/venice-wizard-*`, deleted old wizard bitmaps, and untracked `tools/installer/make_wizard_art.py`. None of these are in the rc1 installer or package. They belong to the next candidate.
+
 ## Candidate (frozen copy, do not modify)
 
 - Frozen package tree: `C:\Users\aaron\VeniceRC\rc1-20260923\orion-package` (578 files: 576 manifested plus the manifest and its signature)
@@ -67,7 +69,7 @@ Native DLL closure (package root):
 | Fork ctest | 4/4 (`build-codex-a3-20260923`, same source as the deployed fork) |
 | Package integrity + signature | PASS, 576 files |
 | `tools/security_audit.py --package-only` | OK |
-| Production binaries contain no `ORION_LEAD_FLOOR_MS` / `ORION_LEAD_BIAS_MS` / `ORION_ONSET_FF` strings | verified |
+| Production build ignores `ORION_LEAD_FLOOR_MS` / `ORION_LEAD_BIAS_MS` / `ORION_ONSET_FF` env overrides | reads compiled out (source `#ifndef ORION_PRODUCTION_BUILD`); **correction (F1 lane):** the names still appear as log/message text in OrionNative/AutomationCore, so "no strings" was wrong. 69 other timing env overrides remain honoured in production (CL3-F1-004, LOW). |
 | Standard verify on this candidate | **not run** |
 | StrictSecurity on this candidate | **not run** (owner) |
 | VM install/update/rollback canary | **not run** (owner) |

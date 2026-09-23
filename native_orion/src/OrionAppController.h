@@ -17,6 +17,7 @@
 #include "LiveMeterHudPolicy.h"
 #include "ManualShotTally.h"
 #include "MeterBoxRing.h"
+#include "MeterBlindnessLatch.h"   // [RT-MED-04 2026-09-23]
 #include "MeterDelayController.h"
 #include "MeterDetector.h"
 #include "MeterOverlayPolicy.h"
@@ -225,6 +226,9 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(QString securityDetail READ securityDetail NOTIFY statusChanged)
     Q_PROPERTY(bool securityLockActive READ securityLockActive NOTIFY statusChanged)
     Q_PROPERTY(QString securityLockReason READ securityLockReason NOTIFY statusChanged)
+    // [RT-MED-09 2026-09-23] True only while settings.json's signature is missing/invalid in a
+    // locked build: the Live page then shows the scoped "Repair settings" banner.
+    Q_PROPERTY(bool settingsRepairAvailable READ settingsRepairAvailable NOTIFY statusChanged)
     Q_PROPERTY(QString entitlementState READ entitlementState NOTIFY statusChanged)
     Q_PROPERTY(QString integrityState READ integrityState NOTIFY statusChanged)
     Q_PROPERTY(QString lastSecurityAuditEvent READ lastSecurityAuditEvent NOTIFY statusChanged)
@@ -538,13 +542,14 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     // Overlay lock gate, driven PURELY by the detector (not the held button). True only while a
     // FRESH, REAL meter detection is on screen; replaces isShooting as the neon-box visibility gate.
     Q_PROPERTY(bool meterConfirmed READ meterConfirmed NOTIFY meterBoxChanged)
-    // METER-BLIND SAFETY NET. True after kMeterBlindStreakTrip_ consecutive PHYSICALLY-ARMED
-    // shot epochs produced ZERO genuine raw detections. Its whole purpose is to catch a
-    // MISCONFIGURED BAR COLOUR, so it deliberately derives from NO detector-health field: a
+    // METER-BLIND SAFETY NET. True after MeterBlindnessLatch::kTripPresses consecutive completed
+    // METER presses got NO meter evidence of any kind. Its whole purpose is to catch a
+    // MISCONFIGURED or PATCHED meter, so it deliberately derives from NO detector-health field: a
     // detector that cannot see the meter reports meter_present=false perfectly truthfully,
     // forever, and every self-reported health signal agrees with it. Only a CV-INDEPENDENT
-    // trigger can raise this, so the counter is driven by shot_.physicalShotEpoch (minted from
-    // the physical controller edge) and cleared by the first genuine raw detection.
+    // trigger can raise this: the engine's per-epoch press_unanswered_no_meter terminal (the
+    // physical controller edge the meter never answered). [RT-MED-04 2026-09-23] Only an
+    // IN-PRESS raw detection resets the streak; the latched state clears after vision-owned shots.
     Q_PROPERTY(bool meterBlindWarning READ meterBlindWarning NOTIFY meterBlindChanged)
     Q_PROPERTY(QString meterBlindHint READ meterBlindHint NOTIFY meterBlindChanged)
     // Reader detector health for the Meter Detection card (PRESENTATION ONLY). Fed by the
@@ -970,7 +975,10 @@ public:
     // inverted in UI copy before, and inverting it makes the calibration DIVERGE).
     LeadCalibrationState leadCal_{};
     bool leadCalActive_ = false;
-    double leadCalStartLeadMs_ = 0.0;   // restored on Cancel (CL/GM-006, CX-007)
+    // [RT-MED-01 / CL3-F4-009 2026-09-23] The exact (lead, user_set, route) tuple Cancel restores,
+    // and whether any calibration step actually persisted a lead (nothing to undo otherwise).
+    ActuationLeadProvenance leadCalStartLead_{};
+    bool leadCalWroteLead_ = false;
     // [ORION_UPDATE_NO_LOCKOUT] A failed update must never be worse than no update. These record
     // the target version of an attempt in the per-user data dir, so a ForceUpdate gate that
     // cannot apply (typically: install dir in Program Files, updater launched unelevated) is
@@ -987,6 +995,7 @@ public:
     [[nodiscard]] QString securityDetail() const noexcept { return securityDetail_; }
     [[nodiscard]] bool securityLockActive() const noexcept { return securityLockActive_; }
     [[nodiscard]] QString securityLockReason() const noexcept { return securityLockReason_; }
+    [[nodiscard]] bool settingsRepairAvailable() const noexcept { return settingsRepairAvailable_; }
     [[nodiscard]] QString entitlementState() const noexcept { return entitlementState_; }
     [[nodiscard]] QString integrityState() const noexcept { return integrityState_; }
     [[nodiscard]] QString lastSecurityAuditEvent() const noexcept { return lastSecurityAuditEvent_; }
@@ -1695,6 +1704,9 @@ public:
     Q_INVOKABLE void verifyReleaseIntegrityNow();
     Q_INVOKABLE void clearInvalidLocalEntitlement();
     Q_INVOKABLE void signSettings();
+    // [RT-MED-09] Scoped customer repair: only acts while the settings signature is invalid;
+    // keeps the rejected file aside and saves + signs factory defaults. Never re-signs it.
+    Q_INVOKABLE void repairSettings();
     Q_INVOKABLE void connectVirtualController();
     // [ORION_PAD_LIVE_INPUT_GATE 2026-08-08] One-time, USER-CONSENTED fix:
     // writes EnhancedPowerManagementEnabled=0 on every known Sony pad USB
@@ -2043,6 +2055,11 @@ private:
     // Meter-blind safety net. Called once per sidecar detection frame with the CV-INDEPENDENT
     // physical shot epoch and whether THIS frame was a genuine raw meter detection.
     void observeMeterBlindness(quint64 physicalShotEpoch, bool genuineRawDetection);
+    // [RT-MED-04 2026-09-23] Engine meterPressUnanswered relay: one completed METER press the
+    // meter never answered.
+    void observeMeterPressUnanswered(quint64 physicalShotEpoch, double holdMs);
+    // Mirrors meterBlindLatch_ into the two bools, the engine gate, the log and the signal.
+    void applyMeterBlindLatchEvent(MeterBlindnessLatch::Event event);
     // Formats one sidecar {"event":"detector_health"} object into detectorHealthLine_ /
     // detectorProvider_. Presentation only — reads nothing from and writes nothing to the
     // engine.
@@ -2192,6 +2209,7 @@ private:
     void pushTempoRemapBridgeState();
     void applySecurityStatus(const SecurityStatus& status);
     void updateSecurityStatus();
+    bool beginSignedSettingsSave();
     void updateRuntimeStatus();
     void ensurePacketBridgeRunning();
     bool startPacketBridgeDebug();
@@ -2537,6 +2555,8 @@ private:
     QString securityState_ = QStringLiteral("Checking");
     QString securityDetail_ = QStringLiteral("Local checks have not run yet.");
     bool securityLockActive_ = false;
+    bool settingsRepairAvailable_ = false;
+    bool settingsSaveRefusedLogged_ = false;
     bool securityReleaseManifestRequired_ = false;
     QString securityLockReason_ = QStringLiteral("-");
     QString entitlementState_ = QStringLiteral("No cached entitlement");
@@ -2627,24 +2647,16 @@ private:
     qint64 lastMeterOverlayVisualSeenMs_ = 0;
     bool meterConfirmed_ = false;
     // ---- meter-blind safety net (see the meterBlindWarning property) ----
-    // The physical shot epoch currently being observed; 0 = none seen yet.
-    quint64 meterBlindEpoch_ = 0;
-    // Did THIS epoch ever produce a genuine raw detection?
-    bool meterBlindEpochSawMeter_ = false;
-    // Consecutive completed epochs that produced none.
-    int meterBlindStreak_ = 0;
+    // [RT-MED-04 / CL3-F4-007 / CL3-F8-009 2026-09-23] The whole rule lives in MeterBlindnessLatch
+    // (pure, unit-tested): the streak counts completed METER presses the meter never answered
+    // (engine signal meterPressUnanswered), only IN-PRESS raw detections reset it, and the latch
+    // clears after MeterBlindnessLatch::kRecoveryOwnedShots VISION-owned shots. The two bools
+    // below mirror it for the existing properties and the engine gate.
+    MeterBlindnessLatch meterBlindLatch_;
     bool meterBlindWarning_ = false;
-    // Three whole shots with zero genuine detections. High enough that an occluded or
-    // off-screen meter cannot trip it, low enough that a wrong colour is caught in seconds.
-    static constexpr int kMeterBlindStreakTrip_ = 3;
-    // [CL2-P9-001 2026-09-23] Latched when the blind warning trips; it drives the engine's
-    // detection_unavailable gate. Unlike the display warning (which one raw detection clears) it
-    // clears only after kDetectionRecoveryOwnedShots_ shots the bot actually OWNED, so a single
-    // false lock on a jersey or court line cannot re-enable timer shots.
+    // [CL2-P9-001 2026-09-23] Mirrors meterBlindLatch_.unavailable(); drives the engine's
+    // detection_unavailable gate.
     bool detectionUnavailable_ = false;
-    int detectionRecoveryOwnedShots_ = 0;
-    quint64 detectionRecoveryLastEpoch_ = 0;
-    static constexpr int kDetectionRecoveryOwnedShots_ = 2;
     // ---- reader detector health (Meter Detection card, presentation only) ----
     // Empty until the sidecar's first detector_health line; cleared when the sidecar exits.
     QString detectorHealthLine_;
@@ -2864,6 +2876,9 @@ private:
     // still trips once it expires. 0 = no suppression.
     std::atomic<qint64> guiFreezeSuppressUntilMs_{0};
     std::atomic<bool> guiFreezeTripped_{false};
+    // [RT-MED-10 2026-09-23] Set on WM_POWERBROADCAST PBT_APMSUSPEND, cleared on resume: the
+    // GUI-freeze watchdog stands down while the system is going to / coming back from sleep.
+    std::atomic<bool> systemSuspended_{false};
     std::atomic<bool> watchdogThreadStop_{false};
     std::thread guiFreezeThread_;
     QString holdSource_ = QStringLiteral("Square");

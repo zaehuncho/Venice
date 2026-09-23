@@ -99,6 +99,16 @@ if (-not $AllowUnsigned) {
     if ($LASTEXITCODE -ne 0) {
         throw "Package verification FAILED (exit $LASTEXITCODE) for $PackageDir - refusing to build an installer from an unverified package. Re-run tools\security\pack_lethe_release.py."
     }
+    if (-not $IsServerShard) {
+        # The installer must contain an EXACT signed file inventory: no extra DLL
+        # or Qt plugin, even if a local development runtime permits diagnostics.
+        $ExactInventoryArgs = @((Join-Path $Root "tools\verify_release_integrity.py"),
+                                "--package", $PackageDir, "--strict-warnings")
+        & $Python @ExactInventoryArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Package has unmanifested or invalid runtime files (exit $LASTEXITCODE): $PackageDir"
+        }
+    }
     Write-Host "[orion-installer] package verification OK"
 } else {
     Write-Warning "-AllowUnsigned: skipping the pinned-key package verification gate. Never ship this artifact."

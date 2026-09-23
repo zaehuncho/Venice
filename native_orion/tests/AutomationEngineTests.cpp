@@ -12,6 +12,7 @@
 #include "../src/FeedforwardAuthorityPolicy.h"
 #include "../src/LeaseGate.h"
 #include "../src/LeadCalibrationPolicy.h"
+#include "../src/MeterBlindnessLatch.h"
 #include "../src/OrionPaths.h"
 #include "../src/LatencyRouteAttestationHandshake.h"
 #include "../src/LicenseClient.h"
@@ -610,6 +611,13 @@ private slots:
     void onsetFeedforwardInertWithoutReferenceGainOrLateOnset();
     // [ORION_ONSET_FF] round 2 (Codex 2026-09-21): learner/trim fences, trim bound, reset, staleness.
     void onsetFeedforwardFencesPhaseAndTrim();
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] every OTHER learner is fenced on the same displacement.
+    void onsetFeedforwardFencesPressTipHoldAndReleaseClockLearners();
+    // [RT-MED-03 / CL3-F4-006 2026-09-23] semantic bands on learning.json load + .bak rotation.
+    void learningSemanticGarbageIsQuarantinedAndNeverRotated();
+    // [RT-MED-04 / CL3-F4-007 / CL3-F8-009 2026-09-23] meter-blind latch from unanswered presses.
+    void meterBlindLatchTripsOnUnansweredMeterPresses();
+    void meterPressUnansweredSignalCarriesTheEpoch();
     void onsetFeedforwardIsBoundedByTheBannerTrimAndResets();
     void onsetFeedforwardDisplacedReleaseDropsTheMarkerAndNormalisesPerRelease();
     // [ORION_PHASE_VETO_DIRECTIONAL] the live-meter veto must keep only its late-hazard direction.
@@ -39287,6 +39295,12 @@ void AutomationEngineTests::devLeadEnvOverrideStillBeatsTheUserShotLead()
     qputenv("ORION_LEAD_BIAS_MS", "62");
     engine.applyConfig(config, orion::LearningData{});
     engine.measuredLatencyAuthorityMs_ = 227.6;
+#ifdef ORION_PRODUCTION_BUILD
+    // [2026-09-23] The customer build compiles these dev sweep reads out: the env is IGNORED and
+    // the customer's own Shot Lead flies. This is the production half of the contract.
+    QCOMPARE(engine.measuredLeadForActuationMs(), 200.0);
+    return;
+#endif
     // 227.6 + 62 = 289.6, floored to 290 — exactly what the rig produces today.
     QCOMPARE(engine.measuredLeadForActuationMs(), 290.0);
 
@@ -45245,6 +45259,13 @@ void AutomationEngineTests::doubleCountedPredictorBiasCorrectionIsNamedNotSilent
         return hits;
     };
 
+#ifdef ORION_PRODUCTION_BUILD
+    // [2026-09-23] The customer build ignores ORION_LEAD_BIAS_MS, so the lead-bias knob can never
+    // be on there and the double-count cannot happen: no warning in any combination.
+    QCOMPARE(warningsFrom(true, true).size(), 0);
+    QCOMPARE(warningsFrom(false, true).size(), 0);
+    return;
+#endif
     // Both on -> exactly one warning, and it must NAME both knobs so the reader can act.
     // REVERT-TRACE: delete the guard block in applyConfig and this QCOMPARE fails with 0.
     const QStringList both = warningsFrom(true, true);
@@ -50945,9 +50966,16 @@ void AutomationEngineTests::onsetFeedforwardInertWithoutReferenceGainOrLateOnset
         qunsetenv("ORION_ONSET_FF_GAIN");
         qunsetenv("ORION_ONSET_FF_CLAMP_MS");
         qunsetenv("ORION_ONSET_FF_ONE_SIDED");
+#ifdef ORION_PRODUCTION_BUILD
+        // [2026-09-23] The customer build ignores every ONSET_FF env knob: the settings stand.
+        QCOMPARE(engine.config().onsetFeedforwardGain, AppConfigData{}.onsetFeedforwardGain);
+        QCOMPARE(engine.config().onsetFeedforwardClampMs, 7.0);
+        QCOMPARE(engine.config().onsetFeedforwardOneSided, AppConfigData{}.onsetFeedforwardOneSided);
+#else
         QCOMPARE(engine.config().onsetFeedforwardGain, AppConfigData::kOnsetFeedforwardGainMax);
         QCOMPARE(engine.config().onsetFeedforwardClampMs, 7.0);
         QVERIFY(!engine.config().onsetFeedforwardOneSided);
+#endif
     }
 }
 
@@ -50987,6 +51015,372 @@ void AutomationEngineTests::onsetFeedforwardFencesPhaseAndTrim()
     QCOMPARE(displaced.bannerLeadTrim_.trimMsForType(type, tempo), 0.0);
     QVERIFY2(control.bannerLeadTrim_.trimMsForType(type, tempo) > 0.0,
              "control: three consecutive LATEs must step the trim");
+}
+
+// [RT-MED-02 / CL3-F4-008 2026-09-23] The phase constant and the banner trim were fenced on the
+// feedforward displacement; the press->tip observation, the no-meter hold, the per-type clock
+// seeds, the velocity prior, the global clocks and the lead-outcome confidence bit were not (6/6
+// FF-applied epochs in session_20260923_120043 logged PRESS-TIP accepted=1). Each is now fenced,
+// and an undisplaced control proves every assertion is about the fence, not another gate.
+void AutomationEngineTests::onsetFeedforwardFencesPressTipHoldAndReleaseClockLearners()
+{
+    // (a) The post-release learners, driven directly like pressTipObservationUnderDelay...:
+    //     the landing is perfect (H confidence, in band, hold 690 ms) except for the displacement.
+    struct PostRelease { QString line; double pressTipWeight; bool holdLearned; };
+    const auto runPostRelease = [](double onsetFfMs) {
+        PostRelease r;
+        AutomationEngine engine;
+        engine.applyConfig(AppConfigData{}, LearningData{});
+        engine.advanceTestClock(120'000.0);
+        const double now = engine.engineNowMs();
+        engine.measuredLFixedMs_ = 180.0;                 // V (l_fixed) -> H confidence
+        engine.meterCapPhysicalEpoch_ = 9'802;
+        engine.meterCapPressWallMs_ = now - 800.0;
+        engine.meterCapReleaseWallMs_ = now - 110.0;      // hold 690 ms, inside the learn band
+        engine.meterCapPhaseStopMs_ = now;
+        engine.meterCapPhaseStopConfirmed_ = true;
+        engine.meterCapAppliedDelayMs_ = 0.0;
+        engine.meterCapBlindRelease_ = false;
+        engine.meterCapLateFireMs_ = 0.0;
+        engine.meterCapHoldBandKind_.clear();
+        engine.meterCapOnsetFfMs_ = onsetFfMs;
+        QSignalSpy diagSpy(&engine, &AutomationEngine::engineDiagnostic);
+        engine.emitPressTipObservation(
+            8, QStringLiteral("Standstill"), /*graded=*/true, /*greenObserved=*/true,
+            QVector<AutomationEngine::MeterCalSample>{});
+        for (const QList<QVariant>& row : diagSpy) {
+            const QString line = row.at(0).toString();
+            if (line.startsWith(QStringLiteral("PRESS-TIP OBSERVATION:"))) {
+                r.line = line;
+            }
+        }
+        r.pressTipWeight = engine.pressAnchoredLearnedWeight(QStringLiteral("Standstill"));
+        r.holdLearned = engine.config().noMeterHoldByType.contains(QStringLiteral("Standstill"));
+        return r;
+    };
+    const PostRelease clean = runPostRelease(0.0);
+    QVERIFY2(clean.line.contains(QStringLiteral("accepted=1")), qPrintable(clean.line));
+    QVERIFY2(clean.pressTipWeight > 0.0, "control: an undisplaced landing teaches press->tip");
+    QVERIFY2(clean.holdLearned, "control: an undisplaced landing teaches the no-meter hold");
+    const PostRelease displaced = runPostRelease(-6.0);
+    QVERIFY2(displaced.line.contains(QStringLiteral("accepted=0")), qPrintable(displaced.line));
+    QCOMPARE(displaced.pressTipWeight, 0.0);
+    QVERIFY2(!displaced.holdLearned,
+             "a feedforward-displaced release must never teach the no-meter hold");
+
+    // (b) The learners INSIDE triggerRelease (per-type clock seed, velocity prior, global clocks,
+    //     lead-outcome confidence). Same immediate-release fixture as the route-binding test; the
+    //     release is marked scheduler-fired so it keeps the displacement it carried.
+    struct AtRelease { bool released; bool clockSeeded; bool visionConfident; double carried; };
+    const auto runRelease = [](double carriedOnsetFfMs) {
+        AtRelease r{};
+        AutomationEngine engine;
+        engine.config_.autonomousVision = true;
+        engine.config_.noMeterEnabled = false;
+        engine.setControllerRouteBindingRequired(true);
+        engine.config_.confidenceGate = 0.5;
+        engine.config_.strictReleaseMaxSourceAgeMs = 50.0;
+        engine.advanceTestClock(120'000.0);
+        const double now = engine.engineNowMs();
+        engine.shot_.state = HoldState::Holding;
+        engine.shot_.lastSampleGenuineAccept = true;
+        engine.shot_.lastFreshAcceptMs = now;
+        engine.shot_.frameAgeMs = 0.0;
+        engine.shot_.fillPct = 92.0;
+        engine.shot_.confidence = 1.0;
+        engine.shot_.releaseReasonCode = QStringLiteral("predictive_target");   // vision-timed
+        engine.shot_.shotType = QStringLiteral("Standstill");
+        engine.shot_.bucketKey = QStringLiteral("Standstill");
+        engine.shot_.holdStartMs = now - 500.0;           // holdElapsed 500 ms: a seedable clock
+        engine.shot_.firedByScheduler = true;
+        engine.lastReleaseOnsetFfMs_ = carriedOnsetFfMs;
+        engine.setControllerDeliveryRouteAttestation(4'401, LatencyControllerRoute::Pipe);
+        r.released = engine.triggerRelease(now);
+        r.clockSeeded = engine.config().shotTypeFeedforwardMs.contains(QStringLiteral("Standstill"));
+        r.visionConfident = engine.lastReleaseVisionConfident_;
+        r.carried = engine.meterCapOnsetFfMs_;
+        return r;
+    };
+    const AtRelease undisplaced = runRelease(0.0);
+    QVERIFY(undisplaced.released);
+    QVERIFY2(undisplaced.clockSeeded, "control: a vision-timed release seeds its per-type clock");
+    QVERIFY2(undisplaced.visionConfident, "control: a fresh confident release is trusted");
+    QCOMPARE(undisplaced.carried, 0.0);
+    const AtRelease ffDisplaced = runRelease(-6.0);
+    QVERIFY(ffDisplaced.released);
+    QVERIFY2(!ffDisplaced.clockSeeded,
+             "a feedforward-displaced release must never seed the per-type clock");
+    QVERIFY2(!ffDisplaced.visionConfident,
+             "a feedforward-displaced outcome must never count as a confident lead lesson");
+    // The capture window samples the displacement for the delayed learners in (a).
+    QCOMPARE(ffDisplaced.carried, -6.0);
+
+    // (c) One predicate owns the rule.
+    AutomationEngine predicate;
+    QVERIFY(!predicate.releaseLearningDisplaced());
+    predicate.lastReleaseOnsetFfMs_ = -2.0;
+    QVERIFY(predicate.releaseLearningDisplaced());
+}
+
+// [RT-MED-03 / CL3-F4-006 2026-09-23] Syntactically valid, semantically absurd learning.json.
+void AutomationEngineTests::learningSemanticGarbageIsQuarantinedAndNeverRotated()
+{
+    // (a) The validator: finite extremes, negative clocks and wrong types are violations; the
+    //     shipped defaults, the owner's real values and 0 ("unarmed") are not.
+    const QJsonObject sane{
+        {QStringLiteral("version"), 3},
+        {QStringLiteral("bias_pct"), 0},
+        {QStringLiteral("ema_fill_per_frame"), 0},
+        {QStringLiteral("ema_green_ratio"), 0},
+        {QStringLiteral("global_appear_to_tip_ms"), 0},
+        {QStringLiteral("global_hold_to_release_ms"), 0},
+        {QStringLiteral("learned_latency_ms"), 0},
+        {QStringLiteral("probe_spawn_offset_ms"), 178.2},
+        {QStringLiteral("global_rise_velocity_pct_ms"), 0.226},
+        {QStringLiteral("lead_rebaselined"), false},
+        {QStringLiteral("learned_phase_physical_ms"), 271},
+        {QStringLiteral("measured_phase_physical_ms"), 286.1489455586299},
+        {QStringLiteral("shot_type_feedforward_ms"), QJsonObject{{QStringLiteral("Standstill"), 0.0}}},
+        {QStringLiteral("no_meter_hold_by_type"),
+         QJsonObject{{QStringLiteral("Go-To"),
+                      QJsonObject{{QStringLiteral("median_ms"), 2044.4}, {QStringLiteral("n"), 12}}}}},
+    };
+    QVERIFY2(AppConfig::learningSemanticViolations(sane).isEmpty(),
+             qPrintable(AppConfig::learningSemanticViolations(sane).join(QLatin1Char(','))));
+    QVERIFY(AppConfig::learningSemanticViolations(QJsonObject{}).isEmpty());
+    const QList<QPair<QString, QJsonValue>> scalarGarbage = {
+        {QStringLiteral("bias_pct"), -60.0},
+        {QStringLiteral("bias_pct"), 1e300},
+        {QStringLiteral("learned_latency_ms"), -1e9},
+        {QStringLiteral("global_hold_to_release_ms"), -5.0},
+        {QStringLiteral("global_appear_to_tip_ms"), 1e300},
+        {QStringLiteral("probe_spawn_offset_ms"), -1.0},
+        {QStringLiteral("global_rise_velocity_pct_ms"), 50.0},
+        {QStringLiteral("ema_green_ratio"), 7.0},
+        {QStringLiteral("bias_pct"), QStringLiteral("0")},   // wrong type
+        {QStringLiteral("learned_phase_physical_ms"), 1e300},
+    };
+    for (const auto& g : scalarGarbage) {
+        QJsonObject bad = sane;
+        bad.insert(g.first, g.second);
+        QVERIFY2(AppConfig::learningSemanticViolations(bad).contains(g.first),
+                 qPrintable(g.first));
+    }
+    const QList<QPair<QString, double>> mapGarbage = {
+        {QStringLiteral("shot_type_learned_offset_ms"), 1e300},
+        {QStringLiteral("shot_type_feedforward_ms"), -300.0},
+        {QStringLiteral("shot_type_meter_to_release_ms"), -1e9},
+        {QStringLiteral("shot_type_appear_to_tip_ms"), 9000.0},
+        {QStringLiteral("shot_type_latency_ms"), 500.0},
+        {QStringLiteral("shot_type_velocity_prior_pct_ms"), -0.1},
+        {QStringLiteral("shot_type_rtt_baseline_ms"), 1e300},
+        {QStringLiteral("shot_type_cal_phase"), 9.0},
+    };
+    for (const auto& g : mapGarbage) {
+        QJsonObject bad = sane;
+        bad.insert(g.first, QJsonObject{{QStringLiteral("Standstill"), g.second}});
+        QVERIFY2(!AppConfig::learningSemanticViolations(bad).isEmpty(), qPrintable(g.first));
+    }
+
+#ifndef ORION_PRODUCTION_BUILD
+    const auto writeJson = [](const QString& path, const QJsonObject& obj) {
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        f.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+        return true;
+    };
+    // (b) With a good backup: the out-of-band file is quarantined and the backup restored.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QString learningFile;
+        QString backupFile;
+        {
+            AppConfig store(dir.path());
+            LearningData d;
+            d.noMeterHoldByType.insert(QStringLiteral("Standstill"), {651.3, 238});
+            d.biasPct = 0.0;
+            QVERIFY(store.saveLearning(d));
+            QVERIFY(store.saveLearning(d));   // promotes the valid file to .bak
+            learningFile = store.learningPath();
+            backupFile = store.learningBackupPath();
+        }
+        QJsonObject bad = sane;
+        bad.insert(QStringLiteral("bias_pct"), -60.0);
+        bad.insert(QStringLiteral("shot_type_learned_offset_ms"),
+                   QJsonObject{{QStringLiteral("Standstill"), 1e300}});
+        QVERIFY(writeJson(learningFile, bad));
+        AppConfig reader(dir.path());
+        reader.load();
+        QCOMPARE(reader.learning().biasPct, 0.0);
+        QVERIFY(!reader.learning().shotTypeLearnedOffsetMs.contains(QStringLiteral("Standstill")));
+        QCOMPARE(reader.learning().noMeterHoldByType.value(QStringLiteral("Standstill")).medianMs,
+                 651.3);   // came back from the last-good copy
+        QVERIFY2(reader.learningLoadNote().contains(QStringLiteral("out-of-range")),
+                 qPrintable(reader.learningLoadNote()));
+        QVERIFY(reader.learningLoadNote().contains(QStringLiteral("restored")));
+        const QDir dataDir = QFileInfo(learningFile).dir();
+        QCOMPARE(dataDir.entryList({QStringLiteral("learning.json.invalid-*")}, QDir::Files).size(), 1);
+    }
+    // (c) Without a backup: quarantined, the out-of-band fields fall to their defaults and the
+    //     in-band fields survive.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        AppConfig store(dir.path());
+        const QString learningFile = store.learningPath();
+        QJsonObject bad = sane;
+        bad.insert(QStringLiteral("bias_pct"), -60.0);
+        bad.insert(QStringLiteral("probe_spawn_offset_ms"), -1e9);
+        QVERIFY(writeJson(learningFile, bad));
+        AppConfig reader(dir.path());
+        reader.load();
+        QCOMPARE(reader.learning().biasPct, LearningData{}.biasPct);
+        QCOMPARE(reader.learning().probeSpawnOffsetMs, LearningData{}.probeSpawnOffsetMs);
+        QCOMPARE(reader.learning().learnedPhasePhysicalMs, 271.0);   // in band: kept
+        QVERIFY(reader.learningLoadNote().contains(QStringLiteral("no valid backup")));
+        QVERIFY(!QFile::exists(learningFile));   // quarantined, never silently rewritten on load
+    }
+    // (d) The rotation guard: a semantically bad CURRENT file is never promoted to .bak, so the
+    //     last-good copy survives the next save.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        AppConfig store(dir.path());
+        LearningData good;
+        good.noMeterHoldByType.insert(QStringLiteral("Standstill"), {651.3, 238});
+        QVERIFY(store.saveLearning(good));
+        QVERIFY(store.saveLearning(good));   // .bak = good
+        QJsonObject bad = sane;
+        bad.insert(QStringLiteral("bias_pct"), -60.0);
+        QVERIFY(writeJson(store.learningPath(), bad));
+        QVERIFY(store.saveLearning(good));   // must NOT rotate the bad file into .bak
+        QJsonObject backup;
+        {
+            QFile f(store.learningBackupPath());
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            backup = QJsonDocument::fromJson(f.readAll()).object();
+        }
+        QVERIFY2(AppConfig::learningSemanticViolations(backup).isEmpty(),
+                 "the last-good copy must still be semantically valid");
+        QCOMPARE(backup.value(QStringLiteral("bias_pct")).toDouble(), 0.0);
+    }
+#endif
+}
+
+// [RT-MED-04 / CL3-F4-007 / CL3-F8-009 2026-09-23] The latch's rules, fail-first against the old
+// controller behaviour: (1) unanswered METER presses trip it, (2) an idle sighting between presses
+// does not reset the streak, (3) an in-press sighting does, (4) Go-To pushes with no meter never
+// clear it -- the controller only reports VISION-owned shots, so they never reach the latch --
+// and (5) two distinct vision-owned shots do.
+void AutomationEngineTests::meterBlindLatchTripsOnUnansweredMeterPresses()
+{
+    using Event = MeterBlindnessLatch::Event;
+    // (1)+(2): three long meterless presses with an idle raw sighting between #2 and #3.
+    MeterBlindnessLatch latch;
+    QCOMPARE(latch.observeUnansweredPress(11, 700.0), Event::Counted);
+    QCOMPARE(latch.observeUnansweredPress(12, 650.0), Event::Counted);
+    latch.observeRawDetection(0);                    // idle false lock between shots
+    QCOMPARE(latch.streak(), 2);
+    QCOMPARE(latch.observeUnansweredPress(13, 820.0), Event::Tripped);
+    QVERIFY(latch.unavailable());
+    QVERIFY(latch.warning());
+    // The same epoch cannot count twice; taps / pump fakes / menu presses never count.
+    QCOMPARE(latch.observeUnansweredPress(13, 820.0), Event::None);
+    MeterBlindnessLatch taps;
+    for (quint64 e = 1; e <= 10; ++e) {
+        QCOMPARE(taps.observeUnansweredPress(e, 120.0), Event::None);
+    }
+    QCOMPARE(taps.observeUnansweredPress(11, std::numeric_limits<double>::quiet_NaN()), Event::None);
+    QVERIFY(!taps.warning());
+    QCOMPARE(taps.streak(), 0);
+
+    // (3) Negative control: an IN-PRESS sighting resets the streak and that press is not counted.
+    MeterBlindnessLatch seen;
+    QCOMPARE(seen.observeUnansweredPress(21, 700.0), Event::Counted);
+    QCOMPARE(seen.observeUnansweredPress(22, 700.0), Event::Counted);
+    seen.observeRawDetection(23);                    // the meter WAS visible during press 23
+    QCOMPARE(seen.streak(), 0);
+    QCOMPARE(seen.observeUnansweredPress(23, 700.0), Event::None);
+    QVERIFY(!seen.warning());
+
+    // While latched, an in-press blip clears the streak but NOT the warning.
+    latch.observeRawDetection(14);
+    QVERIFY(latch.unavailable());
+    QVERIFY(latch.warning());
+
+    // (5) Recovery needs two DISTINCT vision-owned shots; the same epoch twice is one shot.
+    QCOMPARE(latch.observeVisionOwnedShot(15), Event::None);
+    QCOMPARE(latch.observeVisionOwnedShot(15), Event::None);
+    QVERIFY(latch.unavailable());
+    QCOMPARE(latch.observeVisionOwnedShot(16), Event::Recovered);
+    QVERIFY(!latch.unavailable());
+    QVERIFY(!latch.warning());
+
+    // (4) The Go-To half is the controller's predicate: a push that enters Holding with
+    //     release_reason=await_meter carries meterSeenThisShot=false, which observeBotOwnership
+    //     now requires before it calls observeVisionOwnedShot. Pin the engine field it reads.
+    ShotContext gotoAwaitingMeter;
+    gotoAwaitingMeter.mode = ShotMode::GoToStick;
+    gotoAwaitingMeter.state = HoldState::Holding;
+    QVERIFY(!gotoAwaitingMeter.meterSeenThisShot);
+
+    // Reset (NO METER mode) forgets everything.
+    MeterBlindnessLatch cleared = latch;
+    QCOMPARE(cleared.observeUnansweredPress(31, 700.0), Event::Counted);
+    cleared.reset();
+    QCOMPARE(cleared.streak(), 0);
+    QVERIFY(!cleared.unavailable());
+}
+
+// [RT-MED-04 / CL3-F4-007 2026-09-23] The engine half: a meterless METER-mode press emits exactly
+// one meterPressUnanswered for its epoch with the real hold, exposes that epoch as the ACTIVE
+// press while it is held, and -- silent-fire protection -- still passes the player's own press
+// through with no bot release (greenWindowPriority keeps the blind backstop down).
+void AutomationEngineTests::meterPressUnansweredSignalCarriesTheEpoch()
+{
+    AppConfigData config = meterBlindBackstopConfig(650.0, 274.0);   // shipped backstop default
+    AutomationEngine engine;
+    engine.applyConfig(config, LearningData{});
+    QVERIFY(engine.config_.greenWindowPriority);
+    engine.config_.measuredLeadFreshnessMs = 100'000.0;
+    engine.advanceTestClock(1000.0);
+    QCOMPARE(engine.activePhysicalPressEpoch(), quint64{0});
+
+    ControllerState square;
+    square.buttons |= XINPUT_GAMEPAD_X;
+    QSignalSpy unanswered(&engine, &AutomationEngine::meterPressUnanswered);
+    QSignalSpy diag(&engine, &AutomationEngine::engineDiagnostic);
+    beginMeterlessLivePress(engine, square, 4'405);
+    QCOMPARE(engine.activePhysicalPressEpoch(), quint64{4'405});
+    ControllerState output;
+    for (int i = 0; i < 8; ++i) {
+        engine.advanceTestClock(100.0);
+        output = engine.process(square);
+        QVERIFY2(output.square(), "a meterless press must pass through untouched");
+    }
+    QCOMPARE(unanswered.count(), 0);   // not before the player lets go
+    ControllerState neutral;
+    for (int i = 0; i < 3; ++i) {
+        engine.advanceTestClock(4.0);
+        engine.process(neutral);
+    }
+    QCOMPARE(engine.shotsReleased(), 0);
+    QVERIFY(diagnosticMatching(diag, QStringLiteral("METER BACKSTOP: fired")).isEmpty());
+    QVERIFY(!diagnosticMatching(diag, QStringLiteral("reason=press_unanswered_no_meter")).isEmpty());
+    QCOMPARE(unanswered.count(), 1);
+    QCOMPARE(unanswered.at(0).at(0).value<quint64>(), quint64{4'405});
+    QVERIFY2(unanswered.at(0).at(1).toDouble() >= MeterBlindnessLatch::kMinShotHoldMs,
+             qPrintable(QString::number(unanswered.at(0).at(1).toDouble())));
+    QCOMPARE(engine.activePhysicalPressEpoch(), quint64{0});
+
+    // Fed into the latch exactly as the controller relays it, three such presses trip it.
+    MeterBlindnessLatch latch;
+    QCOMPARE(latch.observeUnansweredPress(unanswered.at(0).at(0).value<quint64>(),
+                                          unanswered.at(0).at(1).toDouble()),
+             MeterBlindnessLatch::Event::Counted);
 }
 
 void AutomationEngineTests::onsetFeedforwardIsBoundedByTheBannerTrimAndResets()

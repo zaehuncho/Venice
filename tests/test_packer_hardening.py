@@ -608,7 +608,10 @@ def test_verify_only_refuses_an_unmanifested_runtime_file(tmp_path):
 
     with pytest.raises(SystemExit) as exc:
         pack.verify_only(package, public_key_b64=pub_b64, key_id=TEST_KEY_ID)
-    assert "UNMANIFESTED_PACKAGE_FILE" in str(exc.value)
+    # [RT-MED-08 2026-09-23] The integrity gate now refuses the unlisted file even earlier, at the
+    # signed-inventory check; either refusal is fail-closed.
+    assert ("UNMANIFESTED_PACKAGE_FILE" in str(exc.value)
+            or "Unlisted (unverified) file in package: unmanifested-runtime.dll" in str(exc.value))
     assert _bytes_snapshot(package) == before, "verify-only must never rewrite its input"
 
 

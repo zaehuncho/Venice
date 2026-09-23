@@ -56,6 +56,9 @@ HINT_ENDED = ("Your trial or subscription has ended. Run /status in Discord or r
               "Venice website.")
 HINT_NETWORK = ("Couldn't reach Venice's servers. Check your internet connection and try again "
                 "in a moment.")
+HINT_CLOCK_TLS = ("Check that your PC's date and time are correct (Windows Settings > Time & "
+                  "language > Set time automatically), then try again. If they are, check your "
+                  "internet connection.")
 
 # (message as shown in authMessage, expected hint). Messages are the literal strings from
 # OrionAppController.cpp, LicenseClient.cpp (licenseErrorUserText + transport errors) and
@@ -89,8 +92,9 @@ HINT_CASES = [
     ("Activation is rate limited locally. Wait a moment and retry.", HINT_RATE),
     ("rate_limited", HINT_RATE),
     ("License request timed out. Check your connection and try again.", HINT_NETWORK),
-    ("TLS verification failed.", HINT_NETWORK),
-    ("Pinned server certificate did not match.", HINT_NETWORK),
+    # [CL3-F8-012 / P-E 2026-09-23] A TLS/certificate failure names the PC clock first.
+    ("TLS verification failed.", HINT_CLOCK_TLS),
+    ("Pinned server certificate did not match.", HINT_CLOCK_TLS),
     ("Connection refused", HINT_NETWORK),
     ("Host api.zaeorion.com not found", HINT_NETWORK),
     ("Account access could not be checked just now. Retry shortly.", HINT_NETWORK),
@@ -278,9 +282,11 @@ def test_remaining_customer_surfaces_drop_jargon() -> None:
     json.loads(guide)
     assert "Shot meter **on**, style **Arrow2** (White), in 2K's settings." in guide
     form = source("native_orion/qml/components/StreamSetupForm.qml")
-    assert 'model: ["PS5", "Xbox"]' not in form
-    assert ('model: (orion.debugUiEnabled === true || orion.remotePlayConsole === "Xbox")\n'
-            '                   ? ["PS5", "Xbox"] : ["PS5"]') in form
+    # [RT-LOW-05 / P-E 2026-09-23 owner decision] Xbox is SHOWN to every customer, labelled
+    # experimental and untested (it used to be hidden in customer builds).
+    assert 'model: ["PS5", "Xbox"]' in form
+    assert "Xbox is listed as EXPERIMENTAL (untested)." in form
+    assert "Xbox Remote Play is EXPERIMENTAL and untested." in form
     assert "WGC video" not in form
     assert "HidHide" not in form
 

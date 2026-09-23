@@ -64,6 +64,10 @@ Item {
     readonly property bool inputDead: orion.inputDeadOverlayActive === true
     // [CL2-P8-002 2026-09-23] Non-empty while the licence lease blocks shots.
     readonly property bool leaseBlocked: String(orion.leaseNotice || "").length > 0
+    // [RT-MED-09 2026-09-23] Settings signature lock: the one state with a customer button.
+    readonly property bool settingsRepair: orion.settingsRepairAvailable === true
+    // [CL3-F8-002 2026-09-23] Detection unavailable (blind latch): shots are not being timed.
+    readonly property bool meterBlind: orion.meterBlindWarning === true
     readonly property bool inputDeadCritical: orion.inputDeadCritical === true
     readonly property string inputDeadHeadline: orion.inputDeadHeadline === undefined
                                                 ? "" : String(orion.inputDeadHeadline)
@@ -564,6 +568,7 @@ Item {
                             border.width: level === "maint" ? 2 : 1
                             // [CL2-P8-002 2026-09-23] The lease notice below outranks a notice.
                             visible: orion.motdVisible === true && !root.inputDead && !root.leaseBlocked
+                                     && !root.settingsRepair
                             z: 12
 
                             // Unwrapped width of the notice, measured outside the wrapping Text so
@@ -649,7 +654,7 @@ Item {
                             color: "#F005080D"
                             border.color: Theme.warning
                             border.width: 1
-                            visible: root.leaseBlocked && !root.inputDead
+                            visible: root.leaseBlocked && !root.inputDead && !root.settingsRepair
                             z: 12
 
                             Row {
@@ -693,6 +698,150 @@ Item {
                                 id: leaseMetrics
                                 font: leaseBannerText.font
                                 text: orion.leaseNotice || ""
+                            }
+                        }
+
+                        // ===== [RT-MED-09 2026-09-23] SETTINGS REPAIR BANNER =====================
+                        // settings.json no longer matches its signature (a save interrupted by a
+                        // crash that could not be rolled back, disk damage, or a hand edit).
+                        // Automation stays locked. The ONLY action offered is the scoped repair:
+                        // it keeps the rejected file aside and restores signed defaults; it never
+                        // re-signs what is on disk. Outranks the lease banner and the MOTD (it is
+                        // the one pause the customer fixes with a click); yields to dead input.
+                        Rectangle {
+                            id: settingsRepairBanner
+                            objectName: "settingsRepairBanner"
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.top: parent.top
+                            anchors.topMargin: 16
+                            width: Math.min(settingsRepairRow.implicitWidth + 28, parent.width - 32)
+                            height: settingsRepairRow.implicitHeight + 16
+                            radius: 12
+                            color: "#F005080D"
+                            border.color: Theme.warning
+                            border.width: 1
+                            visible: root.settingsRepair && !root.inputDead
+                            z: 12
+
+                            Row {
+                                id: settingsRepairRow
+                                anchors.centerIn: parent
+                                spacing: 10
+
+                                Rectangle {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: settingsRepairTag.implicitWidth + 12
+                                    height: 18
+                                    radius: 9
+                                    color: Qt.rgba(Theme.warning.r, Theme.warning.g, Theme.warning.b, 0.18)
+                                    border.color: Theme.warning
+                                    border.width: 1
+                                    Text {
+                                        id: settingsRepairTag
+                                        anchors.centerIn: parent
+                                        text: "SHOTS OFF"
+                                        color: Theme.warning
+                                        font.family: Theme.fontUi; font.pixelSize: 9; font.weight: Font.Bold
+                                        font.letterSpacing: 0.8
+                                    }
+                                }
+
+                                Text {
+                                    id: settingsRepairText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    // Same sentence as ui_notifications::settingsRepairCustomerText().
+                                    text: "Venice's settings didn't save cleanly (code ST-01), so shots are off. Repair settings goes back to default settings; your shot timing history is kept."
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontUi; font.pixelSize: 12; font.weight: Font.DemiBold
+                                    wrapMode: Text.WordWrap
+                                    width: Math.min(420, Math.max(80, settingsRepairBanner.parent.width - 32 - 28
+                                                                  - settingsRepairButton.width - 60))
+                                }
+
+                                Rectangle {
+                                    id: settingsRepairButton
+                                    objectName: "settingsRepairButton"
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: settingsRepairButtonText.implicitWidth + 24
+                                    height: 28
+                                    radius: 8
+                                    color: settingsRepairArea.containsMouse
+                                           ? Theme.accent
+                                           : Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.22)
+                                    border.color: Theme.accent
+                                    border.width: 1
+                                    Text {
+                                        id: settingsRepairButtonText
+                                        anchors.centerIn: parent
+                                        text: "Repair settings"
+                                        color: Theme.textPrimary
+                                        font.family: Theme.fontUi; font.pixelSize: 12; font.weight: Font.DemiBold
+                                    }
+                                    MouseArea {
+                                        id: settingsRepairArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: orion.repairSettings()
+                                    }
+                                }
+                            }
+                        }
+
+                        // ===== [CL3-F8-002 2026-09-23] DETECTION UNAVAILABLE BANNER ============
+                        // The blind latch (meterBlindWarning) used to surface only as a 10 px
+                        // line in the Meter card. On patch day that is the state every customer
+                        // is in, so it gets the top-centre slot, below everything that needs an
+                        // action. The owner's MOTD wins the slot when it is up: on patch day it
+                        // carries the real cause ("2K changed the meter; a fix is coming").
+                        Rectangle {
+                            id: meterBlindBanner
+                            objectName: "meterBlindBanner"
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.top: parent.top
+                            anchors.topMargin: 16
+                            width: Math.min(meterBlindRow.implicitWidth + 28, parent.width - 32)
+                            height: meterBlindRow.implicitHeight + 16
+                            radius: 12
+                            color: "#F005080D"
+                            border.color: Theme.warning
+                            border.width: 1
+                            visible: root.meterBlind && !root.inputDead && !root.leaseBlocked
+                                     && !root.settingsRepair && orion.motdVisible !== true
+                            z: 11
+
+                            Row {
+                                id: meterBlindRow
+                                anchors.centerIn: parent
+                                spacing: 10
+
+                                Rectangle {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: meterBlindTag.implicitWidth + 12
+                                    height: 18
+                                    radius: 9
+                                    color: Qt.rgba(Theme.warning.r, Theme.warning.g, Theme.warning.b, 0.18)
+                                    border.color: Theme.warning
+                                    border.width: 1
+                                    Text {
+                                        id: meterBlindTag
+                                        anchors.centerIn: parent
+                                        text: "NOT TIMING"
+                                        color: Theme.warning
+                                        font.family: Theme.fontUi; font.pixelSize: 9; font.weight: Font.Bold
+                                        font.letterSpacing: 0.8
+                                    }
+                                }
+
+                                Text {
+                                    id: meterBlindText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: String(orion.meterBlindHint || "")
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontUi; font.pixelSize: 12; font.weight: Font.DemiBold
+                                    wrapMode: Text.WordWrap
+                                    width: Math.min(460, Math.max(80, meterBlindBanner.parent.width - 32 - 28 - 90))
+                                }
                             }
                         }
 

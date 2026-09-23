@@ -212,16 +212,17 @@ def test_every_bot_payload_builder_carries_the_actor():
     assert bot.staff_lookup_payload(ACTOR, "K")["actor_discord_id"] == ACTOR
 
 
-def test_claim_trial_and_hwid_reset_forward_the_actor(monkeypatch):
+def test_claim_trial_points_to_website_and_hwid_reset_forwards_the_actor(monkeypatch):
+    # [2026-09-23 owner decision] The free trial starts on the website; /claim_trial only points
+    # there and must never call the backend trial route. /hwid_reset still forwards the actor.
     rec = Recorder({bot.ROUTE_TRIAL: [(200, {"ok": True, "message": "sent"})],
                     bot.ROUTE_HWID_RESET: [(200, {"ok": True, "mode": "free"})]})
     monkeypatch.setattr(bot, "lambda_post", rec)
-    i = FakeInteraction()
-    _run(cmd("claim_trial").callback(i))
+    _run(cmd("claim_trial").callback(FakeInteraction()))
+    assert not any(q == bot.ROUTE_TRIAL for (q, _p) in rec.calls)
     _run(cmd("hwid_reset").callback(FakeInteraction()))
-    for path in (bot.ROUTE_TRIAL, bot.ROUTE_HWID_RESET):
-        p = rec.payload(path)
-        assert p["discord_id"] == ACTOR and p["actor_discord_id"] == ACTOR
+    p = rec.payload(bot.ROUTE_HWID_RESET)
+    assert p["discord_id"] == ACTOR and p["actor_discord_id"] == ACTOR
 
 
 def test_deliver_payload_shape():

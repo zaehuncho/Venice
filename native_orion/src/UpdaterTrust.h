@@ -6,6 +6,7 @@
 #include <QtCore/QList>
 #include <QtCore/QString>
 #include <QtCore/QStringList>
+#include <QtCore/QUrl>
 
 #include <functional>
 
@@ -60,6 +61,10 @@ ORION_UPDATER_API TrustRootDecision resolveTrustRoot(const QString& keyId,
 // Never in production: combined with any key override it is an offline path to
 // installing an arbitrary archive, and the launcher never passes it.
 ORION_UPDATER_API bool localManifestAllowed(bool productionBuild);
+
+// Production updater manifest fetches only the launcher's fixed API endpoint.
+// A caller-supplied --manifest-url on another HTTPS host is not authority.
+ORION_UPDATER_API bool productionManifestUrlAllowed(const QUrl& url);
 
 // [Codex F2] The install root the updater will write into. In production it must be
 // the updater's own directory (the launcher always passes exactly that) and it may not

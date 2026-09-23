@@ -660,9 +660,12 @@ class TestOwnerTotp:
                          headers={**OWNER_H, "x-orion-admin-totp": lf.totp_now(secret)})
         assert s == 200
 
-        # And it can be switched back off.
+        # And it can be switched back off. [rc1 P-A] totp_disable is a step-up
+        # action and every code is single-use: the confirm above already burned
+        # the current step, so use the next one (inside the +/-1 window).
         s, b, _ = invoke(lf, "POST", "/api/admin/config",
-                         headers={**OWNER_H, "x-orion-admin-totp": lf.totp_now(secret)},
+                         headers={**OWNER_H, "x-orion-admin-totp":
+                                  lf.totp_at(secret, int(time.time() // 30) + 1)},
                          body={"action": "totp_disable", "reason": "travelling"})
         assert s == 200 and b["owner_totp_required"] is False
         s, b, _ = invoke(lf, "GET", "/api/admin/whoami", headers=OWNER_H)

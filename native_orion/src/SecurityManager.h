@@ -80,13 +80,49 @@ public:
     // still cannot see settingsPath / settingsSigPath / the digest bytes.
     [[nodiscard]] bool hasSettingsSignature() const;
 
+    // [RT-MED-09 2026-09-23] Crash-safe settings save + sign.
+    //
+    // settings.json and settings.json.sig are two files, so a crash or forced reboot between
+    // the two commits used to leave NEW settings next to the OLD signature and lock a paying
+    // customer out. Every save now runs as a small transaction:
+    //   beginSettingsWrite()  - if the current pair verifies, snapshot it to settings.json.prev
+    //                           (+ .prev.sig) and write the settings.json.txn journal LAST;
+    //   <AppConfig::save()>   - atomic QSaveFile replace of settings.json;
+    //   commitSettingsWrite() - sign the new file, record the signed-once marker, drop the journal.
+    // recoverInterruptedSettingsWrite() runs once at startup: with a journal present and a
+    // mismatched pair it restores the snapshotted OLD pair (only if that pair verifies and
+    // matches the journal). The outcome is therefore always the exact old pair or the exact new
+    // pair. It never signs content it did not just write itself.
+    //
+    // Refused: the current pair is already invalid (tamper, damage) outside the one-time
+    // bootstrap. Production must not re-sign whatever is on disk; the customer uses the scoped
+    // Repair settings action, which discards that content for defaults.
+    enum class SettingsWriteGate { Signed, Bootstrap, Refused };
+    [[nodiscard]] SettingsWriteGate beginSettingsWrite(QString* detail = nullptr) const;
+    bool commitSettingsWrite(QString* error = nullptr) const;
+    enum class SettingsWriteRecovery { NoJournal, CompletedEarlier, RolledBack, Unrecoverable };
+    SettingsWriteRecovery recoverInterruptedSettingsWrite(QString* detail = nullptr);
+    // One-time bootstrap: true only while this profile has NEVER held a verified pair (no
+    // signature file and no signed-once marker). Deleting settings.json.sig after that no
+    // longer gets the current file signed at the next start.
+    [[nodiscard]] bool settingsBootstrapAllowed() const;
+    bool markSettingsSignedOnce(QString* error = nullptr) const;
+    // Copies the rejected settings.json aside (settings.rejected.json) for support before a
+    // repair overwrites it. Never signs it.
+    bool preserveRejectedSettings(QString* savedPath = nullptr) const;
+
 signals:
     void securityEvent(QString event, QString detail);
 
 private:
     [[nodiscard]] QByteArray settingsDigest() const;
+    [[nodiscard]] QByteArray settingsDigestForBytes(const QByteArray& data) const;
     [[nodiscard]] QString settingsPath() const;
     [[nodiscard]] QString settingsSigPath() const;
+    [[nodiscard]] QString settingsPrevPath() const;
+    [[nodiscard]] QString settingsPrevSigPath() const;
+    [[nodiscard]] QString settingsJournalPath() const;
+    [[nodiscard]] QString settingsSignedOnceMarkerPath() const;
     [[nodiscard]] QString localEntitlementPath() const;
     [[nodiscard]] QString releaseManifestPath() const;
     [[nodiscard]] QString releaseManifestSignaturePath(const QString& manifestPath) const;

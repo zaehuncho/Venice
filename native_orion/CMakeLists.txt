@@ -969,6 +969,46 @@ if(ORION_BUILD_TESTS)
         Qt6::Test
     )
     orion_add_qtest(OrionLicenseHeartbeatPolicyTests)
+    # [RT-MED-09 2026-09-23] Crash-safe settings save + sign transaction (SecurityCore).
+    add_executable(OrionSettingsSignatureTransactionTests
+        tests/SettingsSignatureTransactionTests.cpp
+    )
+    orion_apply_target_defaults(OrionSettingsSignatureTransactionTests)
+    target_link_libraries(OrionSettingsSignatureTransactionTests PRIVATE
+        OrionCommon
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    orion_add_qtest(OrionSettingsSignatureTransactionTests)
+    # [RT-MED-10 2026-09-23] GUI-freeze watchdog decision (src/GuiFreezeWatchdogPolicy.h,
+    # header-only): sleep/resume and clock steps are not a GUI freeze.
+    add_executable(OrionGuiFreezeWatchdogPolicyTests
+        tests/GuiFreezeWatchdogPolicyTests.cpp
+    )
+    orion_apply_target_defaults(OrionGuiFreezeWatchdogPolicyTests)
+    target_link_libraries(OrionGuiFreezeWatchdogPolicyTests PRIVATE
+        Qt6::Core
+        Qt6::Test
+    )
+    orion_add_qtest(OrionGuiFreezeWatchdogPolicyTests)
+    # [RT-CRIT-01 client 2026-09-23] Owner step-up policy for OrionOwner/OrionStaff: which admin
+    # requests carry a fresh single-use TOTP header, and that the code never reaches a body.
+    add_executable(OrionAdminStepUpPolicyTests
+        tests/AdminStepUpPolicyTests.cpp
+    )
+    orion_apply_target_defaults(OrionAdminStepUpPolicyTests)
+    # AdminToolController.h has an inline appVersion() that expands this macro.
+    target_compile_definitions(OrionAdminStepUpPolicyTests PRIVATE ORION_NATIVE_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(OrionAdminStepUpPolicyTests PRIVATE
+        OrionCommon
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    orion_add_qtest(OrionAdminStepUpPolicyTests)
 
     # [SERVER-SHARD D3] machine_id parity: broker's own compiled deriveMachineId()
     # vs SecurityManager::machineId() from SecurityCore — the two must be equal.

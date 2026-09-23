@@ -77,6 +77,21 @@ ORION_UPDATER_API bool applyTree(const QString& srcDir, const QString& destDir,
 // backup does not contain and copies the backup contents back over destDir.
 ORION_UPDATER_API bool restoreTree(const QString& backupDir, const QString& destDir, QString* error = nullptr);
 
+// Before the first write, prove every installed runtime file that may be
+// replaced/retired can be opened for overwrite/delete. A foreign sharing lock
+// then aborts with the old install unchanged, rather than failing after an
+// overlay has already begun.
+ORION_UPDATER_API bool preflightUpdateDestinations(const QString& installDir,
+                                                   const QJsonObject& oldFiles,
+                                                   const QJsonObject& newFiles,
+                                                   QString* error = nullptr);
+
+// The extracted stage must contain exactly the signed manifest's files plus
+// the manifest and detached signature: no extra DLL/plugin can be applied.
+ORION_UPDATER_API bool verifyExactManifestInventory(const QString& stageDir,
+                                                     const QJsonObject& files,
+                                                     QString* error = nullptr);
+
 // The launcher/updater verifies the old signed release manifest before calling
 // these helpers. `files` is its authenticated files map. Stage the updater EXE,
 // every root DLL, and the Qt plugin families used by the updater into a sibling

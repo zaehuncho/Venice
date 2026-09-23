@@ -77,7 +77,7 @@ test('signed paid monthly checkout provisions only the verified Stripe price and
     assert.deepEqual(calls.map((call) => call.path), ['/v1/subscriptions/sub_test1', '/api/bot/provision']);
     assert.deepEqual(calls[1].body, { order_id: 'stripe:checkout:cs_test1',
       discord_user_id: '123456789012345678', plan: 'month', days: 30, renew: false,
-      notify: true, subscription_id: 'sub_test1' });
+      notify: true, subscription_id: 'sub_test1', stripe_event_id: 'evt_checkout' });
   } finally { globalThis.fetch = originalFetch; }
 });
 
@@ -935,7 +935,8 @@ test('a dahlia-shaped renewal invoice with no `paid` field provisions the renewa
     assert.deepEqual(calls.map((call) => call.path), ['/v1/subscriptions/sub_test1', '/api/bot/provision']);
     assert.equal(calls[0].headers['Stripe-Version'], '2026-08-26.dahlia');
     assert.deepEqual(calls[1].body, { order_id: 'stripe:invoice:in_dahlia1', discord_user_id: '123456789012345678',
-      plan: 'month', days: 30, renew: true, notify: true, subscription_id: 'sub_test1' });
+      plan: 'month', days: 30, renew: true, notify: true, subscription_id: 'sub_test1',
+      stripe_event_id: 'evt_dahlia_renew' });
   } finally { globalThis.fetch = originalFetch; }
 });
 
@@ -961,7 +962,8 @@ test('a renewal invoice whose status is not paid never provisions, whatever lega
 
 const ACTIVATING_TEXT = 'Payment received — activating your Venice subscription. This usually takes under a minute.';
 const ACTIVATING_FALLBACK = 'Still waiting? Open a ticket in Discord with your receipt email — you will not be charged twice.';
-const ENTITLEMENT_TEXT = 'Your Discord account needs an active trial or subscription. Claim the trial in Discord, then try again. Just paid? Activation can take up to a minute — refresh this page.';
+// [P-E 2026-09-23 owner decision] The free trial starts on the website home page, not in Discord.
+const ENTITLEMENT_TEXT = 'Your Discord account needs an active trial or subscription. Start the free trial on the Venice home page, then try again. Just paid? Activation can take up to a minute — refresh this page.';
 
 async function paidCheckoutCookie(discordId = MEMBER_ID) {
   // Obtained exactly as a customer gets it: /checkout/complete after Stripe confirms the session.
@@ -1205,4 +1207,77 @@ test('CW-1: no paid cookie + not yet provisioned tells a just-paid customer to r
   assert.equal(response.status, 403);
   assert.ok(html.includes('Just paid? Activation can take up to a minute — refresh this page.'));
   assert.doesNotMatch(html, /orion:\/\/activate|PAIR-|http-equiv="refresh"/u);
+});
+
+// ── rc1 RT-LOW-04 / CL3-F6-002: Stripe event.id is forwarded for backend dedup ──
+function refundFetch(calls, chargebackReplies) {
+  return async (input, init) => {
+    const path = new URL(input).pathname;
+    calls.push({ path, body: init?.body ? JSON.parse(init.body) : undefined });
+    if (path === '/v1/invoices/in_ref1') return Response.json({ id: 'in_ref1', subscription: 'sub_test1' });
+    if (path === '/v1/subscriptions/sub_test1') return Response.json(subscription);
+    if (path === '/api/bot/chargeback') {
+      const [status, body] = chargebackReplies.shift();
+      return Response.json(body, { status });
+    }
+    throw Error(`unexpected path ${path}`);
+  };
+}
+
+const refundEvent = { id: 'evt_refund_replay1', livemode: true, type: 'charge.refunded', data: { object: {
+  id: 'ch_ref1', livemode: true, refunded: true, amount: 1999, amount_refunded: 1999, invoice: 'in_ref1',
+} } };
+
+test('RT-LOW-04: a replayed Stripe event carries the same event id; the backend no-op is a 200', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = refundFetch(calls, [
+    [200, { ok: true, revoked: true }],
+    [200, { ok: true, duplicate_event: true }],
+  ]);
+  try {
+    for (let i = 0; i < 2; i += 1) {
+      const response = await worker.fetch(await signedStripeEvent(refundEvent), liveStripeEnv);
+      assert.equal(response.status, 200);
+    }
+    const chargebacks = calls.filter((c) => c.path === '/api/bot/chargeback');
+    assert.equal(chargebacks.length, 2);
+    for (const c of chargebacks) assert.equal(c.body.stripe_event_id, 'evt_refund_replay1');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('RT-LOW-04: an in-flight duplicate (409) is a 500 so Stripe retries later', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = refundFetch(calls, [[409, { ok: false, error: 'event_in_progress' }]]);
+  try {
+    const response = await worker.fetch(await signedStripeEvent(refundEvent), liveStripeEnv);
+    assert.equal(response.status, 500);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('RT-LOW-04: provision and cancellation forward the verified event id', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(input).pathname;
+    calls.push({ path, body: init?.body ? JSON.parse(init.body) : undefined });
+    if (path === '/v1/subscriptions/sub_test1') return Response.json(subscription);
+    if (path === '/api/bot/provision') return Response.json({ ok: true }, { status: 201 });
+    if (path === '/api/bot/chargeback') return Response.json({ ok: true });
+    throw Error(`unexpected path ${path}`);
+  };
+  try {
+    await worker.fetch(await signedStripeEvent({ id: 'evt_fwd_checkout', livemode: true,
+      type: 'checkout.session.completed', data: { object: {
+        id: 'cs_fwd1', livemode: true, mode: 'subscription', payment_status: 'paid', amount_total: 1999,
+        subscription: 'sub_test1', metadata: { discord_user_id: '123456789012345678' } } } }), liveStripeEnv);
+    await worker.fetch(await signedStripeEvent({ id: 'evt_fwd_cancel', livemode: true,
+      type: 'customer.subscription.deleted', data: { object: { id: 'sub_test1', livemode: true,
+        status: 'canceled', metadata: subscription.metadata } } }), liveStripeEnv);
+    const provision = calls.find((c) => c.path === '/api/bot/provision');
+    const cancel = calls.find((c) => c.path === '/api/bot/chargeback');
+    assert.equal(provision.body.stripe_event_id, 'evt_fwd_checkout');
+    assert.equal(cancel.body.stripe_event_id, 'evt_fwd_cancel');
+  } finally { globalThis.fetch = originalFetch; }
 });

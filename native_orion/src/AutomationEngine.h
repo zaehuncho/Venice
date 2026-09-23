@@ -4060,6 +4060,12 @@ signals:
     // go (tap / pump fake / manual cancel) or the engine aborted. At most one per physical
     // epoch, and never for an epoch that already released.
     void shotGateDisarm(quint64 physicalShotEpoch, QString reason);
+    // [RT-MED-04 / CL3-F4-007 2026-09-23] A live-METER Square press reached the player's release
+    // with NO meter evidence of any kind (the `SHOT NOT OWNED: reason=press_unanswered_no_meter`
+    // terminal). At most one per physical epoch. Observational only: it is the CV-independent
+    // "the meter was asked and did not answer" count that drives the controller's meter-blind
+    // warning / DETECTION UNAVAILABLE latch (MeterBlindnessLatch); it grants no fire authority.
+    void meterPressUnanswered(quint64 physicalShotEpoch, double holdMs);
     void releaseIssued(orion::ShotContext context);
     // RC-3: emitted at the release-submit site with the release seq and the wall-clock EPOCH ms of the
     // press. OrionAppController relays it to RemotePlaySession::sendReleaseMarker -> the sidecar's
@@ -5691,6 +5697,15 @@ private:
     // MISTIMES scheduled fires, so while armed every learner that rides the release instant
     // (phase constant, feedforward clocks, landing lead, lead-outcome gate) is fenced shut.
     bool devFireOffsetArmed_ = false;
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] ONE predicate for "the release that is teaching right now
+    // was knowingly displaced": the dev sweep, or the shipped onset feedforward (normalised in
+    // triggerRelease to the displacement THIS release carried; 0 for an in-tick release). Every
+    // learner that samples the release instant inside triggerRelease reads this, so a new kind of
+    // displacement is fenced in one place instead of five.
+    [[nodiscard]] bool releaseLearningDisplaced() const noexcept
+    {
+        return devFireOffsetArmed_ || lastReleaseOnsetFfMs_ != 0.0;
+    }
     bool devFireOffsetEnvParsed_ = false;  // parse once; a config re-apply must not reset the cycle
     bool devFireOffsetUniform_ = false;
     double devFireOffsetUniformLoMs_ = 0.0;
@@ -6182,6 +6197,12 @@ private:
     // [ORION_LATE_FIRE_TOLERANCE 2026-09-14] Same sample-and-hold, same purpose: the lateness the
     // release this capture window belongs to actually carried. Non-zero fences the aim learners.
     double meterCapLateFireMs_ = 0.0;
+    // [RT-MED-02 / CL3-F4-008 2026-09-23] Same sample-and-hold, same purpose: the onset-feedforward
+    // displacement the release this capture window belongs to actually carried (0 = undisplaced;
+    // the FF's own 2 ms floor already zeroes sub-floor shots). Non-zero fences the press->tip and
+    // press->release hold learners, which run ~1.2 s later when lastReleaseOnsetFfMs_ may already
+    // belong to a newer release.
+    double meterCapOnsetFfMs_ = 0.0;
     // [ORION_VISION_HOLD_BAND 2026-09-15] Same sample-and-hold, same purpose: whether the release
     // this capture window belongs to had its instant clamped onto the hold band. Non-empty fences
     // the aim learners AND the press->release hold learner — the law must never be taught back
@@ -6231,6 +6252,17 @@ public:
     // with ORION_METER_BLIND_BACKSTOP=0. A timer shot on patch day looks like a broken bot.
     void setDetectionUnavailable(bool unavailable) noexcept { detectionUnavailable_ = unavailable; }
     [[nodiscard]] bool detectionUnavailable() const noexcept { return detectionUnavailable_; }
+    // [RT-MED-04 / CL3-F8-009 2026-09-23] The physical epoch of the press in flight: the owned
+    // shot's epoch while a shot is live, else the still-pending (pre-ownership) Square press's
+    // epoch, else 0. The meter-blind latch uses it to tell an IN-PRESS sighting (evidence about
+    // the shot meter) from an idle one between shots (a false lock, a replay, a HUD element).
+    [[nodiscard]] quint64 activePhysicalPressEpoch() const noexcept
+    {
+        if (shot_.state != HoldState::Idle && shot_.physicalShotEpoch != 0) {
+            return shot_.physicalShotEpoch;
+        }
+        return pendingSquarePhysicalEpoch_;
+    }
 private:
     bool detectionUnavailable_ = false;
     // Is there a meter candidate on screen for the CURRENTLY PENDING press that is still climbing

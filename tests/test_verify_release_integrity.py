@@ -85,14 +85,13 @@ def test_secret_in_package_fails_even_if_manifested(tmp_path):
     assert any("Forbidden file" in e and "signing.pfx" in e for e in r["errors"])
 
 
-def test_unlisted_file_is_warning_not_failure(tmp_path):
+def test_unlisted_file_fails_release_package_gate(tmp_path):
     (tmp_path / "OrionNative.exe").write_bytes(b"exe")
     public_key = _write_signed_release_manifest(tmp_path)
     (tmp_path / "snuck_in.dll").write_bytes(b"late addition")  # added AFTER manifest
     r = _verify_test_release(tmp_path, public_key)
-    # native does not check for extra files -> advisory only, does not lock.
-    assert r["ok"] is True
-    assert any("Unlisted" in w and "snuck_in.dll" in w for w in r["warnings"])
+    assert r["ok"] is False
+    assert any("Unlisted" in e and "snuck_in.dll" in e for e in r["errors"])
 
 
 def test_path_safety_matches_native_rule():
@@ -144,31 +143,44 @@ def test_exact_manifest_byte_tamper_fails_signature(tmp_path):
 def _signed_manifest(tmp_path, **overrides):
     pytest.importorskip("cryptography")
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-    key_path = tmp_path / "update_signing.pem"
-    key_path.write_bytes(
-        Ed25519PrivateKey.generate().private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-    )
+    key = Ed25519PrivateKey.generate()
+    public = base64.b64encode(
+        key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).decode("ascii")
     manifest = pkg.build_update_manifest(
         version="1.2.3", artifact_sha256=overrides.pop("artifact_sha256", "ab" * 32),
         artifact_url="https://dl.example/o.zip", published_at="2026-07-09T00:00:00Z",
     )
-    signed = pkg.sign_update_manifest(manifest, key_path)
+    signed = dict(manifest)
+    signed["signature_alg"] = "ed25519"
+    signed["public_key_b64"] = public
+    signed["signature"] = base64.b64encode(
+        key.sign(pkg.canonical_signing_payload(signed))
+    ).decode("ascii")
     signed.update(overrides)
     path = tmp_path / "update_manifest.json"
     path.write_text(json.dumps(signed), encoding="utf-8")
-    return path
+    return path, public
+
+
+def _verify_fixture_manifest(path, public, artifact=None):
+    return v.verify_update_manifest(
+        path, artifact, trusted_keys={pkg.ED25519_KEY_ID: public},
+    )
 
 
 def test_update_manifest_valid_signature_passes(tmp_path):
-    r = v.verify_update_manifest(_signed_manifest(tmp_path))
+    path, public = _signed_manifest(tmp_path)
+    r = _verify_fixture_manifest(path, public)
     assert r["ok"] is True and r["errors"] == []
 
 
 def test_update_manifest_tampered_field_fails(tmp_path):
     # attacker rewrites artifact_url after signing -> canonical payload changes -> reject
-    r = v.verify_update_manifest(_signed_manifest(tmp_path, artifact_url="https://evil.example/o.zip"))
+    path, public = _signed_manifest(tmp_path, artifact_url="https://evil.example/o.zip")
+    r = _verify_fixture_manifest(path, public)
     assert r["ok"] is False
     assert any("signature INVALID" in e for e in r["errors"])
 
@@ -188,10 +200,10 @@ def test_update_manifest_artifact_hash_gate(tmp_path):
     artifact.write_bytes(b"artifact-bytes")
     good = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
-    ok_path = _signed_manifest(tmp_path, artifact_sha256=good)
-    assert v.verify_update_manifest(ok_path, artifact) == {"ok": True, "errors": []}
+    ok_path, public = _signed_manifest(tmp_path, artifact_sha256=good)
+    assert _verify_fixture_manifest(ok_path, public, artifact) == {"ok": True, "errors": []}
 
     artifact.write_bytes(b"swapped-after-signing")
-    r = v.verify_update_manifest(ok_path, artifact)
+    r = _verify_fixture_manifest(ok_path, public, artifact)
     assert r["ok"] is False
     assert any("Artifact sha256 mismatch" in e for e in r["errors"])

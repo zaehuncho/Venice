@@ -264,6 +264,53 @@ private slots:
         }
     }
 
+    // [P-E 2026-09-23 CL3-F8-001/003/004/006, RT-LOW-01, RT-MED-09/10] Customer lines the P-E
+    // patch writes reach the feed; their engineering twins never do; RP-10 wins over RP-09.
+    void peCustomerStateLinesAndTheirEngineeringTwins()
+    {
+        using ui_notifications::customerRemoteStatus;
+        using ui_notifications::shouldEnterActivityRing;
+        const QString rp10 = QStringLiteral("Another device is using Remote Play on this PS5 (code RP-10). "
+                                            "Close Remote Play there, then press Connect.");
+        for (const QString& raw : {
+                 QStringLiteral("RP_IN_USE: Remote is already in use (0x80108b10) - Chiaki session quit"),
+                 QStringLiteral("Chiaki session quit: 80108b10"),
+                 QStringLiteral("Remote is already in use")}) {
+            QCOMPARE(customerRemoteStatus(raw), rp10);
+        }
+        const QStringList shown = {
+            ui_notifications::settingsRepairCustomerText(),
+            QStringLiteral("Watchdog trip: The capture card stopped sending video"),
+            QStringLiteral("SAFE MODE: The capture card stopped sending video. Shots are paused. Venice usually "
+                           "turns them back on by itself once the stream has been steady for 30 seconds, or "
+                           "click SAFE MODE at the top, then Exit safe mode."),
+            QStringLiteral("Feed paused: Venice is minimized, so shots are paused. They resume when you bring "
+                           "the Venice window back."),
+            QStringLiteral("Venice resumed from sleep. If the picture or your controller doesn't come back, "
+                           "press Disconnect, then Connect."),
+            QStringLiteral("Settings repaired: Venice is back on its default settings. Your shot timing history "
+                           "was kept. Check Shot Lead and your meter style, then press Connect."),
+            QStringLiteral("Remote Play: ") + rp10,
+        };
+        for (const QString& line : shown) {
+            QVERIFY2(shouldEnterActivityRing(line), qPrintable(line));
+            QVERIFY2(!line.contains(QLatin1String("Orion")), qPrintable(line));
+            QVERIFY2(!line.contains(QLatin1String("frozen=")) && !line.contains(QLatin1String(" ms)")),
+                     qPrintable(line));
+        }
+        const QStringList hidden = {
+            QStringLiteral("Watchdog engine detail: capture transport failed (transport age 8123 ms, backend "
+                           "frozen=1; detector frame age 8120 ms, pixel age 8120 ms)"),
+            QStringLiteral("Security engine detail: Remote Play blocked by security lock: Settings signature "
+                           "missing or invalid"),
+            QStringLiteral("Settings engine detail: interrupted settings write rolled back to the last signed settings"),
+            QStringLiteral("Safe mode engine detail: auto-recover budget 2/session"),
+        };
+        for (const QString& line : hidden) {
+            QVERIFY2(!shouldEnterActivityRing(line), qPrintable(line));
+        }
+    }
+
     // [COPY-FIX 2026-09-23 NEW-A7] "Shot not taken (%1)." printed the raw abort enum.
     void shotNotTakenNeverPrintsTheRawReasonEnum()
     {

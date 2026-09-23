@@ -1,0 +1,64 @@
+{
+  "_meta": {
+    "channel": "#announcements",
+    "channel_id": "1549859272341332111",
+    "post_as": "Triton, or Nereus via /announce (use the plain text in each template's nereus_text)",
+    "method": "POST /channels/1549859272341332111/messages with ONE template's `message` as the body",
+    "purpose": "Patch-day / incident status posts (RT-HIGH-04, docs/support/PATCH_DAY_RUNBOOK.md). Owner posts by hand; nothing posts these automatically. Replace {VERSION}, {TIME} and {DETAIL} before posting. Keep the MOTD text (orion-admin server-config set --motd-text) saying the same thing.",
+    "never": "Never run discord_launch/register_commands.py. Never promise a fix time you have not measured."
+  },
+  "templates": {
+    "patch_detected": {
+      "nereus_text": "NBA 2K27 just updated. We're checking that Venice still reads the shot meter. If Venice shows NOT TIMING, or shots feel off, shoot manually for now. We'll post here as soon as we know. No need to reinstall or change settings.",
+      "message": {
+        "embeds": [
+          {
+            "title": "NBA 2K27 update: checking Venice",
+            "color": 15844367,
+            "description": "NBA 2K27 just updated. We're checking that Venice still reads the shot meter.\n\n**What to do now:** if Venice shows **NOT TIMING**, or shots feel off, shoot manually for now. No need to reinstall, re-pair or change settings.\n\nWe'll post here as soon as we know. Started {TIME}.",
+            "footer": { "text": "Venice • Official" }
+          }
+        ]
+      }
+    },
+    "service_paused": {
+      "nereus_text": "We've paused Venice for everyone while we fix an issue from the NBA 2K27 update. Venice will say it's paused by the service. Nothing is wrong with your PC or internet, so there's nothing to change on your side. We'll post here when it's back.",
+      "message": {
+        "embeds": [
+          {
+            "title": "Venice is paused",
+            "color": 15548997,
+            "description": "We've paused Venice for everyone while we fix an issue from the NBA 2K27 update. {DETAIL}\n\nVenice will say: **\"Venice is paused by the service right now. Nothing is wrong with your PC or internet.\"** That's expected. There's nothing to change on your side, and no need to reinstall.\n\nWe'll post here when it's back. Paused at {TIME}.",
+            "footer": { "text": "Venice • Official" }
+          }
+        ]
+      }
+    },
+    "fix_shipped": {
+      "nereus_text": "Venice {VERSION} is out and fixes the NBA 2K27 update issue. Restart Venice and it updates itself. If the update doesn't finish, reinstall from the downloads channel. Your settings and timing history are kept.",
+      "message": {
+        "embeds": [
+          {
+            "title": "Fixed in Venice {VERSION}",
+            "color": 2450411,
+            "description": "Venice **{VERSION}** fixes the NBA 2K27 update issue. {DETAIL}\n\n**Restart Venice** and it updates itself. If the update doesn't finish, reinstall from <#1549499799861067876>. Your settings and shot timing history are kept.\n\nGive it a few practice shots before a Rec or Park game.",
+            "footer": { "text": "Venice • Official" }
+          }
+        ]
+      }
+    },
+    "all_clear": {
+      "nereus_text": "All clear: Venice is working normally with the current NBA 2K27 version. Thanks for your patience. Still seeing a problem? Open a ticket.",
+      "message": {
+        "embeds": [
+          {
+            "title": "All clear",
+            "color": 5763719,
+            "description": "Venice is working normally with the current NBA 2K27 version. Thanks for your patience.\n\nStill seeing a problem? Open a ticket in <#1549499767321534464> with what Venice shows on screen.",
+            "footer": { "text": "Venice • Official" }
+          }
+        ]
+      }
+    }
+  }
+}

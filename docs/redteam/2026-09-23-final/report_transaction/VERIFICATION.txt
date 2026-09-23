@@ -1,0 +1,85 @@
+Venice rc1 final internal-red-team report transaction, 2026-09-23
+
+Branch: fix/timing-input-and-remoteplay-blockers
+Changed field: docs/redteam/2026-09-23-final/RED_TEAM_REPORT.md (new merged verdict and P1-P9/L1-L5 findings; no product source changed by the coordinator).
+Main report: C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\RED_TEAM_REPORT.md
+Original state: report absent. Zero-byte ORIGINAL_FILE sentinel SHA-256 E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855.
+Modified report SHA-256 F68DC63F08848324EFACB4FFE9E573C42E3F92AB91AF57B8341D2FC65FF71876.
+
+Four required artifacts, created and reopened:
+MODIFIED_FILE: C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction\MODIFIED_FILE
+DIFF_FILE: C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction\DIFF_FILE
+VERIFICATION.txt: C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction\VERIFICATION.txt
+ROLLBACK.sh: C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction\ROLLBACK.sh
+ORIGINAL_FILE sentinel: C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction\ORIGINAL_FILE
+
+BASELINE — working directory C:\Users\aaron\Desktop\NexusVision
+Input: RED_TEAM_REPORT.md absent before creation.
+Exact PowerShell command:
+@'
+from pathlib import Path
+p=Path('docs/redteam/2026-09-23-final/RED_TEAM_REPORT.md')
+print('BASELINE report_exists='+str(p.exists()))
+raise SystemExit(0 if p.exists() else 1)
+'@ | .\.venv\Scripts\python.exe -; 'BASELINE_EXIT='+$LASTEXITCODE
+Literal output:
+BASELINE report_exists=False
+BASELINE_EXIT=1
+Exit status: inner baseline Python check 1 (expected absence).
+
+MODIFIED — working directory C:\Users\aaron\Desktop\NexusVision
+Input: RED_TEAM_REPORT.md and MODIFIED_FILE have SHA-256 F68DC63F08848324EFACB4FFE9E573C42E3F92AB91AF57B8341D2FC65FF71876.
+Exact PowerShell command:
+@'
+from pathlib import Path
+from hashlib import sha256
+root=Path('docs/redteam/2026-09-23-final'); report=root/'RED_TEAM_REPORT.md'; tx=root/'report_transaction'; modified=tx/'MODIFIED_FILE'
+text=report.read_text(encoding='utf-8')
+assert report.read_bytes()==modified.read_bytes()
+assert all(x in text for x in ['RT-CRIT-01','RT-CRIT-02','RT-HIGH-07','| P9 ','| L5 '])
+print('MODIFIED report_sha256='+sha256(report.read_bytes()).hexdigest().upper()+' copy_match=True required_rows=5')
+'@ | .\.venv\Scripts\python.exe -; 'MODIFIED_EXIT='+$LASTEXITCODE
+Literal output:
+MODIFIED report_sha256=F68DC63F08848324EFACB4FFE9E573C42E3F92AB91AF57B8341D2FC65FF71876 copy_match=True required_rows=5
+MODIFIED_EXIT=0
+Exit status: inner modified Python check 0.
+
+DIFF — a new test directory, not the active report.
+Input: empty C:\Users\aaron\AppData\Local\Temp\venice-internal-redteam-rc1-20260923-130647\report-patch-test3 and DIFF_FILE.
+Exact PowerShell commands:
+$d='C:\Users\aaron\AppData\Local\Temp\venice-internal-redteam-rc1-20260923-130647\report-patch-test3'
+New-Item -ItemType Directory -Force -Path $d | Out-Null
+$p='C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction\DIFF_FILE'
+git -c core.autocrlf=false -C $d apply --check $p; 'DIFF_CHECK_EXIT='+$LASTEXITCODE
+git -c core.autocrlf=false -C $d apply $p; 'DIFF_APPLY_EXIT='+$LASTEXITCODE
+'DIFF_APPLIED_SHA256='+(Get-FileHash "$d\RED_TEAM_REPORT.md" -Algorithm SHA256).Hash
+Literal output:
+DIFF_CHECK_EXIT=0
+DIFF_APPLY_EXIT=0
+DIFF_APPLIED_SHA256=F68DC63F08848324EFACB4FFE9E573C42E3F92AB91AF57B8341D2FC65FF71876
+Exit statuses: check 0; apply 0.
+
+ROLLBACK — tested only on another copy; the main report and MODIFIED_FILE remain changed/present.
+Input: MODIFIED_FILE copied to report_transaction\rollback-test\RED_TEAM_REPORT.md.
+Exact PowerShell command:
+$tx='C:\Users\aaron\Desktop\NexusVision\docs\redteam\2026-09-23-final\report_transaction'
+$test=Join-Path $tx 'rollback-test'
+New-Item -ItemType Directory -Force -Path $test | Out-Null
+Copy-Item -LiteralPath (Join-Path $tx 'MODIFIED_FILE') -Destination (Join-Path $test 'RED_TEAM_REPORT.md') -Force
+& 'C:\Program Files\Git\bin\bash.exe' '/c/Users/aaron/Desktop/NexusVision/docs/redteam/2026-09-23-final/report_transaction/ROLLBACK.sh' '/c/Users/aaron/Desktop/NexusVision/docs/redteam/2026-09-23-final/report_transaction/rollback-test/RED_TEAM_REPORT.md'
+'ROLLBACK_EXIT='+$LASTEXITCODE
+'ROLLBACK_RESTORED_ABSENT='+(-not(Test-Path -LiteralPath (Join-Path $test 'RED_TEAM_REPORT.md')))
+'MODIFIED_FILE_STILL_PRESENT='+(Test-Path -LiteralPath (Join-Path $tx 'MODIFIED_FILE'))
+Literal output:
+ROLLBACK removed exact modified report; original state absent
+ROLLBACK_EXIT=0
+ROLLBACK_RESTORED_ABSENT=True
+MODIFIED_FILE_STILL_PRESENT=True
+Exit status: Bash rollback 0. Restored behavior/status: the test copy is absent, matching the original report state; the main report and MODIFIED_FILE remain present and hash-matched.
+
+Independent frozen-object validation:
+REPORT_VERIFY sections=LOW,MEDIUM,HIGH,CRITICAL lanes=P1-P9,L1-L5 reviewer_files=4
+CANDIDATE_VERIFY files=578 hash_mismatches=0
+VERIFY_EXIT=0
+Owner learning.json SHA-256 remained B0902C26E934218D48BC459C2B940F7296C2A998FE0363592257EA372DFBDCCA.
+The exact frozen package integrity verifier reported files checked: 576 and RESULT: PASS; its exit status was 0. This validates package bytes, not the missing Standard/StrictSecurity/VM/packaged-play gates.

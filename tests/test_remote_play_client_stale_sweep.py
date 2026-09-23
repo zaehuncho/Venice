@@ -145,13 +145,18 @@ def test_in_process_kill_never_touches_this_process():
 @pytest.mark.skipif(os.name != "nt", reason="toolhelp snapshot is Windows-only")
 def test_real_snapshot_and_sweep_are_cheap_with_nothing_to_kill():
     import time
-    assert remote_play_client._running_image_pids(
-        remote_play_client._CHIAKI_IMAGE_NAMES) is not None
+    running = remote_play_client._running_image_pids(remote_play_client._CHIAKI_IMAGE_NAMES)
+    assert running is not None
+    # [CL3-F3-001 2026-09-23] Check BEFORE sweeping. This test used to call the REAL sweep first
+    # and skip afterwards, so a suite run during a play session TerminateProcess(..., 1)'d the
+    # owner's live OrionStream: the 2026-09-23T02:28:59Z "mid-game disconnect" was this test.
+    if running:
+        pytest.skip(f"a chiaki-family process is running here: {sorted(running)}")
     started = time.perf_counter()
     report = remote_play_client.terminate_chiaki_processes()
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if report["found"]:
-        pytest.skip(f"a chiaki-family process is running here: {report['found']}")
+        pytest.skip(f"a chiaki-family process started during the sweep: {report['found']}")
     assert report["fallback"] is False
     assert elapsed_ms < 250.0, f"sweep cost {elapsed_ms:.0f}ms with nothing to kill"
 

@@ -51,7 +51,8 @@ downloads 852, announcement 975, welcome 1961, purchase 891 — all well inside,
   Customer/Trial/@everyone can no longer post, while **Triton, Nereus, Staff, Admin and Owner
   keep Send** — so all of these still post normally.
 - `downloads.json` still carries `INSTALLER_URL` / `INSTALLER_SHA256` placeholders. Fill them with
-  the signed installer's real URL and hash, and delete the `blocked_by` note, before posting.
+  the real URL and hash of the exact installer being published, and delete the `blocked_by` note,
+  before posting. The beta installer is unsigned by owner decision (2026-09-23) and may be posted.
 - Post the announcement only once live Stripe checkout is verified and the installer is in
   `#downloads`; otherwise it sends buyers at a checkout that provisions nothing.
 - Never run `discord_launch/register_commands.py`: it bulk-overwrites the guild command tree and
@@ -59,12 +60,16 @@ downloads 852, announcement 975, welcome 1961, purchase 891 — all well inside,
 
 ## Copy facts these files are built on
 
-- Free 7-day trial, no card, one per Discord account and one per PC, on the website or `/claim_trial`.
+- Free 7-day trial, no card, one per Discord account and one per PC. It starts on the website home
+  page (owner decision 2026-09-23), not in Discord.
 - Then $25/month. Cancel any time in the billing portal
   `https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00`; access runs to the end of the period
   already paid for.
 - To buy you must be signed in with Discord on `zaeorion.com` **and** be a member of this server.
 - No licence keys. Access is linked to the Discord account; the app is unlocked with a one-time code
   from `https://zaeorion.com/connect`, locked to one PC, with 3 free PC resets.
-- PS5 only (no Xbox yet), through a 60 Hz capture card or PS5 Remote Play.
+- PS5 through a 60 Hz capture card or PS5 Remote Play: both fully supported (owner decision
+  2026-09-23). Xbox ships as EXPERIMENTAL (untested), shown with that label, not hidden.
+- The installer is unsigned for the beta: SmartScreen "More info" -> "Run anyway", then check the
+  published SHA-256 with `Get-FileHash`.
 - Footer on every embed: `Venice • Official`. No stats, reviews, guarantees or "test mode".

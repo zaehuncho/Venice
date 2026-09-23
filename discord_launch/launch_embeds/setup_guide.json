@@ -17,12 +17,12 @@
         "fields": [
           {
             "name": "1 • Install and unlock",
-            "value": "Download the signed installer from <#1549499799861067876> and launch Venice. Open [zaeorion.com/connect](https://zaeorion.com/connect), sign in with the **same Discord account** you use here, and enter the one-time code in the launcher. There is no licence key, and your Discord ID alone is not a code.",
+            "value": "Download the installer from <#1549499799861067876> and launch Venice. Open [zaeorion.com/connect](https://zaeorion.com/connect), sign in with the **same Discord account** you use here, and enter the one-time code in the launcher. There is no licence key, and your Discord ID alone is not a code.",
             "inline": false
           },
           {
             "name": "2 • Connect video",
-            "value": "Use a **60 Hz capture card**, or **PS5 Remote Play**. Confirm the full game frame is visible in the Live Capture panel before you shoot. PS5 only — Xbox is not supported yet.",
+            "value": "Use a **60 Hz capture card**, or **PS5 Remote Play**. Confirm the full game frame is visible in the Live Capture panel before you shoot. Both are fully supported. Xbox is experimental and untested.",
             "inline": false
           },
           {
@@ -37,7 +37,7 @@
           },
           {
             "name": "🎮 Remote Play won't pair, or lags",
-            "value": "PS5: Settings → System → **Remote Play on**, and enable the rest-mode network options. Take a fresh PIN from Link Device — they expire quickly — and pair on the same network. For lag: **wire both ends**. Wi-Fi jitter cannot be timed through, and dropping the stream one quality notch beats a stuttering 1080p.",
+            "value": "PS5: Settings → System → **Remote Play on**, and enable the rest-mode network options. Take a fresh PIN from Link Device — they expire quickly — and pair on the same network. For lag: **wire both ends**. Wi-Fi jitter cannot be timed through, and dropping the stream one quality notch beats a stuttering 1080p. If Venice says another device is using Remote Play (code RP-10), close PS Remote Play on your phone or other PC, then press **Connect**.",
             "inline": false
           },
           {

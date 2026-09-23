@@ -431,4 +431,114 @@ ApplicationWindow {
             }
         }
     }
+
+    // ---- owner step-up (rc1 RT-CRIT-01) ---------------------------------
+    // Owner-sensitive actions (TOTP changes, secret rotation, IP allowlist/alerts,
+    // releasing the kill switch, owner staff rows) are parked by the controller
+    // until the owner types a FRESH code here. The code goes to the controller
+    // once and the field is wiped on every path (submit, cancel, close).
+    Popup {
+        id: stepUpPopup
+        modal: true
+        focus: true
+        anchors.centerIn: Overlay.overlay
+        width: 420
+        padding: 20
+        closePolicy: Popup.CloseOnEscape
+
+        function submit() {
+            if (admin.busy)
+                return
+            const code = stepUpCode.text
+            stepUpCode.text = ""
+            admin.submitStepUp(code)
+        }
+
+        onOpened: {
+            stepUpCode.text = ""
+            stepUpCode.input.forceActiveFocus()
+        }
+        onClosed: {
+            stepUpCode.text = ""
+            if (admin.stepUpPending)
+                admin.cancelStepUp()
+        }
+
+        Connections {
+            target: admin
+            function onStepUpChanged() {
+                if (admin.stepUpPending && !stepUpPopup.opened)
+                    stepUpPopup.open()
+                else if (!admin.stepUpPending && stepUpPopup.opened)
+                    stepUpPopup.close()
+            }
+        }
+
+        background: Rectangle {
+            radius: 14
+            color: Theme.bgCard
+            border.color: Theme.borderStrong
+            border.width: 1
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                text: "OWNER CODE"
+                color: Theme.accentBorder
+                font.pixelSize: Theme.fontMicro
+                font.weight: Font.Bold
+                font.letterSpacing: 1.4
+            }
+            Text {
+                Layout.fillWidth: true
+                text: admin.stepUpPrompt.length > 0 ? admin.stepUpPrompt : "This action needs a fresh owner code."
+                color: Theme.textPrimary
+                font.pixelSize: Theme.fontBody
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Each code works once. It is not saved."
+                color: Theme.textFaint
+                font.pixelSize: Theme.fontMicro
+                wrapMode: Text.WordWrap
+            }
+            AdminField {
+                id: stepUpCode
+                label: "6-digit code"
+                iconText: "#"
+                maximumLength: 8
+                inputMethodHints: Qt.ImhDigitsOnly
+                placeholderText: "from the authenticator"
+                onAccepted: stepUpPopup.submit()
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: admin.stepUpError.length > 0
+                text: admin.stepUpError
+                color: Theme.logErr
+                font.pixelSize: Theme.fontSmall
+                wrapMode: Text.WordWrap
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                AdminButton {
+                    Layout.fillWidth: true
+                    kind: "secondary"
+                    text: "Cancel"
+                    onClicked: stepUpPopup.close()
+                }
+                AdminButton {
+                    Layout.fillWidth: true
+                    kind: "primary"
+                    text: admin.busy ? "Working..." : "Continue"
+                    enabled: !admin.busy && stepUpCode.text.length >= 6
+                    onClicked: stepUpPopup.submit()
+                }
+            }
+        }
+    }
 }

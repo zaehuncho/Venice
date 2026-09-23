@@ -31,7 +31,7 @@ ColumnLayout {
     // stays settable through settings.json (captureCardFps still snaps 120) but is not a choice
     // this picker can make by accident.
     function fpsLabel(fps) {
-        return fps === 30 ? "30 Hz" : "60 Hz (recommended)"
+        return fps === 30 ? "30 Hz (preview only)" : "60 Hz (recommended)"
     }
 
     component SectionLabel: Text {
@@ -105,12 +105,11 @@ ColumnLayout {
         DashboardCombo {
             id: consoleCombo
             Layout.preferredWidth: 118
-            // [COPY-FIX 2026-09-23 CW-14/EA-33] Xbox is untested: customer builds list PS5
-            // only. Dev builds keep Xbox, and an install that already has Xbox selected keeps
-            // the entry so the combo never shows a value missing from its list (switching to
-            // PS5 then removes it).
-            model: (orion.debugUiEnabled === true || orion.remotePlayConsole === "Xbox")
-                   ? ["PS5", "Xbox"] : ["PS5"]
+            // [RT-LOW-05 2026-09-23 owner decision] Xbox ships as EXPERIMENTAL: listed for
+            // every customer (not hidden), labelled experimental/untested in the hint below and
+            // behind the untested-path acknowledgement. The entry text stays "Xbox" because it
+            // is written straight into orion.remotePlayConsole.
+            model: ["PS5", "Xbox"]
             enabled: form.routeIdle
             value: orion.remotePlayConsole
             onActivated: function(index) {
@@ -163,8 +162,8 @@ ColumnLayout {
 
     FieldHint {
         text: orion.remotePlayConsole === "Xbox"
-              ? "Xbox Remote Play — EXPERIMENTAL. No Xbox console has been measured yet, so shot timing on Xbox is untested and not supported. Start Remote Play in the Xbox Windows app, then select its window below."
-              : "Discovery is usually enough. Enter a fixed console IP only when discovery is unavailable."
+              ? "Xbox Remote Play is EXPERIMENTAL and untested. No Xbox console has been measured yet, so Venice makes no timing accuracy claim on Xbox. Start Remote Play in the Xbox Windows app, then select its window below."
+              : "Discovery is usually enough. Enter a fixed console IP only when discovery is unavailable. Xbox is listed as EXPERIMENTAL (untested)."
     }
 
     ColumnLayout {
@@ -183,7 +182,7 @@ ColumnLayout {
             spacing: 10
             Text {
                 Layout.fillWidth: true
-                text: "I understand Xbox support is experimental and untested: no console has been measured and shot timing is not supported on Xbox."
+                text: "I understand Xbox support is experimental and untested: no Xbox console has been measured, so shot timing on Xbox may be off and support can't tune it yet."
                 color: Theme.textPrimary
                 wrapMode: Text.WordWrap
                 font.family: Theme.fontUi
@@ -228,7 +227,7 @@ ColumnLayout {
             text: "Venice watches the Xbox app window and sends input through a virtual controller. Keep the window visible at a fixed size. Disconnecting Venice leaves the Xbox app open."
         }
         FieldHint {
-            text: "Make sure the Xbox app sees only Venice's virtual controller, not your physical pad as well. Xbox has its own Shot Lead; PS5 calibration is preserved. Xbox timing is untested: no accuracy is claimed, and support cannot troubleshoot Xbox timing yet."
+            text: "Make sure the Xbox app sees only Venice's virtual controller, not your physical pad as well. Xbox keeps its own Shot Lead, separate from your PS5 calibration. Xbox timing is untested: no accuracy is claimed, and support can't tune Xbox timing yet."
         }
     }
 
@@ -331,6 +330,8 @@ ColumnLayout {
 
         // Capture refresh rate. The card is opened at this rate on the next
         // connect; a live session keeps the rate it started with.
+        // [RT-MED-05 / P-C 2026-09-23] Timing authority is validated at 60 fps only; a 30 Hz
+        // pick streams as PREVIEW ONLY (the capture qualifier never grants it fire authority).
         RowLayout {
             Layout.fillWidth: true
             spacing: 8
@@ -341,10 +342,10 @@ ColumnLayout {
                 id: captureFpsCombo
                 objectName: "captureFpsCombo"
                 Layout.preferredWidth: 200
-                model: ["30 Hz", "60 Hz (recommended)"]
+                model: ["30 Hz (preview only)", "60 Hz (recommended)"]
                 value: form.fpsLabel(orion.captureCardFps)
                 onValueChanged: {
-                    var next = value === "30 Hz" ? 30 : 60
+                    var next = value === "30 Hz (preview only)" ? 30 : 60
                     if (orion.captureCardFps !== next)
                         orion.captureCardFps = next
                 }
@@ -360,7 +361,7 @@ ColumnLayout {
         }
 
         FieldHint {
-            text: "60 Hz is the meter's native cadence. Only choose 30 Hz if your capture card cannot hold 60."
+            text: "Shot timing needs 60 Hz. At 30 Hz Venice shows the picture but does not time shots."
         }
     }
 

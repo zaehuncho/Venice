@@ -334,7 +334,7 @@ def render_hwid_reset(d: dict) -> tuple:
     here renders a store link."""
     if d.get("ok"):
         mode = str(d.get("mode") or "free")
-        lines = [f"✅ Reset done (**{_MODE_LABEL.get(mode, mode)}**). Activate on your new PC with the same key."]
+        lines = [f"✅ Reset done (**{_MODE_LABEL.get(mode, mode)}**). On your new PC, open https://zaeorion.com/connect with this same Discord account and use a fresh one-time code."]
         rem = _free_resets_remaining(d)
         if rem is not None:
             lines.append(f"Free resets remaining: **{rem}**")
@@ -355,22 +355,22 @@ def render_hwid_reset(d: dict) -> tuple:
         when = f"<t:{int(ra)}:R> (<t:{int(ra)}:f>)" if ra else "later"
         return f"⏳ You reset recently. Try again {when}, or open a ticket if it's urgent.", False
     if err == "locked":
-        return ("🔒 Self-service resets are locked on your license. Open a ticket in **#create-ticket** "
+        return ("🔒 Self-service resets are locked on your account. Open a ticket in **#create-ticket** "
                 "and staff will sort it out."), False
     if err == "payment_required":
         days = _deduct_days(d)
-        return ("⚠️ You've used all 3 free PC resets on this key.\n"
+        return ("⚠️ You've used all 3 free PC resets on your account.\n"
                 f"The next reset takes **{days} {_day_word(days)} off your subscription**.\n"
                 "_Nothing happens until you press a button below._"), True
     if err == "trial_no_deduct":
-        return ("❌ You've used all 3 free PC resets on your trial key. A trial has no subscription "
+        return ("❌ You've used all 3 free PC resets on your trial. A trial has no subscription "
                 "to take a day from — subscribe to keep resetting, or open a ticket."), False
     if err == "insufficient_time":
         days = _deduct_days(d)
         return (f"❌ Less than {days} {_day_word(days)} left on your subscription, so there's nothing "
                 "to deduct. Renew it, or open a ticket."), False
     if err == "paid_only":
-        return ("❌ This key has no expiry to take days from — open a ticket and staff will "
+        return ("❌ Your access has no expiry to take days from — open a ticket and staff will "
                 "reset it for you."), False
     return str(d.get("message") or "❌ Couldn't reset right now — try again or open a ticket."), False
 
@@ -477,7 +477,7 @@ FAQ_TOPICS = {
             "1. On the PS5: **Settings → System → Remote Play → ON**, and **Settings → System → Power Saving → "
             "Features Available in Rest Mode → \"Stay Connected to the Internet\" + \"Enable Turning On PS5 from Network\"** both ON.\n"
             "2. Get the pairing PIN from **Settings → System → Remote Play → Link Device** — it expires quickly, "
-            "so have Chiaki open and ready.\n"
+            "so have Venice's Setup page open and ready.\n"
             "3. PC and PS5 must be on the **same network** for first pairing. Enter the console's IP exactly as shown "
             "under Settings → Network → Connection Status.\n"
             "4. Pairing loops or times out? Reboot the PS5 fully (not rest mode) and generate a fresh PIN.\n\n"
@@ -489,7 +489,9 @@ FAQ_TOPICS = {
             "• Close downloads, cloud sync, and anyone else's Netflix on the network.\n\n"
             "**Be straight with yourself here:** Venice reads your stream and is exactly as fast as that stream. "
             "A clean wired link = clean greens. A congested Wi-Fi link = late reads, and no setting can fix physics. "
-            "This is also why we say it **before** you buy."
+            "This is also why we say it **before** you buy. Remote Play and a capture card are both fully supported setups.\n\n"
+            "**\"Another device is using Remote Play\" (code RP-10):** the PS5 allows one Remote Play session. "
+            "Close PS Remote Play on your phone, tablet or other PC, then press **Connect** in Venice."
         ),
     },
     "no_greens": {
@@ -499,14 +501,14 @@ FAQ_TOPICS = {
         "description": (
             "**Venice runs but shots come out early, late, or the overlay never locks onto the meter? Check these in order:**\n\n"
             "**1. Is the stream actually visible in Venice?** Open the Live Capture panel — you should see your gameplay. "
-            "If it's black, that's the real problem: reconnect (Disconnect → Connect Chiaki), make sure Chiaki shows the game "
-            "and not its setup screen, and keep the Venice window visible (don't minimize it).\n\n"
+            "If it's black, that's the real problem: press **Disconnect**, then **Connect**, make sure the game (not a menu "
+            "or the PS5 home screen) is showing, and keep the Venice window visible (don't minimize it).\n\n"
             "**2. Hold, don't tap.** Venice releases for you — **hold** Square (tempo), right-stick-down (stick tempo), "
             "or right-stick-up (go-to) and let go of nothing. If you release manually, you're fighting the tool.\n\n"
             "**3. Controller in the right place?** It must be plugged into the **PC**. If your pad is paired to the PS5 directly, "
             "Venice can see the meter but can't act on it.\n\n"
-            "**4. Meter visible in-game?** Shot meter ON in 2K's settings, and use a meter style/size Venice has calibrated "
-            "against (defaults work best). A hidden or exotic meter gives the vision system nothing to read.\n\n"
+            "**4. Meter visible in-game?** Shot meter ON in 2K's settings, style **Arrow2** (White). "
+            "A hidden meter or another style gives the vision system nothing to read.\n\n"
             "**5. Let calibration finish.** The first 10–15 shots in practice teach Venice your jumper. "
             "Judging it off shot #2 in a Rec game is judging it before it's calibrated.\n\n"
             "**6. Stream quality dips = read quality dips.** If lag spikes coincide with the misses, it's the network — "
@@ -516,11 +518,11 @@ FAQ_TOPICS = {
         ),
     },
     "new_pc": {
-        "label": "New PC / move my license",
+        "label": "New PC / move my access",
         "emoji": "💻",
-        "title": "💻 I got a new PC (moving your license / HWID reset)",
+        "title": "💻 I got a new PC (moving your access / HWID reset)",
         "description": (
-            "Your license is **single-user and locked to one PC** — that's what keeps keys from being shared "
+            "Your access is **single-user and locked to one PC** — that's what keeps accounts from being shared "
             "and your purchase from being resold. Moving to a new machine is self-service:\n\n"
             "1. In the Discord server, run **`/hwid_reset`**.\n"
             "2. The bot unbinds your membership from the old machine.\n"
@@ -531,8 +533,8 @@ FAQ_TOPICS = {
             "Rebuilt Windows, swapped major hardware, or RMA'd the machine? Same command — a reinstall on the same box "
             "sometimes reads as a \"new\" machine and one reset fixes it.\n\n"
             "Legitimately need more than that (multiple hardware failures, stolen laptop)? Open a ticket with a short "
-            "explanation — staff can reset it manually. What we **don't** do is resets that let two people share one key; "
-            "that pattern gets the key revoked."
+            "explanation — staff can reset it manually. What we **don't** do is resets that let two people share one account; "
+            "that pattern gets the access revoked."
         ),
     },
     "missing_key": {
@@ -553,12 +555,14 @@ FAQ_TOPICS = {
         "emoji": "❓",
         "title": "❓ Quick answers",
         "description": (
-            "• **Is there a free trial?** Yes — `/claim_trial` in the server. Full features, no card. "
-            "One per Discord account and per PC. Then open https://zaeorion.com/connect to sign in; "
-            "your public Discord ID is not an activation code.\n"
+            "• **Is there a free trial?** Yes — start it on the https://zaeorion.com home page, signed in with this "
+            "Discord account. Full features, no card. One per Discord account and per PC. Then open "
+            "https://zaeorion.com/connect to sign in; your public Discord ID is not an activation code.\n"
             "• **What does it cost?** A free 7-day trial, then one **$19.99/month** recurring membership.\n"
             "• **Can I use it on two PCs at once?** No — single-user, one machine. Use `/hwid_reset` to move it.\n"
-            "• **When does my license expire?** Run `/status` — it checks your linked Discord account privately.\n"
+            "• **Which setups work?** PS5 with a 60 Hz capture card or PS5 Remote Play: both fully supported. "
+            "Xbox is experimental and untested.\n"
+            "• **When does my access expire?** Run `/status` — it checks your linked Discord account privately.\n"
             "• **What does Venice actually do to my game?** Nothing. It watches your screen and times a controller input — "
             "it never touches game files, game memory, or your console. See the \"What Venice is\" post in #faq."
         ),
@@ -684,16 +688,14 @@ async def purchase(interaction: discord.Interaction):
 
 @tree.command(name="claim_trial", description="Claim your free 7-day Venice trial", guild=GUILD)
 async def claim_trial(interaction: discord.Interaction):
-    # The backend DMs the Discord connection link and grants Trial server-side.
-    # It never returns the private database key through a bot interaction.
-    # This command is now a thin relay of the backend's message, and it rolls the
-    # claim back itself on a DM bounce, so there's nothing to do here but report.
-    await interaction.response.defer(ephemeral=True)
-    uid = interaction.user.id
-    _, data = await lambda_post(ROUTE_TRIAL, {"discord_id": uid, "actor_discord_id": uid})
-    prefix = "✅ " if data.get("ok") else "❌ "
-    await interaction.followup.send(
-        prefix + data.get("message", "Could not create a trial right now."), ephemeral=True)
+    # [P-E 2026-09-23 owner decision] The free trial STARTS ON THE WEBSITE home page, not in
+    # Discord. The command stays registered (the tree is re-synced by Triton on restart; never
+    # run register_commands.py) and points at the website. To restore the in-Discord claim,
+    # bring back the backend ROUTE_TRIAL relay from git history.
+    await interaction.response.send_message(
+        "The free 7-day trial starts on the Venice website: open https://zaeorion.com, sign in with "
+        "**this** Discord account and press **Start free 7-day trial**. Then get your one-time code "
+        "at https://zaeorion.com/connect.", ephemeral=True)
 
 
 @tree.command(name="hwid_reset", description="Unbind your Venice license so you can activate on a new PC", guild=GUILD)
@@ -730,7 +732,7 @@ async def status(interaction: discord.Interaction):
         await interaction.followup.send("❌ Membership lookup failed. Open a ticket in **#create-ticket**.", ephemeral=True)
         return
     if not data.get("has_license"):
-        await interaction.followup.send("No membership is linked to your Discord account yet. Try `/claim_trial` or visit the Venice website.", ephemeral=True)
+        await interaction.followup.send("No membership is linked to your Discord account yet. Start the free trial on the https://zaeorion.com home page.", ephemeral=True)
         return
     e = discord.Embed(title="Your Venice membership", color=EMBED_COLOR)
     e.add_field(name="Status", value="Active" if data.get("active") else "Expired", inline=True)
@@ -751,7 +753,7 @@ async def setup(interaction: discord.Interaction):
                      "🎥 **Capture card not detected** — Venice can't see your card / black screen\n"
                      "🎮 **Remote Play won't pair / laggy** — pairing loops, PIN timeouts, stutter\n"
                      "🟩 **No greens / overlay not reading** — Venice runs but shots come out early or late\n\n"
-                     "Something else? `/faq` covers licenses, new PCs, and delivery — "
+                     "Something else? `/faq` covers access, new PCs, and delivery — "
                      "or open a ticket in **#create-ticket**."),
         color=EMBED_COLOR)
     if LOGO_URL:
