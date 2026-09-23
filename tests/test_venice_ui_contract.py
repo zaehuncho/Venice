@@ -1007,6 +1007,13 @@ def test_lead_calibration_cancel_restores_exact_provenance() -> None:
     begin = controller[controller.index("void OrionAppController::beginLeadCalibration()") :]
     begin = begin[: begin.index("void OrionAppController::cancelLeadCalibration()")]
     assert "leadCalStartLead_ = captureActuationLeadProvenance(config_.data());" in begin
+    # [2026-09-23 owner] On Auto, the start value is APPLIED (so every verdict grades the lead under
+    # test and a lock at the start value persists) - strictly AFTER the exact snapshot, so Cancel
+    # still restores Auto verbatim.
+    snap = begin.index("leadCalStartLead_ = captureActuationLeadProvenance(config_.data());")
+    apply = begin.index("setActuationLeadMs(leadCal_.leadMs);")
+    assert snap < apply
+    assert "leadAutoSeedMs_" in begin
     cancel = controller[controller.index("void OrionAppController::cancelLeadCalibration()") :]
     cancel = cancel[: cancel.index("void OrionAppController::reportLeadCalibrationVerdict")]
     assert "restoreActuationLeadProvenance(data, leadCalStartLead_)" in cancel

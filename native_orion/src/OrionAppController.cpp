@@ -9490,12 +9490,24 @@ void OrionAppController::beginLeadCalibration()
         return;   // already running; the screen shows its state
     }
     constexpr double kCalibrationStartMs = 300.0;
-    leadCal_ = LeadCalibrationPolicy::begin(
-        actuationLeadMs() > 0.0 ? actuationLeadMs() : kCalibrationStartMs);
+    // [2026-09-23 owner] On an Auto install start from the value Venice is ACTUALLY flying (the
+    // measured auto seed) when it has one - the best first guess this rig can offer.
+    const bool autoLead = actuationLeadMs() <= 0.0;
+    const double startMs = !autoLead ? actuationLeadMs()
+        : (leadAutoSeedActive_ && leadAutoSeedMs_ > 0.0 ? leadAutoSeedMs_ : kCalibrationStartMs);
+    leadCal_ = LeadCalibrationPolicy::begin(startMs);
     // [RT-MED-01 / CL3-F4-009 2026-09-23] Snapshot the WHOLE tuple, not just the number: an Auto
     // install is (0, user_set=false) and must come back as exactly that on Cancel.
     leadCalStartLead_ = captureActuationLeadProvenance(config_.data());
     leadCalWroteLead_ = false;
+    if (autoLead) {
+        // [2026-09-23 owner: "yes, save the value it locks on"] Every verdict must grade the lead
+        // under test. On Auto the engine kept flying its seed while the bisection believed it was
+        // at 300, so the first taps graded the wrong number and a lock at the start value
+        // persisted nothing. Apply the start value now; Cancel still restores Auto exactly.
+        setActuationLeadMs(leadCal_.leadMs);
+        leadCalWroteLead_ = true;
+    }
     leadCalActive_ = true;
     appendLog(QStringLiteral("Lead calibration started at %1 ms.").arg(qRound(leadCal_.leadMs)));
     emit leadCalibrationChanged();
