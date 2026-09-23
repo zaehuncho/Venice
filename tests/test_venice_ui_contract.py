@@ -612,7 +612,13 @@ def test_meter_delay_controls_are_wired_end_to_end() -> None:
     # One shared config->runtime mapping: the constructor priming plus all three
     # setters route through applyMeterDelayRuntimeConfig().
     assert implementation.count("applyMeterDelayRuntimeConfig();") >= 4
-    assert "meterDelay_.setEnabled(cfg.meterDelayEnabled);" in implementation
+    # [2026-09-23 owner] Meter Delay is SHELVED: the controller never arms it, whatever the
+    # persisted setting says (the installed build engaged 250 ms -> early shots and late-seen
+    # meters). Every arm/link/status site goes through meterDelayActive().
+    assert "meterDelay_.setEnabled(meterDelayActive(cfg));" in implementation
+    assert "constexpr bool kMeterDelayShelved = true;" in implementation
+    assert "return !kMeterDelayShelved && d.meterDelayEnabled;" in implementation
+    assert "meterDelay_.setEnabled(cfg.meterDelayEnabled);" not in implementation
     assert "meterDelay_.setManualDelayMs(static_cast<double>(cfg.meterDelayMs));" in implementation
 
 

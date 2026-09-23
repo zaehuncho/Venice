@@ -32,6 +32,9 @@ var
   VeniceTimer: LongWord;
   VeniceFrame: Integer;
   VeniceFramesReady: Boolean;
+  { [2026-09-23] Every frame decoded ONCE at start-up; a tick only assigns an in-memory bitmap
+    (no disk read + decode per tick, which made the glow stutter). }
+  VeniceFrameBitmaps: array of TBitmap;
 
 function VeniceSetTimer(hWnd: LongWord; nIDEvent, uElapse: LongWord; lpTimerFunc: LongWord): LongWord;
   external 'SetTimer@user32.dll stdcall';
@@ -86,16 +89,18 @@ var
   Target: TBitmapImage;
 begin
   VeniceFrame := (VeniceFrame + 1) mod VeniceHeroFrames;
+  { [2026-09-23 owner: "glitchy but functional"] The progress page repaints constantly, and
+    swapping the hero under it flickered, so the progress mark stays still. Only the calm
+    welcome and finished screens breathe. }
   case WizardForm.CurPageID of
     wpWelcome: Target := VeniceWelcomeHero;
-    wpInstalling: Target := VeniceInstallHero;
     wpFinished: Target := VeniceFinishHero;
   else
     Target := nil;
   end;
-  if Target <> nil then
+  if (Target <> nil) and (VeniceFrame < GetArrayLength(VeniceFrameBitmaps)) then
   try
-    Target.Bitmap.LoadFromFile(VeniceHeroFile(VeniceFrame));
+    Target.Bitmap.Assign(VeniceFrameBitmaps[VeniceFrame]);
   except
   end;
 end;
@@ -107,8 +112,13 @@ var
 begin
   VeniceFramesReady := False;
   try
+    SetArrayLength(VeniceFrameBitmaps, VeniceHeroFrames);
     for I := 0 to VeniceHeroFrames - 1 do
+    begin
       ExtractTemporaryFile('venice-hero-' + Format('%.2d', [I]) + '.bmp');
+      VeniceFrameBitmaps[I] := TBitmap.Create;
+      VeniceFrameBitmaps[I].LoadFromFile(VeniceHeroFile(I));
+    end;
     VeniceFramesReady := True;
   except
   end;

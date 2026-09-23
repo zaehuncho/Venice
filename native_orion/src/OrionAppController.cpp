@@ -88,6 +88,20 @@
 
 namespace orion {
 
+// [2026-09-23 owner: "meter delay should be shelved"] Meter Delay is SHELVED: nothing arms it,
+// whatever a persisted settings file or the historical default (true) says. The installed
+// build (VeniceNetSvc present) otherwise engaged a 250 ms delay while shots kept the delay-0
+// lead -> EARLY shots, and the delayed meter arrived ~860 ms after the press -> ownership
+// proof incomplete ("Venice lost track of the shot"). The setting is still stored; flip
+// kMeterDelayShelved to bring the feature back.
+namespace {
+constexpr bool kMeterDelayShelved = true;
+bool meterDelayActive(const orion::AppConfigData& d) noexcept
+{
+    return !kMeterDelayShelved && d.meterDelayEnabled;
+}
+} // namespace
+
 namespace {
 
 static constexpr quint16 PacketBridgePort = 47291;
@@ -4499,7 +4513,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // default ON (see packetBridgeLinkConfigured). Unverified bridge packets are
     // still never timing authority in production.
     if (packetBridgeLinkConfigured(config_.data().networkEnabled,
-                                   config_.data().meterDelayEnabled)) {
+                                   meterDelayActive(config_.data()))) {
         ensurePacketBridgeRunning();
         networkBridge_.start();
     } else {
@@ -4834,7 +4848,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // the headline toggle is ON but nothing on this machine can actuate it. The 2.2 MB
     // production log from the failing session contained zero meter-delay lines; this
     // is the line that makes that failure mode self-identifying.
-    if (config_.data().meterDelayEnabled && !meterDelayBackendAvailable()) {
+    if (meterDelayActive(config_.data()) && !meterDelayBackendAvailable()) {
         appendLog(QStringLiteral(
             "Meter delay is ON in settings but no delay backend exists on this install "
             "(no VeniceNetSvc/NexusVisionSvc service, no nexus_svc.py debug bridge): the "
@@ -9180,7 +9194,7 @@ void OrionAppController::setPacketCaptureEnabled(bool value)
             "Network features enabled by user (diagnostic only; never timing authority)."));
         ensurePacketBridgeRunning();
         networkBridge_.start();
-    } else if (packetBridgeLinkConfigured(data.networkEnabled, data.meterDelayEnabled)) {
+    } else if (packetBridgeLinkConfigured(data.networkEnabled, meterDelayActive(data))) {
         // [ORION_METER_DELAY_LINK 2026-08-08] The network opt-out must not tear
         // down the link Meter Delay is actively using: the bridge is the delay's
         // actuator, and stopping it here would zero the delay mid-session while the
@@ -10585,7 +10599,7 @@ void OrionAppController::applyMeterDelayRuntimeConfig()
     // shared by the constructor priming and the QML setters below. Values only —
     // possession (setOffense) and session gates are runtime state fed elsewhere.
     const auto& cfg = config_.data();
-    meterDelay_.setEnabled(cfg.meterDelayEnabled);
+    meterDelay_.setEnabled(meterDelayActive(cfg));
     meterDelay_.setManualDelayMs(static_cast<double>(cfg.meterDelayMs));
     // [ORION_DEFENSE_FLAG 2026-08-08] OffenseDefense now means "the D-pad Up
     // manual defense flag gates the delay" (bypass while defending); AlwaysOn
@@ -13321,7 +13335,7 @@ void OrionAppController::pollPhysicalController()
             || chiakiEmbedStatus_ == QLatin1String("Embedded");
         if (meterDelayBypassHotkeyTracker_.update(
                 dpadUpHeld, bypassHotkeySessionConnected)
-            && config_.data().meterDelayEnabled
+            && meterDelayActive(config_.data())
             && config_.data().meterDelayBypassOnDefense) {
             const bool defenseOn = !meterDelay_.defenseModeManualActive();
             meterDelay_.setDefenseModeManualActive(defenseOn);
@@ -16008,7 +16022,7 @@ void OrionAppController::ensurePacketBridgeRunning()
     }
     // [ORION_METER_DELAY_LINK 2026-08-08] Same predicate as the constructor start and
     // meterDelayStatusText's bridgeLinkConfigured: network feature OR Meter Delay.
-    if (!packetBridgeLinkConfigured(data.networkEnabled, data.meterDelayEnabled)) {
+    if (!packetBridgeLinkConfigured(data.networkEnabled, meterDelayActive(data))) {
         appendLog(QStringLiteral(
             "Packet bridge disabled by settings (network features off, meter delay off)."));
         return;
@@ -16221,7 +16235,7 @@ QString OrionAppController::meterDelayStatusText() const
     const auto& cfg = config_.data();
     MeterDelayStatusInputs in;
     in.backendAvailable = meterDelayBackendAvailable();
-    in.enabled = cfg.meterDelayEnabled;
+    in.enabled = meterDelayActive(cfg);
     // [VENICENET WAVE 2B] The service arm state + connection now come from the
     // VeniceNet DLL snapshot (the actuation path), mapped onto the honesty enum
     // the static status-line core consumes: HANDLE_OPEN/READY => Armed+connected;
@@ -16245,7 +16259,7 @@ QString OrionAppController::meterDelayStatusText() const
         break;
     }
     in.bridgeLinkConfigured = packetBridgeLinkConfigured(
-        cfg.networkEnabled, cfg.meterDelayEnabled);
+        cfg.networkEnabled, meterDelayActive(cfg));
     in.session = meterDelay_.sessionState();
     in.shot = meterDelay_.shotState();
     in.appliedMs = meterDelay_.currentDelayMs();
