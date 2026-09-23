@@ -125,9 +125,8 @@ WizardImageBackColor=#06080c
 #if FileExists(SourcePath + "assets\venice-wizard-small-100.bmp")
   WizardSmallImageFile={#SourcePath}assets\venice-wizard-small-100.bmp,{#SourcePath}assets\venice-wizard-small-150.bmp,{#SourcePath}assets\venice-wizard-small-200.bmp
 #endif
-#if FileExists(SourcePath + "assets\venice-wizard-back-100.png")
-  WizardBackImageFile={#SourcePath}assets\venice-wizard-back-100.png,{#SourcePath}assets\venice-wizard-back-150.png,{#SourcePath}assets\venice-wizard-back-200.png
-#endif
+; [2026-09-23 owner screenshot] No WizardBackImageFile: the one-screen hero is drawn on the flat
+; #06080c canvas, and a glow texture behind it showed the hero's rectangle as a black box.
 ; Venice branding on the installer itself. Icon comes from the same assets\orion.ico
 ; that OrionNative.exe embeds (blue V), so shortcut + installer + running app all match.
 ; Kept optional-with-fallback because the .ico is gitignored on some clones.
@@ -158,6 +157,15 @@ ClickFinish=
 SetupWindowTitle=Venice Setup
 
 ; [2026-09-23 one-screen look] No Tasks page: the desktop shortcut is always created.
+
+; [2026-09-23 owner: option A] One-screen Venice look: restyles the welcome, progress and
+; finished pages only (its own [Files] art + [Code] page events). Every install step and
+; security rule in this script is unchanged. Included HERE, before the main [Files], so its
+; hero frames are the FIRST files in the solid LZMA stream: Setup extracts them at start-up,
+; and at the end of the stream that meant decompressing ~600 MB first (a ~1 minute blank
+; start). Also before [Code] because its ';' comments are not comments inside Pascal.
+#define VeniceUiAssets SourcePath + "assets"
+#include "ui\venice_ui.iss"
 
 [Files]
 ; --- The signed application package (native exe + 6 DLLs + Qt runtime + OrionStream.exe
@@ -248,12 +256,6 @@ Type: dirifempty; Name: "{localappdata}\NexusVision"
 ; here. Surviving a reinstall is the right default; removal is an explicit interactive
 ; CHOICE handled by MaybeRemoveUserData in CurUninstallStepChanged (never in silent mode).
 
-; [2026-09-23 owner: option A] One-screen Venice look: restyles the welcome, progress and
-; finished pages only (its own [Files] art + [Code] page events). Every install step and
-; security rule in this script is unchanged. Included before [Code] on purpose: its header
-; comments use ';', which is not a comment inside a Pascal [Code] section.
-#define VeniceUiAssets SourcePath + "assets"
-#include "ui\venice_ui.iss"
 
 [Code]
 { Skip a driver install if it is already present. ViGEmBus/HidHide register a service; probing
