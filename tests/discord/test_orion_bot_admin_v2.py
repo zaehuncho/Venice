@@ -170,7 +170,9 @@ def test_purchase_is_ephemeral_single_plan_and_uses_store_url():
     reply = i.last
     assert reply["ephemeral"] is True
     embed = reply["embed"]
-    assert embed.title == "🛒 Venice — $25 / month"
+    # [2026-09-21 owner] $19.99/mo, final. Pinned on purpose
+    # so an accidental price drift in the bot copy fails here.
+    assert embed.title == "🛒 Venice — $19.99 / month"
     assert "Discord ID" in embed.description
     assert "#create-ticket" in embed.description
     assert reply["view"].children[0].url == "https://zaeorion.com/#pricing"

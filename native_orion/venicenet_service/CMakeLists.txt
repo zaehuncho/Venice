@@ -29,6 +29,18 @@ set(VENICENET_SVC_SOURCES
 )
 
 add_executable(VeniceNetSvc ${VENICENET_SVC_SOURCES})
+# [2026-09-21] Customer-facing identity for the service process (Task Manager, firewall
+# prompts): the launcher's template with this exe's description; the filename is untouched.
+set(VENICE_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/orion.ico")
+if(WIN32 AND EXISTS "${VENICE_ICON_PATH}")
+    file(TO_CMAKE_PATH "${VENICE_ICON_PATH}" VENICE_ICON_PATH)
+    set(VENICE_FILE_DESCRIPTION "Venice network service")
+    set(VENICE_INTERNAL_NAME "Venice network service")
+    set(VENICE_ORIGINAL_FILENAME "VeniceNetSvc.exe")
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../venice.rc.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/venice_service.rc" @ONLY)
+    target_sources(VeniceNetSvc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/venice_service.rc")
+endif()
 # Reuses the project-wide hardening flags AND puts native_orion/src on the include
 # path, which is how MeterDelayIntercept.cpp reaches PreciseWaitTimer.h (the
 # reused high-resolution waitable-timer idiom for the flush loop — wave-1 hazard 5).

@@ -13,6 +13,13 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_console_egress(monkeypatch):
+    import remote_play_client
+    # The warm-preview tests exercise scheduling, not live console discovery.
+    monkeypatch.setattr(remote_play_client, "_console_host_lookup", lambda host: host)
+
+
 def _load_sidecar():
     sc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "native_orion", "backend", "autogreen_sidecar.py")

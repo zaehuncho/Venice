@@ -14,6 +14,11 @@
 #include <QtCore/QObject>
 #include <QtCore/QChronoTimer>
 #include <QtCore/QElapsedTimer>
+
+#include "SidecarWatchdog.h"
+
+#include <algorithm>
+#include <chrono>
 #include <QtCore/QJsonObject>
 #include <QtCore/QProcess>
 #include <QtCore/QStringList>
@@ -45,7 +50,7 @@ public:
     Q_ENUM(BandwidthMode)
 
     void start();
-    void stop();
+    void stop(const QString& initiator = QStringLiteral("requested_stop"));
     void waitForStopped(); // application exit / explicitly synchronous internal recovery only
     [[nodiscard]] bool stopping() const noexcept { return !retiringSidecar_.isNull(); }
     // [ORION_CONNECT_LATENCY 2026-09-19] Start the connect stage clock at the USER's
@@ -88,7 +93,8 @@ public:
     // A re-send with the SAME epoch and source="type_upgrade" refreshes the type mid-press
     // (the blind 200 ms grace can re-type a Standstill into a fade) WITHOUT moving the press.
     void armMeterGate(const QString& source, quint64 physicalShotEpoch,
-                      const QString& shotType = QString(), bool rhythm = false);
+                      const QString& shotType = QString(), bool rhythm = false,
+                      double pressWallMsEpoch = 0.0);
     // [ORION_SHOT_GATE_RELEASE 2026-09-15] Close the press window the arm opened. `releaseMs`
     // is EPOCH ms (the sidecar's own fill-sample clock), matching sendReleaseMarker's wall_ms
     // contract. Sent on EVERY release path (vision, blind NO METER, METER BACKSTOP).
@@ -151,13 +157,29 @@ public:
     [[nodiscard]] double duplicateFramePct() const noexcept { return duplicateFramePct_; }
     // Detector-authority age. It can climb while capture transport is still alive when a
     // dark/malformed/loading-screen frame is deliberately rejected from the bot's input.
-    [[nodiscard]] double frameAgeMs() const noexcept { return frameAgeMs_; }
+    // [CL-006 Codex final gate 2026-09-22] Each age below is the value carried by the LAST
+    // telemetry record. The sidecar emits telemetry at >= 60 Hz, so a still-running sidecar that
+    // has gone silent used to leave these frozen at their last (fresh-looking) values. Once
+    // telemetry has been silent for more than kTelemetrySilenceStaleMs, every age reports at least
+    // the silence itself: detection fails closed on frame/pixel age, and the stream watchdog's
+    // transport-age restart (kStreamTransportRestartAgeMs) fires on a silent sidecar exactly as it
+    // does on a stalled capture. MISSING telemetry before the first record ages nothing.
+    [[nodiscard]] qint64 telemetrySilentMs() const noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = [&](std::chrono::steady_clock::time_point t) {
+            return static_cast<qint64>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count());
+        };
+        return sidecarTelemetrySilenceMs(haveTelemetry_, haveTelemetry_ ? ms(lastTelemetryAt_) : 0,
+                                         telemetryArmed_ ? ms(telemetryArmedAt_) : -1);
+    }
+    [[nodiscard]] double frameAgeMs() const noexcept { return silenceAged(frameAgeMs_); }
     // Time since the last UNIQUE (non-duplicate), detector-eligible frame. This is an automation
     // freshness signal, not proof that the capture transport/process died.
-    [[nodiscard]] double pixelAgeMs() const noexcept { return pixelAgeMs_; }
+    [[nodiscard]] double pixelAgeMs() const noexcept { return silenceAged(pixelAgeMs_); }
     // Time since any raw frame was successfully delivered by the active capture backend. This
     // remains fresh through static or dark loading screens and is the process-liveness clock.
-    [[nodiscard]] double transportAgeMs() const noexcept { return transportAgeMs_; }
+    [[nodiscard]] double transportAgeMs() const noexcept { return silenceAged(transportAgeMs_); }
     // Diagnostic-only backend work between the immutable capture/source stamp and
     // publication into Python's latest-wins FrameRingBuffer. Never timing authority.
     [[nodiscard]] double capturePublicationAgeMs() const noexcept {
@@ -289,6 +311,9 @@ signals:
     //                  hasCoverage=false, coverage="" -> there is no cell and never will be
     //                An older sidecar that omits the field reads back TRUE, which keeps the
     //                2026-09-18 strict coverage gate byte-for-byte.
+    // [ORION_ONSET_FF 2026-09-21] The sidecar's RTT sampler locked onto a DIFFERENT public court
+    // (or its first one). Emitted once per change, from the same snapshot the telemetry reads.
+    void courtChanged(QString courtIp);
     void bannerVerdict(QString timing, QString timingColor, QString coverage,
                        double ncc, qint64 frameEpochMs, int seq,
                        int attributed, qint64 releaseSeq, double releaseDelayMs,
@@ -438,6 +463,7 @@ private:
     RemotePlayState state_ = RemotePlayState::Disconnected;
     QString statusText_ = QStringLiteral("Disconnected");
     TelemetrySnapshot telemetry_;
+    QString lastCourtIp_;   // [ORION_ONSET_FF] last court the sampler reported
     QTimer frameTimer_;
     int frameCounter_ = 0;
     QProcess* helperProcess_ = nullptr;
@@ -546,6 +572,13 @@ private:
     // off) to show the HDMI feed before Connect. Cleared the moment Connect upgrades to the full
     // pipeline (which hands the single-open Elgato over via a paced stop+restart).
     bool previewMode_ = false;
+    // Immutable identity of the process actually holding the preview device.
+    // applyConfig() may change the requested settings while that process lives.
+    CaptureSidecarLaunchIdentity activeSidecarLaunchIdentity_;
+    quint64 activeSidecarSessionGeneration_ = 0;
+    qint64 activeSidecarPid_ = 0;
+    quint64 activeSidecarCreationTime100ns_ = 0;
+    QString sidecarStopInitiator_ = QStringLiteral("launcher_stop");
     // --- FIX 1: warm-preview -> stream promotion result tracking -------------------------------
     // A compliant sidecar brackets the promotion: {"event":"stream_promote","state":"begin"} on
     // receipt, then either {"event":"started"} (Chiaki/input up) or {"event":"error"} (it is NOT,
@@ -631,6 +664,10 @@ private:
     int captureLoopFps_ = 0;
     int uniqueFrameFps_ = 0;
     int lastSidecarDetectionFrameCount_ = -1;
+    // Opt-in observation only: no timestamp here is release authority.
+    quint64 meterPipeTraceEpoch_ = 0;
+    qint64 meterPipeTraceStartMs_ = 0;
+    int meterPipeTraceSamples_ = 0;
     // [E4] Last `frame_number` seen in a telemetry payload = the DECODER wire seq of the frame the
     // detector last reported on. This is the counter the preview `frame` stream stamps each JPEG
     // with, so it is the only one previewLag_ can legitimately be subtracted from (frame_count, the
@@ -666,6 +703,15 @@ private:
     double frameAgeMs_ = 0.0;
     // Time since the last UNIQUE (non-duplicate), detector-eligible frame.
     double pixelAgeMs_ = 0.0;
+    // [CL-006] Monotonic receipt time of the last sidecar telemetry record.
+    bool haveTelemetry_ = false;
+    std::chrono::steady_clock::time_point lastTelemetryAt_{};
+    // [CL-006 r2] Armed at every sidecar (re)start, so a sidecar that never reports is caught too.
+    bool telemetryArmed_ = false;
+    std::chrono::steady_clock::time_point telemetryArmedAt_{};
+    [[nodiscard]] double silenceAged(double stored) const noexcept {
+        return silenceAgedHealthMs(stored, telemetrySilentMs());
+    }
     // Independent raw capture-transport liveness; does not revoke detector fail-closed behavior.
     double transportAgeMs_ = 0.0;
     double capturePublicationAgeMs_ = 0.0;

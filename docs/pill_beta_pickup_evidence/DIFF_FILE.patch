@@ -1,0 +1,149 @@
+--- a/simple_meter_reader.py
++++ b/simple_meter_reader.py
+@@ -4709,7 +4709,8 @@
+             # ships ON. Publishing the press window is one tuple swap per press edge, so the
+             # two switches are separated here rather than making the tipless path depend on a
+             # feature nobody has turned on.
+-            if not (_player_anchor.enabled() or self._pa_arm_only()):
++            if not (_player_anchor.enabled() or self._pa_arm_only()
++                    or getattr(self, "_tracking_meter_style", "") == "pill"):
+                 if self._pa_epoch:
+                     self._pa_epoch = 0
+                     _player_anchor.ARM.reset()
+@@ -4741,10 +4742,11 @@
+                 # flushed first, so no record is overwritten unlogged. One operation: the
+                 # control thread's notify_physical_shot_start may already have rolled this
+                 # same press, and a bare flush here would log THIS press's empty record.
+-                # [ORION_CV_TIPLESS_ARMED] behind the ANCHOR's switch: with arm-only
+-                # publication there is no plate search, so every field of the record but the
+-                # epoch would be blank and the census would be a wall of empty lines.
+-                if _player_anchor.enabled():
++                # [ORION_CV_TIPLESS_ARMED] CV remains behind the ANCHOR switch: with
++                # arm-only publication there is no plate search. Pill has a separate
++                # YOLO/reader measurement below and needs its own pickup census.
++                if (_player_anchor.enabled()
++                        or getattr(self, "_tracking_meter_style", "") == "pill"):
+                     self._roll_pickup_record(epoch)
+             elif not armed and self._pa_epoch:
+                 # release FIRST: the anchor stopping is behaviour, the PICKUP line is only
+@@ -4752,7 +4754,8 @@
+                 closing = self._pa_epoch
+                 self._pa_epoch = 0
+                 _player_anchor.ARM.note_release(closing, now)
+-                if _player_anchor.enabled():
++                if (_player_anchor.enabled()
++                        or getattr(self, "_tracking_meter_style", "") == "pill"):
+                     self._flush_pickup_line()
+         except Exception:
+             pass
+@@ -4872,14 +4875,22 @@
+         except AttributeError:
+             pass
+         if _player_anchor is None:
++            if getattr(self, "_tracking_meter_style", "") == "pill":
++                self._flush_pickup_line()
+             return True
+         try:
+-            if _player_anchor.enabled() and self._pa_epoch == epoch:
++            if self._pa_epoch == epoch:
+                 self._pa_epoch = 0
+                 _player_anchor.ARM.note_release(epoch, self._pa_last_ts)
+-                self._flush_pickup_line()
++                if (_player_anchor.enabled()
++                        or getattr(self, "_tracking_meter_style", "") == "pill"):
++                    self._flush_pickup_line()
+         except Exception:
+             pass
++        # The control-thread press can close before its first frame publishes _pa_epoch.
++        # The Pill record was already opened on that press; do not lose its miss line.
++        if getattr(self, "_tracking_meter_style", "") == "pill":
++            self._flush_pickup_line()
+         return True
+ 
+     def _open_pickup_record(self, epoch) -> None:
+@@ -4890,17 +4901,58 @@
+         method writes one dict and nothing else.
+ 
+         `self._meter_detector` is the process-wide ``AsyncMeterLocator`` (see __init__) and
+-        `_base` is the proposer inside it -- ``MeterContourLocator`` under
+-        ORION_METER_PROPOSER=cv, which is the only proposer that keeps a pickup record.
+-        Under the shipped ONNX proposer `_base` has no ``open_pickup_record`` and this is a
+-        no-op, exactly as intended.
++        `_base` is its proposer. CV owns its existing record; Pill gets the same schema
++        on its YOLO proposer so the orchestrator's existing pickup join can read it.
+         """
+         try:
+             base = getattr(getattr(self, "_meter_detector", None), "_base", None)
+             opener = getattr(base, "open_pickup_record", None)
+             if callable(opener):
+                 opener(int(epoch))
++            elif self._tracking_meter_style == "pill" and base is not None:
++                ep = int(epoch)
++                if ep <= 0:
++                    return
++                prior = getattr(base, "pickup", None)
++                if isinstance(prior, dict) and int(prior.get("epoch", 0) or 0) == ep:
++                    return
++                base.pickup = {
++                    "epoch": ep, "first_sight_fill": -1.0,
++                    "first_sight_ms_after_press": -1.0, "anchor_used": 0,
++                    "anchor_conf": 0.0, "refused_outside_patch": 0,
++                    "expect_accept": 0, "anchor_ms": 0.0, "logged": 0,
++                }
+         except Exception:
++            pass
++
++    def _note_pill_pickup(self, ts, fill) -> None:
++        """Record the first valid Pill white-fill read on the frame clock.
++
++        YOLO proposes a box but has no column-height estimate. The Pill landmark
++        ruler supplies the fill only after the reader measures that box. This is
++        therefore a first *valid measured fill*, not raw YOLO proposal latency.
++        Epoch and frame-time checks reject old in-flight frames and post-release
++        measurements; this is forensics only and never changes acceptance.
++        """
++        try:
++            base = getattr(getattr(self, "_meter_detector", None), "_base", None)
++            p = getattr(base, "pickup", None)
++            if (not isinstance(p, dict) or p.get("logged") or _player_anchor is None
++                    or callable(getattr(base, "open_pickup_record", None))):
++                return
++            ep, press_ts, _kind, armed, _rhythm, _release_ts = _player_anchor.ARM.state()
++            if (not armed or int(ep) <= 0 or int(p.get("epoch", 0)) != int(ep)
++                    or int(self._physical_shot_epoch or 0) != int(ep)
++                    or float(p.get("first_sight_fill", -1.0)) >= 0.0):
++                return
++            dt_ms = 1000.0 * (float(ts) - float(press_ts))
++            value = float(fill)
++            if not (np.isfinite(dt_ms) and dt_ms >= 0.0
++                    and np.isfinite(value) and 0.0 < value <= 100.0):
++                return
++            p["first_sight_fill"] = round(value, 1)
++            p["first_sight_ms_after_press"] = round(dt_ms, 1)
++        except (TypeError, ValueError, OverflowError, AttributeError):
+             pass
+ 
+     def _roll_pickup_record(self, epoch) -> None:
+@@ -5034,9 +5086,10 @@
+         # Flush FIRST (the predecessor's line) and only then open, exactly as the frame-clock
+         # path does; open_pickup_record is idempotent per epoch so the two paths cannot
+         # produce two records for one press.
+-        if _player_anchor is not None and self._physical_shot_epoch:
++        if self._physical_shot_epoch:
+             try:
+-                if _player_anchor.enabled():
++                if (self._tracking_meter_style == "pill"
++                        or (_player_anchor is not None and _player_anchor.enabled())):
+                     self._roll_pickup_record(self._physical_shot_epoch)
+             except Exception:
+                 pass
+@@ -13528,6 +13581,9 @@
+                 _measurement_rejected = bool(
+                     not _white_read_valid or self._det_occ_censored_reject
+                     or self._det_pixel_ruler_reject)
++                if (self._tracking_meter_style == "pill"
++                        and not _measurement_rejected and _sp > 0.0):
++                    self._note_pill_pickup(ts, _sp)
+                 if self._det_lifecycle:
+                     # Per-lock fill bookkeeping: the PROVEN-rise latch that earns the extended
+                     # coast (retired peak-hold demanded a real rise) + the white-ribbon presence

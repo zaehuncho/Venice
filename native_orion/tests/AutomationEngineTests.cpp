@@ -57,6 +57,7 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QScopeGuard>
+#include <QtCore/QFileInfo>
 #include <QtCore/QTemporaryDir>
 #include <QtGui/QColor>
 #include <QtGui/QImage>
@@ -130,6 +131,10 @@ struct FrameNativeArmRun {
 class AutomationEngineTests final : public QObject {
     Q_OBJECT
 private slots:
+    void onsetFeedforwardAbArmsParse();
+    void learningRecoversFromBackupWhenCorrupt();
+    void learningWithoutBackupQuarantinesAndDefaults();
+    void ownershipInputTraceIsObservational();
     void inputTimedRelease_data();
     void inputTimedRelease();
     void inputTimedCancelAndNeutralRearm();
@@ -152,6 +157,8 @@ private slots:
     void legacyMeterBlindBackstopFiresWithoutALearnedPrior();
     void meterVisionPrioritySuppressesDefaultBlindBackstop();
     void meterBlindBackstopHonoursItsFlag();
+    void meterBlindBackstopStandsDownWhileDetectionUnavailable();
+    void devFireOffsetArmedRefusesBannerTrimEvidence();
     void legacyMeterBlindBackstopFlicksForTempoSquare();
     void legacyMeterBlindBackstopRetypesALateFade();
     void meterBlindBackstopNeverFiresAfterTheUserReleases();
@@ -216,6 +223,7 @@ private slots:
     void releaseOracleYieldsToAnAttributedBannerForTheSameShot();
     void releaseOracleIgnoresUnknownProxiesAndUnmatchedEpochs();
     void releaseOracleLogsOneLinePerMessage();
+    void queuedReleaseOracleDoesNotCrossResetOrSidecarGeneration();
     // [ORION_LEAD_AUTO_SEED 2026-09-15]
     void leadAutoSeedFliesThePlaceholderUntilThisRigsLatencyIsMeasured();
     void leadAutoSeedRateLimitsAConvergingEstimatorToTwoMsPerShot();
@@ -596,6 +604,14 @@ private slots:
     // [ORION_DEV_FIRE_OFFSET] dev-only commanded fire-offset sweep hook (env-gated).
     void devFireOffsetDisplacesScheduledDeadlineAndFencesLearning();
     void devFireOffsetRefusesMalformedOrOutOfBoundsSpec();
+    // [ORION_ONSET_FF] per-shot onset feedforward: policy math, choke-point displacement, kill switch.
+    void onsetFeedforwardPolicyMathAndColdStart();
+    void onsetFeedforwardDisplacesScheduledDeadlineEarlier();
+    void onsetFeedforwardInertWithoutReferenceGainOrLateOnset();
+    // [ORION_ONSET_FF] round 2 (Codex 2026-09-21): learner/trim fences, trim bound, reset, staleness.
+    void onsetFeedforwardFencesPhaseAndTrim();
+    void onsetFeedforwardIsBoundedByTheBannerTrimAndResets();
+    void onsetFeedforwardDisplacedReleaseDropsTheMarkerAndNormalisesPerRelease();
     // [ORION_PHASE_VETO_DIRECTIONAL] the live-meter veto must keep only its late-hazard direction.
     void phaseVetoDirectionalKeepsPhaseAgainstAnEarlySampler();
     void tipPhaseSoloIgnoresTheSamplerVetoOnADatedPhaseMember();
@@ -3116,6 +3132,43 @@ void AutomationEngineTests::meterBlindBackstopHonoursItsFlag()
     QVERIFY2(unanswered.contains(QStringLiteral("backstop=off")), qPrintable(unanswered));
 }
 
+// [CL2-P9-001 2026-09-23] While the controller reports detection unavailable, the backstop behaves
+// exactly like its kill switch: the press passes through untouched, no timer release, and the
+// abort line names the reason.
+void AutomationEngineTests::meterBlindBackstopStandsDownWhileDetectionUnavailable()
+{
+    AppConfigData config = meterBlindBackstopConfig(650.0, 274.0);
+    AutomationEngine engine;
+    engine.applyConfig(config, LearningData{});
+    engine.config_.measuredLeadFreshnessMs = 100'000.0;
+    // The shipped green-window priority already stands the backstop down; switch it off (as the
+    // legacy backstop tests do) so this isolates the detection_unavailable gate itself.
+    engine.config_.greenWindowPriority = false;
+    engine.setDetectionUnavailable(true);
+    engine.advanceTestClock(1000.0);
+
+    ControllerState square;
+    square.buttons |= XINPUT_GAMEPAD_X;
+    QSignalSpy diag(&engine, &AutomationEngine::engineDiagnostic);
+    beginMeterlessLivePress(engine, square, 4'305);
+    ControllerState output;
+    for (int i = 0; i < 10; ++i) {
+        engine.advanceTestClock(100.0);
+        output = engine.process(square);
+        QVERIFY2(output.square(), "detection unavailable: the press must pass through");
+    }
+    QVERIFY(diagnosticMatching(diag, QStringLiteral("METER BACKSTOP:")).isEmpty());
+    ControllerState neutral;
+    for (int i = 0; i < 3; ++i) {
+        engine.advanceTestClock(4.0);
+        engine.process(neutral);
+    }
+    const QString unanswered = diagnosticMatching(
+        diag, QStringLiteral("reason=press_unanswered_no_meter"));
+    QVERIFY2(unanswered.contains(QStringLiteral("backstop=detection_unavailable")),
+             qPrintable(unanswered));
+}
+
 void AutomationEngineTests::legacyMeterBlindBackstopFlicksForTempoSquare()
 {
     // The edge must be the one the VISION path would have emitted for this shot. Under Rhythm the
@@ -4486,6 +4539,41 @@ void AutomationEngineTests::releaseOracleLogsOneLinePerMessage()
     QCOMPARE(restarted.bannerLeadTrimMsForType(QStringLiteral("Standstill")), 4.5);
 }
 
+void AutomationEngineTests::queuedReleaseOracleDoesNotCrossResetOrSidecarGeneration()
+{
+    const QString type = QStringLiteral("Standstill");
+    for (const bool fullReset : {false, true}) {
+        AutomationEngine engine;
+        engine.applyConfig(bannerTrimConfig(), LearningData{});
+        QSignalSpy changed(&engine, &AutomationEngine::bannerLeadTrimUpdated);
+        // Two completed misses are earned history, but a third is only parked while
+        // the banner grace runs. The old process must not close that batch later.
+        feedReleaseOracle(engine, 80'001, type, 10.8, QStringLiteral("miss"));
+        feedReleaseOracle(engine, 80'002, type, 10.8, QStringLiteral("miss"));
+        engine.noteBannerReleaseForTests(80'003, type);
+        engine.observeReleaseOracle(80'003, 10.8, QStringLiteral("miss"));
+        QCOMPARE(engine.pendingReleaseOracles_.size(), 1);
+        QCOMPARE(engine.bannerTrimReleases_.size(), 1);
+        const int signalsBefore = changed.count();
+        if (fullReset) {
+            engine.reset();
+        } else {
+            engine.beginSidecarProcessGeneration();
+        }
+        QCOMPARE(engine.pendingReleaseOracles_.size(), 0);
+        QCOMPARE(engine.bannerTrimReleases_.size(), 0);
+        engine.advanceTestClock(3'000.0);
+        engine.flushReleaseOracleGraceForTests();
+        QCOMPARE(engine.bannerLeadTrimMsForType(type), 0.0);
+        QCOMPARE(changed.count(), signalsBefore);
+        // The old epoch no longer has release authority; a new epoch still can.
+        engine.observeReleaseOracle(80'003, 10.8, QStringLiteral("miss"));
+        QCOMPARE(engine.pendingReleaseOracles_.size(), 0);
+        feedReleaseOracle(engine, 80'004, type, 10.8, QStringLiteral("miss"));
+        QCOMPARE(engine.pendingReleaseOracles_.size(), 0);
+    }
+}
+
 // == [ORION_LEAD_AUTO_SEED 2026-09-15 owner] ==============================================
 // "How will every user find their tip timing lead... I'm trying to get it as plug and play as
 // possible."
@@ -5136,6 +5224,16 @@ void AutomationEngineTests::shotGateCommandsAreAdditiveInBothDirections()
     QCOMPARE(typed.value(QStringLiteral("shot_type")).toString(), QStringLiteral("Left Fade"));
     QCOMPARE(typed.value(QStringLiteral("rhythm")).toInt(-1), 1);
     QCOMPARE(typed.value(QStringLiteral("shot_epoch")).toString(), QStringLiteral("42"));
+    QVERIFY(!legacy.contains(QStringLiteral("press_ms")));
+    const QJsonObject stamped = makeShotGateArmCommand(
+        QStringLiteral("square_edge"), 42, QStringLiteral("Standstill"), false,
+        1789877408353.0);
+    QCOMPARE(stamped.value(QStringLiteral("press_ms")).toDouble(), 1789877408353.0);
+    for (double bad : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                       std::numeric_limits<double>::quiet_NaN()}) {
+        QVERIFY(!makeShotGateArmCommand(QStringLiteral("square_edge"), 42,
+                    QString(), false, bad).contains(QStringLiteral("press_ms")));
+    }
 
     // Epochs are decimal STRINGS for the same reason pose tokens are: a 64-bit epoch must never
     // round through JSON's IEEE-754 number storage.
@@ -7693,8 +7791,9 @@ static AppConfigData squarePressR2HoldConfig()
     config.meterEnabled = true;
     config.minimumHoldMs = 0.0;
     config.fixedHoldMs = 650.0;
-    // Deliberately NOT touching sprintReleaseOnSquare (false) or squarePressR2HoldMs (50): these
-    // tests run the SHIPPED pair, so a default that drifts fails here first.
+    // The hold is default-off after the 2026-09-21 pass-through repair. These tests explicitly
+    // opt in so the retained A/B mechanism and its bounded window remain covered.
+    config.squarePressR2HoldMs = 50.0;
     return config;
 }
 
@@ -7930,7 +8029,7 @@ void AutomationEngineTests::squarePressR2HoldZeroIsByteIdentical()
 void AutomationEngineTests::squarePressR2HoldSettingsRoundTripAndEnvOverride()
 {
     AppConfigData fresh;
-    QCOMPARE(fresh.squarePressR2HoldMs, 50.0);    // three game frames, the shipped default
+    QCOMPARE(fresh.squarePressR2HoldMs, 0.0);     // faithful trigger pass-through ships by default
 #ifndef ORION_PRODUCTION_BUILD
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
@@ -7942,29 +8041,18 @@ void AutomationEngineTests::squarePressR2HoldSettingsRoundTripAndEnvOverride()
     }
     AppConfig reader(dir.path());
     reader.load();
-    QCOMPARE(reader.data().squarePressR2HoldMs, 120.0);
-    {   // out of band on the way out AND back in -> clamped into it, never rejected
-        AppConfig store(dir.path());
-        AppConfigData wild = store.data();
-        wild.squarePressR2HoldMs = 9'999.0;
-        QVERIFY(store.save(wild));
-        AppConfig clampReader(dir.path());
-        clampReader.load();
-        QCOMPARE(clampReader.data().squarePressR2HoldMs,
-                 AppConfigData::kSquarePressR2HoldMaxMs);
-        AppConfigData tiny = clampReader.data();
-        tiny.squarePressR2HoldMs = -25.0;
-        QVERIFY(store.save(tiny));
-        AppConfig floorReader(dir.path());
-        floorReader.load();
-        QCOMPARE(floorReader.data().squarePressR2HoldMs,
-                 AppConfigData::kSquarePressR2HoldMinMs);
-    }
+    QCOMPARE(reader.data().squarePressR2HoldMs, 0.0);
+    // Save also scrubs the old hidden setting, so an upgraded profile cannot silently revive it.
+    QFile persisted(reader.settingsPath());
+    QVERIFY(persisted.open(QIODevice::ReadOnly));
+    QCOMPARE(QJsonDocument::fromJson(persisted.readAll()).object()
+                 .value(QStringLiteral("square_press_r2_hold_ms")).toDouble(-1.0),
+             0.0);
 #endif
     AutomationEngine engine;
     AppConfigData cfg;
     engine.applyConfig(cfg, LearningData{});
-    QCOMPARE(engine.config().squarePressR2HoldMs, 50.0);
+    QCOMPARE(engine.config().squarePressR2HoldMs, 0.0);
     cfg.squarePressR2HoldMs = 9'999.0;
     engine.applyConfig(cfg, LearningData{});
     QCOMPARE(engine.config().squarePressR2HoldMs, AppConfigData::kSquarePressR2HoldMaxMs);
@@ -15953,6 +16041,9 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // CaptureCardBackend -- so an existing install asks the card for exactly what it
         // always did.
         QStringLiteral("capture_card_fps"),
+        // An empty selected-device ID is deliberately inert. A numerical
+        // default index alone must never imply an explicit card pick.
+        QStringLiteral("capture_card_device_id"),
         // [ORION_LEAD_BY_SOURCE 2026-09-14] The per-video-route Shot Lead stash. Unlike every
         // other key here it does NOT appear at a compiled default (empty): the load path SEEDS
         // the route the live file is using from actuation_lead_ms, which is precisely what makes
@@ -16096,6 +16187,11 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // restore the 2026-09-17 loop byte-for-byte.
         QStringLiteral("banner_trim_bias_window"),
         QStringLiteral("banner_trim_bias_votes"),
+        QStringLiteral("onset_ff_gain"),
+        QStringLiteral("onset_ff_clamp_ms"),
+        QStringLiteral("onset_ff_window"),
+        QStringLiteral("onset_ff_min_samples"),
+        QStringLiteral("onset_ff_one_sided"),
         // [ORION_PILL_YOLO_ROUTE 2026-09-17] The style->proposer route's kill switch. Appears
         // at its compiled default of TRUE, and on an Arrow2/Straight install that changes
         // NOTHING: the route reads it only when meter_style normalises to "pill", and a
@@ -16107,6 +16203,11 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // false (or ORION_PILL_YOLO_ROUTE=0) to restore the pre-route environment byte for
         // byte; the launch then logs "METER STYLE MISMATCH:" instead of routing.
         QStringLiteral("pill_yolo_route"),
+        // [2026-09-21 beta] One-time "Xbox is untested" acknowledgement. Written on every
+        // save (default false) so the key is present in an installed settings.json;
+        // RemotePlaySession::start refuses an Xbox launch while it is false. Never read
+        // on the PS5 route, so its presence changes nothing for a PS5 install.
+        QStringLiteral("xbox_untested_ack"),
     };
     QStringList newKeys;
     const QStringList persistedKeys = persisted.keys();
@@ -16119,6 +16220,7 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
     QCOMPARE(newKeySet.size(), newKeys.size());   // no duplicate keys
     QSet<QString> expectedNewKeys = introducedKeys;
     expectedNewKeys.insert(QStringLiteral("settings_version"));
+    expectedNewKeys.insert(QStringLiteral("lead_offset_left_fade_rev"));   // [ORION_LEFT_FADE_LATER]
     QCOMPARE(newKeySet, expectedNewKeys);
     QCOMPARE(persisted.value(QStringLiteral("settings_version")).toInt(-1),
              AppConfig::kSettingsVersion);
@@ -21997,6 +22099,67 @@ void AutomationEngineTests::ownershipProofReanchorsBelowStaleFirstSample()
                             .arg(static_cast<int>(engine.context().state))));
 }
 
+
+void AutomationEngineTests::ownershipInputTraceIsObservational()
+{
+    const QByteArray previous = qgetenv("ORION_OWNERSHIP_TRACE");
+    const bool wasSet = qEnvironmentVariableIsSet("ORION_OWNERSHIP_TRACE");
+    const auto restore = qScopeGuard([&] {
+        if (wasSet) qputenv("ORION_OWNERSHIP_TRACE", previous);
+        else qunsetenv("ORION_OWNERSHIP_TRACE");
+    });
+    for (const bool tracing : {false, true}) {
+        qputenv("ORION_OWNERSHIP_TRACE", tracing ? "1" : "0");
+        AutomationEngine engine;
+        AppConfigData config;
+        config.remotePlayInputSource = QStringLiteral("square");
+        config.minimumHoldMs = 0.0;
+        config.autonomousVision = true;
+        config.measuredLeadEnabled = true;
+        engine.applyConfig(config, LearningData{});
+        QSignalSpy diagnostics(&engine, &AutomationEngine::engineDiagnostic);
+        constexpr quint64 epoch = 84'220;
+        int frame = 1;
+        auto sample = [&](double fill) {
+            auto r = strictLiveMeterSample(fill, frame++, epoch, 22.0, 2.0, 6);
+            r.frameAgeMs = 0.0;
+            return r;
+        };
+        engine.updateDetection(sample(1.0));
+        engine.setPhysicalShotEpoch(epoch);
+        ControllerState square;
+        square.buttons |= XINPUT_GAMEPAD_X;
+        engine.process(square);
+        engine.advanceTestClock(100.0);
+        auto aged = sample(10.0);
+        aged.frameAgeMs = 67.0;
+        engine.updateDetection(aged);
+        engine.process(square);
+        QCOMPARE(engine.context().state, HoldState::Idle);
+        QCOMPARE(engine.pendingMeterOwnership_.sampleCount, 0);
+        for (const double fill : {16.0, 21.0, 26.0}) {
+            engine.advanceTestClock(20.0);
+            engine.updateDetection(sample(fill));
+            engine.process(square);
+        }
+        QCOMPARE(engine.context().state, HoldState::Holding);
+        QCOMPARE(engine.config().strictReleaseMaxSourceAgeMs, 50.0);
+        QStringList traces;
+        for (const auto& row : diagnostics) {
+            if (row[0].toString().startsWith(QStringLiteral("OWNERSHIP INPUT:")))
+                traces.append(row[0].toString());
+        }
+        QCOMPARE(traces.isEmpty(), !tracing);
+        if (tracing) {
+            const auto rejected = std::find_if(traces.cbegin(), traces.cend(), [](const QString& s) {
+                return s.contains(QStringLiteral("age_ms=67.000"));
+            });
+            QVERIFY(rejected != traces.cend());
+            QVERIFY(rejected->contains(QStringLiteral("age_ok=0")));
+            QVERIFY(rejected->contains(QStringLiteral("eligible=0")));
+        }
+    }
+}
 
 void AutomationEngineTests::ownershipPromotionCensusPreservesProofAndStampHistory_data()
 {
@@ -28751,8 +28914,8 @@ void AutomationEngineTests::leadOffsetFadeMidReplacesTheFadeOffsetForAMidRangeSh
     // is what makes an install that cannot read the nameplate byte-identical to 2026-09-16.
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade"), Range::Mid), 6.0);
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Right Fade"), Range::Mid), 6.0);
-    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade"), Range::Three), 8.0);
-    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade"), Range::Unknown), 8.0);
+    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade"), Range::Three), -6.0);
+    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade"), Range::Unknown), -6.0);
     // Range is FADE-ONLY: a Standstill handed a mid range is still the Standstill bucket.
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Standstill"), Range::Mid), 0.0);
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Go-To"), Range::Mid), 0.0);
@@ -28760,11 +28923,12 @@ void AutomationEngineTests::leadOffsetFadeMidReplacesTheFadeOffsetForAMidRangeSh
     // THE LIVE PRESS SPENDS IT. 274 + 6, not 274 + 8.
     engine.shot_.physicalShotEpoch = 7'200;
     engine.shot_.shotType = QStringLiteral("Left Fade");
-    QCOMPARE(engine.measuredLeadForActuationMsForTests(), 282.0);
+    // [ORION_LEFT_FADE_LATER 2026-09-22] non-mid left fade: 274 - 6; mid still 274 + 6.
+    QCOMPARE(engine.measuredLeadForActuationMsForTests(), 268.0);
     QVERIFY(engine.noteShotRange(7'200, QStringLiteral("mid"), 1.0));
     QCOMPARE(engine.measuredLeadForActuationMsForTests(), 280.0);
     QVERIFY(engine.noteShotRange(7'200, QStringLiteral("three"), 1.0));
-    QCOMPARE(engine.measuredLeadForActuationMsForTests(), 282.0);
+    QCOMPARE(engine.measuredLeadForActuationMsForTests(), 268.0);
 
     // CLAMPED ON EVERY ROUTE, like the other four.
     AppConfigData wild = bannerTrimConfig();
@@ -28783,7 +28947,7 @@ void AutomationEngineTests::leadOffsetFadeMidReplacesTheFadeOffsetForAMidRangeSh
     qputenv("ORION_LEAD_OFFSET_FADE_MID_MS", "2.5");
     engine.applyConfig(bannerTrimConfig(), LearningData{});
     QCOMPARE(engine.config().leadOffsetFadeMidMs, 2.5);
-    QCOMPARE(engine.config().leadOffsetLeftFadeMs, 8.0);
+    QCOMPARE(engine.config().leadOffsetLeftFadeMs, -6.0);   // [ORION_LEFT_FADE_LATER 2026-09-22]
     qputenv("ORION_LEAD_OFFSET_FADE_MID_MS", "banana");          // ignore, never guess
     engine.applyConfig(bannerTrimConfig(), LearningData{});
     QCOMPARE(engine.config().leadOffsetFadeMidMs, 6.0);
@@ -28918,8 +29082,8 @@ void AutomationEngineTests::shipConfigDefaultsArePinned()
     // --- and every other knob the ship launch line depends on, pinned where it stood ------
     // Refuted live 09-16 23:04 (every R2-held press went dead); kept, default off.
     QCOMPARE(ship.sprintReleaseOnSquare, false);
-    // Its replacement: the output R2 latched through the press window.
-    QCOMPARE(ship.squarePressR2HoldMs, 50.0);
+    // The replacement experiment is retained, but faithful output ships inert.
+    QCOMPARE(ship.squarePressR2HoldMs, 0.0);
     // The banner trim and its tempo sub-buckets are the 09-16 lead learner.
     QCOMPARE(ship.bannerLeadTrim, true);
     QCOMPARE(ship.bannerTrimTempoBuckets, true);
@@ -28931,8 +29095,8 @@ void AutomationEngineTests::shipConfigDefaultsArePinned()
     // The owner's own numbers from the 09-16 20:26 session: slider 269 = fixed 200 + 69.
     QCOMPARE(ship.aimMarginMs, 69.0);
     QCOMPARE(ship.leadFactoryPlaceholderMs, 269.0);
-    // Fades fire 8 ms early; every other type is untouched.
-    QCOMPARE(ship.leadOffsetLeftFadeMs, 8.0);
+    // Right fades fire 8 ms early; left fades 6 ms LATER (ORION_LEFT_FADE_LATER 2026-09-22).
+    QCOMPARE(ship.leadOffsetLeftFadeMs, -6.0);
     QCOMPARE(ship.leadOffsetRightFadeMs, 8.0);
     QCOMPARE(ship.leadOffsetStandstillMs, 0.0);
     QCOMPARE(ship.leadOffsetOtherMs, 0.0);
@@ -28995,14 +29159,14 @@ void AutomationEngineTests::shipConfigDefaultsSurviveAKeylessSettingsFile()
     // The rest of the ship list reaches the same install through the same loader.
     QCOMPARE(probe.data().aimMarginMs, 69.0);
     QCOMPARE(probe.data().leadFactoryPlaceholderMs, 269.0);
-    QCOMPARE(probe.data().squarePressR2HoldMs, 50.0);
+    QCOMPARE(probe.data().squarePressR2HoldMs, 0.0);
     QCOMPARE(probe.data().sprintReleaseOnSquare, false);
     QCOMPARE(probe.data().bannerLeadTrim, true);
     QCOMPARE(probe.data().bannerTrimTempoBuckets, true);
     QCOMPARE(probe.data().bannerTrimRangeBuckets, true);
     QCOMPARE(probe.data().leadAutoSeed, true);
     QCOMPARE(probe.data().tipFrameNative, true);
-    QCOMPARE(probe.data().leadOffsetLeftFadeMs, 8.0);
+    QCOMPARE(probe.data().leadOffsetLeftFadeMs, -6.0);
     QCOMPARE(probe.data().leadOffsetRightFadeMs, 8.0);
     QCOMPARE(probe.data().leadOffsetFadeMidMs, 6.0);
     QCOMPARE(probe.data().meterBackstopGraceMs, 100.0);
@@ -44592,7 +44756,7 @@ void AutomationEngineTests::leadAutoSeedIsCarriedAppendOnlyOnTheReservationLine(
 void AutomationEngineTests::leadOffsetByTypeFiresAFadeEarlierAndLeavesTheStandstillAlone()
 {
     // The shipped defaults, stated once: 8 ms on both fades, 0 everywhere else.
-    QCOMPARE(AppConfigData{}.leadOffsetLeftFadeMs, 8.0);
+    QCOMPARE(AppConfigData{}.leadOffsetLeftFadeMs, -6.0);   // [ORION_LEFT_FADE_LATER 2026-09-22]
     QCOMPARE(AppConfigData{}.leadOffsetRightFadeMs, 8.0);
     QCOMPARE(AppConfigData{}.leadOffsetStandstillMs, 0.0);
     QCOMPARE(AppConfigData{}.leadOffsetOtherMs, 0.0);
@@ -44604,7 +44768,8 @@ void AutomationEngineTests::leadOffsetByTypeFiresAFadeEarlierAndLeavesTheStandst
     // THE BUCKETS ARE THE BANNER TRIM'S, so the constant offset and the closed loop can never
     // disagree about what a fade is -- including the "Other" catch-all, which is what keeps a
     // type this build does not name from fragmenting into a setting nobody tuned.
-    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade")), 8.0);
+    // [ORION_LEFT_FADE_LATER 2026-09-22] left fades now default to -6 (fire later); right stays +8.
+    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade")), -6.0);
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Right Fade")), 8.0);
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Standstill")), 0.0);
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Go-To")), 0.0);
@@ -44656,9 +44821,11 @@ void AutomationEngineTests::leadOffsetByTypeIsCarriedOnTheReservationLine()
         /*epochSwapAtFrame=*/-1, /*userLeadMs=*/274.0, /*leftStickX=*/-127);
     QVERIFY2(fade.everHeld, "harness never reached the owned autonomous holding path");
     QVERIFY(!fade.createdLine.isEmpty());
-    QCOMPARE(diagField(fade.createdLine, QStringLiteral("lead_ms")), 274.0);
+    // [ORION_LEFT_FADE_LATER 2026-09-22] The non-mid fade policy removes only a POSITIVE advance;
+    // the left fade's new -6 default is kept, so this left fade flies 274 - 6 = 268.
+    QCOMPARE(diagField(fade.createdLine, QStringLiteral("lead_ms")), 268.0);
     bool ok = false;
-    QCOMPARE(diagField(fade.createdLine, QStringLiteral("lead_offset_ms"), &ok), 0.0);
+    QCOMPARE(diagField(fade.createdLine, QStringLiteral("lead_offset_ms"), &ok), -6.0);
     QVERIFY2(ok, qPrintable(fade.createdLine));
     // The provenance stays honest: an 8 ms per-type term must not turn a user-lead shot into an
     // "authority" one, which is the exact mislabel the lead_kind/lead_source split exists to end.
@@ -44739,7 +44906,7 @@ void AutomationEngineTests::leadOffsetByTypeEnvKillSwitchAndFadeOverride()
     // rather than installing a fabricated one.
     qputenv("ORION_LEAD_OFFSET_FADE_MS", "later");
     engine.applyConfig(config, LearningData{});
-    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade")), 8.0);
+    QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade")), -6.0);
 
     // ...and an out-of-range one is clamped into the band exactly as the file and the setting
     // are, so the three routes can never disagree about what an offset of "500" means.
@@ -44831,6 +44998,22 @@ void AutomationEngineTests::leadOffsetByTypeClampsOnEveryRouteAndRoundTrips()
 #endif
 }
 
+// [CL2-P6-003 2026-09-23, Codex] While the dev fire-offset hook is armed, releases are displaced on
+// purpose: no banner verdict may move the persisted trim, and the refusal is named in the log.
+void AutomationEngineTests::devFireOffsetArmedRefusesBannerTrimEvidence()
+{
+    AutomationEngine engine;
+    engine.applyConfig(bannerTrimConfig(), LearningData{});
+    primeBannerTrimLeadAuthority(engine);
+    engine.devFireOffsetArmed_ = true;
+    QSignalSpy diag(&engine, &AutomationEngine::engineDiagnostic);
+    feedBannerVerdict(engine, 7'101, QStringLiteral("Left Fade"), QStringLiteral("LATE"));
+    feedBannerVerdict(engine, 7'102, QStringLiteral("Left Fade"), QStringLiteral("LATE"));
+    QCOMPARE(engine.bannerLeadTrimMsForType(QStringLiteral("Left Fade")), 0.0);
+    QVERIFY(!diagnosticMatching(diag, QStringLiteral("BANNER TRIM: ignored reason=dev_offset")).isEmpty());
+    QVERIFY(diagnosticMatching(diag, QStringLiteral("BANNER TRIM: verdict=")).isEmpty());
+}
+
 void AutomationEngineTests::leadOffsetByTypeAndTheBannerTrimBothApply()
 {
     // TWO CORRECTIONS, ONE LEAD, DIFFERENT OWNERS. The offset is a SETTING (a fixed property of
@@ -44853,7 +45036,7 @@ void AutomationEngineTests::leadOffsetByTypeAndTheBannerTrimBothApply()
     QVERIFY2(line.contains(QStringLiteral("type=Left Fade")), qPrintable(line));
     QVERIFY2(line.contains(QStringLiteral("user_lead=274")), qPrintable(line));
     QVERIFY2(line.contains(QStringLiteral("effective=277")), qPrintable(line));
-    QVERIFY2(line.contains(QStringLiteral("lead_offset_ms=8.0")), qPrintable(line));
+    QVERIFY2(line.contains(QStringLiteral("lead_offset_ms=-6.0")), qPrintable(line));
 
     // End to end, this separate ungraded live shot reports the policy-adjusted
     // offset (zero), not the configured +8ms. It has no banner trim yet. The raw
@@ -44862,9 +45045,11 @@ void AutomationEngineTests::leadOffsetByTypeAndTheBannerTrimBothApply()
         /*leadMs=*/196.0, /*leadSdMs=*/2.0, /*velocityPctPerMs=*/0.18, /*maxFrames=*/60,
         /*epochSwapAtFrame=*/-1, /*userLeadMs=*/274.0, /*leftStickX=*/-127);
     QVERIFY(!run.createdLine.isEmpty());
-    QCOMPARE(diagField(run.createdLine, QStringLiteral("lead_ms")), 274.0);   // no verdicts yet
+    // [ORION_LEFT_FADE_LATER 2026-09-22] The policy removes only a positive advance; the left fade's
+    // -6 default is kept: 274 - 6.
+    QCOMPARE(diagField(run.createdLine, QStringLiteral("lead_ms")), 268.0);   // no verdicts yet
     QCOMPARE(diagField(run.createdLine, QStringLiteral("banner_trim_ms")), 0.0);
-    QCOMPARE(diagField(run.createdLine, QStringLiteral("lead_offset_ms")), 0.0);
+    QCOMPARE(diagField(run.createdLine, QStringLiteral("lead_offset_ms")), -6.0);
 
     // The same arithmetic on the engine that DID grade two late fades: the trim rides on top of
     // the constant, not instead of it. (measuredLeadForActuationMs reads the LIVE shot's bucket,
@@ -44873,7 +45058,7 @@ void AutomationEngineTests::leadOffsetByTypeAndTheBannerTrimBothApply()
     QCOMPARE(engine.measuredLeadForActuationMsForTests(), 274.0);
     QCOMPARE(engine.leadOffsetMsForType(QStringLiteral("Left Fade"))
                  + engine.bannerLeadTrimMsForType(QStringLiteral("Left Fade")),
-             11.0);
+             -3.0);   // [ORION_LEFT_FADE_LATER 2026-09-22] -6 constant + 3 trim (was 8 + 3)
 }
 
 void AutomationEngineTests::tipPhaseConstantLearnsPhysicalTermWithoutEatingTheAimOffset()
@@ -47190,6 +47375,92 @@ void AutomationEngineTests::meterTimeScaleScalesEveryMeterTimeConstant()
     }
     qunsetenv("ORION_METER_TIME_SCALE");
     QCOMPARE(bad.meterTimeScaleForTests(), 1.0);
+}
+
+// [2026-09-22 RED TEAM GM-002 / CX-001] learning.json last-good generation. A zero-byte or
+// truncated file used to load as {} (defaults) and the next save overwrote the customer's tuned
+// profile with those defaults, silently. Now: every save of a VALID file promotes it to .bak; an
+// unreadable file is quarantined (evidence kept), the backup is restored, and the launcher logs it.
+void AutomationEngineTests::learningRecoversFromBackupWhenCorrupt()
+{
+#ifndef ORION_PRODUCTION_BUILD
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QString learningFile;
+    QString backupFile;
+    {
+        AppConfig store(dir.path());
+        LearningData d;
+        d.noMeterHoldByType.insert(QStringLiteral("Standstill"), {651.3, 238});
+        QVERIFY(store.saveLearning(d));          // first save: nothing valid to promote yet
+        QVERIFY(!QFile::exists(store.learningBackupPath()));
+        QVERIFY(store.saveLearning(d));          // second save promotes the valid file
+        QVERIFY(QFile::exists(store.learningBackupPath()));
+        learningFile = store.learningPath();
+        backupFile = store.learningBackupPath();
+    }
+    {   // the crash mid-write the owner hit: a zero-byte learning.json beside a good backup
+        QFile f(learningFile);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        f.close();
+    }
+    QCOMPARE(QFileInfo(learningFile).size(), qint64(0));
+
+    AppConfig reader(dir.path());
+    reader.load();
+    QCOMPARE(reader.learning().noMeterHoldByType.value(QStringLiteral("Standstill")).medianMs, 651.3);
+    QCOMPARE(reader.learning().noMeterHoldByType.value(QStringLiteral("Standstill")).n, 238);
+    QVERIFY(reader.learningLoadNote().contains(QStringLiteral("restored")));
+    const QDir dataDir = QFileInfo(learningFile).dir();
+    QCOMPARE(dataDir.entryList({QStringLiteral("learning.json.corrupt-*")}, QDir::Files).size(), 1);
+    QVERIFY(QFileInfo(learningFile).size() > 0);
+    QVERIFY(QFileInfo(backupFile).size() > 0);
+#endif
+}
+
+void AutomationEngineTests::learningWithoutBackupQuarantinesAndDefaults()
+{
+#ifndef ORION_PRODUCTION_BUILD
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QString learningFile;
+    {
+        AppConfig store(dir.path());
+        LearningData d;
+        d.noMeterHoldByType.insert(QStringLiteral("Standstill"), {651.3, 238});
+        QVERIFY(store.saveLearning(d));          // one save only: no .bak exists
+        learningFile = store.learningPath();
+    }
+    {
+        QFile f(learningFile);
+        QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QVERIFY(f.write("{ not json") > 0);
+        f.close();
+    }
+    AppConfig reader(dir.path());
+    reader.load();
+    QVERIFY(!reader.learning().noMeterHoldByType.contains(QStringLiteral("Standstill")));
+    QVERIFY(reader.learningLoadNote().contains(QStringLiteral("no backup")));
+    const QDir dataDir = QFileInfo(learningFile).dir();
+    QCOMPARE(dataDir.entryList({QStringLiteral("learning.json.corrupt-*")}, QDir::Files).size(), 1);
+    QVERIFY(!QFile::exists(learningFile));      // never silently rewritten as defaults on load
+#endif
+}
+
+// [2026-09-22 VARIANCE HUNT] ORION_ONSET_FF_AB spec parsing: clamps into the bands, drops malformed
+// arms, and disables itself below two valid arms so a typo can never half-enable an experiment.
+void AutomationEngineTests::onsetFeedforwardAbArmsParse()
+{
+    const auto arms = orion::parseOnsetFeedforwardArms(QStringLiteral("0.2:10:1, 0.45:40:0"), 1.0, 40.0);
+    QCOMPARE(arms.size(), 2);
+    QCOMPARE(arms[0].gain, 0.2);   QCOMPARE(arms[0].clampMs, 10.0); QVERIFY(arms[0].oneSided);
+    QCOMPARE(arms[1].gain, 0.45);  QCOMPARE(arms[1].clampMs, 40.0); QVERIFY(!arms[1].oneSided);
+    const auto clamped = orion::parseOnsetFeedforwardArms(QStringLiteral("5:99:0,0.3:20:1"), 1.0, 40.0);
+    QCOMPARE(clamped.size(), 2);
+    QCOMPARE(clamped[0].gain, 1.0); QCOMPARE(clamped[0].clampMs, 40.0);
+    QVERIFY(orion::parseOnsetFeedforwardArms(QStringLiteral("0.2:10:1,bogus"), 1.0, 40.0).isEmpty());
+    QVERIFY(orion::parseOnsetFeedforwardArms(QStringLiteral("0.2:10:2,0.45:40:0"), 1.0, 40.0).isEmpty());
+    QVERIFY(orion::parseOnsetFeedforwardArms(QString(), 1.0, 40.0).isEmpty());
 }
 
 QTEST_MAIN(AutomationEngineTests)
@@ -50478,4 +50749,506 @@ void AutomationEngineTests::bannerTrimBiasVotesKillSwitchLeavesTheLeadAlone()
     banded.applyConfig(wild, LearningData{});
     QCOMPARE(banded.config().bannerTrimBiasVotes, AppConfigData::kBannerTrimBiasVotesMax);
     QCOMPARE(banded.config().bannerTrimBiasWindow, AppConfigData::kBannerTrimBiasWindowMax);
+}
+
+// ---------------------------------------------------------------------------------------------
+// [ORION_ONSET_FF 2026-09-21] The per-shot onset feedforward (OnsetFeedforward.h).
+// ---------------------------------------------------------------------------------------------
+void AutomationEngineTests::onsetFeedforwardPolicyMathAndColdStart()
+{
+    orion::OnsetFeedforward ff;
+    orion::OnsetFeedforwardLimits limits;
+    limits.gain = 0.2;
+    limits.clampMs = 10.0;
+    limits.window = 10;
+    limits.minSamples = 4;
+    limits.oneSided = true;
+    const QString bucket = QStringLiteral("Standstill");
+
+    // Cold: fewer than minSamples completed onsets is no reference, whatever the live onset.
+    for (double onset : {500.0, 510.0, 490.0}) {
+        ff.observe(bucket, onset, limits.window);
+    }
+    auto d = ff.decide(bucket, 600.0, limits);
+    QVERIFY(!d.applied);
+    QCOMPARE(d.reason, QStringLiteral("cold"));
+    QCOMPARE(d.samples, 3);
+    // Warm: the reference is the bucket's median; +30 ms later than usual -> 6 ms earlier.
+    ff.observe(bucket, 500.0, limits.window);
+    d = ff.decide(bucket, 530.0, limits);
+    QVERIFY(d.applied);
+    QCOMPARE(d.referenceMs, 500.0);
+    QCOMPARE(d.deviationMs, 30.0);
+    QCOMPARE(d.offsetMs, -6.0);
+    // [CL2-P6-004 2026-09-22] Below the 2 ms floor nothing is displaced, so the shot stays learnable:
+    // +9 ms late -> -1.8 ms -> "zero"; +10 ms -> -2.0 ms -> applied.
+    d = ff.decide(bucket, 509.0, limits);
+    QVERIFY(!d.applied);
+    QCOMPARE(d.reason, QStringLiteral("zero"));
+    QCOMPARE(d.offsetMs, 0.0);
+    d = ff.decide(bucket, 510.0, limits);
+    QVERIFY(d.applied);
+    QCOMPARE(d.offsetMs, -2.0);
+    // The clamp is the ceiling: +80 ms late is not 16 ms earlier, it is 10.
+    d = ff.decide(bucket, 580.0, limits);
+    QVERIFY(d.applied);
+    QCOMPARE(d.offsetMs, -10.0);
+    // One-sided: an EARLIER-than-usual meter moves nothing (measured: that side does not miss).
+    d = ff.decide(bucket, 470.0, limits);
+    QVERIFY(!d.applied);
+    QCOMPARE(d.reason, QStringLiteral("one_sided"));
+    QCOMPARE(d.offsetMs, 0.0);
+    // Two-sided is available for the experiment arm and is sign-symmetric.
+    limits.oneSided = false;
+    d = ff.decide(bucket, 470.0, limits);
+    QVERIFY(d.applied);
+    QCOMPARE(d.offsetMs, 6.0);
+    limits.oneSided = true;
+    // Kill switch and missing onset.
+    limits.gain = 0.0;
+    QCOMPARE(ff.decide(bucket, 600.0, limits).reason, QStringLiteral("off"));
+    limits.gain = 0.2;
+    QCOMPARE(ff.decide(bucket, -1.0, limits).reason, QStringLiteral("no_onset"));
+    // Buckets are independent and the window evicts from the oldest end.
+    QCOMPARE(ff.samples(QStringLiteral("Left Fade")), 0);
+    QCOMPARE(ff.decide(QStringLiteral("Left Fade"), 900.0, limits).reason, QStringLiteral("cold"));
+    orion::OnsetFeedforward small;
+    for (double onset : {100.0, 200.0, 300.0, 400.0}) {
+        small.observe(bucket, onset, 3);
+    }
+    QCOMPARE(small.samples(bucket), 3);
+    QCOMPARE(small.referenceMs(bucket, 3), 300.0);
+    // A blind release (no onset) never enters the ring.
+    small.observe(bucket, -1.0, 3);
+    QCOMPARE(small.samples(bucket), 3);
+}
+
+void AutomationEngineTests::onsetFeedforwardDisplacesScheduledDeadlineEarlier()
+{
+    // A meter that showed up 60 ms later than this bucket's recent norm fires 10 ms earlier
+    // (0.2 * 60 = 12, clamped to 10) at the scheduleFire choke point; the undisplaced deadline
+    // stays recoverable as (deadline - dev - ff) exactly like the dev sweep offset.
+    AutomationEngine engine;
+    AppConfigData config;
+    config.autonomousVision = true;
+    config.onsetFeedforwardGain = 0.2;
+    config.onsetFeedforwardClampMs = 10.0;
+    config.onsetFeedforwardMinSamples = 4;
+    engine.applyConfig(config, LearningData{});
+    QCOMPARE(engine.config().onsetFeedforwardGain, 0.2);
+    // The ring is fed through the SAME release stamp the banner trim uses, once per epoch.
+    for (quint64 epoch = 1; epoch <= 5; ++epoch) {
+        engine.noteBannerReleaseForTests(epoch, QStringLiteral("Standstill"), 500.0);
+        engine.noteBannerReleaseForTests(epoch, QStringLiteral("Standstill"), 900.0);   // dup epoch
+    }
+    QCOMPARE(engine.onsetFeedforward_.samples(QStringLiteral("Standstill")), 5);
+    QCOMPARE(engine.onsetFeedforward_.referenceMs(QStringLiteral("Standstill"), 4), 500.0);
+    const double now = engine.engineNowMs();
+    engine.shot_.shotType = QStringLiteral("Standstill");
+    engine.shot_.meterSeenThisShot = true;
+    // The engine clock can sit near 0 in a fresh engine; only the DIFFERENCE is the onset.
+    engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+    engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 560.0;   // +60 vs the 500 reference
+    QCOMPARE(engine.liveShotOnsetMs(), 560.0);
+    primeRollingLeaseEngine(engine, now, 12.0);
+    QVERIFY(engine.scheduleFire(
+        now + 60.0, now, -1.0,
+        AutomationEngine::ScheduledFireAuthority::AutonomousMeterVision));
+    QVERIFY2(std::abs(engine.scheduledFireDeadlineMs() - (now + 50.0)) < 1e-6,
+             qPrintable(QStringLiteral("deadline must move 10 ms EARLIER; got eta %1")
+                            .arg(engine.scheduledFireDeadlineMs() - now)));
+    QCOMPARE(engine.schedFireAppliedOnsetFfMs_, -10.0);
+    QCOMPARE(engine.schedFireAppliedDevOffsetMs_, 0.0);
+    QVERIFY2(std::abs((engine.scheduledFireDeadlineMs() - engine.schedFireAppliedDevOffsetMs_
+                       - engine.schedFireAppliedOnsetFfMs_) - (now + 60.0)) < 1e-6,
+             "the UNDISPLACED deadline must be recoverable for drift comparisons");
+    // A deadline the displacement would push into the past is pinned just ahead of now, never
+    // armed in the past.
+    engine.clearScheduledFire();
+    QCOMPARE(engine.schedFireAppliedOnsetFfMs_, 0.0);
+    primeRollingLeaseEngine(engine, now, 12.0);
+    QVERIFY(engine.scheduleFire(
+        now + 4.0, now, -1.0,
+        AutomationEngine::ScheduledFireAuthority::AutonomousMeterVision));
+    QVERIFY(engine.scheduledFireDeadlineMs() > now);
+    QVERIFY(engine.scheduledFireDeadlineMs() < now + 4.0);
+}
+
+void AutomationEngineTests::onsetFeedforwardInertWithoutReferenceGainOrLateOnset()
+{
+    const auto schedule = [](AutomationEngine& engine, double now) {
+        primeRollingLeaseEngine(engine, now, 12.0);
+        QVERIFY(engine.scheduleFire(
+            now + 60.0, now, -1.0,
+            AutomationEngine::ScheduledFireAuthority::AutonomousMeterVision));
+    };
+    // 1. Gain 0 (the kill switch): bit-identical scheduling even with a warm ring and a late meter.
+    {
+        AutomationEngine engine;
+        AppConfigData config;
+        config.autonomousVision = true;
+        config.onsetFeedforwardGain = 0.0;
+        engine.applyConfig(config, LearningData{});
+        for (quint64 epoch = 1; epoch <= 5; ++epoch) {
+            engine.noteBannerReleaseForTests(epoch, QStringLiteral("Standstill"), 500.0);
+        }
+        const double now = engine.engineNowMs();
+        engine.shot_.meterSeenThisShot = true;
+        engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+        engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 600.0;   // onset 600
+        schedule(engine, now);
+        QVERIFY(std::abs(engine.scheduledFireDeadlineMs() - (now + 60.0)) < 1e-6);
+        QCOMPARE(engine.schedFireAppliedOnsetFfMs_, 0.0);
+    }
+    // 2. Cold ring: the default gain is on, but with no reference nothing moves.
+    {
+        AutomationEngine engine;
+        AppConfigData config;
+        config.autonomousVision = true;
+        engine.applyConfig(config, LearningData{});
+        QVERIFY(engine.config().onsetFeedforwardGain > 0.0);
+        const double now = engine.engineNowMs();
+        engine.shot_.meterSeenThisShot = true;
+        engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+        engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 600.0;
+        schedule(engine, now);
+        QVERIFY(std::abs(engine.scheduledFireDeadlineMs() - (now + 60.0)) < 1e-6);
+        QCOMPARE(engine.schedFireAppliedOnsetFfMs_, 0.0);
+    }
+    // 3. Warm ring, EARLIER-than-usual meter: one-sided by default, nothing moves.
+    {
+        AutomationEngine engine;
+        AppConfigData config;
+        config.autonomousVision = true;
+        engine.applyConfig(config, LearningData{});
+        for (quint64 epoch = 1; epoch <= 5; ++epoch) {
+            engine.noteBannerReleaseForTests(epoch, QStringLiteral("Standstill"), 500.0);
+        }
+        const double now = engine.engineNowMs();
+        engine.shot_.meterSeenThisShot = true;
+        engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+        engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 450.0;   // -50 vs reference
+        schedule(engine, now);
+        QVERIFY(std::abs(engine.scheduledFireDeadlineMs() - (now + 60.0)) < 1e-6);
+        QCOMPARE(engine.schedFireAppliedOnsetFfMs_, 0.0);
+    }
+    // 4. Env clamp-on-every-route: an out-of-band env gain lands inside the band, a non-numeric
+    //    one leaves the setting alone, and the keying switch honours only 0/1.
+    {
+        qputenv("ORION_ONSET_FF_GAIN", QByteArrayLiteral("9"));
+        qputenv("ORION_ONSET_FF_CLAMP_MS", QByteArrayLiteral("abc"));
+        qputenv("ORION_ONSET_FF_ONE_SIDED", QByteArrayLiteral("0"));
+        AutomationEngine engine;
+        AppConfigData config;
+        config.onsetFeedforwardClampMs = 7.0;
+        engine.applyConfig(config, LearningData{});
+        qunsetenv("ORION_ONSET_FF_GAIN");
+        qunsetenv("ORION_ONSET_FF_CLAMP_MS");
+        qunsetenv("ORION_ONSET_FF_ONE_SIDED");
+        QCOMPARE(engine.config().onsetFeedforwardGain, AppConfigData::kOnsetFeedforwardGainMax);
+        QCOMPARE(engine.config().onsetFeedforwardClampMs, 7.0);
+        QVERIFY(!engine.config().onsetFeedforwardOneSided);
+    }
+}
+
+void AutomationEngineTests::onsetFeedforwardFencesPhaseAndTrim()
+{
+    // (a) The phase-constant learner refuses a landing whose release the feedforward displaced,
+    //     exactly as it refuses a dev-sweep-displaced one; a control engine accepts the same landing.
+    auto fenced = driveCaptureWindow(false, true, kSubframeRise);
+    auto open = driveCaptureWindow(false, true, kSubframeRise);
+    fenced->lastReleaseOnsetFfMs_ = -6.0;
+    for (auto* e : {fenced.get(), open.get()}) {
+        QVERIFY(e->meterCapPhaseStopConfirmed_);
+        e->meterCapPhaseAnchorMs_ = e->meterCapPhaseStopMs_ - 380.0;
+        e->meterCapPhaseAnchorLevelPct_ = e->config().tipPhaseAnchorPct;
+        e->recordPhaseConstantSample();
+    }
+    QCOMPARE(open->phaseConstantSamplesMs_.size(), 1);
+    QVERIFY2(fenced->phaseConstantSamplesMs_.isEmpty(),
+             "a feedforward-displaced landing must never teach the phase constant");
+
+    // (b) The banner trim refuses the verdict of a displaced release (hysteresis broken, nothing
+    //     stepped) while the same three consecutive LATEs step a control engine's trim.
+    const QString type = QStringLiteral("Standstill");
+    const auto tempo = orion::BannerLeadTrim::tempoFor(type, 520.0);
+    AutomationEngine displaced;
+    displaced.applyConfig(bannerTrimConfig(), LearningData{});
+    AutomationEngine control;
+    control.applyConfig(bannerTrimConfig(), LearningData{});
+    for (quint64 epoch = 1; epoch <= 3; ++epoch) {
+        displaced.lastReleaseOnsetFfMs_ = -6.0;   // what the release stamp reads at the shot gate
+        displaced.noteBannerReleaseForTests(epoch, type, 520.0);
+        displaced.observeBannerVerdict(epoch, QStringLiteral("LATE"), QStringLiteral("OPEN"));
+        control.lastReleaseOnsetFfMs_ = 0.0;
+        control.noteBannerReleaseForTests(epoch, type, 520.0);
+        control.observeBannerVerdict(epoch, QStringLiteral("LATE"), QStringLiteral("OPEN"));
+    }
+    QCOMPARE(displaced.bannerLeadTrim_.trimMsForType(type, tempo), 0.0);
+    QVERIFY2(control.bannerLeadTrim_.trimMsForType(type, tempo) > 0.0,
+             "control: three consecutive LATEs must step the trim");
+}
+
+void AutomationEngineTests::onsetFeedforwardIsBoundedByTheBannerTrimAndResets()
+{
+    const QString type = QStringLiteral("Standstill");
+    // (a) ONE bound for the two "fire earlier" corrections: a bucket the trim already pulls
+    //     +15 ms earlier gets no feedforward on top; one it pulls +9 earlier gets at most 6.
+    //     Six consecutive LATEs step the trim to its +15 cap (steps on verdicts 2..6); four
+    //     step it to +9 (verdicts 2..4).
+    const std::vector<std::pair<int, double>> cases = {{6, 0.0}, {4, -6.0}};
+    for (const auto& c : cases) {
+        const int lates = c.first;
+        const double expectedFf = c.second;
+        AutomationEngine engine;
+        auto config = bannerTrimConfig();
+        config.onsetFeedforwardGain = 0.2;
+        config.onsetFeedforwardClampMs = 10.0;
+        engine.applyConfig(config, LearningData{});
+        for (int i = 1; i <= lates; ++i) {
+            engine.noteBannerReleaseForTests(static_cast<quint64>(i), type, 520.0);
+            engine.observeBannerVerdict(static_cast<quint64>(i), QStringLiteral("LATE"),
+                                        QStringLiteral("OPEN"));
+        }
+        const double now = engine.engineNowMs();
+        engine.shot_.shotType = type;
+        engine.shot_.meterSeenThisShot = true;
+        engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+        engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 570.0;   // +50 vs 520
+        const double trimMs = engine.appliedBannerLeadTrimMs();
+        QVERIFY2(trimMs > 0.0, "the trim must have stepped before the bound is meaningful");
+        primeRollingLeaseEngine(engine, now, 12.0);
+        QVERIFY(engine.scheduleFire(
+            now + 60.0, now, -1.0,
+            AutomationEngine::ScheduledFireAuthority::AutonomousMeterVision));
+        QVERIFY2(std::abs(engine.schedFireAppliedOnsetFfMs_ - expectedFf) < 1e-6,
+                 qPrintable(QStringLiteral("trim %1 -> ff %2 (expected %3)")
+                                .arg(trimMs)
+                                .arg(engine.schedFireAppliedOnsetFfMs_)
+                                .arg(expectedFf)));
+        QVERIFY(trimMs - engine.schedFireAppliedOnsetFfMs_
+                <= engine.config().bannerTrimMaxMs + 1e-6);
+    }
+    // The pure FF policy proposes -10 ms, but the final physical displacement can
+    // have only fractional headroom after the banner trim. Every sub-2 ms result
+    // must leave both the deadline and learner marker untouched.
+    for (const auto& [headroom, expectedFf] :
+         std::vector<std::pair<double, double>>{{0.0, 0.0}, {0.5, 0.0},
+                                                {1.0, 0.0}, {1.99, 0.0},
+                                                {2.0, -2.0}, {3.0, -3.0}}) {
+        AutomationEngine engine;
+        auto config = bannerTrimConfig();
+        config.onsetFeedforwardGain = 0.2;
+        config.onsetFeedforwardClampMs = 10.0;
+        engine.applyConfig(config, LearningData{});
+        for (quint64 epoch = 1; epoch <= 5; ++epoch) {
+            engine.noteBannerReleaseForTests(epoch, type, 520.0);
+        }
+        const double trimMs = config.bannerTrimMaxMs - headroom;
+        engine.bannerLeadTrim_.restoreDecayed(
+            {{QStringLiteral("Standstill/normal"), trimMs * 2.0}},
+            config.bannerTrimMaxMs);
+        const double now = engine.engineNowMs();
+        engine.shot_.shotType = type;
+        engine.shot_.meterSeenThisShot = true;
+        engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+        engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 570.0;
+        primeRollingLeaseEngine(engine, now, 12.0);
+        QVERIFY(engine.scheduleFire(
+            now + 60.0, now, -1.0,
+            AutomationEngine::ScheduledFireAuthority::AutonomousMeterVision));
+        QVERIFY2(std::abs(engine.schedFireAppliedOnsetFfMs_ - expectedFf) < 1e-6,
+                 qPrintable(QStringLiteral("headroom=%1 final_ff=%2 expected=%3")
+                                .arg(headroom)
+                                .arg(engine.schedFireAppliedOnsetFfMs_)
+                                .arg(expectedFf)));
+        QVERIFY(std::abs(engine.scheduledFireDeadlineMs() - (now + 60.0 + expectedFf)) < 1e-6);
+        // Paired learner evidence: a zero final shift may teach both the banner
+        // and oracle path; an actual >=2 ms shift fences them.
+        engine.lastReleaseOnsetFfMs_ = engine.schedFireAppliedOnsetFfMs_;
+        engine.noteBannerReleaseForTests(90'001, type, 520.0);
+        QCOMPARE(engine.bannerTrimReleases_.last().onsetFfMs, expectedFf);
+        engine.observeBannerVerdict(90'001, QStringLiteral("LATE"), QStringLiteral("OPEN"));
+        QCOMPARE(engine.bannerLeadTrim_.recentString(type),
+                 expectedFf == 0.0 ? QStringLiteral("L") : QStringLiteral("O"));
+        engine.noteBannerReleaseForTests(90'002, type, 520.0);
+        engine.observeReleaseOracle(90'002, 10.8, QStringLiteral("miss"));
+        engine.advanceTestClock(2'700.0);
+        engine.flushReleaseOracleGraceForTests();
+        QCOMPARE(engine.bannerLeadTrim_.oracleRecentString(type),
+                 expectedFf == 0.0 ? QStringLiteral("M") : QString());
+    }
+    // Clipping against now can also make a nominal -10 ms proposal sub-floor.
+    {
+        AutomationEngine engine;
+        auto config = bannerTrimConfig();
+        config.onsetFeedforwardGain = 0.2;
+        engine.applyConfig(config, LearningData{});
+        for (quint64 epoch = 1; epoch <= 5; ++epoch) {
+            engine.noteBannerReleaseForTests(epoch, type, 520.0);
+        }
+        const double now = engine.engineNowMs();
+        engine.shot_.shotType = type;
+        engine.shot_.meterSeenThisShot = true;
+        engine.shot_.physicalPressMs = std::max(0.0, now - 700.0);
+        engine.shot_.firstMeterSeenMs = engine.shot_.physicalPressMs + 570.0;
+        primeRollingLeaseEngine(engine, now, 12.0);
+        QVERIFY(engine.scheduleFire(
+            now + 1.0, now, -1.0,
+            AutomationEngine::ScheduledFireAuthority::AutonomousMeterVision));
+        QCOMPARE(engine.schedFireAppliedOnsetFfMs_, 0.0);
+        QVERIFY(std::abs(engine.scheduledFireDeadlineMs() - (now + 1.0)) < 1e-6);
+    }
+    // (b) reset() is a new context: the ring, the epoch fence and the carried displacement clear.
+    {
+        AutomationEngine engine;
+        AppConfigData config;
+        config.autonomousVision = true;
+        engine.applyConfig(config, LearningData{});
+        for (quint64 epoch = 1; epoch <= 5; ++epoch) {
+            engine.noteBannerReleaseForTests(epoch, type, 500.0);
+        }
+        engine.lastReleaseOnsetFfMs_ = -4.0;
+        QCOMPARE(engine.onsetFeedforward_.samples(type), 5);
+        engine.reset();
+        QCOMPARE(engine.onsetFeedforward_.samples(type), 0);
+        QCOMPARE(engine.onsetFeedforwardLastEpoch_, quint64{0});
+        QCOMPARE(engine.lastReleaseOnsetFfMs_, 0.0);
+        engine.noteBannerReleaseForTests(1, type, 500.0);   // a reused epoch observes again
+        QCOMPARE(engine.onsetFeedforward_.samples(type), 1);
+        // A court change (RemotePlaySession::courtChanged -> noteContextChanged) drops the
+        // reference the same way, but leaves the displacement a release already carried alone.
+        for (quint64 epoch = 2; epoch <= 5; ++epoch) {
+            engine.noteBannerReleaseForTests(epoch, type, 500.0);
+        }
+        engine.lastReleaseOnsetFfMs_ = -4.0;
+        QCOMPARE(engine.onsetFeedforward_.samples(type), 5);
+        engine.noteContextChanged(QStringLiteral("court_changed"));
+        QCOMPARE(engine.onsetFeedforward_.samples(type), 0);
+        QCOMPARE(engine.onsetFeedforwardLastEpoch_, quint64{0});
+        QCOMPARE(engine.lastReleaseOnsetFfMs_, -4.0);
+        engine.noteBannerReleaseForTests(1, type, 500.0);
+        QCOMPARE(engine.onsetFeedforward_.samples(type), 1);
+    }
+    // (c) Staleness: a bucket last fed longer ago than staleMs is a different context -- it is
+    //     refused (`stale`) and emptied before the next onset enters it.
+    {
+        orion::OnsetFeedforward ff;
+        orion::OnsetFeedforwardLimits limits;
+        limits.gain = 0.2;
+        limits.clampMs = 10.0;
+        limits.minSamples = 4;
+        limits.staleMs = 1000.0;
+        for (int i = 0; i < 5; ++i) {
+            ff.observe(type, 500.0, 10, 100.0 + i, limits.staleMs);
+        }
+        QVERIFY(ff.decide(type, 560.0, limits, 500.0).applied);
+        const auto stale = ff.decide(type, 560.0, limits, 5000.0);
+        QVERIFY(!stale.applied);
+        QCOMPARE(stale.reason, QStringLiteral("stale"));
+        ff.observe(type, 700.0, 10, 5000.0, limits.staleMs);
+        QCOMPARE(ff.samples(type), 1);
+        QCOMPARE(ff.decide(type, 760.0, limits, 5001.0).reason, QStringLiteral("cold"));
+        // Without a clock (the pure-policy path) staleness never fires.
+        orion::OnsetFeedforward clockless;
+        for (int i = 0; i < 5; ++i) {
+            clockless.observe(type, 500.0, 10);
+        }
+        QVERIFY(clockless.decide(type, 560.0, limits).applied);
+    }
+}
+
+void AutomationEngineTests::onsetFeedforwardDisplacedReleaseDropsTheMarkerAndNormalisesPerRelease()
+{
+    // (a) A SCHEDULED release whose token the feedforward displaced emits NO release marker (the
+    //     latency estimator must not learn the displacement), logs `marker_suppressed_onset_ff`,
+    //     reports `Release onsetff: applied_ms=-10.00 scheduled=1` and stamps -10 on its
+    //     trim-ring entry. A control engine with the term off emits the marker exactly as before.
+    // (b) The NEXT release, made in-tick, must not inherit that displacement: its marker is
+    //     emitted, its line says `applied_ms=0.00 scheduled=0` and its ring entry carries 0.
+    // The driver below arms through the fused feedforward clock, not the AutonomousMeterVision
+    // authority the term applies under (that decision is covered by
+    // onsetFeedforwardDisplacesScheduledDeadlineEarlier against scheduleFire directly), so the
+    // displacement is placed on the armed token by hand: this test is about the RELEASE PATH's
+    // handling of a displaced token, which is where the round-2 sequencing defect lived.
+    auto configure = [](AutomationEngine& engine, double gain) {
+        AppConfigData config;
+        config.remotePlayInputSource = QStringLiteral("square");
+        config.minimumHoldMs = 0.0;
+        config.onsetFeedforwardGain = gain;
+        config.onsetFeedforwardClampMs = 10.0;
+        LearningData learning;
+        learning.shotTypeFeedforwardMs.insert(QStringLiteral("Standstill"), 250.0);
+        engine.applyConfig(config, learning);
+    };
+    const QString type = QStringLiteral("Standstill");
+    for (const bool displaced : {true, false}) {
+        AutomationEngine engine;
+        configure(engine, displaced ? 0.2 : 0.0);
+        ControllerState physical;
+        // The trim ring is keyed on the controller-origin shot epoch, latched at the press.
+        engine.setPhysicalShotEpoch(41);
+        const double deadline = driveToScheduledFire(engine, physical);
+        QVERIFY2(deadline > 0.0, "the driver must reach a scheduled fire");
+        const quint64 token = engine.scheduledFireToken();
+        // The armed token carries the displacement (what the choke point would have stored).
+        engine.schedFireAppliedOnsetFfMs_ = displaced ? -10.0 : 0.0;
+        QSignalSpy marker(&engine, &AutomationEngine::releaseMarker);
+        QSignalSpy diag(&engine, &AutomationEngine::engineDiagnostic);
+        connect(&engine, &AutomationEngine::scheduledFireFallbackInvalidating,
+                &engine, [&engine, token](quint64 fencedToken) {
+                    if (fencedToken == token) {
+                        engine.confirmScheduledFire(token, engine.engineNowMs());
+                    }
+                }, Qt::DirectConnection);
+        engine.advanceTestClock(
+            deadline - engine.engineNowMs() + engine.config().schedulerGraceMs + 1.0);
+        engine.process(physical);
+        QVERIFY(engine.context().firedByScheduler);
+        QCOMPARE(marker.count(), displaced ? 0 : 1);
+        bool sawRelease = false;
+        bool sawSuppressed = false;
+        for (const QList<QVariant>& row : diag) {
+            const QString line = row.at(0).toString();
+            if (line.startsWith(QStringLiteral("Release onsetff:"))) {
+                sawRelease = true;
+                QVERIFY2(line.contains(QStringLiteral("applied_ms=-10.00 scheduled=1")),
+                         qPrintable(line));
+            }
+            if (line.contains(QStringLiteral("marker_suppressed_onset_ff"))) {
+                sawSuppressed = true;
+            }
+        }
+        QCOMPARE(sawRelease, displaced);      // the line exists only while the term is on
+        QCOMPARE(sawSuppressed, displaced);
+        QVERIFY(!engine.bannerTrimReleases_.isEmpty());
+        QCOMPARE(engine.bannerTrimReleases_.last().onsetFfMs, displaced ? -10.0 : 0.0);
+        if (!displaced) {
+            continue;
+        }
+        // (b) the next, in-tick release
+        diag.clear();
+        const int before = marker.count();
+        const int firstSeq = engine.context().releaseSeq;
+        reArmToIdle(engine);                 // the fixture's own between-shots reset
+        engine.setPhysicalShotEpoch(42);
+        const int seq = driveStandstillToRelease(engine);
+        QVERIFY2(seq > firstSeq, "the driver must produce a second release");
+        QVERIFY2(!engine.context().firedByScheduler,
+                 "the second release must be the in-tick fallback for this leg to mean anything");
+        QCOMPARE(marker.count(), before + 1);
+        bool sawSecond = false;
+        for (const QList<QVariant>& row : diag) {
+            const QString line = row.at(0).toString();
+            if (line.startsWith(QStringLiteral("Release onsetff:"))) {
+                sawSecond = true;
+                QVERIFY2(line.contains(QStringLiteral("applied_ms=0.00 scheduled=0")),
+                         qPrintable(line));
+            }
+            QVERIFY2(!line.contains(QStringLiteral("marker_suppressed_onset_ff")), qPrintable(line));
+        }
+        QVERIFY(sawSecond);
+        QCOMPARE(engine.bannerTrimReleases_.last().onsetFfMs, 0.0);
+        QCOMPARE(engine.lastReleaseOnsetFfMs_, 0.0);
+    }
 }

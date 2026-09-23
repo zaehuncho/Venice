@@ -9,15 +9,25 @@ Windows may show a security warning the first time you run this installer:
 
 This appears because the installer isn't code-signed yet. It is not a virus
 warning — it is the standard warning Windows shows any new indie software
-whose publisher hasn't accumulated install reputation.
+whose publisher hasn't built up install reputation.
 
 To install:
 
   1. Click "More info"
   2. Click "Run anyway"
 
-A code-signed version is coming in the first update. Once you've installed
-Venice, the built-in updater will deliver it automatically — you'll never see
-this warning again.
+Setup then asks for administrator rights. That is expected: it installs a
+controller driver.
 
-Questions or issues: <your support channel>
+Check your download first (recommended):
+
+  In PowerShell, run:
+      Get-FileHash $HOME\Downloads\VeniceSetup-*.exe
+  The hash it prints must match the SHA-256 posted in the Venice Discord's
+  #downloads channel. If it doesn't match, don't run the file — open a ticket.
+
+Only download Venice from the #downloads channel. Venice is never sent by DM,
+file-sharing link or another server.
+
+Questions or issues: open a ticket in the Venice Discord (#create-ticket) —
+never post a one-time code or payment details in a public channel.

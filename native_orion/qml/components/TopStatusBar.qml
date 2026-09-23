@@ -40,11 +40,16 @@ Rectangle {
 
         // Single status indicator: Online normally, Update when one is pending
         // (it applies itself), Offline if the backend/license is unreachable.
+        // [CL2-P8-002 2026-09-23] "Reconnecting" while the licence lease blocks shots
+        // (the RemotePlay banner carries the full sentence), instead of a green Online.
         StatusPill {
+            readonly property bool leaseBlocked: String(orion.leaseNotice || "").length > 0
             statusText: orion.updateAvailable ? "Update"
+                        : leaseBlocked ? "Reconnecting"
                         : root.serverOnline ? "Online"
                         : "Offline"
             tone: orion.updateAvailable ? "warning"
+                  : leaseBlocked ? "warning"
                   : root.serverOnline ? "success"
                   : "danger"
         }

@@ -23,22 +23,38 @@ try:
         COMPILED_SIDECAR_REQUIRED_FILES,
         FORBIDDEN_FILE_SUFFIXES as FORBIDDEN_PACKAGE_SUFFIXES,
         FORBIDDEN_PATH_COMPONENTS as FORBIDDEN_PACKAGE_NAMES,
+        is_admitted_package_executable,
         is_crown_jewel_python,
         is_debug_dll,
         is_forbidden_file_name,
+        is_lab_check_executable,
         is_stale_binary_name,
+        is_stray_packed_executable,
         is_unapproved_model_path,
+        security_policy_violations,
+        qt_quick_style_violations,
+        qt_quick_style_requirements_missing,
+        QT_QUICK_STREAM_DIR,
+        QT_QUICK_STYLE_ROOTS,
     )
 except ModuleNotFoundError:  # Imported by path from the repository root in tests/tools.
     from tools.release_filter_policy import (
         COMPILED_SIDECAR_REQUIRED_FILES,
         FORBIDDEN_FILE_SUFFIXES as FORBIDDEN_PACKAGE_SUFFIXES,
         FORBIDDEN_PATH_COMPONENTS as FORBIDDEN_PACKAGE_NAMES,
+        is_admitted_package_executable,
         is_crown_jewel_python,
         is_debug_dll,
         is_forbidden_file_name,
+        is_lab_check_executable,
         is_stale_binary_name,
+        is_stray_packed_executable,
         is_unapproved_model_path,
+        security_policy_violations,
+        qt_quick_style_violations,
+        qt_quick_style_requirements_missing,
+        QT_QUICK_STREAM_DIR,
+        QT_QUICK_STYLE_ROOTS,
     )
 
 
@@ -94,6 +110,12 @@ PACKAGE_BINARY_STRING_SUFFIXES = {
     ".pyd",
 }
 
+# FIX #10: EVERY first-party binary is stream-scanned regardless of size (opencv/Qt
+# third-party DLLs stay excluded — a secret we could leak lives in code we wrote, and
+# scanning 60 MB third-party runtimes only adds noise). Includes the standalone sidecar,
+# the custom Chiaki stream client, the packet-bridge host, and the server-shard chain
+# (the unpacked broker + the Lethe-packed inner payload; the bootstrap ships AS
+# OrionNative.exe and is already covered).
 ORION_BINARY_STRING_SCAN_NAMES = {
     "OrionNative.exe",
     "OrionOwner.exe",
@@ -105,6 +127,11 @@ ORION_BINARY_STRING_SCAN_NAMES = {
     "RemotePlayCore.dll",
     "SecurityCore.dll",
     "UpdaterCore.dll",
+    "OrionSidecar.exe",
+    "OrionStream.exe",
+    "VeniceNetSvc.exe",
+    "OrionActivate.exe",
+    "OrionNative.packed.exe",
 }
 
 SOURCE_FINDING_ALLOWLIST = {
@@ -318,7 +345,40 @@ def audit_tracked_source(root: Path) -> list[Finding]:
     return findings
 
 
-def audit_package_structure(package_dir: Path) -> list[Finding]:
+def audit_executable_admission(package_dir: Path, *, server_shard: bool = False) -> list[Finding]:
+    """Profile-aware POSITIVE admission for every executable in the package.
+
+    The copy filter already drops an arbitrary top-level ``*.exe`` during packaging.
+    This is the independent twin that rejects the same set in a package that was
+    assembled or signed elsewhere, keeping the two gates in lockstep: `random_tool.exe`
+    is a finding here exactly as it is dropped there, and `OrionNative.packed.exe` is
+    admitted ONLY when the shard profile is explicitly selected.
+    """
+    findings: list[Finding] = []
+    if not package_dir.exists():
+        return findings
+    for path in sorted(package_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() != ".exe":
+            continue
+        rel_name = path.relative_to(package_dir).as_posix()
+        if is_admitted_package_executable(rel_name, server_shard=server_shard):
+            continue
+        detail = "executable is not on the release allowlist for this package profile"
+        if rel_name.lower().endswith(".packed.exe"):
+            detail = ("packed payload is admitted only in a server-shard package "
+                      "(pass --server-shard to audit a shard release)")
+        findings.append(
+            Finding(
+                severity="HIGH",
+                code="UNADMITTED_EXECUTABLE_PACKAGED",
+                path=f"{rel(package_dir)}/{rel_name}",
+                detail=detail,
+            )
+        )
+    return findings
+
+
+def audit_package_structure(package_dir: Path, *, server_shard: bool = False) -> list[Finding]:
     findings: list[Finding] = []
     if not package_dir.exists():
         return [
@@ -351,6 +411,49 @@ def audit_package_structure(package_dir: Path) -> list[Finding]:
                     detail="required runtime/security file is absent from package",
                 )
             )
+    # [ORION_QT_STYLE_PRUNE 2026-09-21] The packager prunes to the pinned-style allowlist; this is
+    # the INDEPENDENT read of the same policy (release_filter_policy.QT_QUICK_STYLE_ROOTS), so a
+    # packager edit that widens the allowlist, or a package assembled by hand, is refused here.
+    for violation in qt_quick_style_violations(package_dir):
+        findings.append(
+            Finding(
+                severity="HIGH",
+                code="PACKAGE_QT_STYLE_UNPRUNED",
+                path=f"{rel(package_dir)}/{violation}",
+                detail="Qt Quick style content outside the pinned-style allowlist",
+            )
+        )
+    # [ORION_QT_STYLE_PRUNE 2026-09-21 Codex r2] ...and the other half of the same policy, read
+    # independently of the packager: a root whose APP is shipped (OrionNative.exe at the package
+    # root, OrionStream.exe in the stream dir) must carry its Qt Quick Controls tree and every
+    # file its pinned style needs. A hand-assembled or truncated package renders an empty
+    # window, not a crash, so presence of the exe alone is not evidence the UI can load.
+    # Fixture packages without those exes are untouched.
+    for rel_root, keep in QT_QUICK_STYLE_ROOTS:
+        app_root = package_dir / rel_root
+        app_exe = app_root / ("OrionStream.exe" if rel_root == QT_QUICK_STREAM_DIR else "OrionNative.exe")
+        if not app_exe.is_file():
+            continue
+        controls = app_root / "qml" / "QtQuick" / "Controls"
+        if not controls.is_dir():
+            findings.append(
+                Finding(
+                    severity="HIGH",
+                    code="PACKAGE_QT_ROOT_MISSING",
+                    path=f"{rel(package_dir)}/{(controls.relative_to(package_dir)).as_posix()}",
+                    detail="shipped app has no Qt Quick Controls tree (the UI cannot load)",
+                )
+            )
+            continue
+        for missing in qt_quick_style_requirements_missing(app_root, keep):
+            findings.append(
+                Finding(
+                    severity="HIGH",
+                    code="PACKAGE_QT_STYLE_INCOMPLETE",
+                    path=f"{rel(package_dir)}/{(app_root / missing).relative_to(package_dir).as_posix()}",
+                    detail="a file the app's pinned Qt Quick style needs is absent (empty window)",
+                )
+            )
 
     for path in package_dir.rglob("*"):
         relative = path.relative_to(package_dir)
@@ -373,6 +476,22 @@ def audit_package_structure(package_dir: Path) -> list[Finding]:
                     code="TEST_BINARY_PACKAGED",
                     path=f"{rel(package_dir)}/{rel_name}",
                     detail="test executables must not ship",
+                )
+            )
+            continue
+        if path.is_file() and (
+            is_lab_check_executable(path.name) or is_stray_packed_executable(path.name)
+        ):
+            # Release blocker (FIX #2): a lab/behaviour-check binary
+            # (GreenWindowMathChecks.exe) or a stray *.packed.exe (any name other than
+            # the one permitted server-shard payload OrionNative.packed.exe) means the
+            # build dir was contaminated — packaging FAILS instead of leaking it.
+            findings.append(
+                Finding(
+                    severity="HIGH",
+                    code="LAB_OR_STRAY_EXECUTABLE_PACKAGED",
+                    path=f"{rel(package_dir)}/{rel_name}",
+                    detail="lab/check or stray packer executable must not ship",
                 )
             )
             continue
@@ -442,6 +561,15 @@ def audit_package_structure(package_dir: Path) -> list[Finding]:
                     detail="Orion app QML source must be compiled into resources, not shipped loose",
                 )
             )
+
+    # Profile-aware positive executable admission, in lockstep with the copy filter.
+    # Files already reported above (test/lab/stray binaries) are not re-reported.
+    already = {finding.path for finding in findings}
+    findings.extend(
+        finding
+        for finding in audit_executable_admission(package_dir, server_shard=server_shard)
+        if finding.path not in already
+    )
     return findings
 
 
@@ -450,7 +578,15 @@ def audit_package_manifest(package_dir: Path) -> list[Finding]:
     manifest_path = package_dir / "release_manifest.json"
     policy_path = package_dir / "security_policy.json"
 
-    if policy_path.exists():
+    if not policy_path.exists():
+        # A package without the runtime policy fails OPEN on the client (SecurityCore
+        # has nothing telling it to require the manifest), so its absence is a blocker,
+        # not a skipped check.
+        findings.append(
+            Finding("CRITICAL", "SECURITY_POLICY_MISSING", f"{rel(package_dir)}/security_policy.json",
+                    "package must ship the fail-closed runtime security policy")
+        )
+    else:
         try:
             policy = json.loads(policy_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
@@ -458,18 +594,18 @@ def audit_package_manifest(package_dir: Path) -> list[Finding]:
                 Finding("HIGH", "SECURITY_POLICY_INVALID_JSON", rel(policy_path), str(exc))
             )
         else:
-            if policy.get("schema") != "orion.security_policy.v1":
-                findings.append(
-                    Finding("HIGH", "SECURITY_POLICY_SCHEMA", rel(policy_path), "unexpected policy schema")
-                )
-            if policy.get("require_release_manifest") is not True:
-                findings.append(
-                    Finding("CRITICAL", "RELEASE_MANIFEST_NOT_REQUIRED", rel(policy_path), "package policy must fail closed")
-                )
-            if policy.get("allow_local_dev_bypass") is not False:
-                findings.append(
-                    Finding("CRITICAL", "LOCAL_DEV_BYPASS_ALLOWED", rel(policy_path), "customer package must not allow local dev bypass")
-                )
+            # FULL semantic validation against the shared production contract: a
+            # correctly SIGNED policy that does not fail closed is still refused.
+            for problem in security_policy_violations(policy):
+                if problem.startswith("require_release_manifest"):
+                    code, severity = "RELEASE_MANIFEST_NOT_REQUIRED", "CRITICAL"
+                elif problem.startswith("allow_local_dev_bypass"):
+                    code, severity = "LOCAL_DEV_BYPASS_ALLOWED", "CRITICAL"
+                elif problem.startswith("unexpected policy schema") or problem.endswith("JSON object"):
+                    code, severity = "SECURITY_POLICY_SCHEMA", "HIGH"
+                else:
+                    code, severity = "SECURITY_POLICY_UNSAFE_VALUE", "CRITICAL"
+                findings.append(Finding(severity, code, rel(policy_path), problem))
 
     if not manifest_path.exists():
         return findings
@@ -528,25 +664,56 @@ def audit_package_manifest(package_dir: Path) -> list[Finding]:
     return findings
 
 
+def _scan_binary_strings_streaming(path: Path) -> list[Finding]:
+    """Stream-scan a first-party binary for embedded secrets with NO size cap.
+
+    The whole file is read in overlapping windows so a secret at ANY offset — including
+    one past the retired 25 MB cap — is still caught. The overlap (well beyond the
+    longest secret pattern) bridges chunk boundaries, and the window length is even so
+    UTF-16LE alignment is preserved. Findings are de-duplicated per (code) so the
+    overlap does not report the same embedded key twice.
+    """
+    label = f"{rel(path)}:strings"
+    chunk_size = 1 << 20   # 1 MiB working set — bounded memory regardless of file size
+    overlap = 8192         # >> the longest secret pattern, so a straddling match is whole
+    findings: list[Finding] = []
+    seen_codes: set[str] = set()
+    carry = b""
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    break
+                window = carry + chunk
+                for finding in scan_secret_text(label, printable_strings(window)):
+                    if finding.code not in seen_codes:
+                        seen_codes.add(finding.code)
+                        findings.append(finding)
+                carry = window[-overlap:]
+    except OSError:
+        return findings
+    return findings
+
+
 def audit_package_secret_content(package_dir: Path) -> list[Finding]:
     findings: list[Finding] = []
     if not package_dir.exists():
         return findings
     for path in package_dir.rglob("*"):
-        if not path.is_file() or path.stat().st_size > TEXT_SCAN_MAX_BYTES:
-            if not should_scan_binary_strings(path) or path.stat().st_size > BINARY_STRING_SCAN_MAX_BYTES:
-                continue
-            findings.extend(scan_secret_text(f"{rel(path)}:strings", printable_strings(path.read_bytes()[:BINARY_STRING_SCAN_MAX_BYTES])))
-        elif is_probably_text(path):
+        if not path.is_file():
+            continue
+        if should_scan_binary_strings(path):
+            # First-party binary: stream the whole file (no cap, FIX #10).
+            findings.extend(_scan_binary_strings_streaming(path))
+        elif is_probably_text(path) and path.stat().st_size <= TEXT_SCAN_MAX_BYTES:
             findings.extend(scan_secret_text(rel(path), read_text_limited(path)))
-        elif should_scan_binary_strings(path):
-            findings.extend(scan_secret_text(f"{rel(path)}:strings", printable_strings(path.read_bytes()[:BINARY_STRING_SCAN_MAX_BYTES])))
     return findings
 
 
-def audit_package(package_dir: Path) -> list[Finding]:
+def audit_package(package_dir: Path, *, server_shard: bool = False) -> list[Finding]:
     findings: list[Finding] = []
-    findings.extend(audit_package_structure(package_dir))
+    findings.extend(audit_package_structure(package_dir, server_shard=server_shard))
     if package_dir.exists():
         findings.extend(audit_package_manifest(package_dir))
         findings.extend(audit_package_secret_content(package_dir))
@@ -560,6 +727,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-only", action="store_true")
     parser.add_argument("--package-only", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument("--server-shard", action="store_true",
+                        help="Audit a server-shard package: admits OrionActivate.exe and the "
+                             "packed inner payload OrionNative.packed.exe. Without this flag a "
+                             "*.packed.exe at the package root is stray packer debris.")
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
@@ -568,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.package_only:
         findings.extend(audit_tracked_source(root))
     if not args.source_only:
-        findings.extend(audit_package(package_dir))
+        findings.extend(audit_package(package_dir, server_shard=args.server_shard))
 
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     findings.sort(key=lambda f: (severity_order.get(f.severity, 99), f.code, f.path))

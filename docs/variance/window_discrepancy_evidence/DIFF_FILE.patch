@@ -1,0 +1,1501 @@
+diff --git a/docs/variance/PREREGISTRATION_OFFSET_SWEEP.md b/docs/variance/PREREGISTRATION_OFFSET_SWEEP.md
+--- a/docs/variance/PREREGISTRATION_OFFSET_SWEEP.md
++++ b/docs/variance/PREREGISTRATION_OFFSET_SWEEP.md
+@@ -2,7 +2,15 @@
+ 
+ **Frozen before new data, 2026-09-22.** This is a read-only analysis plan for the proposed `run_orion.local.ps1 -VarianceHunt -OffsetSweep` run, not a result. The sampling unit is one controller-origin **physical shot epoch**, not one schedule refinement or banner read. Any amendment must be dated and frozen before inspecting the new verdicts. Do not change exclusions, models, peers, or thresholds after seeing grade-by-arm/offset results.
+ 
+-## Audit of the appended corrections to `ONLINE_GRADING_CLOCK_2026-09-22.md`
++## Pre-data amendment, 2026-09-22: reconciliation and window discrepancy
++
++**This amendment precedes the sweep.** The inspected 57-file corpus still has digest `fb9403a7064315c90ac4a50474d853148a2436ada76da91dd588e73346de7224`; neither retained native log contains a sweep draw or an A/B arm assignment. Sections 7–8 add competing visible-window predictions and executable analysis conventions. They do not substitute historical shots for randomised observations.
++
++The audit below is retained as **historical review text, superseded where the RECONCILED LADDER answers it**. The old impossible prize table is now marked superseded; the +1.56-point objection used that old baseline and is not an objection to the corrected ladder. With the quoted `beta=.44, sigma=43.54, cuts=-54.61..39.78`, deterministic onset-only integration gives **66.46 / 68.22 / 70.90 / 71.47 / 72.16%** (no FF / arm 0 / arm 1 / perfect onset cancellation / additionally centred). Retaining observed meter deviations gives **67.26 / 68.46 / 69.78%** for the first three. These are model illustrations, not causal gains; the small difference from the ladder's rounded/simulated entries is not the earlier residual error. **471/14** newer and **345** older shots are the reproducible counts; the prior 470/346 was erroneous. Filtered offline 39-shot SDs are 48.3/48.5 ms, not the all-40 SDs. The present probe excludes non-initial IPv4 fragments as well as using snaplen 42; link/header validation and packet-identity qualification still apply. The ladder's last phrase must not be read as a verified capture-to-command join: this plan's first-stage gate is the independent **local release timestamp** regression; passive packet identity remains unverified.
++
++One further numerical audit is recorded in `WINDOW_DISCREPANCY.md`: two independent optimisers on the now-exact 816-shot selection give `beta=.446004, sigma=44.216, W=95.824, c=-7.350`, rather than exactly 94.39/43.54; `p_max=72.145%`. This tiny likelihood improvement does not resolve the physical-scale problem. Keep **94.39/43.54** as the already stated, approximate *planning benchmark*, not a fixed constraint on new data.
++
++### Historical audit of the appended corrections (read with the amendment above)
+ 
+ | Correction | Audit |
+ |---|---|
+@@ -45,7 +53,7 @@
+ P(LATE_i)      = 1 − Φ((U − μ_i)/σ)
+ ```
+ 
+-Estimate `c` (band centre relative to zero dev/arm 0), `W>0` (effective EXCELLENT width), `σ>0` (effective per-shot residual SD under the current pipeline), and nuisance arm shift `δ`. Fix the coefficient of **delivered** D to 1 only after the fidelity gate; refit it as a sensitivity parameter and show its CI. Give profile-likelihood 95% CIs for `c,W,σ` and `p_max=2Φ(W/(2σ))−1`, with a parametric-bootstrap interval if the profile is irregular or an estimate reaches a numerical boundary. Do not subtract onset variation from this already-conditional σ again. Do not call it uplink/server jitter. Check five prespecified Z bins (`[-25,-15),[-15,-5),[-5,5),[5,15),[15,25]`): use Pearson's sum of `(observed−expected)²/expected` over the 15 bin×grade cells, where expected counts sum each shot's fitted probability, and obtain the lack-of-fit p-value from **2,000 parametric simulations with a complete refit each time**; **p<0.05 rejects a single fixed band/normal noise ceiling**. A prespecified sensitivity adds centred onset and linear shot order and lets arm interact with onset; changes >20% in `W` or `σ` make the pooled ruler context-dependent, not definitive.
++Estimate `c` (band centre relative to zero dev/arm 0), `W>0` (effective EXCELLENT width), `σ>0` (effective per-shot residual SD under the current pipeline), and nuisance arm shift `δ`. Fix the coefficient of **delivered** D to 1 only after the fidelity gate. **Correction before data:** never estimate that coefficient jointly with free `c,W,σ,δ`: multiplying all five by the same constant leaves every probability unchanged. That formerly requested sensitivity CI is unidentified. Instead report independent first-stage calibration and refit at coefficients **fixed separately to 0.8 and 1.2**, labelled scale sensitivities, not alternative MLEs for delivery gain. Give profile-likelihood 95% CIs for `c,W,σ` and `p_max=2Φ(W/(2σ))−1`, with a parametric-bootstrap interval if the profile is irregular or an estimate reaches a numerical boundary. Do not subtract onset variation from this already-conditional σ again. Do not call it uplink/server jitter. Check five prespecified Z bins (`[-25,-15),[-15,-5),[-5,5),[5,15),[15,25]`): use Pearson's sum of `(observed−expected)²/expected` over the 15 bin×grade cells, where expected counts sum each shot's fitted probability, and obtain the lack-of-fit p-value from **2,000 parametric simulations with a complete refit each time**; **p<0.05 rejects a single fixed band/normal noise ceiling**. A prespecified sensitivity adds centred onset and linear shot order and lets arm interact with onset; changes >20% in `W` or `σ` make the pooled ruler context-dependent, not definitive.
+ 
+ **Precision forecast, not a result.** Fisher information for uniform delivered offsets ±25 ms, 50/50 arms with no true arm shift, historical `c≈−7.4`, `W=94.39`, `σ=43.54`, 100% graded/fidelitous shots, and the four-parameter model above gives approximately:
+ 
+@@ -90,3 +98,51 @@
+ | A qualified network feature clears its ≥20% sigma-reduction/held-out gate | **Build measurement/packet-identity instrumentation first**, not an aim controller based on post-release data. A subsequent pre-decision predictor needs its own randomised intervention before shipping. |
+ 
+ The result report must publish the complete attempt funnel, all ambiguous/missing joins, first-stage slopes, planned and actual offset distributions, arm assignment/actual F, category counts by offset bin/arm, profile intervals, width eligibility, capture/peer checks, and every predeclared held-out score. Keep observational legacy fits separate from these randomised results.
++
++## 7. Competing window hypotheses — locked before the sweep
++
++These hypotheses concern the **effective grade-versus-local-command curve**, not a server timestamp. The visual duration is a proxy: integrate the frozen convex fill curve `T(green_end)-T(green_start)`; the 90–100% segment is extrapolated, with 41.1 ms per 10 percentage points at time scale 1.0. A width-only release snapshot is approximated as `4.11 * greenWidth` ms. Neither operation measures a per-shot top crossing. Never divide a near-top width by the velocity sampled around 35–40% at the much earlier command. Do not equate release-snapshot confirmation with a pre-decision width latch.
++
++- **H_visible:** the grade window is approximately the visible duration, **12–20 ms** (plausible 0.5–5 pp range reaches **20.55 ms** at this curve scale). For a like-for-like illustrative peak of 72.161%, set `sigma = W / [2 Phi^-1((1+.721611)/2)]`: 5.54 / 7.38 / 9.23 ms for W=12/16/20. Allow the unknown centre and FF arm shift to be fitted, rather than assuming release zero is centred. A narrow window plus the old 43.54 ms physical noise would instead have a maximum EXCELLENT probability only **10.96–18.17%** for W=12–20; it does not explain ~67% merely by recentering.
++- **H_broad:** the prior ordinal band represents a real effective **~94 ms** timing acceptance band; use `W=94.39, sigma=43.54` as the planning curve. It should remain broad under the independently calibrated intervention. A visual window may then be a rendering/detector proxy rather than the acceptance interval; the experiment alone does not identify the game's internal cause.
++- **H_scale/context:** the old observational normalisation is misleading (endogenous timing, shared detector error, changing centres/widths, non-normal or arm-dependent noise). The independently calibrated fitted width can become narrow, or a single ordered-probit curve can fail goodness-of-fit. Pooling a mixture of narrow windows does **not** by itself evade the area constraint below. A changing width/centre caused by the offset, broken delivery, or selected/missing outcomes violates that constraint's assumptions and must be diagnosed, not relabelled a broad grading window.
++
++For arm 0 at offsets measured **from each model's optimal centre**, expected EXCELLENT rates are:
++
++| Hypothesis | -25 ms | -12.5 ms | centre | +12.5 ms | +25 ms |
++|---|---:|---:|---:|---:|---:|
++| Broad 94.39 / sigma 43.54 | 64.63% | 70.21% | 72.16% | 70.21% | 64.63% |
++| Visible 12 / sigma 5.54 | 0.03% | 11.97% | 72.16% | 11.97% | 0.03% |
++| Visible 16 / sigma 7.38 | 1.06% | 26.83% | 72.16% | 26.83% | 1.06% |
++| Visible 20 / sigma 9.23 | 5.19% | 38.58% | 72.16% | 38.58% | 5.19% |
++
++For the **actual commanded** D range -25..25 and historical illustrative `c=-7.415, delta=0`, the broad probabilities at D=-25/0/+25 are **68.34 / 71.47 / 59.91%**, and its uniform-sweep mean is **68.97%**. The corresponding W=16 narrow probabilities are **9.68 / 51.32 / 0.047%**, with mean **31.33%**. Narrow misses move predominantly EARLY on the early side and LATE on the late side. A centre displaced from -7.415 translates the curves; do not require that exact centre to adjudicate width. EXCELLENT has zero derivative at its peak for *both* hypotheses, so test the ordered three-category curves rather than a single linear binary-success slope. The script emits complete EARLY/EXCELLENT/LATE tables for all four curves.
++
++**Distribution-free cross-check, conditional on fidelity:** if D is truly independent uniform[-25,25] and enters timing additively with coefficient one, each shot has a timing interval of width W_i, and the interval/noise/centre are unaffected by D, then
++
++```text
++integral over all d of P(EXCELLENT | do(D=d)) dd = E[W_i]
++mean EXCELLENT over a uniform 50-ms sweep <= E[W_i] / 50
++```
++
++This follows by integrating the interval indicator before averaging over noise/centre/width. It needs no normality and permits arbitrary independent width/centre/noise mixtures and FF shifts. Thus a 12–20 ms window supports at most **24–40%** uniform-sweep success (20.55 ms gives **41.1%**), not ~69%. With noncompliance on a fraction epsilon of draws, a conservative upper bound is `E[W_i]/50 + epsilon`, capped at 1; do not apply the ideal bound to selected graded survivors or a nonuniform delivered-offset distribution. Gate-level tolerances, finite-sample uncertainty, missing grades, centre drift, and measured visual-scale uncertainty must be carried into that comparison. This is a diagnostic cross-check, **not an additional unadjusted shipping/ceiling test**.
++
++**Adjudication:** apply the existing fidelity, selection, MLE, profile, and 2,000-refit lack-of-fit gates first. A well-fitting calibrated width with its 95% profile wholly above 20.55 ms contradicts the narrow *proxy-calibrated* fixed-band hypothesis; a profile containing both the narrow range and ~94 ms leaves the discrepancy unresolved. A well-fitting narrow width and steep tails contradict treating the old ~94 ms as a physical band. Rejected fixed-band fit, strong context sensitivity, or uncalibrated visual time scale means neither physical explanation is established. Do not force the new fit to either benchmark or use these comparisons to promote arm 1. **100 can distinguish these extreme curves when fidelity and data quality are strong; it is still too few to separately estimate a broad W and sigma precisely or resolve a small FF gain.** The planned extension and all held-out shipping/stop rules remain unchanged.
++
++## 8. Executable conventions for the reviewed draft
++
++The implementation is `tools/timing/sweep_analysis.py`; tests are `tools/timing/test_sweep_analysis.py`. Both perform offline analysis only. No implicit newest capture/session selection is allowed for a real trial. Supply an explicit UTC marker, declared session ID(s), and a 100- or 200-press block. The native **physical press ledger**, not surviving JSONL grades, selects the first consecutive block. A missing/ambiguous press record or invalid/conflicting JSONL identity blocks the primary fit. Identical duplicated records/forwarded lines are deduplicated, never counted twice. Epochs/attempts remain integers without a float round trip. Native process partitions follow observed physical-epoch/release-counter resets; rotation files are merged chronologically, not treated as separate processes. Never guess through an identity collision.
++
++Primary release identity requires `Release onsetff`. `Release delivery identity` is a labelled legacy fallback **only** for descriptive widths. A release must match exactly one record by epoch, press-to-close interval, and ±150 ms release timestamp. Attempt/seq/scheduled fields must agree. `Release devoffset`, not the last refinement line, supplies D; all refinements remain auditable in the per-shot output. Distinct arm-token draws are counted once per token; identical forwarded draws are not extra treatments. The last FF covariate timestamp must be **at or before** the record release, not later. A `scheduled=0` release carrying nonzero D or F is inconsistent and quarantined. For retrospective visible endpoints only, `Release landing` matches unique `(process,native seq)` within **0–5,000 ms after release**, even if the banner already closed the JSONL record. Those endpoints are never a pre-fire predictor.
++
++Local H-on-Z fidelity uses **all joined scheduled releases with H**, including missing-banner releases, rather than conditioning on a grade. D-versus-draw agreement is over all scheduled releases; missing D/Z is not agreement. At least 90% of joined scheduled releases must have finite H. A released record with a nonfinite/impossible press-release-close order, negative hold, or more than 1 ms disagreement between hold and wall-clock release minus press is a reported clock failure and blocks the gate, not a silently trimmed shot. Z_final is the release token's draw for this first stage; Z_first remains the policy/attrition/bin assignment. Additional conservative parsing gates require release identity and known scheduled/in-tick status for ≥90% of eligible graded shots; both FF arms must occur in the grade fit. Unknown schedule cannot disappear from the denominator. Invalid draws outside [-25,25] block inference. Report H-on-D too. HC3 intervals use a t critical value with residual degrees of freedom; the 2,000-resample sensitivity samples contiguous blocks of 20 chronological shots (a last partial block is retained, and blocks do not cross session boundaries). These block intervals are not independent-session validation.
++
++The MLE fixes D's coefficient at one; numerical optimisation uses multiple broad/narrow starts and positive W/sigma, stable log-probabilities, and linear positive W(w) over observed widths for the width alternative. Profile intervals invert a 1-df LR threshold 3.841459; a numerical endpoint is reported **open**, not a finite confidence bound. An irregular/boundary primary fit additionally runs 2,000 parametric refits for percentile intervals; this does not repair open profiles or authorise a ceiling claim. Lack-of-fit uses Z_first bins, complete per-replicate refits, and `(1 + exceedances)/(1 + successful simulations)`; fewer than 95% converged simulations gives no p-value. Failed bootstrap/optimisation results are explicit missing results. Random seed **20260922** is frozen. The real CLI does not offer a switch to silently reduce the registered 2,000/10,000 resampling counts.
++
++FF exact permutation uses all arm allocations conditional on the observed arm counts (hypergeometric sufficient statistic for binary policy success); its two-sided statistic is absolute arm-1 minus arm-0 risk difference. G-computation standardises over the same first-assigned-Z covariates for both arms; bootstrap resamples physical epochs, not log lines. Constant nuisance columns are removed, but nonconstant rank deficiency/separation is reported, not silently regularised. Adjusted comparisons with missing Z are explicitly complete-covariate sensitivity analyses; raw policy-success remains primary. Onset/order sensitivity compares to the **same complete-onset cohort** baseline. Explicit-open-only fits supplement, never replace, the stated primary cohort.
++
++Width audit selection is made without grades: compute Z_first quartiles among otherwise width-eligible shots, then select the **first five chronological keys in each of eight arm × Z-quartile cells** (exactly 40; shortage means inconclusive, not replacement based on outcomes). Freeze independent frame annotations as JSON with `blinded:true`, `selected_before_labels:true`, and `rows:[{session,epoch,first_confirmed_width_pp,release_width_pp},...]`; duplicate/wrong keys or release annotations differing by >0.1 pp from the logged one-decimal value invalidate the supplied audit. Use absolute differences for the median≤0.2/p95≤0.5 pp stability thresholds. A claimed blinded annotation is a manual prerequisite, not something a Boolean can prove. The script returns width results as exploratory when the pre-decision gate fails; it reports a full-positive-width sensitivity, quartile first stages, profiles, verdict derivatives, and optimal aim as `(c(w)-delta*A)/(1+gamma*(w-w0))`, not merely c(w). Missing/still-uncertain quartile delivery blocks a physical grade-slope interpretation.
++
++Real-run protocol JSON requires `same_spot:true`, `online_open_standstills:true`, `offset_spec:"uniform:-25:25"`, `ff_spec:"0.2:10:1,0.45:40:0"`, and real `build_sha256`/`settings_sha256`. These are acquisition attestations, not inferred ownership or binary verification. The script checks hook/arm-setting logs and a nonempty, time-overlapping capture `meta.json`/`packets.csv`. It does **not** promote a first-packet proxy to verified delivery, inspect pcap link-layer identity, or implement the later multi-session network/policy-validation extension. Those remain independent gates in sections 3–6. A missing capture fails the planned acquisition protocol; a good capture does not replace the independent local first stage. Dry runs always suppress the randomised primary fit and never fabricate assignments.
++
++The script creates a fresh output directory with `shots.csv` (exact keyed joins and line provenance), `summary.json` (input hashes, fits, gates, distributions, predictions), and `RUN.txt`; it refuses to overwrite prior output and aborts if input hashes change while analysing. A completed legacy dry run exits 0 with `PRIMARY_SUPPRESSED`; a real trial with failed protocol/fidelity exits 2. A statistically analysed run is not automatically approved for shipping or a ceiling claim. Keep source, build, and runtime untouched during this pre-data review.
+diff --git a/docs/variance/WINDOW_DISCREPANCY.md b/docs/variance/WINDOW_DISCREPANCY.md
+new file mode 100644
+--- /dev/null
++++ b/docs/variance/WINDOW_DISCREPANCY.md
+@@ -0,0 +1,173 @@
++needs changes
++
++# Visible green window versus fitted EXCELLENT band
++
++**2026-09-22, pre-sweep, offline review.** The discrepancy is real in the logged visual measurements versus the *normalised observational fit*. It is **not yet an identified sixfold difference between two physical acceptance windows**. The visible proxy is about **15 ms**, not 94 ms; the old model's millisecond interpretation needs the independent randomised-delivery calibration. No source, launcher, build, app, capture, or live endpoint was changed or started. The new analysis and amended plan are ready for review; this is not a runtime or shipping approval.
++
++## 1. What was measured, on which shots
++
++Inputs were the 57 JSONL files under `D:/NexusVision/shot_records`, plus both retained native logs. There are **2,974 unique physical records**, no malformed/conflicting record identities in this snapshot, and **816 selected historical online shots / 27 sessions**: 548 EXCELLENT, 170 LATE, 98 EARLY. The newer/older split is **471/345**. The latest record press is **2026-09-22 03:25:53.869 UTC**. No retained native line has an offset-sweep draw, sweep-armed marker, or logged A/B assignment; this is not new sweep data.
++
++Frozen corpus digest (sorted filename, NUL, then binary file SHA-256):
++
++```text
++fb9403a7064315c90ac4a50474d853148a2436ada76da91dd588e73346de7224
++```
++
++Log SHA-256:
++
++```text
++orion_native.log.1  BEA62C5EB199642086C69EC8D4B7AEA162AB2C9A9D2D5182866F959E015373D3
++orion_native.log    C56956943701329E2974D129279DCB6053A9D6DAAB50D2866BBF120D9F6010E0
++```
++
++### Exact identity join
++
++1. Keep `(shot_record.session, integer epoch)` as the record key. JSONL `seq` is **not** native release seq. Deduplicate identical records/forwarded diagnostics; quarantine conflicting or ambiguous identities.
++2. Merge both logs in UTC order; partition at observed physical-epoch/native-release-counter resets. There are **12 partitions**, not two independent files/processes. Match `Release onsetff` or the older `Release delivery identity` to exactly one same-epoch record within its press-to-close interval and **±150 ms of record release time**. The two identities must agree on process/attempt/native seq.
++3. Match attribution/timing/issued/schedule lines by `(process,native seq)` in that same release interval. For **descriptive historical widths only**, `Release delivery identity` is an admissible fallback when `Release onsetff` did not yet exist. It does not invent an FF arm or applied offset.
++4. Match delayed `Release landing` by that native process/seq within **0–5,000 ms after release**. Landing often arrives after the banner closed the JSONL record; requiring it inside press-to-close would unnecessarily lose valid widths. Never use the landing endpoints as a pre-fire predictor.
++
++The logs contain 479 release identities and 474 landing lines. Across all records, **479** releases join uniquely: **423** legacy identity and **56** `Release onsetff`; no contradictory release identities were found. The 816-shot analysis cohort contains **284** positive attribution widths and **288** qualified landing measurements. Unmatched records are missing, not zero-width shots. Width availability covers **eight sessions**, not the entire 27-session population.
++
++### Millisecond conversion is a calibrated-curve proxy
++
++The current source is [AutomationEngine.cpp](C:/Users/aaron/Desktop/NexusVision/native_orion/src/AutomationEngine.cpp), around lines **20253–20307**, and [AutomationEngine.h](C:/Users/aaron/Desktop/NexusVision/native_orion/src/AutomationEngine.h), around **1342–1344, 1400–1403, 6626–6638**. The header lines in the question have moved. The convex curve's fill/time knots are:
++
++```text
++fill pp: 20   25    30    35     40     50    60    70    80    90    100
++time ms:  0  29.42 58.30 86.22 112.58 163.7 211.4 257.4 302.4 344.4 385.5
++```
++
++Use the piecewise-linear integral **`T(end)-T(start)`**. At 90–100%, it is **4.11 ms per percentage point**, or 0.2433 pp/ms. The 90–100 segment is explicitly **extrapolated**, not directly measured per shot. For attribution's width-only field, use `4.11 * greenWidth`; endpoint-bearing landing/issued diagnostics use the integral. The inspected launcher sets time scale **1.0**; the five logged rate-stretch events are also 1.000. This does not independently certify every shot's actual top speed. The report therefore calls these **curve-equivalent milliseconds**, not video-observed time spent inside green.
++
++Do **not** divide by `vel_at_rel`: the controller releases early, around 35–40% fill, to compensate actuation delay. That slower sampled velocity is not the near-top speed. Doing so would give a median **20.38 ms**, rather than **15.08 ms**, for the same landing rows. That mistake still would not explain a 94 ms band.
++
++### Per-shot distributions in the 816-shot historical cohort
++
++Pre-confirmed means `greenConfirmed=1`, positive width, valid `greenConfirmMs`, and `appearToRelMs-greenConfirmMs >= 20`. Plausible width is the already registered **0.5–5.0 pp** range. A landing needs `graded=1`, at least three green observations, and valid ordered endpoints in 0–100. No grade category was preferentially selected.
++
++| Measurement | n | Median width, pp | Median, ms | IQR, ms | 10th–90th, ms |
++|---|---:|---:|---:|---:|---:|
++| Pre-confirmed plausible release snapshot | **265** | **3.70** | **15.207** | 15.207–16.029 | 10.439–18.495 |
++| Plausible settled landing endpoints | **207** | **3.67** | **15.084** | 12.433–15.762 | 7.505–16.892 |
++| All qualified landing endpoints, no 5-pp cap | **288** | 3.76 | **15.454** | 14.251–22.369 | 8.195–22.852 |
++| Issued window endpoints, descriptive full range | **286** | — | **15.207** | 14.796–18.495 | 11.097–18.906 |
++
++The plausible pre/landing means are **14.748 / 13.700 ms**, with SD **3.351 / 3.824 ms**. The unfiltered landing maximum is **29.984 ms**. Removing the width cap does not make the median remotely approach 94 ms. In the broader all-online graded Standstill set (1,085 shots / 51 sessions), plausible pre and landing medians are **15.207 / 15.022 ms**, respectively. This is not an artefact of the historical onset/meter-tail filter.
++
++There are **194** plausible paired pre/landing widths. Median signed difference is just +0.01 pp, but median **absolute** difference is **0.26 pp**, p95 **1.73 pp**. That is not proof of first-confirmed versus release stability: the second measurement is later, and its detector differs. The pre-confirmation lead median is **68 ms**, not a width-latch timestamp. Also, **106/265** plausible pre widths are exactly 3.7 pp and their IQR is only **0.20 pp**, below the registered width-interaction gate of **1.0 pp**. The current corpus offers little independent width variation for an actionable aim rule.
++
++Every joined shot, including missing fields, and source log line references are in [shots.csv](C:/Users/aaron/Desktop/NexusVision/docs/variance/window_discrepancy_evidence/dry_run_final/shots.csv). Distributions and per-session counts are in [summary.json](C:/Users/aaron/Desktop/NexusVision/docs/variance/window_discrepancy_evidence/dry_run_final/summary.json).
++
++## 2. Is the gap physical, or a probit artefact?
++
++**The measurement gap is robust; its physical interpretation is unresolved.** Relative to the requested 94.39 ms benchmark, the visible pre median is **6.21× smaller**. Plausible near-top rates 0.22–0.27 pp/ms would price 3.7 pp at 13.7–16.8 ms. A 94.39 ms traversal of 3.7 pp would require only 0.0392 pp/ms, about sixfold slower than the frozen curve. This is worth independent frame timing, not an assumed correction factor.
++
++### A. The millisecond ruler was an assumption in the passive fit
++
++The old normalised model is `mu = meter_c + beta*onset_c`, with free cutpoints and sigma. Conditional on fixing the coefficient of `meter_c` to one, those parameters are statistically identifiable. But **that coefficient is not a measured intervention response**: meter-relative timing is generated by the controller, detector, and feedback loop, not an independent randomised displacement.
++
++If instead its physical gain is unknown, then multiplying **all** timing coefficients, cutpoints, and sigma by a positive constant leaves the probabilities unchanged. For example, multiply the old fit by **0.161108**: `W=15.207`, `sigma=7.015`, and a 0.161108 effect per observed meter-relative millisecond give exactly the same verdict probabilities. This is a demonstration of the missing calibration, **not evidence that the actual gain equals 0.161**. The earlier reported 0.29 delivery slope is another reason not to assume one-to-one actuation.
++
++Consequently the prior ~43.5 ms is neither a directly observed noise SD nor a proven network component. The preregistration formerly requested a free delivered-offset coefficient *and* free sigma/cuts as a sensitivity. That is an exact scale degeneracy, now corrected before data: coefficient one after the first stage, with **fixed 0.8 and 1.2** calibration sensitivities, never a jointly free scale CI.
++
++### B. Pooling/context and visible-width variation matter, but do not settle it
++
++The new draft refits the historical model on the **same visible-data shots**, retaining the original session medians rather than recentering the subset:
++
++| Observational cohort | n / sessions | beta | Fitted W | Fitted sigma | Normal-model peak |
++|---|---:|---:|---:|---:|---:|
++| Exact historical selection | 816 / 27 | **0.4460** | **95.824 ms** | **44.216 ms** | 72.145% |
++| Pre-confirmed plausible widths | 265 / 8 | 0.3662 | **71.932 ms** | 35.026 ms | 69.551% |
++| Plausible landing widths | 207 / 8 | 0.2287 | **59.872 ms** | 29.949 ms | 68.248% |
++
++The new full fit is **not numerically identical** to the earlier 94.39/43.54 reproduction: a separately parameterised Nelder–Mead fit agrees with the new multistart MLE to <0.0001 ms; NLL is **637.258115**, versus **637.265182** at the quoted rounded old parameters. The same digest/counts make this a minor fit/selection-reproduction discrepancy, not new data. Its cause cannot be assigned precisely without the old executable analysis. It changes neither the ~72.2% model peak nor the width-discrepancy conclusion. The frozen predictions below deliberately retain 94.39/43.54 as the requested benchmark.
++
++Matching the available-width population reduces the apparent ratio from about six to **four–five**, but does not collapse it to one. That demonstrates context/availability sensitivity, **not** that varying visual widths caused the reduction. Width, detector error, session drift, non-normal errors and historical control actions can all affect an effective pooled band. The sparse, concentrated pre-width distribution is not a sufficient test of their separate causes.
++
++A truly narrow 12–20 ms band with independent **43.54 ms physical Gaussian noise** has a best-centred EXCELLENT rate only **10.96–18.17%**, nowhere near 67%. To preserve a ~72% peak with narrow widths, physical sigma would have to be about **5.5–9.2 ms**, or the additive/noise/selection assumptions would have to change. One cannot simultaneously keep the narrow physical band, the old physical sigma, and the old high success rate in that model.
++
++### C. A distinct grading window remains a hypothesis
++
++The displayed green interval could differ from the effective grade-versus-command interval, or its time conversion/measurement could be wrong. Current logs observe visual detections and delayed banner labels, not an authoritative grade-boundary timestamp. The proper result is **“15 ms visual proxy versus ~60–96 ms normalised observational band; physical explanation unproven”**, not “the server definitely has a 94 ms window.”
++
++## 3. What the offset sweep should show
++
++These exact competing curves and their assumptions are now frozen in [preregistration sections 7–8](C:/Users/aaron/Desktop/NexusVision/docs/variance/PREREGISTRATION_OFFSET_SWEEP.md). Predictions assume a 1:1 independent additive release displacement; a failed first-stage gate invalidates both physical comparisons.
++
++### Shape at equal illustrative peak, offsets relative to the best centre
++
++| W / sigma, ms | EXCELLENT at -25 | at -12.5 | at centre | at +12.5 | at +25 |
++|---|---:|---:|---:|---:|---:|
++| **94.39 / 43.54** | 64.63% | 70.21% | 72.16% | 70.21% | 64.63% |
++| **12 / 5.54** | 0.03% | 11.97% | 72.16% | 11.97% | 0.03% |
++| **16 / 7.38** | 1.06% | 26.83% | 72.16% | 26.83% | 1.06% |
++| **20 / 9.23** | 5.19% | 38.58% | 72.16% | 38.58% | 5.19% |
++
++At the historical illustrative centre **c=-7.415 ms**, with arm shift delta=0, the *actual* D=-25/0/+25 predictions are:
++
++| Model | D | EARLY | EXCELLENT | LATE |
++|---|---:|---:|---:|---:|
++| Broad | -25 | 24.823% | **68.337%** | 6.840% |
++| Broad | 0 | 10.488% | **71.467%** | 18.045% |
++| Broad | +25 | 3.374% | **59.913%** | 36.713% |
++| Narrow 16 | -25 | 90.298% | **9.676%** | 0.026% |
++| Narrow 16 | 0 | 1.837% | **51.322%** | 46.841% |
++| Narrow 16 | +25 | ~0% | **0.047%** | 99.953% |
++
++The unknown centre and FF shift translate these curves. A 72% peak is used for an apples-to-apples illustration, not imposed on the new fit. Under a uniform -25..25 sweep with c=-7.415, the means are **68.97% broad**, versus **23.93 / 31.33 / 37.83%** for the 12/16/20 ms examples. EXCELLENT is not monotone; both models have zero success derivative at their own peak, whereas the EARLY/LATE tails and shoulders discriminate them. The old 43.54 ms was conditional on onset, whereas the primary new fit uses D and A only: residual onset scatter or arm-dependent variance can change its fitted sigma and average success. The onset/arm sensitivity and lack-of-fit checks must address that difference; these planning curves are not exact forecasts of a particular FF arm's realised rate.
++
++### Why a mixture of narrow windows does not explain high sweep success
++
++For a shot with interval width W_i, integrate its success indicator over all possible additive offsets, then average over arbitrary noise, centres and widths. The area under the success curve is **E[W_i]**. Thus independent uniform offsets across 50 ms imply **average success <= E[W_i]/50**: at most **24–40%** for 12–20 ms, or **41.1%** for the 5-pp/20.55-ms limit. Normality is unnecessary. A mixture can blur the shoulders but does not manufacture area.
++
++This bound requires the interval/noise to be unaffected by assignment and offsets to be delivered 1:1. With a noncompliant fraction epsilon, the conservative bound becomes `E[W_i]/50 + epsilon`; with selected graded survivors or an unknown/nonuniform delivery distribution, the ideal bound is not directly applicable. Include finite-sample uncertainty; a 100-shot percentage is not a population truth. This is a prespecified cross-check, not an extra shipping test.
++
++**Interpretation rules:** good fidelity plus broad, nearly flat high success across the range and a width profile wholly above 20.55 ms contradicts the narrow proxy-calibrated fixed-band model. Good fidelity plus steep EARLY-to-LATE transitions and a narrow band contradicts a physical 94 ms band. Broad/open profiles, failed goodness-of-fit, arm/context dependence, visual calibration failure, or delivery attenuation leave the explanation unresolved. **100 shots may distinguish these extreme shapes; 100 is still too few for useful separate broad-band/sigma estimates or a +3–5-point FF claim.** At n=200 the preregistered broad-model SEs remain roughly 24 ms for width and 11 ms for sigma. Do not call non-significance a confirmed ceiling.
++
++## 4. Executable draft and review coverage
++
++[sweep_analysis.py](C:/Users/aaron/Desktop/NexusVision/tools/timing/sweep_analysis.py) implements:
++
++- Integer-safe epoch/process/native-seq/attempt joins, final carried D/F rather than refinement guesses, A=unknown rather than arm 0 when missing; per-shot provenance and attempt audit.
++- Explicit first-100/200 native physical presses after a declared marker, complete-record ledger/protocol checks, all-attempt arm and attrition denominators; local H-on-Z/D HC3 equivalence and block-20 bootstrap. A 0.29 fixture fails; a 1.0 fixture passes.
++- Gated ordered-probit MLE, band centre/width/sigma/peak profiles, boundary/open-profile reporting and bootstrap fallback; registered five-bin 2,000-refit goodness-of-fit; fixed-scale and onset/order/arm-interaction sensitivities.
++- Raw assigned-policy FF risk difference, Newcombe-Wilson interval and exact conditional arm permutation; missing banners count as non-success, not EARLY; graded-only comparison, adjusted g-computation with 10,000 epoch bootstraps, warm-reference and arm-onset analyses.
++- Width eligibility/stability audit, 3-df centre/width/slope interaction, profiles, quartile verdict curves and derivatives, quartile delivery checks, full-positive-width sensitivity. No frame audit means exploratory, never a pre-decision controller claim.
++- Curve-integrated per-shot visible widths, historical matched-population fits and both competing prediction tables. Legacy calculations are separate from the randomised primary estimator.
++
++The later **multi-session** network-feature and production-equivalent no-sweep/adaptive-policy validation are deliberately **not represented as completed analyses** by this single-session script. Its output states that those gates remain external work; it never authorises shipping or declares a ceiling just because an in-sample fit succeeds. A passive packet timestamp is not treated as a verified command-bearing datagram. Those limitations are part of the amended plan, not missing values silently filled with zeros.
++
++### Reproduce the legacy dry run
++
++From `C:/Users/aaron/Desktop/NexusVision` (choose a *new* output directory if rerunning):
++
++```powershell
++python -B tools/timing/sweep_analysis.py --dry-run --records-dir D:/NexusVision/shot_records --logs logs/orion_native.log.1 logs/orion_native.log --out-dir docs/variance/window_discrepancy_evidence/dry_run_final
++python -B tools/timing/test_sweep_analysis.py
++```
++
++The dry run exits **0** as a completed *diagnostic*, with **`records=2974`, `assigned=0`, `status=PRIMARY_SUPPRESSED`, `fidelity_pass=False`, `primary_fit=False`**. The existing corpus has no randomised draw/arm evidence; no invented control observations enter a primary fit. `summary.json` contains the failure funnel, all legacy widths/fits, source hashes and full prediction tables. Output directories are immutable-by-convention: the script refuses an existing destination and detects source input changes during a run.
++
++**22 offline tests pass.** The tests exercise uint64 identity, counter resets/rotation deduplication, ambiguous epochs, landing after close, missing assignments, final versus refinement values, multiple arm tokens, nonzero in-tick contradictions, record corruption, exact FF inference, scale invariance, broad/narrow likelihood recovery, fidelity rejection at slope 0.29, missing-banner policy denominators, first-press rather than surviving-grade sampling, profile inversion and the primary/width paths. A separate **synthetic-only** full-count analysis completed **2,000/2,000** goodness-of-fit refits and **10,000/10,000** FF bootstrap resamples; its fidelity gate passed and its unaudited width result stayed `exploratory_only`. It is not sweep evidence. The first full run found a NumPy Boolean JSON-serialization failure; explicit Boolean conversion and an artifact-serialization regression check fixed it before the passing rerun. Exact command/output/exit-status evidence and rollback verification are in [VERIFICATION.txt](C:/Users/aaron/Desktop/NexusVision/docs/variance/window_discrepancy_evidence/VERIFICATION.txt).
++
++### Real trial interface — acquisition by the owner, not executed here
++
++```powershell
++python -B tools/timing/sweep_analysis.py --records-dir D:/NexusVision/shot_records --logs logs/orion_native.log.1 logs/orion_native.log --session SESSION_ID --start-utc START_WITH_UTC_OFFSET --block 100 --protocol-json docs/variance/RUN_PROTOCOL.json --capture-dir D:/NexusVision/netcap/CAPTURE_ID --out-dir docs/variance/SWEEP_BLOCK_100
++```
++
++The explicit protocol JSON must contain actual build/settings hashes, same-spot/open-online attestations, and exact offset/FF specifications listed in preregistration section 8. An independent frame audit is optional input via `--width-audit`, but required for confirmatory width interpretation. Missing protocol, missing capture or failed fidelity means **exit 2 / primary suppressed**, not “zero effect.” Extend to the already planned first 200 presses independently of interim grade results. No historical 200/60-ms outcome-tail filter is reused for the randomised sweep.
++
++## 5. Findings and next decision
++
++| Finding | Affected object / impact | Required next verification |
++|---|---|---|
++| ~15 ms visible proxy vs ~60–96 ms observational band | Physical interpretation of the grading-clock model; treating sigma as measured timing noise is premature | Calibrated randomised delivered-offset curve, plus independently timed visual top crossing |
++| Free D coefficient with free cuts/sigma is exactly unidentified | Old preregistration sensitivity clause; false confidence intervals | Corrected before data to fixed coefficient and fixed 0.8/1.2 sensitivity; scale-invariance test verifies the issue |
++| Current pre-width IQR 0.20 pp and release snapshot is not a latch | Width-conditioned aim; current observations do not establish usable pre-decision variation | Label-blinded first-confirmed frame audit, >=1-pp IQR, quartile first stages, then independent-session adaptive gain |
++| Fresh exact passive MLE is 95.824/44.216, not exactly 94.39/43.54 | Small reproduction discrepancy; not a new causal result or material change in ceiling | Retain exact current outputs and old constants as approximate benchmark; do not splice parameter sets |
++| No existing draw/arm/capture evidence for this experiment | Primary sweep/FF/noise claim would be fabricated if run as real data | Owner's preregistered acquisition, complete first-press ledger, capture collected, fidelity gate before grade inference |
++
++**Next:** run the pre-registered measurement block, not a source tuning change. The discrepancy is a good reason to run it: it can falsify a large physical-width interpretation even when it is underpowered for a small FF improvement. Keep the later independent-session shipping/ceiling rules intact.
+diff --git a/tools/timing/sweep_analysis.py b/tools/timing/sweep_analysis.py
+new file mode 100644
+--- /dev/null
++++ b/tools/timing/sweep_analysis.py
+@@ -0,0 +1,994 @@
++#!/usr/bin/env python
++"""Offline, identity-joined offset-sweep analysis. Never controls or launches Orion.
++
++Python 3.10+, NumPy, SciPy. Missing assignments are UNKNOWN, never arm 0 / offset 0.
++Run --dry-run on legacy records; a failed fidelity gate suppresses the primary fit.
++See docs/variance/PREREGISTRATION_OFFSET_SWEEP.md for the frozen estimands.
++"""
++from __future__ import annotations
++
++import argparse
++from bisect import bisect_right
++from collections import Counter, defaultdict
++from datetime import datetime, timezone
++import csv
++import hashlib
++import json
++import math
++from pathlib import Path
++import re
++import sys
++
++import numpy as np
++from scipy import optimize, special, stats
++
++VERSION = "2026-09-22-predata-1"
++SEED = 20260922
++OFFLINE_SESSION = "session_20260920_170027"
++GRADES = {"EARLY": 0, "EXCELLENT": 1, "LATE": 2}
++OPEN = {"OPEN", "WIDE OPEN"}
++CURVE_FILL = np.array([20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100.])
++CURVE_MS = np.array([0, 29.42, 58.30, 86.22, 112.58, 163.7, 211.4, 257.4, 302.4, 344.4, 385.5])
++TOP_RATE = 10 / (385.5 - 344.4)  # 90..100 is extrapolated in the source, not observed per shot.
++KV = re.compile(r"\b([A-Za-z_]\w*)=([^\s]+)")
++TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z)\s+(.*)$")
++GREEN = re.compile(r"\(green\s+([\d.]+)-([\d.]+)\)")
++TAGS = {
++    "Physical shot epoch:": "press", "Release issued:": "issued",
++    "Release delivery identity:": "identity", "Release onsetff:": "release_ff",
++    "Release devoffset:": "release_dev", "Release attribution:": "attribution",
++    "Release timing:": "timing", "Scheduled fire:": "schedule",
++    "Release landing:": "landing", "DEV FIRE OFFSET DRAW:": "draw",
++    "DEV FIRE OFFSET APPLIED:": "dev_refinement", "ONSET FF: reason=": "ff",
++    "TIP RESERVATION:": "reservation", "Shot abort identity:": "abort",
++    "DEV FIRE OFFSET SWEEP ARMED:": "hook", "TIP PHASE RATE STRETCH:": "stretch",
++}
++
++
++def number(x):
++    if isinstance(x,bool):
++        return None
++    try:
++        v = float(x)
++        return v if math.isfinite(v) else None
++    except (TypeError, ValueError, OverflowError):
++        return None
++
++
++def ident(x):
++    # Identity must never travel through a float (uint64 physical epochs).
++    if isinstance(x, bool) or not re.fullmatch(r"[0-9]+", str(x)):
++        return None
++    v = int(x)
++    return v if 0 < v < 2**64 else None
++
++
++def utc_ms(s):
++    d = datetime.fromisoformat(s.replace("Z", "+00:00"))
++    if d.tzinfo is None:
++        raise ValueError("UTC/offset-aware timestamp required")
++    return d.timestamp() * 1000
++
++
++def distribution(values):
++    a = np.array([v for x in values if (v := number(x)) is not None])
++    if not len(a):
++        return {"n": 0}
++    return dict(n=len(a), mean=float(a.mean()), sd=float(a.std(ddof=1)) if len(a)>1 else None,
++                **{k: float(np.quantile(a, q)) for k, q in
++                   [("min", 0), ("p10", .1), ("p25", .25), ("median", .5),
++                    ("p75", .75), ("p90", .9), ("p95", .95), ("max", 1)]})
++
++
++def coverage_state(x):
++    s = str(x or "").upper().replace("_", " ").strip()
++    if s in OPEN:
++        return "open"
++    if any(w in s for w in ("CONTEST", "COVERED", "SMOTHER", "TIGHT", "GUARD")):
++        return "contested"
++    return "unknown"
++
++
++def curve_time(f):
++    if not math.isfinite(f):
++        return float("nan")
++    if f < 20:
++        return (f-20)/.158
++    if f > 100:
++        return 385.5+(f-100)/TOP_RATE
++    return float(np.interp(f, CURVE_FILL, CURVE_MS))
++
++
++def curve_window(start, end, scale=1.):
++    if start is None or end is None or not (0 <= start < end <= 100):
++        return None
++    return scale*(curve_time(end)-curve_time(start))
++
++
++def load_records(paths):
++    records, conflicting, counts = {}, set(), Counter()
++    for p in paths:
++        for line in p.read_text(encoding="utf-8").splitlines():
++            counts["lines"] += 1
++            try:
++                r = json.loads(line)
++            except ValueError:
++                counts["invalid_json"] += 1
++                continue
++            if not isinstance(r,dict):
++                counts["invalid_json"] += 1
++                continue
++            epoch = ident(r.get("epoch")); session = r.get("session")
++            start, end = number(r.get("press_ts_ms")), number(r.get("closed_ts_ms"))
++            if epoch is None or not isinstance(session, str) or not session or start is None or end is None or start < 0 or end < start:
++                counts["invalid_identity_or_interval"] += 1
++                continue
++            key = (session, epoch)
++            if key in records:
++                if records[key] != r:
++                    conflicting.add(key); counts["conflicting_duplicates"] += 1
++                else:
++                    counts["identical_duplicates"] += 1
++            else:
++                records[key] = r
++    for k in conflicting:
++        records.pop(k, None)
++    return sorted(records.values(), key=lambda r: (r["press_ts_ms"], r["session"], r["epoch"])), dict(counts)
++
++
++def load_events(paths):
++    events, seen, counts = [], set(), Counter()
++    for p in paths:
++        for line_no, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
++            if "Sidecar tail:" in line:
++                continue
++            m = TS.match(line)
++            if not m:
++                continue
++            body = m.group(2)
++            stage = next((v for k, v in TAGS.items() if body.startswith(k)), None)
++            if stage is None:
++                continue
++            key = (m.group(1), body)
++            if key in seen:
++                counts["identical_forwarded_lines"] += 1
++                continue
++            seen.add(key)
++            fields = dict(KV.findall(body))
++            if stage == "issued" and (g := GREEN.search(body)):
++                fields.update(issued_green_start=g.group(1), issued_green_end=g.group(2))
++            events.append(dict(t=utc_ms(m.group(1)), stage=stage, f=fields,
++                               file=str(p.resolve()), line=line_no, order=len(events)))
++    events.sort(key=lambda e: (e["t"], e["order"]))
++    # Reset boundaries come from physical epoch/release-counter resets, not 600 s idle gaps.
++    boundaries=[]; last_ep=None; last_seq=None; last_press=None; last_release=None
++    for e in events:
++        if e["stage"] == "press":
++            ep=ident(e["f"].get("epoch"))
++            if ep is not None and last_ep is not None and ep <= last_ep:
++                boundaries.append(e["t"]); last_seq=None
++            last_ep=ep; last_press=e["t"]
++        elif e["stage"] == "issued":
++            seq=ident(e["f"].get("seq"))
++            if seq is not None and last_seq is not None and seq <= last_seq:
++                boundaries.append(last_press if last_press is not None and last_press > last_release else e["t"]-150)
++            last_seq=seq; last_release=e["t"]
++    boundaries=sorted(set(boundaries))
++    for e in events:
++        e["process"] = bisect_right(boundaries, e["t"])
++    counts.update(Counter(e["stage"] for e in events))
++    counts["process_partitions"]=len(boundaries)+1
++    return events, dict(counts)
++
++
++def unique_fields(events):
++    unique={tuple(sorted(e["f"].items())) for e in events}
++    return dict(next(iter(unique))) if len(unique)==1 else None
++
++
++def join_shots(records, events, scale=1.):
++    rows=[]; by_epoch=defaultdict(list); stages=defaultdict(list)
++    for e in events:
++        stages[e["stage"]].append(e)
++    for r in records:
++        b=r.get("banner") or {}; typ=r.get("shot_type_upgraded") or r.get("shot_type")
++        row=dict(session=r["session"], epoch=int(r["epoch"]), record_seq=r.get("seq"),
++                 press_ms=number(r["press_ts_ms"]), closed_ms=number(r["closed_ts_ms"]),
++                 release_ms=number(r.get("release_ms")), hold_ms=number(r.get("release_after_press_ms")),
++                 onset_ms=number(r.get("onset_ms")), onset_source=r.get("onset_source"),
++                 shot_type=typ, outcome=r.get("outcome"), grade=b.get("timing"),
++                 coverage=b.get("coverage"), coverage_state=coverage_state(b.get("coverage")),
++                 distance_ft=number(b.get("distance_ft")), online=r["session"]!=OFFLINE_SESSION,
++                 release_seq=None, attempt=None, process=None, join_source=None, join_conflicts=[],
++                 A=None, Z_first=None, Z_final=None, D=None, F=None, scheduled=None,
++                 ff_n=None, onset_dev=0., reference_unavailable=1, draw_count=0,
++                 arm_conflict=False, pre_width_pp=None, pre_width_ms=None, landing_width_pp=None,
++                 landing_width_ms=None, confirm_lead_ms=None, pre_confirmed=False,
++                 identity_candidates=[], ff_events=[], attempt_events=[])
++        row["clock_failure"]=False
++        if row["outcome"]=="released":
++            t=row["release_ms"];h=row["hold_ms"]
++            row["clock_failure"]=(t is None or h is None or not (row["press_ms"]<=t<=row["closed_ms"]) or
++                                   h<0 or abs(t-row["press_ms"]-h)>1.)
++        rows.append(row); by_epoch[row["epoch"]].append(row)
++    # Both native identities must agree. Primary needs release_ff; legacy delivery identity
++    # is allowed ONLY for historical/descriptive width joins, never fabricated A/F.
++    for stage in ("release_ff", "identity", "ff", "reservation", "abort", "stretch"):
++        for e in stages[stage]:
++            ep=ident(e["f"].get("physical_epoch"))
++            candidates=[r for r in by_epoch.get(ep,[]) if r["press_ms"] <= e["t"] <= r["closed_ms"]]
++            if stage in ("release_ff", "identity"):
++                candidates=[r for r in candidates if r["release_ms"] is not None and abs(r["release_ms"]-e["t"]) <= 150]
++            if len(candidates)!=1:
++                continue
++            r=candidates[0]
++            if stage in ("release_ff", "identity"):
++                seq=ident(e["f"].get("seq" if stage=="release_ff" else "release_seq"))
++                at=ident(e["f"].get("shot_attempt"))
++                if seq is not None and at is not None:
++                    r["identity_candidates"].append((e["process"],seq,at,stage))
++            if stage=="ff":
++                r["ff_events"].append(e)
++            if ident(e["f"].get("shot_attempt")):
++                r["attempt_events"].append(e)
++    event_by_seq=defaultdict(list); draw_by_attempt=defaultdict(list)
++    for e in events:
++        if (seq:=ident(e["f"].get("seq"))) is not None:
++            event_by_seq[(e["process"],seq,e["stage"])].append(e)
++        if e["stage"]=="draw" and (at:=ident(e["f"].get("shot_attempt"))) is not None:
++            draw_by_attempt[(e["process"],at)].append(e)
++    for r in rows:
++        keys={x[:3] for x in r["identity_candidates"]}
++        if len(keys)>1:
++            r["join_conflicts"].append("release_identity")
++        elif len(keys)==1:
++            r["process"],r["release_seq"],r["attempt"]=next(iter(keys))
++            r["join_source"]="release_ff" if any(x[3]=="release_ff" for x in r["identity_candidates"]) else "delivery_legacy"
++        attempts={(e["process"],ident(e["f"].get("shot_attempt"))) for e in r["attempt_events"]}
++        if r["attempt"] is not None:
++            attempts.add((r["process"],r["attempt"]))
++        draws=[e for k in attempts for e in draw_by_attempt[k] if r["press_ms"]<=e["t"]<=r["closed_ms"]]
++        draws.sort(key=lambda e:e["t"])
++        by_attempt=defaultdict(set)
++        for e in draws:
++            by_attempt[(e["process"],ident(e["f"].get("shot_attempt")))].add(number(e["f"].get("offset_ms")))
++        r["draw_count"]=len(by_attempt)
++        r["draw_audit"]=[dict(attempt=ident(e["f"].get("shot_attempt")),Z=number(e["f"].get("offset_ms")),t=e["t"],source=f"{e['file']}:{e['line']}") for e in draws]
++        refinements=[e for e in stages["dev_refinement"] if (e["process"],ident(e["f"].get("shot_attempt"))) in attempts and r["press_ms"]<=e["t"]<=r["closed_ms"]]
++        r["dev_refinement_audit"]=[dict(fields=e["f"],t=e["t"],source=f"{e['file']}:{e['line']}") for e in refinements]
++        r["ff_assignment_sources"]=[f"{e['file']}:{e['line']}" for e in r["ff_events"]]
++        if any(len(v)!=1 or None in v for v in by_attempt.values()):
++            r["join_conflicts"].append("draw_conflict")
++        elif draws:
++            r["Z_first"]=number(draws[0]["f"].get("offset_ms"))
++            vals=by_attempt.get((r["process"],r["attempt"]))
++            if vals:
++                r["Z_final"]=next(iter(vals))
++        arms={e["f"].get("ab_arm") for e in r["ff_events"] if "ab_arm" in e["f"]}
++        r["arm_conflict"]=len(arms)>1 or bool(arms-{"0","1"})
++        if len(arms)==1 and not r["arm_conflict"]:
++            r["A"]=int(next(iter(arms)))
++        ff=sorted(r["ff_events"],key=lambda e:e["t"])
++        # No future log message is used as a pre-command covariate.
++        ff=[e for e in ff if r["release_ms"] is None or e["t"]<=r["release_ms"]]
++        if ff:
++            f=ff[-1]["f"]; r["ff_n"]=number(f.get("n"))
++            r["ff_gain"]=number(f.get("gain"));r["ff_clamp_ms"]=number(f.get("clamp_ms"))
++            r["one_sided"]=number(f.get("one_sided"));r["ff_reason"]=f.get("reason")
++            if number(f.get("ref_ms")) is not None and number(f["ref_ms"])>=0 and (r["ff_n"] or 0)>=4:
++                d=number(f.get("dev_ms"))
++                if d is not None:
++                    r["onset_dev"]=d;r["reference_unavailable"]=0
++        measured={}
++        if r["release_seq"] is not None:
++            for stage in ("issued","release_ff","release_dev","attribution","timing","schedule","landing"):
++                ev=event_by_seq[(r["process"],r["release_seq"],stage)]
++                if stage=="landing":
++                    ev=[e for e in ev if 0<=e["t"]-r["release_ms"]<=5000]
++                else:
++                    ev=[e for e in ev if abs(e["t"]-r["release_ms"])<=150 and r["press_ms"]<=e["t"]<=r["closed_ms"]]
++                f=unique_fields(ev)
++                if ev and f is None:
++                    r["join_conflicts"].append(stage)
++                elif f:
++                    measured[stage]=f
++                    r[stage+"_source"]=";".join(f"{e['file']}:{e['line']}" for e in ev)
++        dev=measured.get("release_dev",{});relff=measured.get("release_ff",{});sc=measured.get("schedule",{})
++        sched={f.get("scheduled") for f in (dev,relff,sc) if f.get("scheduled") is not None}
++        if len(sched)==1 and sched<= {"0","1"}:
++            r["scheduled"]=int(next(iter(sched)))
++        elif sched:
++            r["join_conflicts"].append("scheduled_conflict")
++        for f,key in ((dev,"D"),(relff,"F")):
++            if f and ident(f.get("shot_attempt"))==r["attempt"]:
++                r[key]=number(f.get("applied_ms"))
++            elif f:
++                r["join_conflicts"].append(key+"_attempt_mismatch")
++        if sc.get("shot_attempt") is not None and ident(sc["shot_attempt"])!=r["attempt"]:
++            r["join_conflicts"].append("schedule_attempt_mismatch")
++        if r["scheduled"]==0 and any(r[k] not in (None,0.) for k in ("D","F")):
++            r["join_conflicts"].append("nonzero_in_tick_displacement")
++        r["scheduler_delta_ms"]=number(sc.get("deltaMs"))
++        a=measured.get("attribution",{});t=measured.get("timing",{});l=measured.get("landing",{});i=measured.get("issued",{})
++        w=number(a.get("greenWidth"));gc=number(a.get("greenConfirmMs"));elapsed=number(t.get("appearToRelMs"))
++        r["pre_width_pp"]=w if w is not None and w>0 else None
++        # Width-only tracker has no endpoints; price it on the extrapolated 90..100 segment.
++        r["pre_width_ms"]=w/TOP_RATE*scale if w is not None and w>0 else None
++        r["confirm_lead_ms"]=elapsed-gc if elapsed is not None and gc is not None and gc>=0 else None
++        r["pre_confirmed"]=a.get("greenConfirmed")=="1" and r["pre_width_pp"] is not None and r["confirm_lead_ms"] is not None and r["confirm_lead_ms"]>=20
++        r["release_velocity_pp_ms"]=number(a.get("vel"))
++        r["issued_window_ms"]=curve_window(number(i.get("issued_green_start")),number(i.get("issued_green_end")),scale)
++        gs,ge=number(l.get("green_start")),number(l.get("green_end"))
++        if l.get("graded")=="1" and (number(l.get("green_obs_n")) or 0)>=3 and gs is not None and ge is not None and 0<gs<ge<=100:
++            r["landing_start_pp"],r["landing_end_pp"]=gs,ge
++            r["landing_width_pp"]=ge-gs;r["landing_width_ms"]=curve_window(gs,ge,scale)
++            v=number(l.get("vel_at_rel"))
++            r["landing_width_ms_release_velocity_WRONG_GLOBAL_RULER"]=(ge-gs)/v if v is not None and v>0 else None
++        r["primary_join"]=r["join_source"]=="release_ff" and not r["join_conflicts"] and all(r[k] is not None for k in ("D","F","Z_final","A","scheduled")) and any(ident(e["f"].get("shot_attempt"))==r["attempt"] for e in r["ff_events"])
++        r["H"]=r["hold_ms"]-r["onset_ms"] if r["hold_ms"] is not None and r["onset_ms"] is not None else None
++        for k in ("identity_candidates","ff_events","attempt_events"):
++            del r[k]
++    return rows
++
++
++def historical_selection(rows):
++    groups=defaultdict(list)
++    for r in rows:
++        if r["online"] and r["shot_type"]=="Standstill" and r["outcome"]=="released" and r["grade"] in GRADES and r["onset_source"]=="detect_loop" and r["H"] is not None:
++            groups[r["session"]].append(r)
++    out=[]
++    for rr in groups.values():
++        if len(rr)<12:
++            continue
++        om=np.median([r["onset_ms"] for r in rr]);hm=np.median([r["hold_ms"] for r in rr])
++        for r in rr:
++            o=r["onset_ms"]-om;m=r["hold_ms"]-hm-o
++            if abs(o)<=200 and abs(m)<=60:
++                out.append(dict(r, onset_c=float(o), meter_c=float(m)))
++    return out
++
++
++def window_summary(rows):
++    def summarise(rr):
++        pre=[r for r in rr if r["pre_confirmed"] and .5<=r["pre_width_pp"]<=5]
++        land=[r for r in rr if r["landing_width_pp"] is not None and .5<=r["landing_width_pp"]<=5]
++        paired=[r for r in pre if r["landing_width_pp"] is not None and .5<=r["landing_width_pp"]<=5]
++        return dict(shots=len(rr),sessions=len({r["session"] for r in rr}),
++                    attribution_any=distribution(r["pre_width_pp"] for r in rr),
++                    confirmed_plausible_pp=distribution(r["pre_width_pp"] for r in pre),
++                    confirmed_plausible_ms=distribution(r["pre_width_ms"] for r in pre),
++                    landing_any_pp=distribution(r["landing_width_pp"] for r in rr),
++                    landing_any_ms=distribution(r["landing_width_ms"] for r in rr),
++                    pre_plausible_sessions=len({r["session"] for r in pre}),
++                    landing_plausible_sessions=len({r["session"] for r in land}),
++                    landing_plausible_pp=distribution(r["landing_width_pp"] for r in land),
++                    landing_plausible_ms=distribution(r["landing_width_ms"] for r in land),
++                    paired_width_difference_pp=distribution(r["pre_width_pp"]-r["landing_width_pp"] for r in paired),
++                    confirmation_lead_ms=distribution(r["confirm_lead_ms"] for r in pre),
++                    issued_window_ms=distribution(r.get("issued_window_ms") for r in rr),
++                    wrong_release_velocity_conversion_ms=distribution(r.get("landing_width_ms_release_velocity_WRONG_GLOBAL_RULER") for r in land),
++                    paired_n=len(paired))
++    hist=historical_selection(rows)
++    return {"all_online_graded_standstills":summarise([r for r in rows if r["online"] and r["shot_type"]=="Standstill" and r["grade"] in GRADES and r["outcome"]=="released"]),
++            "historical_816_selection":summarise(hist),
++            "historical_by_session":{s:summarise([r for r in hist if r["session"]==s]) for s in sorted({r["session"] for r in hist})}}
++
++
++def ordinal_probs(D, A, c, W, sigma, delta=0., slope=1., wc=None, eta=0., kappa=0., gamma=0., extra_mu=0.):
++    D=np.asarray(D,dtype=float);A=np.asarray(A,dtype=float)
++    wc=np.zeros_like(D) if wc is None else np.asarray(wc,dtype=float)
++    center=c+eta*wc; width=W+kappa*wc
++    mu=(slope+gamma*wc)*D+delta*A+extra_mu
++    zlo=(center-width/2-mu)/sigma;zhi=(center+width/2-mu)/sigma
++    return np.column_stack((special.ndtr(zlo),special.ndtr(zhi)-special.ndtr(zlo),special.ndtr(-zhi)))
++
++
++def _log_grade(zlo,zhi,y):
++    # Use survival differences in the positive tail to avoid 1-1 cancellation.
++    a=np.where(zlo>0,special.log_ndtr(-zlo),special.log_ndtr(zhi))
++    b=np.where(zlo>0,special.log_ndtr(-zhi),special.log_ndtr(zlo))
++    mid=a+np.log(np.maximum(-np.expm1(np.minimum(b-a,0)),1e-300))
++    return np.where(y==0,special.log_ndtr(zlo),np.where(y==2,special.log_ndtr(-zhi),mid))
++
++
++def fit_ordinal(D,A,y, *, width=None, extra=None, fixed=None, slope=1., start=None, multistart=True):
++    """MLE with delivered-offset coefficient FIXED. A free coefficient destroys ms identity.
++
++    q=(c/25, W/25, log(sigma), delta/25, [eta/25,kappa/25,gamma], extra/25).
++    Width alternative is exactly the preregistered linear c(w), W(w), D*width model.
++    """
++    D=np.asarray(D,float);A=np.asarray(A,float);y=np.asarray(y,int)
++    if len(D)<4 or len(np.unique(y))<2 or not np.isfinite(D).all() or not np.isfinite(A).all():
++        return {"success":False,"reason":"insufficient_or_invalid_rows"}
++    wc=None if width is None else np.asarray(width,float)-np.median(width)
++    X=np.empty((len(D),0)) if extra is None else np.asarray(extra,float).reshape(len(D),-1)
++    if not np.isfinite(X).all() or (wc is not None and not np.isfinite(wc).all()):
++        return {"success":False,"reason":"nonfinite_covariate"}
++    names=["c","W","sigma","delta"]+(["eta","kappa","gamma"] if wc is not None else [])+[f"extra_{i}" for i in range(X.shape[1])]
++    fixed=dict(fixed or {})
++    if np.ptp(A)==0:
++        fixed["delta"]=0.
++    npar=len(names); inds={n:i for i,n in enumerate(names)}
++    def natural(q):
++        out={k:(math.exp(q[i]) if k=="sigma" else q[i] if k=="gamma" else 25*q[i]) for i,k in enumerate(names)}
++        out.update(fixed)
++        if "pmax" in fixed:
++            out["W"]=2*out["sigma"]*stats.norm.ppf((fixed["pmax"]+1)/2)
++        return out
++    def encode(p):
++        return np.array([math.log(p[k]) if k=="sigma" else p[k] if k=="gamma" else p[k]/25 for k in names])
++    held=set(fixed)|({"W"} if "pmax" in fixed else set())
++    free=[i for i,k in enumerate(names) if k not in held]
++    def full(x,q0):
++        q=q0.copy();q[free]=x;return q
++    def objective(q):
++        p=natural(q); w=p["W"]+(p.get("kappa",0)*wc if wc is not None else 0)
++        if np.any(np.asarray(w)<=.001):
++            return 1e30
++        center=p["c"]+(p.get("eta",0)*wc if wc is not None else 0)
++        mu=(slope+(p.get("gamma",0)*wc if wc is not None else 0))*D+p["delta"]*A
++        if X.shape[1]:
++            mu=mu+X@np.array([p[f"extra_{i}"] for i in range(X.shape[1])])
++        zlo=(center-w/2-mu)/p["sigma"];zhi=(center+w/2-mu)/p["sigma"]
++        return float(-_log_grade(zlo,zhi,y).sum())
++    seeds=[dict(c=-7.4,W=94.,sigma=44.,delta=0.),dict(c=0.,W=16.,sigma=8.,delta=0.)]
++    if start is not None:
++        seeds.insert(0,start)
++    if not multistart:
++        seeds=seeds[:1]
++    bounds=[(-80,80),(.00008,400),(-4,9),(-80,80)]+([(-80,80),(-80,80),(-5,5)] if wc is not None else [])+[(-80,80)]*X.shape[1]
++    results=[]
++    for seed in seeds:
++        seed={**{k:0. for k in names},**seed};q0=encode(seed)
++        fun=lambda x:objective(full(x,q0))
++        cons=[]
++        if wc is not None:
++            def positive(x):
++                p=natural(full(x,q0))
++                return p["W"]+p["kappa"]*wc-.001
++            cons=[{"type":"ineq","fun":positive}]
++        result=optimize.minimize(fun,q0[free],method="SLSQP" if cons else "L-BFGS-B",
++                                 bounds=[bounds[i] for i in free],constraints=cons,
++                                 options={"maxiter":1800,"ftol":1e-10})
++        results.append((result,full(result.x,q0)))
++    candidates=[x for x in results if x[0].success and math.isfinite(x[0].fun) and x[0].fun<1e25]
++    if not candidates:
++        return {"success":False,"reason":"MLE_not_converged","messages":[str(r.message) for r,q in results]}
++    res,q=min(candidates,key=lambda x:x[0].fun);p=natural(q)
++    sigma=p["sigma"];W=p["W"]
++    edge=any(abs(q[i]-bounds[i][j])<1e-4 for i in free for j in (0,1))
++    probs=ordinal_probs(D,A,p["c"],W,sigma,p["delta"],slope,wc,p.get("eta",0),p.get("kappa",0),p.get("gamma",0),
++                        X@np.array([p[f"extra_{i}"] for i in range(X.shape[1])]) if X.shape[1] else 0.)
++    return {"success":True,"n":len(D),"nll":float(res.fun),"params":p,"pmax":float(2*special.ndtr(W/(2*sigma))-1),
++            "boundary":edge,"width_center_pp":float(np.median(width)) if width is not None else None,
++            "slope_fixed":slope,"probs":probs.tolist()}
++
++
++def profile_intervals(D,A,y,fit, *, width=None, extra=None, parameters=("c","W","sigma","pmax")):
++    if not fit.get("success"):
++        return {}
++    cutoff=fit["nll"]+stats.chi2.ppf(.95,1)/2
++    result={}
++    for name in parameters:
++        value=fit["pmax"] if name=="pmax" else fit["params"][name]
++        if name=="pmax":
++            limits=(.00001,.99999);step=.03
++        elif name in ("W","sigma"):
++            limits=(.002,9900.);step=max(value*.2,1.)
++        elif name=="gamma":
++            limits=(-4.99,4.99);step=.02
++        else:
++            limits=(-1900.,1900.);step=max(abs(value)*.2,5.)
++        def f(v):
++            out=fit_ordinal(D,A,y,width=width,extra=extra,fixed={name:v},start=fit["params"],multistart=False)
++            return out["nll"]-cutoff if out.get("success") else None
++        ends=[];flags=[]
++        for sign in (-1,1):
++            prev=value;v=value;dv=step;bracket=None;failure=False
++            for _ in range(22):
++                v=max(limits[0],min(limits[1],value+sign*dv));fv=f(v)
++                if fv is None:
++                    failure=True;break
++                if fv>=0:
++                    bracket=sorted((prev,v));break
++                prev=v
++                if v==limits[0] or v==limits[1]:
++                    break
++                dv*=1.8
++            if bracket:
++                try:
++                    endpoint=optimize.brentq(lambda v:f(v),*bracket,xtol=1e-4)
++                    ends.append(float(endpoint));flags.append("finite")
++                except (TypeError,ValueError):
++                    ends.append(None);flags.append("profile_failed")
++            else:
++                ends.append(None);flags.append("profile_failed" if failure else "open_at_numerical_search_limit")
++        result[name]={"estimate":value,"lower95":ends[0],"upper95":ends[1],"endpoint_status":flags}
++    return result
++
++
++def gof_bootstrap(D,A,y,Z,fit,reps=2000,seed=SEED):
++    if not fit.get("success"):
++        return {"status":"not_fitted"}
++    D=np.asarray(D);A=np.asarray(A);y=np.asarray(y);Z=np.asarray(Z)
++    bins=np.clip(np.searchsorted([-15,-5,5,15],Z,side="right"),0,4)
++    def statistic(y,p):
++        cells=[];total=0.
++        for k in range(5):
++            ix=bins==k;expected=p[ix].sum(axis=0);observed=np.bincount(y[ix],minlength=3)
++            ok=expected>0;total+=float(np.sum((observed[ok]-expected[ok])**2/expected[ok]))
++            cells.append(dict(bin=k,n=int(ix.sum()),observed=observed.tolist(),expected=expected.tolist()))
++        return total,cells
++    p=np.asarray(fit["probs"]);obs,cells=statistic(y,p);rng=np.random.default_rng(seed);null=[]
++    for _ in range(reps):
++        yy=(rng.random(len(D))[:,None]>np.cumsum(p,axis=1)[:,:2]).sum(axis=1)
++        ff=fit_ordinal(D,A,yy,start=fit["params"],multistart=False)
++        if ff.get("success"):
++            null.append(statistic(yy,np.asarray(ff["probs"]))[0])
++    valid=len(null)>=.95*reps and reps>0
++    return dict(statistic=obs,cells=cells,requested=reps,successful=len(null),
++                p=(1+sum(v>=obs for v in null))/(1+len(null)) if valid else None,
++                status="complete" if valid else "bootstrap_incomplete")
++
++
++def ols_hc3(y,x,nuisance=None):
++    y=np.asarray(y,float);x=np.asarray(x,float)
++    X=np.column_stack((np.ones(len(y)),x))
++    if nuisance is not None:
++        N=np.asarray(nuisance,float).reshape(len(y),-1)
++        # Drop only CONSTANT nuisance columns. Nonconstant collinearity is a failed gate.
++        N=N[:,np.ptp(N,axis=0)>1e-10];X=np.column_stack((X,N))
++    n,p=X.shape
++    if n<=p+2 or not np.isfinite(X).all() or np.ptp(x)==0 or np.linalg.matrix_rank(X)<p:
++        return {"status":"not_identifiable","n":n}
++    bread=np.linalg.inv(X.T@X);b=bread@X.T@y;res=y-X@b;h=np.sum((X@bread)*X,axis=1)
++    if np.any(h>=1-1e-9):
++        return {"status":"unit_leverage","n":n}
++    cov=bread@(X.T*((res/(1-h))**2))@X@bread;se=math.sqrt(max(cov[1,1],0))
++    critical=stats.t.ppf(.95,n-p)
++    lo,hi=b[1]-critical*se,b[1]+critical*se
++    return dict(status="estimated",n=n,rank=p,slope=float(b[1]),se_hc3=se,lower90=float(lo),upper90=float(hi))
++
++
++def fidelity(rows, *, reps=2000, seed=SEED):
++    target=[r for r in rows if r["shot_type"]=="Standstill"]
++    graded=[r for r in target if r["outcome"]=="released" and r["grade"] in GRADES and r["coverage_state"]!="contested" and all(r.get(k) is not None for k in ("release_ms","hold_ms","press_ms"))]
++    sched=[r for r in graded if r["scheduled"]==1]
++    joined=[r for r in sched if r["primary_join"]]
++    assigned=[r for r in target if r["A"] is not None and not r["arm_conflict"]]
++    scheduled_all=[r for r in target if r["outcome"]=="released" and r["scheduled"]==1]
++    scheduled_joined=[r for r in scheduled_all if r["primary_join"]]
++    agreement=[r["D"] is not None and r["Z_final"] is not None and abs(r["D"]-r["Z_final"])<=.25 for r in scheduled_all]
++    multicount=sum(r["draw_count"]>1 for r in rows)
++    availability={}
++    for field in ("Z_first","A"):
++        groups=[[r for r in target if r[field] is not None and (int(r[field]>=0) if field=="Z_first" else r[field])==v] for v in (0,1)]
++        rates=[sum(r["outcome"]=="released" and r["grade"] in GRADES for r in rr)/len(rr) if rr else None for rr in groups]
++        availability[field]=dict(n=[len(rr) for rr in groups],grade_rates=rates,difference=abs(rates[1]-rates[0]) if None not in rates else None,
++                                 in_tick_rates=[sum(r["scheduled"]==0 for r in rr)/len(rr) if rr else None for rr in groups],
++                                 abort_rates=[sum(r["outcome"]!="released" for r in rr)/len(rr) if rr else None for rr in groups],
++                                 missing_banner_rates=[sum(r["outcome"]=="released" and r["grade"] not in GRADES for r in rr)/len(rr) if rr else None for rr in groups])
++    local=[r for r in scheduled_joined if r["H"] is not None]
++    local.sort(key=lambda r:r["press_ms"])
++    nuisance=np.array([[r["A"],r["onset_dev"],r["reference_unavailable"],i/max(1,len(local)-1)] for i,r in enumerate(local)])
++    fit=ols_hc3([r["H"] for r in local],[r["Z_final"] for r in local],nuisance) if local else {"status":"no_rows","n":0}
++    against_d=ols_hc3([r["H"] for r in local],[r["D"] for r in local],nuisance) if local else {"status":"no_rows","n":0}
++    blocks=[]
++    for session in sorted({r["session"] for r in local}):
++        ix=[i for i,r in enumerate(local) if r["session"]==session]
++        blocks.extend(np.array(ix[j:j+20]) for j in range(0,len(ix),20))
++    boot=[];rng=np.random.default_rng(seed)
++    if fit.get("status")=="estimated" and len(blocks)>=2:
++        for _ in range(reps):
++            ix=np.concatenate([blocks[j] for j in rng.integers(0,len(blocks),len(blocks))])
++            b=ols_hc3([local[i]["H"] for i in ix],[local[i]["Z_final"] for i in ix],nuisance[ix])
++            if b["status"]=="estimated":
++                boot.append(b["slope"])
++    counts=Counter(r["grade"] for r in joined)
++    def ratio(a,b):return a/b if b else None
++    conditions={
++        "graded_release_identity_coverage_ge90":(ratio(sum(r["release_seq"] is not None for r in graded),len(graded)) or 0)>=.9,
++        "graded_schedule_known_ge90":(ratio(sum(r["scheduled"] is not None for r in graded),len(graded)) or 0)>=.9,
++        "scheduled_primary_join_coverage_ge90":(ratio(len(joined),len(sched)) or 0)>=.9,
++        "local_clock_coverage_ge90":(ratio(len(local),len(scheduled_joined)) or 0)>=.9,
++        "record_release_clocks_valid":not any(r.get("clock_failure",False) for r in rows),
++        "all_attempt_arm_assignment_ge80":(ratio(len(assigned),len(rows)) or 0)>=.8,
++        "multiple_dev_draw_epochs_le2pct":(ratio(multicount,len(rows)) or 0)<=.02,
++        "ff_arm_consistent":not any(r["arm_conflict"] for r in rows),
++        "carried_vs_draw_agreement_ge95":bool((np.mean(agreement) if agreement else 0)>=.95),
++        "both_offset_signs":any(r["D"]<0 for r in joined) and any(r["D"]>0 for r in joined),
++        "both_arms":{r["A"] for r in joined}=={0,1},
++        "draws_within_uniform_support":all(-25<=r[k]<=25 for r in rows for k in ("Z_first","Z_final") if r[k] is not None),
++        "eight_early_and_late":counts["EARLY"]>=8 and counts["LATE"]>=8,
++        "grade_availability_difference_le10pp":all(v["difference"] is not None and v["difference"]<=.10 for v in availability.values()),
++        "local_first_stage_equivalent":fit.get("status")=="estimated" and fit["lower90"]>=.8 and fit["upper90"]<=1.2,
++    }
++    return dict(pass_all=all(conditions.values()),conditions=conditions,failed=[k for k,v in conditions.items() if not v],
++                funnel=dict(presses=len(rows),target_standstills=len(target),assigned=len(assigned),graded=len(graded),
++                            scheduled_all=len(scheduled_all),scheduled_graded=len(sched),joined_scheduled_graded=len(joined),local_clock_rows=len(local),
++                            in_tick=sum(r["scheduled"]==0 for r in target),unknown_schedule=sum(r["scheduled"] is None for r in target),
++                            multiple_draw_epochs=multicount),
++                delivery_agreement=ratio(sum(agreement),len(agreement)),availability=availability,
++                D_distribution=distribution(r["D"] for r in scheduled_all),Z_distribution=distribution(r["Z_first"] for r in rows),
++                F_by_arm={str(a):distribution(r["F"] for r in assigned if r["A"]==a) for a in (0,1)},
++                first_stage_Z=fit,first_stage_D=against_d,
++                block20_bootstrap=dict(blocks=len(blocks),successful=len(boot),requested=reps,
++                                       lower90=float(np.quantile(boot,.05)) if boot else None,
++                                       upper90=float(np.quantile(boot,.95)) if boot else None),
++                scheduler_absolute_delta_ms=distribution(abs(r["scheduler_delta_ms"]) for r in joined if r["scheduler_delta_ms"] is not None),
++                grade_counts=dict(counts))
++
++
++def wilson(k,n):
++    if not n:
++        return None
++    z=stats.norm.ppf(.975);p=k/n;den=1+z*z/n
++    mid=(p+z*z/(2*n))/den;h=z*math.sqrt(p*(1-p)/n+z*z/(4*n*n))/den
++    return mid-h,mid+h
++
++
++def risk_difference(k1,n1,k0,n0):
++    if not n1 or not n0:
++        return {"status":"missing_arm","counts":[k1,n1,k0,n0]}
++    p1=k1/n1;p0=k0/n0;l1,u1=wilson(k1,n1);l0,u0=wilson(k0,n0);rd=p1-p0
++    N=n1+n0;S=k1+k0;ks=np.arange(max(0,n1-(N-S)),min(n1,S)+1)
++    pmf=stats.hypergeom.pmf(ks,N,S,n1);diff=ks/n1-(S-ks)/n0
++    return dict(status="estimated",counts=[k1,n1,k0,n0],arm1_rate=p1,arm0_rate=p0,difference=rd,
++                lower95=rd-math.sqrt((p1-l1)**2+(u0-p0)**2),
++                upper95=rd+math.sqrt((u1-p1)**2+(p0-l0)**2),
++                permutation_p_two_sided=float(pmf[np.abs(diff)>=abs(rd)-1e-12].sum()),
++                permutation_p_arm1_better=float(pmf[diff>=rd-1e-12].sum()))
++
++
++def logistic_fit(X,y):
++    X=np.asarray(X,float);y=np.asarray(y,float)
++    if len(np.unique(y))<2 or np.linalg.matrix_rank(X)<X.shape[1]:return None
++    def fg(b):
++        z=X@b
++        return np.logaddexp(0,z).sum()-y@z,X.T@(special.expit(z)-y)
++    res=optimize.minimize(fg,np.zeros(X.shape[1]),jac=True,method="BFGS",options={"gtol":1e-6,"maxiter":500})
++    if not np.isfinite(res.fun) or np.max(np.abs(res.x))>30 or np.linalg.norm(fg(res.x)[1],np.inf)>1e-4:
++        return None
++    return res.x,float(res.fun)
++
++
++def ff_contrast(rows, *, reps=10000,seed=SEED):
++    rr=[r for r in rows if r["shot_type"]=="Standstill" and r["A"] is not None and not r["arm_conflict"]]
++    def contrast(sub,success):
++        ns=[sum(r["A"]==a for r in sub) for a in (0,1)]
++        ks=[sum(r["A"]==a and success(r) for r in sub) for a in (0,1)]
++        return risk_difference(ks[1],ns[1],ks[0],ns[0])
++    result=dict(assigned_n=len(rr),policy_success=contrast(rr,lambda r:r["outcome"]=="released" and r["grade"]=="EXCELLENT"),
++                graded_only=contrast([r for r in rr if r["outcome"]=="released" and r["grade"] in GRADES],lambda r:r["grade"]=="EXCELLENT"),
++                abort_or_missing=contrast(rr,lambda r:r["outcome"]!="released" or r["grade"] not in GRADES),
++                early_all_assigned=contrast(rr,lambda r:r["outcome"]=="released" and r["grade"]=="EARLY"),
++                warm_reference=contrast([r for r in rr if (r["ff_n"] or 0)>=4],lambda r:r["outcome"]=="released" and r["grade"]=="EXCELLENT"),
++                actual_F_by_arm={str(a):distribution(r["F"] for r in rr if r["A"]==a) for a in (0,1)})
++    ready=[r for r in rr if r["Z_first"] is not None]
++    if len(ready)<20 or len({r["A"] for r in ready})<2:
++        result["adjusted"]={"status":"insufficient_covariates_or_arms"};return result
++    X=np.array([[1,r["A"],r["Z_first"]/25,(r["Z_first"]/25)**2,r["onset_dev"]/50,r["reference_unavailable"],i/max(1,len(ready)-1)-.5] for i,r in enumerate(ready)])
++    keep=[0,1]+[j for j in range(2,X.shape[1]) if np.ptp(X[:,j])>1e-10];X=X[:,keep]
++    y=np.array([r["outcome"]=="released" and r["grade"]=="EXCELLENT" for r in ready],float)
++    def gcomp(X,y):
++        f=logistic_fit(X,y)
++        if f is None:return None
++        x1=X.copy();x0=X.copy();x1[:,1]=1;x0[:,1]=0
++        return float(np.mean(special.expit(x1@f[0])-special.expit(x0@f[0])))
++    estimate=gcomp(X,y);rng=np.random.default_rng(seed);boot=[]
++    if estimate is not None:
++        for _ in range(reps):
++            ix=rng.integers(0,len(y),len(y));v=gcomp(X[ix],y[ix])
++            if v is not None:boot.append(v)
++    result["adjusted"]=dict(status="estimated" if estimate is not None else "rank_or_separation_failure",n=len(ready),difference=estimate,
++                            bootstrap_requested=reps,bootstrap_successful=len(boot),
++                            lower95=float(np.quantile(boot,.025)) if reps and len(boot)>=.95*reps else None,
++                            upper95=float(np.quantile(boot,.975)) if reps and len(boot)>=.95*reps else None)
++    base=logistic_fit(X,y);interaction=np.array([r["A"]*r["onset_dev"]/50 for r in ready]);alt=logistic_fit(np.column_stack((X,interaction)),y)
++    result["arm_onset_interaction"]={"lr":float(max(0,2*(base[1]-alt[1]))),"p":float(stats.chi2.sf(max(0,2*(base[1]-alt[1])),1))} if base and alt else {"status":"not_identifiable"}
++    return result
++
++
++def compact_fit(fit):
++    return {k:v for k,v in fit.items() if k!="probs"}
++
++
++def historical_fit(rows):
++    """Observational diagnostic, NEVER a randomized primary fit."""
++    selected=historical_selection(rows)
++    subsets={"all":selected,
++             "confirmed_visible": [r for r in selected if r["pre_confirmed"] and .5<=r["pre_width_pp"]<=5],
++             "landing_visible": [r for r in selected if r["landing_width_pp"] is not None and .5<=r["landing_width_pp"]<=5]}
++    result={}
++    for label,rr in subsets.items():
++        if len(rr)<20:
++            result[label]={"success":False,"n":len(rr)};continue
++        # Reuse the ORIGINAL session medians, not medians recalculated on the subset.
++        f=fit_ordinal([r["meter_c"] for r in rr],np.zeros(len(rr)),[GRADES[r["grade"]] for r in rr],
++                      extra=np.array([r["onset_c"]/25 for r in rr])[:,None])
++        f=compact_fit(f);f["sessions"]=len({r["session"] for r in rr})
++        f["grade_counts"]=dict(Counter(r["grade"] for r in rr))
++        if f.get("success"):
++            f["beta"]=f["params"]["extra_0"]/25
++            f["L"]=f["params"]["c"]-f["params"]["W"]/2
++            f["U"]=f["params"]["c"]+f["params"]["W"]/2
++        result[label]=f
++    return result
++
++
++def hypothesis_predictions():
++    W=94.39;sigma=43.54;c=-7.415
++    pmax=2*special.ndtr(W/(2*sigma))-1
++    d=np.array([-25,-12.5,0,12.5,25.]);grid=np.linspace(-25,25,10001)
++    out={"convention":"arm 0; positive D is later; probabilities, not percentages", "hypotheses":{}}
++    for name,w in (("broad94",W),("visible12",12.),("visible16",16.),("visible20",20.)):
++        s=w/(2*special.ndtri((1+pmax)/2))
++        raw=ordinal_probs(d,np.zeros(len(d)),c,w,s)
++        centered=ordinal_probs(d,np.zeros(len(d)),0,w,s)
++        pg=ordinal_probs(grid,np.zeros(len(grid)),c,w,s)
++        out["hypotheses"][name]=dict(W=w,sigma=s,c=c,pmax=float(pmax),
++            raw_D=d.tolist(),raw_probabilities=raw.tolist(),
++            centered_offsets=d.tolist(),centered_probabilities=centered.tolist(),
++            uniform_sweep_EXCELLENT=float(np.trapezoid(pg[:,1],grid)/50),
++            area_bound=min(1.,w/50))
++    out["area_identity"]="Integral over all offsets of P(EXCELLENT|D=d) dd = E[W]; independent uniform +/-25 implies sweep success <= E[W]/50."
++    out["assumptions"]=["one-to-one independent additive offset", "width/center/noise unaffected by assignment", "no outcome-dependent selection"]
++    out["narrow20_with_broad_sigma_max"]=float(2*special.ndtr(20/(2*sigma))-1)
++    return out
++
++
++def interval_bootstrap(D,A,y,fit, *, reps=2000,seed=SEED):
++    p=np.asarray(fit["probs"]);rng=np.random.default_rng(seed);boot=[]
++    for _ in range(reps):
++        yy=(rng.random(len(y))[:,None]>np.cumsum(p,axis=1)[:,:2]).sum(axis=1)
++        f=fit_ordinal(D,A,yy,start=fit["params"],multistart=False)
++        if f.get("success") and not f["boundary"]:
++            boot.append([f["params"][k] for k in ("c","W","sigma")]+[f["pmax"]])
++    valid=reps>0 and len(boot)>=.95*reps
++    return dict(requested=reps,successful=len(boot),status="complete" if valid else "bootstrap_incomplete",
++                intervals={k:dict(lower95=float(np.quantile(np.array(boot)[:,j],.025)),
++                                   upper95=float(np.quantile(np.array(boot)[:,j],.975)))
++                           for j,k in enumerate(("c","W","sigma","pmax"))} if valid else {},
++                note="A bootstrap interval does not close an open likelihood profile or repair a boundary fit.")
++
++
++def width_interaction(rows, audit=None):
++    rr=[r for r in rows if r["pre_confirmed"] and r["pre_width_pp"] is not None and .5<=r["pre_width_pp"]<=5]
++    w=np.array([r["pre_width_pp"] for r in rr]);D=np.array([r["D"] for r in rr]);A=np.array([r["A"] for r in rr]);y=np.array([GRADES[r["grade"]] for r in rr])
++    q25,q75=np.quantile(w,[.25,.75]) if len(w) else (float("nan"),float("nan"))
++    groups=[np.flatnonzero(w<=q25),np.flatnonzero(w>=q75)]
++    temporal=ols_hc3(w,[r["Z_final"] for r in rr]) if len(rr) else {"status":"no_rows"}
++    # This audit must be independently made before seeing grades. Its keys are exact.
++    # Required columns: session,epoch,first_confirmed_width_pp,release_width_pp.
++    # Required companion JSON: blinded=true, selected_before_labels=true.
++    audit_result={"status":"no_independent_frame_audit"};audit_pass=False
++    if audit:
++        entries=audit.get("rows",[]);lookup={(r["session"],r["epoch"]):r for r in rr};seen=set();diff=[];strata=Counter();valid=True
++        zquartiles=np.quantile([r["Z_first"] for r in rr],[.25,.5,.75]) if rr else []
++        expected=[]
++        for arm in (0,1):
++            for quartile in range(4):
++                sub=sorted([r for r in rr if r["A"]==arm and np.searchsorted(zquartiles,r["Z_first"],side="right")==quartile],key=lambda r:r["press_ms"])
++                expected.extend((r["session"],r["epoch"]) for r in sub[:5])
++        for v in entries:
++            key=(v.get("session"),ident(v.get("epoch")));r=lookup.get(key)
++            a=number(v.get("first_confirmed_width_pp"));b=number(v.get("release_width_pp"))
++            if key in seen or r is None or a is None or b is None or not (.5<=a<=5 and .5<=b<=5) or abs(b-r["pre_width_pp"])>.1:
++                valid=False;continue
++            seen.add(key);diff.append(abs(a-b));strata[(r["A"],int(np.searchsorted(zquartiles,r["Z_first"],side="right")))]+=1
++        audit_pass=bool(valid and audit.get("blinded") is True and audit.get("selected_before_labels") is True and
++                    len(entries)==40 and len(expected)==40 and seen==set(expected) and len(diff)==40 and np.median(diff)<=.2 and np.quantile(diff,.95)<=.5)
++        audit_result=dict(status="passed" if audit_pass else "failed",n=len(diff),absolute_difference_pp=distribution(diff),
++                          selection="first five chronological eligible shots in each A x Z-quartile stratum; exact 40 keys",strata={str(k):v for k,v in strata.items()})
++    conditions=dict(at_least_60=len(rr)>=60,iqr_ge_1pp=bool(q75-q25>=1),twenty_each_outer_quartile=all(len(g)>=20 for g in groups),
++                    independent_frame_audit=audit_pass,
++                    width_not_shifted_by_Z=temporal.get("status")=="estimated" and temporal["lower90"]>=-.02 and temporal["upper90"]<=.02)
++    result=dict(n=len(rr),width_pp=distribution(w),conditions=conditions,confirmatory_eligible=all(conditions.values()),
++                frame_audit=audit_result,width_on_Z=temporal,local_first_stage_by_width={})
++    for name,g in zip(("narrow","wide"),groups):
++        sub=[rr[i] for i in g if rr[i]["H"] is not None]
++        result["local_first_stage_by_width"][name]=ols_hc3([r["H"] for r in sub],[r["Z_final"] for r in sub],
++                   [[r["A"],r["onset_dev"],r["reference_unavailable"],i/max(1,len(sub)-1)] for i,r in enumerate(sub)]) if sub else {"status":"no_rows"}
++    result["quartile_delivery_unresolved"]=any(v.get("status")!="estimated" or v["lower90"]<.8 or v["upper90"]>1.2 for v in result["local_first_stage_by_width"].values())
++    full=[r for r in rows if r["pre_confirmed"] and r["pre_width_pp"] is not None and r["pre_width_pp"]>0]
++    result["full_range_sensitivity"]={"n":len(full),"status":"insufficient_rows"}
++    if len(full)>=60 and len({r["pre_width_pp"] for r in full})>=4:
++        result["full_range_sensitivity"]={"n":len(full),"status":"exploratory_only",
++            "base":compact_fit(fit_ordinal([r["D"] for r in full],[r["A"] for r in full],[GRADES[r["grade"]] for r in full])),
++            "alternative":compact_fit(fit_ordinal([r["D"] for r in full],[r["A"] for r in full],[GRADES[r["grade"]] for r in full],width=[r["pre_width_pp"] for r in full]))}
++    if len(rr)<60 or len(np.unique(w))<4 or len(np.unique(y))<3:
++        result["status"]="insufficient_for_width_model";return result
++    base=fit_ordinal(D,A,y);alt=fit_ordinal(D,A,y,width=w)
++    result.update(base=compact_fit(base),alternative=compact_fit(alt),status="confirmatory" if result["confirmatory_eligible"] else "exploratory_only")
++    if not base.get("success") or not alt.get("success"):
++        result["status"]="fit_failed";return result
++    lr=max(0.,2*(base["nll"]-alt["nll"]));result["LRT3"]=dict(statistic=lr,p=float(stats.chi2.sf(lr,3)))
++    result["profiles"]=profile_intervals(D,A,y,alt,width=w,parameters=("eta","kappa","gamma"))
++    p=alt["params"];predictions=[]
++    for width in (q25,q75):
++        wc=width-alt["width_center_pp"];slope=1+p["gamma"]*wc
++        center=p["c"]+p["eta"]*wc;width_ms=p["W"]+p["kappa"]*wc
++        for arm in (0,1):
++            for d in (-25.,0.,25.):
++                lo=(center-width_ms/2-slope*d-p["delta"]*arm)/p["sigma"]
++                hi=(center+width_ms/2-slope*d-p["delta"]*arm)/p["sigma"]
++                # Units: change in probability per ms of delivered D.
++                deriv=[-slope/p["sigma"]*stats.norm.pdf(lo),slope/p["sigma"]*(stats.norm.pdf(lo)-stats.norm.pdf(hi)),slope/p["sigma"]*stats.norm.pdf(hi)]
++                predictions.append(dict(width_pp=float(width),D=d,A=arm,probabilities=ordinal_probs([d],[arm],p["c"],p["W"],p["sigma"],p["delta"],wc=[wc],eta=p["eta"],kappa=p["kappa"],gamma=p["gamma"])[0].tolist(),derivative=deriv))
++    result["predictions"]=predictions
++    result["band_center_IQR_shift_ms"]=float(p["eta"]*(q75-q25))
++    def optimum(q,a):
++        wc=q-alt["width_center_pp"];slope=1+p["gamma"]*wc
++        return (p["c"]+p["eta"]*wc-p["delta"]*a)/slope if abs(slope)>1e-8 else None
++    result["optimal_D_by_arm_and_width"]={str(a):[optimum(q,a) for q in (q25,q75)] for a in (0,1)}
++    result["build_authorized"]=False
++    result["build_reason"]="Later independent sessions and held-out adaptive policy gain remain required; an interaction alone is not a shipping result."
++    return result
++
++
++def trial_analysis(rows, *, protocol_pass=False, width_audit=None, reps_gof=2000, reps_ff=10000, reps_fidelity=2000):
++    gate=fidelity(rows,reps=reps_fidelity)
++    result=dict(fidelity=gate,FF=ff_contrast(rows,reps=reps_ff),protocol_pass=bool(protocol_pass),
++                network={"status":"not_confirmatory_in_single_session","C1_C2":"Requires separate >=5-session held-out extension; not fitted by this script."},
++                shipping_decision="No sweep-only shipping or ceiling-confirmed decision.")
++    target=[r for r in rows if r["shot_type"]=="Standstill"]
++    coverage=Counter(r["coverage_state"] for r in target)
++    result["population"]=dict(coverage=dict(coverage),distance_ft=distribution(r.get("distance_ft") for r in target),
++          open_generalisation=bool(target) and coverage["contested"]/len(target)<=.2 and coverage["unknown"]/len(target)<=.5)
++    result["arm_offset_bins"]=[]
++    for arm in (0,1):
++        for b in range(5):
++            sub=[r for r in target if r["A"]==arm and r["Z_first"] is not None and np.searchsorted([-15,-5,5,15],r["Z_first"],side="right")==b]
++            result["arm_offset_bins"].append(dict(A=arm,bin=b,n=len(sub),grades=dict(Counter(r["grade"] or "MISSING" for r in sub))))
++    result["FF"]["causal_interpretation_eligible"]=bool(protocol_pass and gate["pass_all"])
++    if not protocol_pass or not gate["pass_all"]:
++        result.update(status="PRIMARY_SUPPRESSED",primary={"status":"not_fitted","reason":"protocol_or_fidelity_gate_failed"},width={"status":"not_fitted_after_failed_gate"})
++        return result
++    rr=[r for r in rows if r["shot_type"]=="Standstill" and r["outcome"]=="released" and r["grade"] in GRADES and
++        r["coverage_state"]!="contested" and r["scheduled"]==1 and r["primary_join"] and r["hold_ms"] is not None]
++    D=np.array([r["D"] for r in rr]);A=np.array([r["A"] for r in rr]);y=np.array([GRADES[r["grade"]] for r in rr]);Z=np.array([r["Z_first"] for r in rr])
++    fit=fit_ordinal(D,A,y);result.update(status="ANALYSED",primary=compact_fit(fit))
++    if not fit.get("success"):
++        result["status"]="PRIMARY_FIT_FAILED";return result
++    profiles=profile_intervals(D,A,y,fit);result["primary"]["profiles"]=profiles
++    if fit["boundary"] or any(v is None for item in profiles.values() for v in (item["lower95"],item["upper95"])):
++        result["primary"]["bootstrap_fallback"]=interval_bootstrap(D,A,y,fit,reps=reps_gof)
++    result["primary"]["goodness_of_fit"]=gof_bootstrap(D,A,y,Z,fit,reps=reps_gof)
++    result["primary"]["fixed_scale_sensitivity"]={str(s):compact_fit(fit_ordinal(D,A,y,slope=s)) for s in (.8,1.2)}
++    o=np.array([r["onset_ms"] if r["onset_ms"] is not None else np.nan for r in rr]);o-=np.nanmedian(o)
++    keep=np.isfinite(o);order=np.arange(len(rr))/max(1,len(rr)-1)-.5
++    extra=np.column_stack((o[keep]/50,order[keep],A[keep]*o[keep]/50))
++    if len(extra):extra=extra[:,np.ptp(extra,axis=0)>1e-10]
++    sensitive=fit_ordinal(D[keep],A[keep],y[keep],extra=extra)
++    same_cohort_base=fit_ordinal(D[keep],A[keep],y[keep])
++    shifts={k:sensitive["params"][k]/same_cohort_base["params"][k]-1 for k in ("W","sigma")} if sensitive.get("success") and same_cohort_base.get("success") else {}
++    result["context_sensitivity"]=dict(fit=compact_fit(sensitive),same_cohort_base=compact_fit(same_cohort_base),fractional_shifts=shifts,context_dependent=any(abs(v)>.2 for v in shifts.values()),missing_onset=int((~keep).sum()))
++    explicit=[r for r in rr if r["coverage_state"]=="open"]
++    result["explicit_open_sensitivity"]=compact_fit(fit_ordinal([r["D"] for r in explicit],[r["A"] for r in explicit],[GRADES[r["grade"]] for r in explicit]))
++    result["width"]=width_interaction(rr,width_audit)
++    return result
++
++
++def cohort_from_presses(rows,events,start,sessions,block):
++    presses=[e for e in events if e["stage"]=="press" and e["t"]>=start][:block]
++    chosen=[];missing=[];duplicates=[];used=set()
++    for e in presses:
++        ep=ident(e["f"].get("epoch"))
++        matches=[r for r in rows if r["epoch"]==ep and abs(r["press_ms"]-e["t"])<=150 and r["session"] in sessions]
++        if len(matches)!=1:
++            missing.append(dict(epoch=ep,press_ms=e["t"],matches=len(matches)));continue
++        r=matches[0];key=(r["session"],r["epoch"])
++        if key in used:duplicates.append(key);continue
++        used.add(key);chosen.append(r)
++    return chosen,dict(requested=block,physical_presses=len(presses),records_matched=len(chosen),missing_or_ambiguous=missing,duplicate_keys=duplicates,
++                       complete=len(presses)==block and not missing and not duplicates)
++
++
++def capture_check(path,rows):
++    if path is None:return {"pass":False,"reason":"capture_not_supplied"}
++    try:
++        meta=json.loads((path/"meta.json").read_text(encoding="utf-8-sig"))
++        times=[];invalid=0
++        with (path/"packets.csv").open(encoding="utf-8-sig",newline="") as f:
++            for r in csv.DictReader(f):
++                t=number(r.get("wall_ms"))
++                if t is not None and r.get("dir") in ("in","out") and r.get("peer") and number(r.get("len")) is not None:
++                    times.append(t)
++                else:invalid+=1
++        overlap=bool(times and rows and min(times)<=min(r["press_ms"] for r in rows) and max(times)>=max(r["closed_ms"] for r in rows))
++        return dict(pass_=bool(overlap and not invalid and meta.get("snaplen")==42),rows=len(times),invalid=invalid,covers_block=overlap,
++                    snaplen=meta.get("snaplen"),packet_identity="unverified; no capture delivery-fidelity claim",pcap_header_audit="manual independent prerequisite for network analysis")
++    except (OSError,ValueError) as e:
++        return {"pass_":False,"reason":str(e)}
++
++
++def protocol_check(protocol,events,rows,cohort,capture,record_counts):
++    required={"same_spot":True,"online_open_standstills":True,"offset_spec":"uniform:-25:25","ff_spec":"0.2:10:1,0.45:40:0"}
++    fields={k:protocol.get(k)==v for k,v in required.items()}
++    for k in ("build_sha256","settings_sha256"):
++        fields[k]=bool(re.fullmatch(r"[0-9a-fA-F]{64}",str(protocol.get(k,""))))
++    processes={r["process"] for r in rows if r["process"] is not None}
++    hooks={e["process"] for e in events if e["stage"]=="hook" and e["f"].get("spec")=="uniform:-25:25" and rows and e["t"]<=max(r["closed_ms"] for r in rows)}
++    fields["hook_in_each_process"]=bool(processes) and processes<=hooks
++    fields["complete_press_ledger"]=cohort.get("complete",False)
++    fields["capture_collecting"]=capture.get("pass_",False)
++    fields["no_corrupt_input_identity"]=not any(record_counts.get(k,0) for k in ("invalid_json","invalid_identity_or_interval","conflicting_duplicates"))
++    # Verify logged arm settings, not just a declaration or nonzero displacement.
++    assigned=[r for r in rows if r["A"] in (0,1)]
++    fields["logged_arm_parameters"]=bool(assigned) and all(r.get("ff_gain")==(.2 if r["A"]==0 else .45) and
++         r.get("ff_clamp_ms")== (10 if r["A"]==0 else 40) and r.get("one_sided")== (1 if r["A"]==0 else 0) for r in assigned)
++    return {"pass_all":all(fields.values()),"conditions":fields,"capture":capture,"declaration":protocol}
++
++
++def sha256(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def write_outputs(out,rows,report):
++    out.mkdir(parents=True,exist_ok=False)  # Freeze results; never overwrite a prior run.
++    fields=sorted({k for r in rows for k in r})
++    with (out/"shots.csv").open("w",encoding="utf-8",newline="") as f:
++        writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
++        for r in rows:
++            writer.writerow({k:json.dumps(v,separators=(",",":")) if isinstance(v,(dict,list)) else v for k,v in r.items()})
++    (out/"summary.json").write_text(json.dumps(report,indent=2,allow_nan=False),encoding="utf-8")
++    lines=[f"sweep_analysis {VERSION}",f"mode={report['mode']}",f"records={len(rows)}",
++           f"status={report['trial']['status']}",f"assigned={report['trial']['fidelity']['funnel']['assigned']}",
++           f"fidelity_pass={report['trial']['fidelity']['pass_all']}",
++           "failed="+",".join(report['trial']['fidelity']['failed']),
++           "primary_fit="+str(report['trial']['primary'].get('success',False)),
++           "No application launch, build, capture, network connection, or source modification performed."]
++    text="\n".join(lines)+"\n";(out/"RUN.txt").write_text(text,encoding="utf-8");return text
++
++
++def main(argv=None):
++    ap=argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--records-dir",type=Path,required=True)
++    ap.add_argument("--logs",type=Path,nargs="+",required=True)
++    ap.add_argument("--out-dir",type=Path,required=True)
++    ap.add_argument("--dry-run",action="store_true")
++    ap.add_argument("--session",action="append",default=[])
++    ap.add_argument("--start-utc")
++    ap.add_argument("--block",type=int,choices=(100,200),default=100)
++    ap.add_argument("--protocol-json",type=Path)
++    ap.add_argument("--capture-dir",type=Path)
++    ap.add_argument("--width-audit",type=Path,help="JSON with blinded, selected_before_labels and exact-key rows; see preregistration")
++    args=ap.parse_args(argv)
++    if args.out_dir.exists():ap.error("output directory already exists; use a new path")
++    if not args.dry_run and (not args.session or not args.start_utc or not args.protocol_json):
++        ap.error("real analysis requires --session, --start-utc and --protocol-json")
++    paths=sorted(args.records_dir.glob("*.jsonl"))
++    if not paths:ap.error("no shot-record JSONL files")
++    plan_path=Path(__file__).resolve().parents[2]/"docs"/"variance"/"PREREGISTRATION_OFFSET_SWEEP.md"
++    inputs=paths+args.logs+[Path(__file__).resolve()]+[p for p in (args.protocol_json,args.width_audit) if p]
++    if plan_path.is_file():inputs.append(plan_path)
++    if args.capture_dir:
++        inputs += [args.capture_dir/name for name in ("meta.json","packets.csv","pings.csv") if (args.capture_dir/name).is_file()]
++    before={str(p.resolve()):sha256(p) for p in inputs}
++    records,rc=load_records(paths);events,ec=load_events(args.logs);rows=join_shots(records,events)
++    corpus=hashlib.sha256()
++    for p in paths:corpus.update(p.name.encode()+b"\0"+bytes.fromhex(before[str(p.resolve())]))
++    audit=json.loads(args.width_audit.read_text(encoding="utf-8-sig")) if args.width_audit else None
++    windows=window_summary(rows);legacy=historical_fit(rows) if args.dry_run else {"status":"not_run_on_new_trial"}
++    if args.dry_run:
++        cohort={"status":"legacy_all_records_not_a_trial"};protocol={"pass_all":False,"reason":"dry_run_never_a_preregistered_trial"}
++    else:
++        rows,cohort=cohort_from_presses(rows,events,utc_ms(args.start_utc),set(args.session),args.block)
++        p=json.loads(args.protocol_json.read_text(encoding="utf-8-sig"))
++        protocol=protocol_check(p,events,rows,cohort,capture_check(args.capture_dir,rows),rc)
++    trial=trial_analysis(rows,protocol_pass=protocol["pass_all"],width_audit=audit)
++    if any(sha256(p)!=before[str(p.resolve())] for p in inputs):
++        raise RuntimeError("input changed during analysis; discard this result and rerun on frozen inputs")
++    report=dict(version=VERSION,mode="legacy_dry_run" if args.dry_run else "preregistered_trial",argv=sys.argv[1:] if argv is None else argv,
++                created_utc=datetime.now(timezone.utc).isoformat(),numpy=np.__version__,scipy=__import__('scipy').__version__,
++                input_sha256=before,corpus_digest=corpus.hexdigest(),record_parse=rc,event_parse=ec,
++                join_counts=dict(Counter(r["join_source"] or "none" for r in rows)),
++                conflicts=[{"session":r["session"],"epoch":r["epoch"],"reasons":r["join_conflicts"]} for r in rows if r["join_conflicts"]],
++                cohort=cohort,protocol=protocol,trial=trial,visible_windows=windows,legacy_observational_fit=legacy,
++                hypothesis_predictions=hypothesis_predictions())
++    print(write_outputs(args.out_dir,rows,report),end="")
++    return 0 if args.dry_run or trial["status"]=="ANALYSED" else 2
++
++
++if __name__=="__main__":
++    raise SystemExit(main())
+diff --git a/tools/timing/test_sweep_analysis.py b/tools/timing/test_sweep_analysis.py
+new file mode 100644
+--- /dev/null
++++ b/tools/timing/test_sweep_analysis.py
+@@ -0,0 +1,238 @@
++"""Offline regression tests. Temporary fixtures stay under docs/variance/.
++
++Run: python -B tools/timing/test_sweep_analysis.py
++No Orion imports, launches, builds, capture, or live network operations.
++"""
++from datetime import datetime, timezone
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++
++import numpy as np
++from scipy import stats
++import sweep_analysis as sa
++
++ROOT=Path(__file__).resolve().parents[2]
++TMP=ROOT/"docs"/"variance"/"window_discrepancy_evidence"
++
++
++def stamp(t):
++    return datetime.fromtimestamp(t/1000,timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z")
++
++
++def record(ep=9007199254740993,seq=700,start=1789992000000.,release=None,session="fixture"):
++    release=start+600 if release is None else release
++    return dict(session=session,epoch=ep,seq=seq,press_ts_ms=start,closed_ts_ms=release+700,
++                release_ms=release,release_after_press_ms=release-start,onset_ms=200,
++                onset_source="detect_loop",shot_type="Standstill",outcome="released",
++                banner=dict(timing="EXCELLENT",coverage="WIDE OPEN"))
++
++
++def log_lines(r,native_seq=4,attempt=17,Z=12.,D=None,A=1,F=-10.,scheduled=1,landing=True,draw=True):
++    p=r["press_ts_ms"];t=r["release_ms"];ep=r["epoch"];D=Z if D is None else D
++    lines=[(p,f"Physical shot epoch: epoch={ep}"),
++           (p+20,f"TIP RESERVATION: physical_epoch={ep} shot_attempt={attempt}"),
++           (p+30,f"ONSET FF: reason=applied onset_ms=200 ref_ms=180 dev_ms=20 applied_ms={F} n=5 gain={.45 if A==1 else .2} clamp_ms={40 if A==1 else 10} one_sided={0 if A==1 else 1} physical_epoch={ep} shot_attempt={attempt}"+(f" ab_arm={A}" if A is not None else "")),
++           (t,f"Release issued: (green 93.0-96.7) seq={native_seq}"),
++           (t,f"Release delivery identity: physical_epoch={ep} shot_attempt={attempt} release_seq={native_seq}"),
++           (t,f"Release onsetff: seq={native_seq} physical_epoch={ep} shot_attempt={attempt} applied_ms={F} scheduled={scheduled}"),
++           (t,f"Release devoffset: seq={native_seq} shot_attempt={attempt} applied_ms={D} scheduled={scheduled}"),
++           (t,f"Scheduled fire: seq={native_seq} shot_attempt={attempt} scheduled={scheduled} deltaMs=0.2"),
++           (t,f"Release attribution: seq={native_seq} greenConfirmed=1 greenWidth=3.7 greenConfirmMs=40 vel=0.18"),
++           (t,f"Release timing: seq={native_seq} appearToRelMs=100 holdToRelMs=90")]
++    if draw:lines.append((p+25,f"DEV FIRE OFFSET DRAW: shot_attempt={attempt} offset_ms={Z}"))
++    if landing:lines.append((t+1200,f"Release landing: seq={native_seq} graded=1 green_obs_n=4 green_start=93.0 green_end=96.7 vel_at_rel=0.18"))
++    return [stamp(t)+" "+s for t,s in sorted(lines,key=lambda v:v[0])]
++
++
++def synthetic_rows(n=200,delivery=1.,seed=910):
++    rng=np.random.default_rng(seed);Z=rng.uniform(-25,25,n);A=rng.integers(0,2,n);o=rng.normal(0,30,n)
++    probabilities=sa.ordinal_probs(Z,A,-7.4,94.39,43.54,delta=-3.)
++    y=(rng.random(n)[:,None]>np.cumsum(probabilities,axis=1)[:,:2]).sum(axis=1)
++    rows=[]
++    for i in range(n):
++        r=dict(session="synthetic",epoch=i+1,press_ms=float(i*10000),release_ms=float(i*10000+600),hold_ms=600.,
++               closed_ms=float(i*10000+1300),onset_ms=200+o[i],onset_dev=float(o[i]),reference_unavailable=0,
++               shot_type="Standstill",outcome="released",grade=list(sa.GRADES)[y[i]],coverage_state="open",
++               release_seq=i+201,join_source="release_ff",join_conflicts=[],primary_join=True,A=int(A[i]),
++               Z_first=float(Z[i]),Z_final=float(Z[i]),D=float(Z[i]),F=float(-3*A[i]),scheduled=1,
++               draw_count=1,arm_conflict=False,H=float(400+delivery*Z[i]+.2*o[i]-3*A[i]+rng.normal(0,1)),
++               ff_n=5,scheduler_delta_ms=.2,pre_confirmed=True,pre_width_pp=float(rng.uniform(.6,4.9)))
++        rows.append(r)
++    return rows
++
++
++class SweepTests(unittest.TestCase):
++    def setUp(self):
++        TMP.mkdir(parents=True,exist_ok=True)
++        self.tmp=tempfile.TemporaryDirectory(prefix="unit_",dir=TMP)
++        self.path=Path(self.tmp.name)
++    def tearDown(self):self.tmp.cleanup()
++
++    def join(self,records,lines):
++        p=self.path/"native.log";p.write_text("\n".join(lines),encoding="utf-8")
++        ev,counts=sa.load_events([p]);return sa.join_shots(records,ev),ev,counts
++
++    def test_curve_not_release_velocity(self):
++        self.assertAlmostEqual(sa.curve_window(90,100),41.1)
++        self.assertAlmostEqual(sa.curve_window(93,96.7),15.207)
++        self.assertIsNone(sa.curve_window(98,95))
++        self.assertAlmostEqual(sa.curve_time(10),-10/.158)
++
++    def test_exact_physical_key_native_seq_and_late_landing(self):
++        r=record();rows,_,_=self.join([r],log_lines(r));x=rows[0]
++        self.assertEqual(x["epoch"],9007199254740993)
++        self.assertEqual(x["record_seq"],700);self.assertEqual(x["release_seq"],4)
++        self.assertTrue(x["primary_join"])
++        self.assertAlmostEqual(x["landing_width_ms"],15.207)
++        self.assertGreater(r["release_ms"]+1200,r["closed_ts_ms"])
++        self.assertAlmostEqual(x["H"],400)  # NOT native holdToRelMs=90.
++        self.assertEqual((x["Z_first"],x["D"],x["F"],x["A"]),(12.,12.,-10.,1))
++
++    def test_resets_and_forwarded_duplicate(self):
++        a=record(ep=21,session="a");b=record(ep=1,session="b",start=a["press_ts_ms"]+10000)
++        la=log_lines(a,native_seq=7);lb=log_lines(b,native_seq=1)
++        rows,_,counts=self.join([a,b],la+lb+[la[0]])
++        self.assertEqual(counts["process_partitions"],2)
++        self.assertNotEqual(rows[0]["process"],rows[1]["process"])
++        self.assertTrue(all(r["primary_join"] for r in rows))
++        self.assertEqual(counts["identical_forwarded_lines"],1)
++
++    def test_ambiguous_epoch_is_quarantined(self):
++        a=record();b=dict(a,session="overlapping")
++        rows,_,_=self.join([a,b],log_lines(a))
++        self.assertTrue(all(r["release_seq"] is None and not r["primary_join"] for r in rows))
++
++    def test_missing_assignments_are_not_zero(self):
++        r=record();rows,_,_=self.join([r],log_lines(r,A=None,F=0,draw=False))
++        self.assertIsNone(rows[0]["A"]);self.assertIsNone(rows[0]["Z_first"])
++        self.assertFalse(rows[0]["primary_join"])
++
++    def test_impossible_release_clock_blocks_inference(self):
++        r=record();r['release_after_press_ms']+=10
++        rows,_,_=self.join([r],log_lines(r))
++        self.assertTrue(rows[0]['clock_failure'])
++        self.assertFalse(sa.fidelity(rows,reps=0)['conditions']['record_release_clocks_valid'])
++
++    def test_release_value_not_last_refinement(self):
++        r=record();lines=log_lines(r)
++        lines.append(stamp(r["release_ms"]+1)+" DEV FIRE OFFSET APPLIED: shot_attempt=17 applied_ms=-21")
++        x=self.join([r],lines)[0][0]
++        self.assertEqual(x["D"],12);self.assertEqual(len(x["dev_refinement_audit"]),1)
++
++    def test_distinct_arm_token_draws_preserve_first_and_final(self):
++        r=record();lines=log_lines(r,attempt=18,Z=20)
++        lines.extend([stamp(r["press_ts_ms"]+5)+f" TIP RESERVATION: physical_epoch={r['epoch']} shot_attempt=17",
++                      stamp(r["press_ts_ms"]+10)+" DEV FIRE OFFSET DRAW: shot_attempt=17 offset_ms=-15"])
++        x=self.join([r],lines)[0][0]
++        self.assertEqual((x["Z_first"],x["Z_final"],x["D"],x["draw_count"]),(-15,20,20,2))
++
++    def test_in_tick_must_be_zero_and_arm_conflicts_fail(self):
++        r=record();x=self.join([r],log_lines(r,scheduled=0,D=12))[0][0]
++        self.assertFalse(x["primary_join"])
++        lines=log_lines(r);lines.append(stamp(r["press_ts_ms"]+40)+f" ONSET FF: reason=applied physical_epoch={r['epoch']} shot_attempt=17 ab_arm=0")
++        x=self.join([r],lines)[0][0]
++        self.assertTrue(x["arm_conflict"]);self.assertIsNone(x["A"])
++
++    def test_record_dedup_and_invalid_identity(self):
++        r=record();p=self.path/"records.jsonl"
++        p.write_text("\n".join(json.dumps(v) for v in [r,r,dict(r,banner={}),dict(r,epoch=1.25),"bad"]),encoding="utf-8")
++        rr,c=sa.load_records([p]);self.assertEqual(rr,[])
++        self.assertEqual(c["identical_duplicates"],1);self.assertEqual(c["conflicting_duplicates"],1)
++        self.assertEqual(c["invalid_identity_or_interval"],1);self.assertEqual(c["invalid_json"],1)
++
++    def test_newcombe_and_exact_permutation(self):
++        x=sa.risk_difference(7,10,3,10)
++        self.assertAlmostEqual(x["difference"],.4)
++        self.assertLess(x["lower95"],0);self.assertGreater(x["upper95"],.4)
++        # Symmetric equal-sized design: two-sided hypergeometric tail = Fisher exact.
++        self.assertAlmostEqual(x["permutation_p_two_sided"],stats.fisher_exact([[7,3],[3,7]]).pvalue)
++        self.assertEqual(sa.risk_difference(0,0,3,10)["status"],"missing_arm")
++
++    def test_scale_nonidentification_demonstrated(self):
++        D=np.linspace(-40,40,40);A=np.zeros(40);a=15.207/94.39
++        p=sa.ordinal_probs(D,A,-7.415,94.39,43.54)
++        q=sa.ordinal_probs(D,A,-7.415*a,94.39*a,43.54*a,slope=a)
++        np.testing.assert_allclose(p,q,atol=1e-14)
++
++    def test_broad_and_narrow_MLE_recovery(self):
++        for W,sigma in ((94.39,43.54),(16.,7.38)):
++            rng=np.random.default_rng(148);n=5000;D=rng.uniform(-25,25,n);A=rng.integers(0,2,n)
++            p=sa.ordinal_probs(D,A,-7.4,W,sigma,delta=-3)
++            y=(rng.random(n)[:,None]>np.cumsum(p,axis=1)[:,:2]).sum(axis=1)
++            f=sa.fit_ordinal(D,A,y)
++            self.assertTrue(f["success"],f)
++            self.assertLess(abs(f["params"]["W"]/W-1),.2)
++            self.assertLess(abs(f["params"]["sigma"]/sigma-1),.2)
++            self.assertLess(abs(f["params"]["c"]+7.4),3)
++
++    def test_fidelity_one_vs_029(self):
++        good=sa.fidelity(synthetic_rows(),reps=20)
++        bad=sa.fidelity(synthetic_rows(delivery=.29),reps=20)
++        self.assertTrue(good["pass_all"],good["failed"])
++        self.assertFalse(bad["pass_all"])
++        self.assertLess(bad["first_stage_Z"]["upper90"],.8)
++
++    def test_fidelity_uses_ungraded_releases_and_flags_multidraw(self):
++        rows=synthetic_rows();rows[0]["grade"]=None
++        out=sa.fidelity(rows,reps=0)
++        self.assertEqual(out["funnel"]["local_clock_rows"],len(rows))
++        for r in rows[:5]:r["draw_count"]=2
++        self.assertFalse(sa.fidelity(rows,reps=0)["conditions"]["multiple_dev_draw_epochs_le2pct"])
++
++    def test_ff_missing_banner_is_policy_failure_not_early(self):
++        rows=synthetic_rows(100)
++        r=next(r for r in rows if r["A"]==1);r["grade"]=None
++        out=sa.ff_contrast(rows,reps=10)
++        self.assertEqual(sum(out["policy_success"]["counts"][1::2]),100)
++        self.assertEqual(sum(out["graded_only"]["counts"][1::2]),99)
++        self.assertEqual(out["early_all_assigned"]["counts"][0],sum(r["A"]==1 and r["grade"]=="EARLY" for r in rows))
++
++    def test_area_and_competing_curves(self):
++        h=sa.hypothesis_predictions()["hypotheses"]
++        self.assertGreater(h["broad94"]["uniform_sweep_EXCELLENT"],.65)
++        self.assertLess(h["visible16"]["uniform_sweep_EXCELLENT"],.32)
++        for v in h.values():self.assertLessEqual(v["uniform_sweep_EXCELLENT"],v["area_bound"]+1e-8)
++
++    def test_no_primary_without_protocol_and_width_no_audit(self):
++        rows=synthetic_rows()
++        out=sa.trial_analysis(rows,protocol_pass=False,reps_gof=2,reps_ff=2,reps_fidelity=2)
++        self.assertEqual(out["status"],"PRIMARY_SUPPRESSED")
++        with patch.object(sa,"profile_intervals",return_value={}):
++            w=sa.width_interaction(rows)
++        self.assertFalse(w["confirmatory_eligible"])
++        self.assertEqual(w["status"],"exploratory_only")
++
++    def test_primary_estimator_smoke(self):
++        rows=synthetic_rows()
++        # Fit likelihoods and resample for real; profile API covered below.
++        with patch.object(sa,"profile_intervals",return_value={}):
++            out=sa.trial_analysis(rows,protocol_pass=True,reps_gof=3,reps_ff=3,reps_fidelity=3)
++        self.assertEqual(out["status"],"ANALYSED")
++        self.assertTrue(out["primary"]["success"])
++        self.assertEqual(out["primary"]["goodness_of_fit"]["requested"],3)
++        self.assertEqual(out["width"]["status"],"exploratory_only")
++        # Exercise the real artifact serialization, not only Python return values.
++        self.assertIn('ANALYSED',json.dumps(out,allow_nan=False))
++
++    def test_profiles_contain_fit(self):
++        rows=synthetic_rows(200);D=[r["D"] for r in rows];A=[r["A"] for r in rows];y=[sa.GRADES[r["grade"]] for r in rows]
++        f=sa.fit_ordinal(D,A,y);p=sa.profile_intervals(D,A,y,f,parameters=("c","pmax"))
++        for x in p.values():
++            self.assertIsNotNone(x["lower95"]);self.assertIsNotNone(x["upper95"])
++            self.assertLess(x["lower95"],x["estimate"]);self.assertGreater(x["upper95"],x["estimate"])
++
++    def test_cohort_uses_first_presses_not_graded_survivors(self):
++        a=record(ep=1);b=record(ep=2,start=a["press_ts_ms"]+10000)
++        rows,ev,_=self.join([b],log_lines(a)+log_lines(b))
++        chosen,cohort=sa.cohort_from_presses(rows,ev,a["press_ts_ms"],{"fixture"},1)
++        self.assertEqual(chosen,[]);self.assertFalse(cohort["complete"])
++        self.assertEqual(cohort["missing_or_ambiguous"][0]["epoch"],1)
++
++    def test_output_refuses_overwrite(self):
++        with self.assertRaises(FileExistsError):sa.write_outputs(self.path,[],{})
++
++
++if __name__=="__main__":unittest.main(verbosity=2)

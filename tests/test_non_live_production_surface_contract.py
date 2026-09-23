@@ -50,7 +50,10 @@ def test_setup_keeps_backend_contracts_and_has_no_customer_performance_label() -
     assert 'title: "Production Setup"' not in dashboard
     assert 'title: "Connection"' in dashboard
     assert "StreamSetupForm {" in dashboard
-    assert 'title: "Profiles"' in dashboard
+    # [2026-09-21] The "Profiles" card left the Dashboard with the 09-14 simplification
+    # (profile/account data lives in the Sidebar licence flyout); this contract had kept
+    # asserting the removed card and was failing at HEAD.
+    assert 'title: "Profiles"' not in dashboard
     assert "Advanced Detection" not in dashboard
 
     for binding in (
@@ -169,8 +172,11 @@ def test_sidebar_and_tour_only_name_current_customer_surfaces() -> None:
     # may route to page "general" any more.
     assert "Overview" not in tour
     assert 'page: "general"' not in tour
-    assert "Setup holds your console, video source, controller, profiles, and account" in tour
-    assert "Setup keeps your source, controller" in tour
+    # [2026-09-21] Current tour copy (the 09-14 rewrite): Live / Setup / Updates are the only
+    # surfaces named, and Setup is described by what it actually holds today.
+    assert "Setup holds your console, video source, and audio settings, and Updates carries release notes." in tour
+    assert "Setup keeps your connection and stream settings in one place." in tour
+    assert "profiles, and account" not in tour
     assert "Performance shows" not in tour
     assert 'title: "Track your results"' not in tour
     # The connect CTA copy tracks the button.

@@ -63,14 +63,19 @@ endif()
 # SecurityCore shared library
 # ---------------------------------------------------------------------------
 add_library(SecurityCore SHARED
+    "${ORION_SRC_DIR}/BrokerInstallTrust.cpp"
+    "${ORION_SRC_DIR}/BrokerInstallTrust.h"
     "${ORION_SRC_DIR}/Ed25519.cpp"
     "${ORION_SRC_DIR}/Ed25519.h"
     "${ORION_SRC_DIR}/LeaseGate.cpp"
     "${ORION_SRC_DIR}/LeaseGate.h"
     "${ORION_SRC_DIR}/LicenseClient.cpp"
     "${ORION_SRC_DIR}/LicenseClient.h"
+    "${ORION_SRC_DIR}/MachineIdentity.cpp"
+    "${ORION_SRC_DIR}/MachineIdentity.h"
     "${ORION_SRC_DIR}/NetworkSecurity.cpp"
     "${ORION_SRC_DIR}/NetworkSecurity.h"
+    "${ORION_SRC_DIR}/PinnedSpki.h"
     "${ORION_SRC_DIR}/ReleaseManifestTrust.h"
     "${ORION_SRC_DIR}/SecurityManager.cpp"
     "${ORION_SRC_DIR}/SecurityManager.h"
@@ -111,7 +116,8 @@ if(TARGET OrionCommon)
     target_link_libraries(SecurityCore PUBLIC OrionCommon)
 endif()
 if(WIN32)
-    target_link_libraries(SecurityCore PUBLIC advapi32 crypt32 user32)
+    # wintrust: BrokerInstallTrust.cpp's Authenticode gate (WinVerifyTrust).
+    target_link_libraries(SecurityCore PUBLIC advapi32 crypt32 user32 wintrust)
 endif()
 
 # ---------------------------------------------------------------------------

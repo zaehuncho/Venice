@@ -21,12 +21,58 @@ These tests pin the fixes at the seams a unit test can actually reach: the new
 RemotePlayOrchestrator.close_remote_play_client() and recover_input_link()'s
 stopping-intent check.
 """
+import ast
+import inspect
 import threading
 import time
+from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 
 import remote_play_orchestrator as rpo
+from native_orion.backend import autogreen_sidecar as sidecar
+
+
+@pytest.mark.parametrize("bad_line", ["[]", "null", "1"])
+def test_non_object_command_drops_then_reader_reaches_shutdown(bad_line):
+    drops = []
+    source = ast.parse(inspect.getsource(sidecar.main))
+    loop = next(node for node in source.body[0].body
+                if isinstance(node, ast.FunctionDef) and node.name == "_stdin_loop")
+    scope = {
+        "sys": SimpleNamespace(stdin=StringIO(bad_line + '\n{"cmd":"shutdown"}\n')),
+        "_iter_stdin_commands": lambda lines: sidecar._iter_stdin_commands(
+            lines, lambda kind, exc: drops.append(kind)),
+        "_EXIT_REASON": {},
+        "stop_evt": threading.Event(),
+    }
+    exec(compile(ast.Module(body=[loop], type_ignores=[]), "sidecar-stdin", "exec"), scope)
+    scope["_stdin_loop"]()
+    assert drops == ["stdin_bad_schema"]
+    assert scope["stop_evt"].is_set()
+    assert scope["_EXIT_REASON"]["reason"] == "shutdown-cmd"
+
+
+def test_stdin_eof_remains_distinct_from_bad_schema():
+    source = ast.parse(inspect.getsource(sidecar.main))
+    names = {"_stdin_loop", "_stdin_loop_wrapped"}
+    loops = [node for node in source.body[0].body
+             if isinstance(node, ast.FunctionDef) and node.name in names]
+    logs = []
+    scope = {
+        "sys": SimpleNamespace(stdin=StringIO("[]\n")),
+        "_iter_stdin_commands": lambda lines: sidecar._iter_stdin_commands(
+            lines, lambda kind, exc: logs.append(kind)),
+        "_EXIT_REASON": {},
+        "_log": lambda message, level: logs.append((message, level)),
+        "stop_evt": threading.Event(),
+    }
+    exec(compile(ast.Module(body=loops, type_ignores=[]), "sidecar-stdin", "exec"), scope)
+    scope["_stdin_loop_wrapped"]()
+    assert logs[0] == "stdin_bad_schema"
+    assert "stdin EOF" in logs[1][0] and logs[1][1] == "warn"
+    assert scope["_EXIT_REASON"]["reason"] == "stdin-eof-then-unknown"
 
 
 class _FakeClientManager:

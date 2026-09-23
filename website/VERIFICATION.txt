@@ -1,6 +1,13 @@
 VENICE STOREFRONT + TRITON DEPLOYMENT VERIFICATION
 Generated: 2026-09-15 America/Chicago
 
+SUPERSEDED NOTE (2026-09-21): this is a historical record of the 2026-09-15 run. The
+customer price it verified ($25/month) was changed to $20/month (final) on 2026-09-21
+(website copy, bot, embeds, account page). The Stripe price objects pinned in
+website/wrangler.jsonc were NOT yet replaced at the time of this note; a fresh
+verification against the $20 price object is required before the next launch claim.
+Nothing below has been edited.
+
 DECISION
 needs changes
 

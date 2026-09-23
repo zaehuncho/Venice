@@ -1017,3 +1017,88 @@ def test_real_reader_is_silent_when_the_anchor_knob_is_off(clean_env, monkeypatc
         r.set_shot_state(True, 0.0, False)
 
     assert not _pickup_lines(caplog)
+
+
+@pytest.mark.parametrize("kind", ["Left Fade", "Right Fade", "Left_Fade", "Right_Fade"])
+@pytest.mark.parametrize("height", [360, 720, 1080])
+def test_fade_anchor_keeps_population_and_learned_x_hypotheses(clean_env, kind, height):
+    """Recorded ep8 was outside a standstill-trained x patch, not outside the meter gates."""
+    anchor = pa.PlayerAnchor()
+    anchor._off_dx = [26.5] * 6
+    anchor._off_dy = [163.95348837209303] * 6
+    anchor._tag = np.zeros((1, 1), dtype=np.uint8)  # identity already learned, as in ep8
+    before = (list(anchor._off_dx), list(anchor._off_dy))
+    pa.ARM.note_press(8, 100.0, kind)
+    scale = height / 720.0
+    width = int(height * 16 / 9)
+    a = anchor._anchor_from(535 * scale, 583 * scale, .86, .9, .9, 10,
+                            100.808, width, height)
+    # The real meter from retained source frame idx1149 (center 632, bottom442).
+    assert a.contains_box(619 * scale, 330 * scale, 26 * scale, 112 * scale)
+    # Keep the learned standstill location too; neither history nor its band is reset.
+    assert a.contains_box(495.5 * scale, 330 * scale, 26 * scale, 112 * scale)
+    assert a.cx_lo == pytest.approx(423.5 * scale)
+    assert a.cx_hi == pytest.approx(650 * scale)
+    assert a.x0 <= a.cx_lo and a.x1 >= a.cx_hi
+    # Neither the vertical band nor the two existing x tolerances becomes unbounded.
+    assert not a.contains_box(690 * scale, 330 * scale, 26 * scale, 112 * scale)
+    assert not a.contains_box(619 * scale, 550 * scale, 26 * scale, 112 * scale)
+    assert anchor._off_dx == before[0] and anchor._off_dy == before[1]
+    assert pa.PlayerAnchor.refuse_ok(a)  # strong anchor still refuses outside BOTH bands
+
+
+@pytest.mark.parametrize("kind, armed", [
+    ("Standstill", True), ("Go-To", True), ("unknown", True),
+    ("Left Fade", False), ("Right Fade", False),
+])
+def test_nonfade_or_released_anchor_geometry_stays_identical(clean_env, kind, armed):
+    anchor = pa.PlayerAnchor()
+    anchor._off_dx = [26.5] * 6
+    anchor._off_dy = [163.95348837209303] * 6
+    pa.ARM.note_press(8, 100.0, kind)
+    if not armed:
+        pa.ARM.note_release(8, 100.8)
+    actual = anchor._anchor_from(535, 583, .86, .9, .9, 10, 100.808, 1280, 720)
+    expected = pa.Anchor(535, 583, .86, actual.conf, .9, .9, 10, 100.808,
+                         26.5, 163.95348837209303 * .86, 85, 70 * .86,
+                         130, 1280, 720)
+    assert {key: getattr(actual, key) for key in actual.__slots__} == {
+        key: getattr(expected, key) for key in expected.__slots__}
+
+
+def test_fade_anchor_retains_operator_prior_not_a_hidden_constant(clean_env, monkeypatch):
+    monkeypatch.setenv("ORION_ANCHOR_DX", "-40")
+    anchor = pa.PlayerAnchor()
+    anchor._off_dx = [26.5] * 6
+    anchor._off_dy = [163.95348837209303] * 6
+    pa.ARM.note_press(8, 100.0, "Left Fade")
+    a = anchor._anchor_from(535, 583, .86, .9, .9, 10, 100.808, 1280, 720)
+    assert a.cx_hi == pytest.approx(660)
+    assert a.cx_lo == pytest.approx(423.5)
+
+
+@pytest.mark.parametrize("invalid", ["nan", "inf", "-inf"])
+def test_fade_anchor_ignores_nonfinite_extra_prior(clean_env, monkeypatch, invalid):
+    monkeypatch.setenv("ORION_ANCHOR_DX", invalid)
+    anchor = pa.PlayerAnchor()
+    anchor._off_dx = [26.5] * 6
+    anchor._off_dy = [163.95348837209303] * 6
+    pa.ARM.note_press(8, 100.0, "Left Fade")
+    a = anchor._anchor_from(535, 583, .86, .9, .9, 10, 100.808, 1280, 720)
+    assert a.cx_lo == pytest.approx(423.5)
+    assert a.cx_hi == pytest.approx(593.5)
+    assert a.valid()
+
+
+@pytest.mark.parametrize("prior, tolerance", [(-400, 85), (400, 85), (-30, 10)])
+def test_fade_anchor_does_not_allow_a_gap_between_disjoint_priors(clean_env, monkeypatch,
+                                                               prior, tolerance):
+    monkeypatch.setenv("ORION_ANCHOR_DX", str(prior))
+    monkeypatch.setenv("ORION_ANCHOR_TOL_X", str(tolerance))
+    anchor = pa.PlayerAnchor()
+    anchor._off_dx = [26.5] * 6
+    anchor._off_dy = [163.95348837209303] * 6
+    pa.ARM.note_press(8, 100.0, "Left Fade")
+    a = anchor._anchor_from(535, 583, .86, .9, .9, 10, 100.808, 1280, 720)
+    assert a.cx_lo == pytest.approx(535 - 26.5 - tolerance)
+    assert a.cx_hi == pytest.approx(535 - 26.5 + tolerance)

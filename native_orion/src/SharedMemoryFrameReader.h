@@ -57,6 +57,11 @@ public:
 
     [[nodiscard]] bool isOpen() const noexcept { return view_ != nullptr; }
     [[nodiscard]] QString lastError() const { return lastError_; }
+    // Raw Win32 mutex result from the most recent readFrame wait. Diagnostic
+    // only; 0xffffffff means readFrame did not reach WaitForSingleObject.
+    [[nodiscard]] std::uint32_t lastMutexWaitResult() const noexcept {
+        return lastMutexWaitResult_;
+    }
     [[nodiscard]] std::uint64_t framesRead() const noexcept { return framesRead_; }
     [[nodiscard]] std::uint64_t lastReadGeneration() const noexcept {
         return lastWriteCount_;
@@ -88,6 +93,7 @@ private:
     int cachedWidth_ = 0;
     int cachedHeight_ = 0;
     QString lastError_;
+    std::uint32_t lastMutexWaitResult_ = 0xffffffffu;
 };
 
 } // namespace orion

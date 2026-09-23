@@ -1,0 +1,6 @@
+SYNTHETIC ONLY ANALYSED
+fidelity True
+gof 2000 / 2000
+ff_bootstrap 10000 / 10000
+width exploratory_only
+seconds 45.85

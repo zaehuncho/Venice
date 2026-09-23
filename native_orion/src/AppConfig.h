@@ -63,6 +63,29 @@ inline QString normalizedMeterProposer(const QString& value)
     return QStringLiteral("cv");
 }
 
+// [ORION_PILL_REMOVED 2026-09-21] THE ONE meter-style acceptance rule. Every ingress --
+// settings.json load, AppConfig::save(), OrionAppController::setMeterStyle(),
+// switchProfile() -- must go through here so a withdrawn or unknown style can never be
+// persisted or selected. "pill" is deliberately absent: Pill (beta) was withdrawn on
+// 2026-09-21 and a stored Pill migrates to the certified default. Accepted values keep
+// the caller's spelling (the profile table and tests compare case-insensitively).
+inline QString normalizedMeterStyle(const QString& value)
+{
+    const QString cleaned = value.trimmed().left(48);
+    const QString lower = cleaned.toLower();
+    if (lower == QLatin1String("arrow")
+        || lower == QLatin1String("arrow2")
+        || lower == QLatin1String("dial")
+        // [ORION_PILL_REMOVED 2026-09-21, re-withdrawn 2026-09-23 owner] Pill (beta) was re-offered
+        // for one live test on 09-22 (12/20 standstills in a drill) and "performed terribly in a
+        // real game": withdrawn again. A persisted "pill" loads as Arrow2.
+        || lower == QLatin1String("straight")
+        || lower == QLatin1String("sword")) {
+        return cleaned;
+    }
+    return QStringLiteral("Arrow2");
+}
+
 // [ORION_CAPTURE_FPS 2026-09-14] Capture-card refresh rate, snapped to the only three rates an
 // Elgato-class HDMI card negotiates at 1080p. Shared by the settings loader, the QML controller
 // setter, and the sidecar environment (ORION_CAPTURE_FPS -> CaptureCardBackend(fps=...), which
@@ -220,6 +243,10 @@ struct AppConfigData {
     // Switching consoles preserves PS5's capture settings and separates leads.
     QString remotePlayConsole = QStringLiteral("PS5");
     QString xboxRemotePlayWindowTitle;
+    // [2026-09-21 beta] Xbox is UNTESTED (no console measured, no timing claim). The
+    // user must acknowledge that once before an Xbox session may start; persisted so
+    // the Setup form does not nag every launch. Never consulted on the PS5 route.
+    bool xboxUntestedAcknowledged = false;
     // First-run onboarding: false until the user finishes the post-auth Stream Setup
     // screen once; afterward stream setup is edited on the Dashboard.
     bool streamSetupComplete = false;
@@ -239,6 +266,9 @@ struct AppConfigData {
     // ORION_CAPTURE_CARD env and, in capture-card mode, keeps the chiaki window hidden (input-only).
     QString videoSource = QStringLiteral("capture_card");
     int captureCardIndex = 0;
+    // Empty until the picker is activated. Index 0 is only a UI default, never
+    // evidence that the customer selected the device occupying that slot.
+    QString captureCardDeviceId;
     // [ORION_CAPTURE_FPS 2026-09-14] The rate the capture card is ASKED for, in fps.
     // {30, 60, 120} only (see snappedCaptureCardFps above); 60 is the shipped default and the
     // rate every previous build hard-coded, so an install that never touches this is unchanged.
@@ -746,11 +776,12 @@ struct AppConfigData {
     // touched, and R2 is never touched at all when Square is not pressed, when the trigger was not
     // deep-held at the edge, on a stick-armed press, or in NO METER.
     //
-    // 50 ms is three game frames: comfortably past the frame the press landed in, and short enough
-    // that a player who meant to stop sprinting still stops within a fifth of a second.
-    // 0 = inert (output byte-identical to the 2026-09-16 build). Env
-    // ORION_SQUARE_PRESS_R2_HOLD_MS on the ignore-non-numeric / clamp-numeric policy.
-    double squarePressR2HoldMs = 50.0;
+    // 2026-09-21 owner report: R2 (and occasionally other buttons downstream) looked physically
+    // held after release.  The live output-divergence census found that Orion's only invented
+    // trigger holds were this policy's exact 50 ms windows.  Faithful pass-through now wins by
+    // default: 0 is inert and a deliberate diagnostic A/B may still opt in through the
+    // ORION_SQUARE_PRESS_R2_HOLD_MS environment override.
+    double squarePressR2HoldMs = 0.0;
     static constexpr double kSquarePressR2HoldMinMs = 0.0;
     static constexpr double kSquarePressR2HoldMaxMs = 150.0;
     // [ORION_SETTLE_SMOOTH_MOTION 2026-08-13] Grade a smoothly-TRANSLATING settled marker. Shipped
@@ -1257,6 +1288,34 @@ struct AppConfigData {
     int bannerTrimBiasVotes = 0;
     static constexpr int kBannerTrimBiasVotesMin = 0;
     static constexpr int kBannerTrimBiasVotesMax = 20;
+    // == [ORION_ONSET_FF 2026-09-21 owner] PER-SHOT ONSET FEEDFORWARD ======================
+    // The measurement and the rule are in OnsetFeedforward.h. Four magnitudes and one keying
+    // switch, every magnitude CLAMPED into its band on every route (file, setting, env) exactly
+    // like the banner trim's limits, because the band is what keeps this a bounded per-shot
+    // correction rather than a second lead control. gain 0 is the kill switch.
+    //   onset_ff_gain        ms of fire displacement per ms of later-than-usual onset
+    //   onset_ff_clamp_ms    |displacement| ceiling
+    //   onset_ff_window      completed onsets that form the per-bucket reference median
+    //   onset_ff_min_samples fewer than this in a bucket -> no reference -> no displacement
+    //   onset_ff_one_sided   only a LATER-than-reference onset moves the fire (measured: the
+    //                        earlier side does not miss)
+    // SHIPS ON at 0.2 / 10 ms: the ordinal fit of the late tails puts the correctable bias at
+    // ~10-12 ms, so the ceiling IS the expected full correction and the gain reaches it at a
+    // +50 ms deviation. Env ORION_ONSET_FF_GAIN / _CLAMP_MS / _WINDOW / _MIN_SAMPLES (clamped;
+    // non-numeric ignored) and ORION_ONSET_FF_ONE_SIDED=0/1.
+    double onsetFeedforwardGain = 0.2;
+    static constexpr double kOnsetFeedforwardGainMin = 0.0;
+    static constexpr double kOnsetFeedforwardGainMax = 1.0;
+    double onsetFeedforwardClampMs = 10.0;
+    static constexpr double kOnsetFeedforwardClampMinMs = 0.0;
+    static constexpr double kOnsetFeedforwardClampMaxMs = 40.0;
+    int onsetFeedforwardWindow = 10;
+    static constexpr int kOnsetFeedforwardWindowMin = 3;
+    static constexpr int kOnsetFeedforwardWindowMax = 40;
+    int onsetFeedforwardMinSamples = 4;
+    static constexpr int kOnsetFeedforwardMinSamplesMin = 2;
+    static constexpr int kOnsetFeedforwardMinSamplesMax = 20;
+    bool onsetFeedforwardOneSided = true;
     // == [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16 owner] ====================================
     // A FIXED per-shot-type addition to the Shot Lead. One slider, one number, every shot type
     // -- and the owner's own read-out of the 2026-09-16 15:00 baseline session says that is one
@@ -1294,7 +1353,14 @@ struct AppConfigData {
     // Env: ORION_LEAD_OFFSET_FADE_MS=<ms> sets BOTH fades (numeric, clamped; a non-numeric value
     // is ignored rather than guessed) and ORION_LEAD_OFFSET_BY_TYPE=0 zeroes all four, which
     // restores the 2026-09-16 baseline lead byte-for-byte on every type.
-    double leadOffsetLeftFadeMs = 8.0;
+    // [ORION_LEFT_FADE_LATER 2026-09-22 owner] Left fades land EARLY on 4 of 5 days even after the
+    // 09-19 fade-window rule strips the +8 advance (09-17..22: 33 % EARLY vs 15 % LATE; 09-21 and
+    // 09-22 40 % EARLY; owner: "most fades are early"). A NEGATIVE offset fires later and the
+    // fade-window rule deliberately leaves negative offsets intact. -6 is a cautious first step of
+    // the ~8-10 ms the 09-22 sweep slope (~2 pp/ms) implies. Right fades stay +8 (balanced since
+    // 09-18). A persisted +8 from before this change is migrated once (AppConfig.cpp,
+    // lead_offset_left_fade_rev).
+    double leadOffsetLeftFadeMs = -6.0;
     double leadOffsetRightFadeMs = 8.0;
     double leadOffsetStandstillMs = 0.0;
     double leadOffsetOtherMs = 0.0;
@@ -2033,6 +2099,10 @@ public:
     // Active profile's learning file: learning.json for "Default", else
     // learning.<slug>.json (see profileLearningSlug).
     [[nodiscard]] QString learningPath() const;
+    // [2026-09-22 RED TEAM GM-002 / CX-001] last-good copy written before every learning save.
+    [[nodiscard]] QString learningBackupPath() const;
+    // Non-empty after reloadLearning() had to recover or quarantine: the launcher logs it once.
+    [[nodiscard]] QString learningLoadNote() const { return learningLoadNote_; }
     [[nodiscard]] static QString profileLearningSlug(const QString& profileName);
 
     // === Settings-file schema versioning + migration (2026-08-08) ==================
@@ -2147,6 +2217,7 @@ private:
     QString rootDir_;
     AppConfigData data_;
     LearningData learning_;
+    QString learningLoadNote_;
     QJsonObject profiles_;
 };
 

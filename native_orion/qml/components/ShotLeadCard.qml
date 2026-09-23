@@ -9,7 +9,9 @@ import OrionNative
 // lead in milliseconds (settings.json actuation_lead_ms, 150..400 ms on the 1..100 scale, ~2.5 ms
 // per step); nothing in the timing stack changed, only what the user sees. The direction hint at
 // the bottom is the whole calibration procedure: read the game's TIMING banner, EARLY -> lower,
-// LATE -> raise.
+// LATE -> raise -- but only on a consistent bias over 20+ shots. [2026-09-22 RED TEAM GMC-011]
+// Online late streaks are connection variance; chasing them resets the learned baseline
+// (discord_launch/launch_embeds/timing_expectations.json says the same).
 Card {
     id: root
     title: "Shot Lead"
@@ -39,11 +41,6 @@ Card {
     readonly property bool leadConflict: configured
                                          && orion.shotLeadMaxUsableMs > 0
                                          && orion.actuationLeadMs > orion.shotLeadMaxUsableMs
-    readonly property bool leadDisagrees: configured
-                                          && orion.leadAuthorityMs > 0
-                                          && orion.leadAuthoritySdMs > 0
-                                          && Math.abs(orion.actuationLeadMs - orion.leadAuthorityMs)
-                                             > 3 * orion.leadAuthoritySdMs
 
     ColumnLayout {
         id: col
@@ -67,38 +64,21 @@ Card {
                 color: Theme.warning
                 font.family: Theme.fontUi
                 font.pixelSize: 12
-                text: "Shot Lead " + root.shownValue + " is more than Tip Timing can schedule — "
-                      + "live tip shots cannot fire and will abort. Lower it to "
-                      + root.valueFromMs(orion.shotLeadMaxUsableMs) + " or less, or raise/reset Tip Timing."
+                // [2026-09-23 copy] No engine vocabulary: Tip Timing is not on the customer screen.
+                text: "Shot Lead " + root.shownValue + " is too high — Venice can't release in "
+                      + "time, so shots are skipped. Lower it to "
+                      + root.valueFromMs(orion.shotLeadMaxUsableMs) + " or less."
                       + (orion.shotLeadConflictMisses > 0
-                         ? " " + orion.shotLeadConflictMisses + " shot(s) already aborted this session."
+                         ? " " + orion.shotLeadConflictMisses + " shot(s) skipped this session."
                          : "")
             }
         }
 
-        Rectangle {
-            objectName: "shotLeadDisagreementBanner"
-            visible: root.leadDisagrees
-            Layout.fillWidth: true
-            implicitHeight: disagreementText.implicitHeight + 16
-            radius: 6
-            color: Theme.warningDim
-            border.color: Theme.warningBorder
-            border.width: 1
-            Text {
-                id: disagreementText
-                anchors.fill: parent
-                anchors.margins: 8
-                wrapMode: Text.WordWrap
-                color: Theme.warning
-                font.family: Theme.fontUi
-                font.pixelSize: 12
-                text: "Shot Lead " + root.shownValue + " disagrees with this rig's validated "
-                      + "measurement of " + root.valueFromMs(orion.leadAuthorityMs) + " (from "
-                      + orion.leadAuthoritySamples + " shots). Venice still fires with your value; "
-                      + "the measurement is advisory."
-            }
-        }
+        // [2026-09-23 owner] The "Shot Lead N disagrees with this rig's validated measurement"
+        // banner is REMOVED. It was advisory only (Venice always fires with the customer's value),
+        // it fired on as few as 6 shots, and it told customers their number was wrong right after
+        // Calibrate my lead had set it -- the exact "is it broken?" moment we design against.
+        // orion.leadAuthorityMs stays engine-side for diagnostics.
 
         RowLayout {
             Layout.fillWidth: true
@@ -152,7 +132,7 @@ Card {
             id: leadSlider
             objectName: "shotLeadSlider"
             Layout.fillWidth: true
-            Layout.minimumWidth: 240
+            Layout.minimumWidth: 160
             from: 1
             to: 100
             stepSize: 1
@@ -221,21 +201,27 @@ Card {
                 font.family: Theme.fontMono
                 font.pixelSize: 10
             }
-            Item { Layout.fillWidth: true }
+            // [2026-09-23 owner] Wraps: a fixed-width line here set the whole card's minimum
+            // width, so the layout overflowed the side panel and cut every line on the right.
             Text {
                 objectName: "shotLeadDirectionHint"
-                text: "Shots landing EARLY → lower it · LATE → raise it"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                wrapMode: Text.WordWrap
+                horizontalAlignment: Text.AlignHCenter
+                text: "Consistently EARLY over 20+ shots → lower · LATE → raise"
                 color: Theme.textMuted
                 font.family: Theme.fontUi
                 font.pixelSize: 11
             }
             InfoTip {
-                text: "Shot Lead is how far ahead of the meter Venice releases. Read the game's "
-                      + "TIMING banner over a few shots: if it says EARLY, the release came too "
-                      + "soon — lower the value. If it says LATE, raise it. Move by 2 to 4 at a "
-                      + "time; the sweet spot is where EARLY and LATE are equally rare."
+                text: "Shot Lead is how far ahead of the meter Venice releases. Change it only if "
+                      + "the game's TIMING banner is consistently EARLY or LATE over many shots "
+                      + "(20 or more), never after one or two. Online, a short run of LATEs is "
+                      + "normal connection variance, and moving Shot Lead resets what Venice has "
+                      + "learned. Consistently EARLY: lower it. Consistently LATE: raise it. Move "
+                      + "by 2 to 4 at a time."
             }
-            Item { Layout.fillWidth: true }
             Text {
                 text: "100"
                 color: Theme.textFaint
@@ -255,9 +241,10 @@ Card {
             Layout.fillWidth: true
             Layout.topMargin: 2
             elide: Text.ElideRight
-            text: "Auto-trim from game feedback: "
+            // [2026-09-23 copy] In the slider's own 1..100 units, never milliseconds.
+            text: "Auto-adjusting from game feedback: "
                   + (orion.bannerLeadTrimMs > 0 ? "+" : "−")
-                  + Math.abs(Math.round(orion.bannerLeadTrimMs)) + " ms"
+                  + Math.max(1, Math.round(Math.abs(orion.bannerLeadTrimMs) * 99 / (root.msHi - root.msLo)))
             color: Theme.textMuted
             font.family: Theme.fontUi
             font.pixelSize: 11
@@ -277,15 +264,131 @@ Card {
             Layout.topMargin: 2
             elide: Text.ElideRight
             text: orion.leadAutoSeedKind === "measured"
-                  ? "Auto: measured latency " + Math.round(orion.leadAutoSeedMeasuredMs)
-                    + " ms + " + Math.round(orion.leadAutoSeedMarginMs) + " ms margin = "
-                    + Math.round(orion.leadAutoSeedMs) + " ms"
-                  : "Auto: calibrating… using " + Math.round(orion.leadAutoSeedMs)
-                    + " ms until your latency is measured"
+                  ? "Auto: set to " + root.valueFromMs(orion.leadAutoSeedMs) + " from your measured setup"
+                  : "Auto: calibrating… using " + root.valueFromMs(orion.leadAutoSeedMs)
+                    + " until your setup is measured"
             color: Theme.textMuted
             font.family: Theme.fontUi
             font.pixelSize: 11
         }
 
+        // ---- Guided calibration --------------------------------------------------------
+        // [ORION_LEAD_CALIBRATION 2026-09-21 owner] "figure out how the customers get their own
+        // lead". The bisection has lived in the controller since 08-04 (LeadCalibrationPolicy.h,
+        // begin/report/cancel below) but never had a screen. This is it: the customer takes an
+        // open shot, reads the game's own TIMING banner -- the one oracle that has ever tracked
+        // reality on this project -- and taps what it said. Ten to fifteen shots lock the lead;
+        // every step is persisted, so closing the app mid-way keeps the progress.
+        Rectangle {
+            objectName: "shotLeadCalibrationPanel"
+            Layout.fillWidth: true
+            Layout.topMargin: 10
+            implicitHeight: calCol.implicitHeight + 20
+            radius: 8
+            color: orion.leadCalibrationActive ? Theme.accentSoft : "transparent"
+            border.width: orion.leadCalibrationActive ? 1 : 0
+            border.color: Theme.accentBorder
+
+            ColumnLayout {
+                id: calCol
+                anchors.fill: parent
+                anchors.margins: 10
+                spacing: 8
+
+                // Idle: one button, and an honest line about why a new install should press it.
+                RowLayout {
+                    visible: !orion.leadCalibrationActive
+                    Layout.fillWidth: true
+                    spacing: 10
+                    PrimaryButton {
+                        objectName: "shotLeadCalibrateButton"
+                        text: "Calibrate my lead"
+                        enabled: orion.remoteRunning
+                        onClicked: orion.beginLeadCalibration()
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: !orion.remoteRunning
+                              ? "Start a session first, then calibrate in shoot-around."
+                              : (!root.configured && !orion.actuationLeadUserSet)
+                                ? "Not set yet — 10 to 15 open shots find this rig's own number."
+                                : "Re-run any time you change capture hardware or your TV."
+                        color: Theme.textMuted
+                        font.family: Theme.fontUi
+                        font.pixelSize: 11
+                    }
+                }
+
+                // Active: the instruction, three verdict buttons, skip / cancel, done when locked.
+                Text {
+                    objectName: "shotLeadCalibrationHint"
+                    visible: orion.leadCalibrationActive
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: orion.leadCalibrationHint
+                    color: Theme.textPrimary
+                    font.family: Theme.fontUi
+                    font.pixelSize: 12
+                }
+                RowLayout {
+                    visible: orion.leadCalibrationActive && !orion.leadCalibrationLocked
+                    Layout.fillWidth: true
+                    spacing: 8
+                    // Labelled by what the BANNER said. The direction the lead moves is the
+                    // policy's business (early -> smaller lead), never this screen's.
+                    PrimaryButton {
+                        objectName: "shotLeadVerdictEarly"
+                        Layout.fillWidth: true
+                        text: "EARLY"
+                        onClicked: orion.reportLeadCalibrationVerdict("early")
+                    }
+                    PrimaryButton {
+                        objectName: "shotLeadVerdictGood"
+                        Layout.fillWidth: true
+                        text: "GOOD"
+                        onClicked: orion.reportLeadCalibrationVerdict("good")
+                    }
+                    PrimaryButton {
+                        objectName: "shotLeadVerdictLate"
+                        Layout.fillWidth: true
+                        text: "LATE"
+                        onClicked: orion.reportLeadCalibrationVerdict("late")
+                    }
+                }
+                RowLayout {
+                    visible: orion.leadCalibrationActive
+                    Layout.fillWidth: true
+                    spacing: 16
+                    Text {
+                        objectName: "shotLeadVerdictSkip"
+                        visible: !orion.leadCalibrationLocked
+                        text: "Skip — I missed the banner"
+                        color: skipHover.hovered ? Theme.accentHover : Theme.textMuted
+                        font.family: Theme.fontUi
+                        font.pixelSize: 11
+                        HoverHandler { id: skipHover }
+                        TapHandler { onTapped: orion.reportLeadCalibrationVerdict("skip") }
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        objectName: "shotLeadCalibrationCancel"
+                        visible: !orion.leadCalibrationLocked
+                        text: "Cancel"
+                        color: cancelHover.hovered ? Theme.accentHover : Theme.textMuted
+                        font.family: Theme.fontUi
+                        font.pixelSize: 11
+                        HoverHandler { id: cancelHover }
+                        TapHandler { onTapped: orion.cancelLeadCalibration() }
+                    }
+                    PrimaryButton {
+                        objectName: "shotLeadCalibrationDone"
+                        visible: orion.leadCalibrationLocked
+                        text: "Done"
+                        onClicked: orion.cancelLeadCalibration()
+                    }
+                }
+            }
+        }
     }
 }

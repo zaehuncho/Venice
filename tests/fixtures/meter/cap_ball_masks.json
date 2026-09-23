@@ -1,0 +1,198 @@
+{
+  "session": "session_20260920_005825",
+  "description": "Strict HSV raw masks, observed apex at row334; lower background ball overlaps detector rectangle in frames54-56. Both pre-display and drawn rectangles.",
+  "frames": [
+    {
+      "key": "raw_50",
+      "filename": "ep1_f000050_1_raw.bmp",
+      "sha256": "0d9e9ef55d24c650d7cc06e2d8eced2e7531e9e87561905d02017e422c97a080",
+      "box": [
+        273,
+        330,
+        26,
+        110
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_50",
+      "filename": "ep1_f000050_1_raw.bmp",
+      "sha256": "0d9e9ef55d24c650d7cc06e2d8eced2e7531e9e87561905d02017e422c97a080",
+      "box": [
+        273,
+        326,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_51",
+      "filename": "ep1_f000051_1_raw.bmp",
+      "sha256": "889c3f20508a9852f7ac55c5da73483a88b1fc73a955daeaa56cb1b2a1d4b943",
+      "box": [
+        272,
+        331,
+        26,
+        109
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_51",
+      "filename": "ep1_f000051_1_raw.bmp",
+      "sha256": "889c3f20508a9852f7ac55c5da73483a88b1fc73a955daeaa56cb1b2a1d4b943",
+      "box": [
+        272,
+        326,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_52",
+      "filename": "ep1_f000052_1_raw.bmp",
+      "sha256": "faacb26123a6f95ecd73c7a18f556f8c2d8d32633783b06d1d8d833d8d4ca724",
+      "box": [
+        272,
+        331,
+        26,
+        109
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_52",
+      "filename": "ep1_f000052_1_raw.bmp",
+      "sha256": "faacb26123a6f95ecd73c7a18f556f8c2d8d32633783b06d1d8d833d8d4ca724",
+      "box": [
+        272,
+        326,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_53",
+      "filename": "ep1_f000053_1_raw.bmp",
+      "sha256": "dc812937096b7c4a11ae0ece86956c7136e315be676a1414b368afb423786201",
+      "box": [
+        271,
+        330,
+        26,
+        110
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_53",
+      "filename": "ep1_f000053_1_raw.bmp",
+      "sha256": "dc812937096b7c4a11ae0ece86956c7136e315be676a1414b368afb423786201",
+      "box": [
+        271,
+        327,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_54",
+      "filename": "ep1_f000054_1_raw.bmp",
+      "sha256": "95812b678fb3b77903cb0f9061666bce5cd0488f44273bf95e1dc2a90a93306a",
+      "box": [
+        270,
+        330,
+        26,
+        110
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_54",
+      "filename": "ep1_f000054_1_raw.bmp",
+      "sha256": "95812b678fb3b77903cb0f9061666bce5cd0488f44273bf95e1dc2a90a93306a",
+      "box": [
+        270,
+        326,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_55",
+      "filename": "ep1_f000055_1_raw.bmp",
+      "sha256": "c08b57c5294307a85e3c850148543cc4ca697568b29d84a5f4740014c2069752",
+      "box": [
+        269,
+        330,
+        26,
+        110
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_55",
+      "filename": "ep1_f000055_1_raw.bmp",
+      "sha256": "c08b57c5294307a85e3c850148543cc4ca697568b29d84a5f4740014c2069752",
+      "box": [
+        269,
+        326,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_56",
+      "filename": "ep1_f000056_1_raw.bmp",
+      "sha256": "3c1f132ca9680213b254e16b1a6af3f1f0ce498d49886c466eebb508915ece73",
+      "box": [
+        269,
+        330,
+        26,
+        110
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_56",
+      "filename": "ep1_f000056_1_raw.bmp",
+      "sha256": "3c1f132ca9680213b254e16b1a6af3f1f0ce498d49886c466eebb508915ece73",
+      "box": [
+        269,
+        327,
+        26,
+        120
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "raw_57",
+      "filename": "ep1_f000057_1_raw.bmp",
+      "sha256": "f324473d9893161f75644c8ef7c1b57d35d63e4b79e7ffe75d4d12a917213193",
+      "box": [
+        269,
+        330,
+        26,
+        110
+      ],
+      "expected_global_top": 334
+    },
+    {
+      "key": "display_57",
+      "filename": "ep1_f000057_1_raw.bmp",
+      "sha256": "f324473d9893161f75644c8ef7c1b57d35d63e4b79e7ffe75d4d12a917213193",
+      "box": [
+        269,
+        326,
+        26,
+        121
+      ],
+      "expected_global_top": 334
+    }
+  ]
+}

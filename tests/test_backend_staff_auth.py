@@ -118,6 +118,8 @@ class Env:
         self.tokens = FakeTokensTable("token_id")
         self.nonces = FakeNoncesTable()
         self.audit = FakeTable("audit_id")
+        self.unified_audit = FakeTable("event_id")
+        self.config = FakeTable("config_key")
         self.licenses = FakeTable("license_key")
 
 
@@ -134,6 +136,9 @@ def env(monkeypatch):
     monkeypatch.setattr(backend, "tokens_table", lambda: e.tokens)
     monkeypatch.setattr(backend, "nonces_table", lambda: e.nonces)
     monkeypatch.setattr(backend, "staff_audit_table", lambda: e.audit)
+    monkeypatch.setattr(backend, "audit_table", lambda: e.unified_audit)
+    monkeypatch.setattr(backend, "config_table", lambda: e.config)
+    monkeypatch.setattr(backend, "_config_cache", {})
     monkeypatch.setattr(backend, "licenses_table", lambda: e.licenses)
     monkeypatch.setattr(backend, "get_staff_token_secret", lambda: UNIT_STAFF_SECRET)
     monkeypatch.setattr(backend, "ssm_get", _fake_ssm_get)
@@ -395,7 +400,7 @@ def test_admin_staff_list_requires_admin_and_omits_machine_ids(env, monkeypatch)
     assert all("machine_id" not in s for s in body["staff"])
 
 
-def test_version_reports_service_identity():
+def test_version_reports_service_identity(env):
     resp = backend.handle_version(make_event(method="GET", path="/api/version"))
     body = json.loads(resp["body"])
     assert resp["statusCode"] == 200
@@ -422,6 +427,8 @@ def test_admin_tamper_report_is_audited_without_secret_leak(env, monkeypatch):
     assert json.loads(resp["body"])["ok"] is True
     row = env.audit.put_history[-1]
     assert row["action"] == "admin_tamper_report"
+    assert env.unified_audit.put_history[-1]["action"] == "admin_tamper_report"
+    assert env.unified_audit.put_history[-1]["event_id"] == row["audit_id"]
     dumped = json.dumps(row)
     assert "admintool-machine-abcdef123456" not in dumped  # suffix only
     assert "3456" in row["details"]
@@ -448,6 +455,8 @@ def test_staff_tamper_report_requires_valid_staff_token_and_audits(env):
     assert resp["statusCode"] == 200
     row = env.audit.put_history[-1]
     assert row["action"] == "staff_tamper_report"
+    assert env.unified_audit.put_history[-1]["action"] == "staff_tamper_report"
+    assert env.unified_audit.put_history[-1]["event_id"] == row["audit_id"]
     assert row["actor"] == "staff_1"
     assert "staff-machine-abcdef123456" not in json.dumps(row)
     assert "3456" in row["details"]

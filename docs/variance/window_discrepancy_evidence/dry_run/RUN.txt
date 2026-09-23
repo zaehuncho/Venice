@@ -1,0 +1,9 @@
+sweep_analysis 2026-09-22-predata-1
+mode=legacy_dry_run
+records=2974
+status=PRIMARY_SUPPRESSED
+assigned=0
+fidelity_pass=False
+failed=graded_release_identity_coverage_ge90,graded_schedule_known_ge90,scheduled_primary_join_coverage_ge90,all_attempt_arm_assignment_ge80,carried_vs_draw_agreement_ge95,both_offset_signs,both_arms,eight_early_and_late,grade_availability_difference_le10pp,local_first_stage_equivalent
+primary_fit=False
+No application launch, build, capture, network connection, or source modification performed.

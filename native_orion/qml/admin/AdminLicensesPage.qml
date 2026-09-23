@@ -98,7 +98,7 @@ Item {
                         id: keyQuery
                         label: "License key"
                         iconText: "K"
-                        placeholderText: "ORION-XXXX-XXXX-XXXX"
+                        placeholderText: "paste the licence key"
                         onAccepted: lookupButton.clicked()
                     }
                     AdminField {

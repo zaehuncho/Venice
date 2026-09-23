@@ -12,10 +12,16 @@ Rectangle {
     property alias headerRow: headerActions.data
     default property alias content: body.data
 
-    color: Theme.bgCard
     radius: Theme.radiusCard
     border.color: Theme.borderSoft
     border.width: 1
+    // Same surface as the launcher's cards: a little lighter at the top so stacked cards read
+    // as panels rather than flat boxes.
+    gradient: Gradient {
+        orientation: Gradient.Vertical
+        GradientStop { position: 0.0; color: Theme.bgCardTop }
+        GradientStop { position: 1.0; color: Theme.bgCardBottom }
+    }
     implicitHeight: column.implicitHeight + padding * 2
     implicitWidth: 240
 

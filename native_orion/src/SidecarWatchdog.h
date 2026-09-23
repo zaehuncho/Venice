@@ -34,6 +34,32 @@
 
 namespace orion {
 
+// [CL-006 r2 2026-09-23, Codex] How stale a sidecar health value must be REPORTED, given how long
+// the sidecar's telemetry has been silent. The sidecar emits telemetry at >= 60 Hz, so silence
+// beyond kTelemetrySilenceStaleMs means its event loop is not speaking: every age then reports at
+// least the silence, detection fails closed on frame/pixel age and the stream watchdog's transport
+// restart fires. Silence counts from the LAST record, or - before the first record - from the
+// moment the sidecar was (re)started, after a generous first-record grace (cold start: Chiaki
+// Vulkan init + capture open take 11-20 s). -1 = never armed (nothing to judge).
+inline constexpr qint64 kTelemetrySilenceStaleMs = 1000;
+inline constexpr qint64 kFirstTelemetryGraceMs = 20000;
+[[nodiscard]] inline qint64 sidecarTelemetrySilenceMs(bool haveTelemetry, qint64 msSinceLastRecord,
+                                                      qint64 msSinceArmed) noexcept
+{
+    if (haveTelemetry) {
+        return msSinceLastRecord;
+    }
+    if (msSinceArmed < 0) {
+        return -1;
+    }
+    return std::max<qint64>(0, msSinceArmed - kFirstTelemetryGraceMs);
+}
+[[nodiscard]] inline double silenceAgedHealthMs(double stored, qint64 silenceMs) noexcept
+{
+    return silenceMs > kTelemetrySilenceStaleMs ? std::max(stored, static_cast<double>(silenceMs))
+                                                : stored;
+}
+
 // --- Fix 1: watchdog restart pacing -------------------------------------------------------
 
 // Decoder-pipe mode has no DirectShow device to release, so it keeps the historical fast beat
@@ -156,15 +182,28 @@ enum class InputLinkRecoveryAction {
 // Chiaki input child. Permit exactly one smallest-scope recovery attempt:
 // recoverInputLink() retains Running, independently revokes route authority,
 // and latches `pending`, so subsequent telemetry cannot request a duplicate
-// child. Missing evidence is treated the same as an explicit false verdict and
-// remains fail-closed.
+// child.
+// [2026-09-22 RED TEAM CL-006] MISSING evidence is not a verdict. Treating it as
+// `false` made a telemetry gap kill a healthy Chiaki child (10 pipe drops -> 8
+// recoveries -> 2 full sidecar restarts in 22 minutes). Only an EXPLICIT
+// `input_ready=false` requests the recovery; fail-closed for the bot is
+// preserved elsewhere (route attestation + the forced-neutral recovery gate),
+// so a gap in telemetry can no longer be mistaken for a dead input link.
 [[nodiscard]] inline constexpr bool shouldAutoRecoverInputFromTelemetry(
     bool running, bool recoveryPending,
     bool hasExplicitInputReady, bool inputReady) noexcept
 {
     return running && !recoveryPending
-        && (!hasExplicitInputReady || !inputReady);
+        && hasExplicitInputReady && !inputReady;
 }
+static_assert(!shouldAutoRecoverInputFromTelemetry(true, false, /*explicit*/ false, false),
+              "missing telemetry evidence must not trigger an input recovery");
+static_assert(shouldAutoRecoverInputFromTelemetry(true, false, true, false),
+              "an explicit input_ready=false must trigger exactly one recovery");
+static_assert(!shouldAutoRecoverInputFromTelemetry(true, true, true, false),
+              "a pending recovery must not be duplicated");
+static_assert(!shouldAutoRecoverInputFromTelemetry(true, false, true, true),
+              "a healthy link is never recovered");
 
 [[nodiscard]] inline constexpr qint64 extendStreamWindowContainmentGrace(
     qint64 currentDeadlineMs, qint64 nowMs) noexcept
@@ -221,6 +260,42 @@ inline constexpr int kSidecarGracefulShutdownMs = 5000;
                                                            bool connectSourceIsCaptureCard) noexcept
 {
     return warmPreviewRunning && warmSourceIsCaptureCard && connectSourceIsCaptureCard;
+}
+
+// A running producer may not silently inherit another source's Shot Lead.
+[[nodiscard]] inline constexpr bool videoSourceChangeAllowed(
+    bool connecting, bool running, bool disconnecting) noexcept
+{
+    return !connecting && !running && !disconnecting;
+}
+
+struct CaptureSidecarLaunchIdentity {
+    int index = -1;
+    int fps = 0;
+    QString selectedDeviceId;
+
+    [[nodiscard]] bool operator==(const CaptureSidecarLaunchIdentity& other) const noexcept
+    {
+        return index == other.index && fps == other.fps
+            && selectedDeviceId == other.selectedDeviceId;
+    }
+};
+
+[[nodiscard]] inline CaptureSidecarLaunchIdentity captureSidecarLaunchIdentity(
+    const AppConfigData& config)
+{
+    return {config.captureCardIndex, snappedCaptureCardFps(config.captureCardFps),
+            config.captureCardDeviceId};
+}
+
+[[nodiscard]] inline bool shouldReuseWarmSidecarForConnect(
+    bool warmPreviewRunning, bool warmSourceIsCaptureCard,
+    bool connectSourceIsCaptureCard, const CaptureSidecarLaunchIdentity& launched,
+    const CaptureSidecarLaunchIdentity& requested) noexcept
+{
+    return shouldReuseWarmSidecarForConnect(
+               warmPreviewRunning, warmSourceIsCaptureCard, connectSourceIsCaptureCard)
+        && launched == requested;
 }
 
 // A preview-sidecar `started` event means only that capture + detection are

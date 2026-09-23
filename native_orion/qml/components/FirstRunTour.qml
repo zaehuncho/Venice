@@ -77,7 +77,9 @@ Item {
             // 2026-09-14 rewrite drops the pointer to the "Timing" pill and the
             // warming-up banner — both surfaces are gone — without going back to the
             // old lie that there is no warm-up at all.
-            body: "Pick the Style and Color that match the in-game meter. Detection adapts on its own while you play, and Venice keeps refining its timing on your setup over your first shots."
+            // [COPY-FIX 2026-09-23 CW-5] Style and Color are both locked (Arrow2 / White),
+            // so the tour must not tell the customer to pick them.
+            body: "Arrow2 (White) is preset here — set your in-game shot meter to Arrow2 (White). Detection adapts on its own while you play, and Venice keeps refining its timing on your setup over your first shots."
         },
         {
             page: "remotePlay", target: "rp:shotType",

@@ -21,8 +21,8 @@
  * Worker VARS  (wrangler.toml [vars]):
  *   ORION_API_BASE            direct execute-api origin (bypasses Cloudflare bot-fight)
  *   STORE_URL                 the website /purchase sends everyone to. Owner rule
- *                             2026-09-15: one product line (free 3-day trial, then
- *                             $25/month recurring), so /purchase shows NO tiers and
+ *                             2026-09-15: one product line (free 7-day trial, then
+ *                             $19.99/month recurring), so /purchase shows NO tiers and
  *                             NO prices — one embed, one button, one destination.
  *   GUMROAD_BASE              (legacy/fallback) storefront base, e.g.
  *                             https://<seller>.gumroad.com/l — used only when
@@ -68,7 +68,7 @@ const BRAND_COLOR = 2450411;         // #2563EB
 const MAX_REASON = 200;              // contract: every mutation carries reason ≤ 200 chars
 const MAX_KEYGEN_COUNT = 25;         // contract §2: count ≤ 25 per call
 
-// There are no tiers any more (owner rule 2026-09-15): a free 3-day trial, then
+// There are no tiers any more (owner rule 2026-09-15): a free 7-day trial, then
 // one recurring monthly subscription, and the price lives on the website — never
 // in this file, so it can change without a Worker deploy. The old tier array and
 // its unfilled price templates are gone with it. The webhook's PRODUCT_MAP keeps the
@@ -243,7 +243,7 @@ async function cmdPurchase(env, interaction) {
     title: "Venice — Precision Shot-Timing",
     color: BRAND_COLOR,
     description:
-      "Start with the **free 3-day trial** (`/claim_trial`), then subscribe on the " +
+      "Start with the **free 7-day trial** (`/claim_trial`), then subscribe on the " +
       "website to keep going. Your license key is **DM'd to you automatically** the " +
       "moment payment clears, and the 💎 Customer role is added.",
     footer: { text: "Keys arrive by DM — make sure your DMs are open." },

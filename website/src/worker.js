@@ -1,5 +1,12 @@
 const SESSION_COOKIE = "venice_session";
 const OAUTH_COOKIE = "venice_oauth";
+// [2026-09-22 RED TEAM GMC-001] Set by /checkout/complete once the Worker has confirmed (with the
+// Stripe call it already makes) that this Discord account's checkout is complete. It only changes
+// the MESSAGE /connect shows while the webhook is still provisioning; it never grants access.
+const PAID_COOKIE = "venice_paid";
+const PAID_COOKIE_SECONDS = 1800;
+const ACTIVATING_RETRY_SECONDS = 5;
+const ACTIVATING_MAX_ATTEMPTS = 24; // 24 x 5 s = 2 minutes
 const MAX_BODY_BYTES = 1_000_000;
 const STRIPE_TOLERANCE_SECONDS = 300;
 // Pinned to the live webhook endpoint's API version so objects fetched here
@@ -199,7 +206,9 @@ async function readJson(response) {
 
 async function currentSession(request, env) {
   if (!env.SESSION_SECRET) return null;
-  return verifyValue(parseCookies(request)[SESSION_COOKIE], env.SESSION_SECRET);
+  const session = await verifyValue(parseCookies(request)[SESSION_COOKIE], env.SESSION_SECRET);
+  // A paid-checkout hint shares the signing key; it must never stand in for a session.
+  return session && session.paid === undefined ? session : null;
 }
 
 function canonicalOrigin(url) {
@@ -526,9 +535,14 @@ function discordAccountPage(session, purchaseComplete = false) {
     ? `<img src="https://cdn.discordapp.com/avatars/${id}/${session.avatar}.png?size=128" width="72" height="72" alt="">`
     : `<span aria-hidden="true">${name.slice(0, 1)}</span>`;
   const notice = purchaseComplete
-    ? '<p class="account-notice" role="status">Checkout complete. Triton will DM your subscription confirmation when activation finishes.</p>'
+    ? '<p class="account-notice" role="status">Checkout complete. The Venice bot will DM your subscription confirmation in Discord as soon as activation finishes.</p>'
     : '';
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#05070b"><title>Your Discord account · Venice</title><link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="/styles.css"></head><body><main class="shell account-page" id="main"><a class="brand" href="/"><span class="brand-mark"><img src="/orion.png" width="28" height="28" alt=""></span><span>VENICE</span></a><section class="account-panel" aria-labelledby="account-title"><p class="kicker">VENICE ACCOUNT</p><h1 id="account-title">Discord connected.</h1>${notice}<div class="account-identity"><div class="account-avatar">${avatar}</div><div><strong>${name}</strong><span>Discord ID ${id}</span></div></div><p>This is the Discord profile linked to this browser. Venice uses this verified account for checkout and launcher access; your Discord ID by itself is not a sign-in code.</p><div class="account-actions"><a class="button primary" href="/buy">Subscribe · $25/month</a><a class="button secondary" href="/connect">Get your one-time code</a></div><div class="account-trial"><strong>Starting the 7-day trial?</strong><p>Start it on the Venice home page with this same account — 7 days free, no card needed. Then choose Get your one-time code and paste that code into Venice on your PC. Need help? Open a ticket in the server.</p></div><form action="/logout" method="post"><button class="account-switch" type="submit">Use a different Discord account</button></form></section></main></body></html>`;
+  // [COPY-FIX 2026-09-23 CW-4] After checkout the one-time code is the ONLY next step:
+  // no Subscribe button (they just paid) and no trial block.
+  const actions = purchaseComplete
+    ? '<div class="account-actions"><a class="button primary" href="/connect">Get your one-time code</a></div>'
+    : '<div class="account-actions"><a class="button primary" href="/buy">Subscribe · $19.99/month</a><a class="button secondary" href="/connect">Get your one-time code</a></div><div class="account-trial"><strong>Starting the 7-day trial?</strong><p>Start it on the Venice home page with this same account — 7 days free, no card needed. Then choose Get your one-time code and paste that code into Venice on your PC. Need help? Open a ticket in the server.</p></div>';
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#05070b"><title>Your Discord account · Venice</title><link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="/styles.css"></head><body><main class="shell account-page" id="main"><a class="brand" href="/"><span class="brand-mark"><img src="/orion.png" width="28" height="28" alt=""></span><span>VENICE</span></a><section class="account-panel" aria-labelledby="account-title"><p class="kicker">VENICE ACCOUNT</p><h1 id="account-title">Discord connected.</h1>${notice}<div class="account-identity"><div class="account-avatar">${avatar}</div><div><strong>${name}</strong><span>Discord ID ${id}</span></div></div><p>This is the Discord profile linked to this browser. Venice uses this verified account for checkout and launcher access; your Discord ID by itself is not a sign-in code.</p>${actions}<form action="/logout" method="post"><button class="account-switch" type="submit">Use a different Discord account</button></form></section></main></body></html>`;
   const response = withHeaders(new Response(html, {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store', 'Vary': 'Cookie' },
   }));
@@ -545,19 +559,57 @@ async function discordAccount(request, env, url) {
   return discordAccountPage(session, url.searchParams.get('purchase') === 'complete');
 }
 
-function connectPage(session, code = '', error = '') {
+const ACTIVATING_MESSAGE = 'Payment received — activating your Venice subscription. This usually takes under a minute.';
+const ACTIVATING_FALLBACK_MESSAGE = 'Still waiting? Open a ticket in Discord with your receipt email — you will not be charged twice.';
+
+// `activating` = { attempt } while a paid checkout is still being provisioned, or
+// { timedOut: true } once the bounded retry is spent. Retry is a meta refresh because the
+// CSP allows no inline script; the attempt counter in the URL bounds it (nothing is trusted
+// from it except the loop count).
+function connectPage(session, code = '', error = '', activating = null) {
   const name = escapeHtml(session.username || 'Discord account');
   const id = escapeHtml(session.discordId);
-  const action = code
-    ? `<p class="kicker">ONE-TIME CONNECTION</p><h1>Connect Venice.</h1><p>Signed in as <strong>${name}</strong> (${id}). This code expires in five minutes and works once.</p><p><a class="button primary" href="orion://activate?key=${code}">Open Venice →</a></p><p>If the app does not open, enter <code>${code}</code> in its unlock screen.</p>`
-    : `<p class="kicker">ACCOUNT ACCESS</p><h1>Not ready to connect.</h1><p>${escapeHtml(error)}</p><p><a class="button secondary" href="/discord">View your Discord account →</a></p>`;
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Connect Venice</title><link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="/styles.css"></head><body><main class="shell" id="main"><a class="brand" href="/"><span class="brand-mark"><img src="/orion.png" width="28" height="28" alt=""></span><span>VENICE</span></a><section class="section">${action}</section></main></body></html>`;
+  let action;
+  let status = code ? 200 : 403;
+  let refresh = '';
+  if (code) {
+    action = `<p class="kicker">ONE-TIME CONNECTION</p><h1>Connect Venice.</h1><p>Signed in as <strong>${name}</strong> (${id}). This code expires in five minutes and works once.</p><p><a class="button primary" href="orion://activate?key=${code}">Open Venice →</a></p><p>If the app does not open, enter <code>${code}</code> in its unlock screen.</p>`;
+  } else if (activating?.timedOut) {
+    status = 202;
+    action = `<p class="kicker">PAYMENT RECEIVED</p><h1>Still activating.</h1><p role="status">${escapeHtml(ACTIVATING_FALLBACK_MESSAGE)}</p><p><a class="button primary" href="/connect">Check again</a> <a class="button secondary" href="/discord">View your Discord account →</a></p>`;
+  } else if (activating) {
+    status = 202;
+    const next = `/connect?activating=${activating.attempt + 1}`;
+    const retrySeconds = activating.retrySeconds || ACTIVATING_RETRY_SECONDS;
+    if (retrySeconds <= ACTIVATING_RETRY_SECONDS) {
+      refresh = `<meta http-equiv="refresh" content="${retrySeconds};url=${next}">`;
+    }
+    const message = activating.rateLimited
+      ? `Too many connection-code requests. Try again in ${retrySeconds} seconds; your payment and account access are unchanged.`
+      : ACTIVATING_MESSAGE;
+    action = `<p class="kicker">PAYMENT RECEIVED</p><h1>Activating Venice.</h1><p role="status">${escapeHtml(message)}</p><p>${activating.rateLimited ? 'Your existing code remains valid until it expires.' : `This page checks again every ${ACTIVATING_RETRY_SECONDS} seconds and shows your one-time code as soon as it is ready.`}</p><p><a class="button secondary" href="${next}">Check now</a></p>`;
+  } else {
+    action = `<p class="kicker">ACCOUNT ACCESS</p><h1>Not ready to connect.</h1><p>${escapeHtml(error)}</p><p><a class="button secondary" href="/discord">View your Discord account →</a></p>`;
+  }
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">${refresh}<title>Connect Venice</title><link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="/styles.css"></head><body><main class="shell" id="main"><a class="brand" href="/"><span class="brand-mark"><img src="/orion.png" width="28" height="28" alt=""></span><span>VENICE</span></a><section class="section">${action}</section></main></body></html>`;
   const response = withHeaders(new Response(html, {
-    status: code ? 200 : 403,
+    status,
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store', 'Vary': 'Cookie' },
   }));
   response.headers.set('Referrer-Policy', 'no-referrer');
   return response;
+}
+
+// True only when the signed paid-checkout cookie belongs to the signed-in Discord account.
+async function recentPaidCheckout(request, env, session) {
+  const paid = await verifyValue(parseCookies(request)[PAID_COOKIE], env.SESSION_SECRET);
+  return Boolean(paid?.paid === true && paid.discordId && paid.discordId === session.discordId);
+}
+
+function activatingAttempt(url) {
+  const raw = url.searchParams.get('activating') || '0';
+  const attempt = /^\d{1,3}$/u.test(raw) ? Number(raw) : 0;
+  return Math.min(attempt, ACTIVATING_MAX_ATTEMPTS);
 }
 
 async function connectLauncher(request, env, url) {
@@ -566,14 +618,72 @@ async function connectLauncher(request, env, url) {
   if (!/^\d{16,22}$/u.test(String(session?.discordId || ''))) {
     return withHeaders(Response.redirect(`${canonicalOrigin(url)}/auth/discord?return_to=%2Fconnect`, 302));
   }
+  // Poll entitlement/provisioning on a NON-MINTING endpoint. A pair-issue call
+  // consumes its five-per-ten-minute quota and only happens once readiness is
+  // confirmed. The signed paid cookie affects copy, never backend authority.
+  // [COPY-FIX 2026-09-23 CW-1] A customer who paid in ANOTHER browser has no paid cookie and
+  // lands here while the webhook is still provisioning; tell them to refresh.
+  const ENTITLEMENT_MESSAGE = 'Your Discord account needs an active trial or subscription. Claim the trial in Discord, then try again. Just paid? Activation can take up to a minute — refresh this page.';
+  const OUTAGE_MESSAGE = "Venice's servers didn't respond just now. Nothing is wrong with your account — wait a minute and try again. If it keeps happening, open a ticket in the Venice Discord.";
+  const paid = await recentPaidCheckout(request, env, session);
+  const attempt = activatingAttempt(url);
+  let statusResponse;
   try {
-    const response = await callOrion(env, '/api/bot/pair-issue', { discord_id: session.discordId }, true);
-    const data = await response.json();
-    if (!/^PAIR-[A-HJ-NP-Z2-9]{32}$/u.test(String(data.pair_code || ''))) throw Error('Invalid pair code');
-    return connectPage(session, data.pair_code);
-  } catch {
-    return connectPage(session, '', 'Your Discord account needs an active trial or subscription. Claim the trial in Discord, then try again.');
+    statusResponse = await orionRequest(env, '/api/bot/pair-status',
+      { discord_id: session.discordId }, { pairIssuer: true });
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'pair_status_unreachable', error: String(error?.name || 'Error'), discord: redactId(session.discordId) }));
+    return connectPage(session, '', OUTAGE_MESSAGE);
   }
+  if (statusResponse.status === 429 && paid) {
+    const retry = await readJson(statusResponse);
+    const retrySeconds = Math.max(1, Math.min(600, Number(retry.retry_after_s) || 60));
+    return connectPage(session, '', '', attempt >= ACTIVATING_MAX_ATTEMPTS
+      ? { timedOut: true } : { attempt, rateLimited: true, retrySeconds });
+  }
+  if (statusResponse.status >= 500 || statusResponse.status === 429) {
+    console.warn(JSON.stringify({ event: 'pair_status_backend_error', status: statusResponse.status, discord: redactId(session.discordId) }));
+    return connectPage(session, '', OUTAGE_MESSAGE);
+  }
+  if (!statusResponse.ok) {
+    return connectPage(session, '', ENTITLEMENT_MESSAGE);
+  }
+  const status = await readJson(statusResponse);
+  if (status.ready !== true) {
+    if (!paid) return connectPage(session, '', ENTITLEMENT_MESSAGE);
+    console.log(JSON.stringify({ event: 'pair_status_awaiting_provision', attempt, discord: redactId(session.discordId) }));
+    return connectPage(session, '', '', attempt >= ACTIVATING_MAX_ATTEMPTS ? { timedOut: true } : { attempt });
+  }
+  let response;
+  try {
+    response = await orionRequest(env, '/api/bot/pair-issue',
+      { discord_id: session.discordId }, { pairIssuer: true });
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'pair_issue_unreachable', error: String(error?.name || 'Error'), discord: redactId(session.discordId) }));
+    return connectPage(session, '', OUTAGE_MESSAGE);
+  }
+  if (response.status === 429 && paid) {
+    const retry = await readJson(response);
+    const retrySeconds = Math.max(1, Math.min(600, Number(retry.retry_after_s) || 60));
+    return connectPage(session, '', '', attempt >= ACTIVATING_MAX_ATTEMPTS
+      ? { timedOut: true } : { attempt, rateLimited: true, retrySeconds });
+  }
+  if (response.status >= 500 || response.status === 429) {
+    return connectPage(session, '', OUTAGE_MESSAGE);
+  }
+  if (!response.ok) {
+    if (paid) return connectPage(session, '', '', attempt >= ACTIVATING_MAX_ATTEMPTS
+      ? { timedOut: true } : { attempt });
+    return connectPage(session, '', ENTITLEMENT_MESSAGE);
+  }
+  const data = await readJson(response);
+  if (!/^PAIR-[A-HJ-NP-Z2-9]{32}$/u.test(String(data.pair_code || ''))) {
+    console.warn(JSON.stringify({ event: 'pair_issue_bad_code', discord: redactId(session.discordId) }));
+    return connectPage(session, '', OUTAGE_MESSAGE);
+  }
+  const issued = connectPage(session, data.pair_code);
+  if (parseCookies(request)[PAID_COOKIE]) issued.headers.append('Set-Cookie', clearCookie(PAID_COOKIE));
+  return issued;
 }
 
 function discordIdFrom(object) {
@@ -665,6 +775,35 @@ async function processStripeEvent(env, event) {
     return "revoked";
   }
   if (event.type === "invoice.payment_failed") return "payment_failure_recorded";
+  // [2026-09-22 RED TEAM CX-002] A FULL refund or an opened dispute revokes the paid entitlement
+  // even when the subscription itself is still active. Partial refunds are left to the owner (no
+  // automatic action). Identity is resolved through the charge's invoice -> subscription, and the
+  // backend's own chargeback route audits + alerts.
+  if (event.type === "charge.refunded" || event.type === "charge.dispute.created") {
+    const charge = event.type === "charge.refunded" ? object
+      : await stripeRequest(env, `/v1/charges/${encodeURIComponent(String(object.charge || ""))}`);
+    if (event.type === "charge.refunded") {
+      const amount = Number(charge.amount || 0);
+      const refunded = Number(charge.amount_refunded || 0);
+      if (charge.refunded !== true && (amount <= 0 || refunded < amount)) return "partial_refund_recorded";
+    }
+    const invoiceId = String(charge.invoice || "");
+    if (!/^in_[A-Za-z0-9]+$/u.test(invoiceId)) return "refund_without_invoice_recorded";
+    const invoice = await stripeRequest(env, `/v1/invoices/${encodeURIComponent(invoiceId)}`);
+    const subId = subscriptionId(invoice)
+      || String(invoice.parent?.subscription_details?.subscription || invoice.subscription || "");
+    if (!/^sub_[A-Za-z0-9]+$/u.test(subId)) return "refund_without_subscription_recorded";
+    const subscription = await stripeRequest(env, `/v1/subscriptions/${encodeURIComponent(subId)}`);
+    const discordId = discordIdFrom(subscription) || discordIdFrom(invoice);
+    if (!discordId) throw new Error("Refund/dispute did not identify a Discord-linked subscription");
+    await callOrion(env, "/api/bot/chargeback", {
+      discord_user_id: discordId,
+      kind: event.type === "charge.refunded" ? "refunded" : "disputed",
+      reason: `Stripe ${event.type} ${String(charge.id || "").slice(0, 40)}`,
+      subscription_id: subId,
+    });
+    return event.type === "charge.refunded" ? "refund_revoked" : "dispute_revoked";
+  }
   return "ignored";
 }
 
@@ -696,8 +835,17 @@ async function checkoutComplete(request, env, url) {
     const checkout = await stripeRequest(env, `/v1/checkout/sessions/${encodeURIComponent(sessionId)}`);
     const session = await currentSession(request, env);
     if (!session?.discordId || discordIdFrom(checkout) !== session.discordId) return json({ error: "Checkout session does not match this Discord account." }, 403);
-    const destination = checkout.status === "complete" ? "/discord?purchase=complete" : "/#pricing";
-    return withHeaders(Response.redirect(`${canonicalOrigin(url)}${destination}`, 302));
+    const complete = checkout.status === "complete";
+    const destination = complete ? "/discord?purchase=complete" : "/#pricing";
+    const response = new Response(null, { status: 302, headers: { Location: `${canonicalOrigin(url)}${destination}`, "Cache-Control": "no-store" } });
+    if (complete) {
+      // [GMC-001] Messaging hint only: /connect shows "activating" instead of "needs a
+      // subscription" while the webhook provisions. Access still comes from the backend.
+      const paid = await signValue({ discordId: session.discordId, paid: true,
+        exp: Math.floor(Date.now() / 1000) + PAID_COOKIE_SECONDS }, env.SESSION_SECRET);
+      response.headers.append("Set-Cookie", cookie(PAID_COOKIE, paid, PAID_COOKIE_SECONDS));
+    }
+    return withHeaders(response);
   } catch {
     return json({ error: "Checkout status could not be confirmed." }, 502);
   }

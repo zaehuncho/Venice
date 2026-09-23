@@ -38,6 +38,22 @@
   #define SourcePackageDir "..\release\orion-package"
 #endif
 
+; SERVER-SHARD launch chain. When the packed package carries the unpacked activation
+; broker (OrionActivate.exe), the customer-facing launch target, the Start-menu/desktop
+; shortcuts, and the orion:// protocol handler must all point at the BROKER, not the
+; packed inner OrionNative.exe: on a shard build OrionNative.exe is the Lethe bootstrap
+; and cannot run until the broker has written the DPAPI session (docs/ACTIVATION_BROKER
+; _2026-09-19.md). MyAppExeName stays OrionNative.exe (the updater + deep-link owner
+; check resolve it by name); LaunchExeName is the separate, correct launch entry point.
+; The signed release_manifest.json/.sig ship beside the broker (they are part of the
+; package) so the broker's --register self-trust gate is satisfied.
+#if FileExists(SourcePackageDir + "\OrionActivate.exe")
+  #define LaunchExeName "OrionActivate.exe"
+  #define ServerShardBuild
+#else
+  #define LaunchExeName "OrionNative.exe"
+#endif
+
 ; ==== Compile-time ship gates (fail loud at iscc time, not on a customer machine) ====
 ; A template-stage version must never reach an artifact. Define AllowDevVersion for a
 ; local IDE smoke-compile only.
@@ -52,6 +68,16 @@
 #if !FileExists(SourcePackageDir + "\release_manifest.json")
   #error SourcePackageDir does not contain release_manifest.json - point at the output of tools/package_orion_release.py
 #endif
+; A server-shard package (broker present) is incomplete without the packed inner
+; payload and the signed manifest the broker's self-trust gate verifies.
+#ifdef ServerShardBuild
+  #if !FileExists(SourcePackageDir + "\OrionNative.packed.exe")
+    #error Server-shard package has OrionActivate.exe but no OrionNative.packed.exe - re-run pack_lethe_release.py --server-shard
+  #endif
+  #if !FileExists(SourcePackageDir + "\release_manifest.sig")
+    #error Server-shard package must ship a signed release_manifest.sig beside the broker (its --register self-trust anchor)
+  #endif
+#endif
 
 [Setup]
 AppId={{B7E2F1A0-4C3D-4E9A-9F21-ORION0000001}
@@ -64,6 +90,12 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 ; Kernel-driver installs require elevation.
 PrivilegesRequired=admin
+; The only per-user paths this installer touches are the uninstall cleanup of
+; {localappdata}\NexusVision (nexus_bridge.token + dirifempty) and the DataDir read in
+; [Code]; the elevated-vs-logged-in profile mismatch is the KNOWN, ACCEPTED Inno caveat
+; documented at the DataDir helper below. Acknowledged here so the packing gate's compile
+; log stays warning-free and a NEW warning cannot hide behind this known one.
+UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Customer-visible installer FILENAME — matches the app it installs (Venice).
@@ -72,6 +104,16 @@ OutputBaseFilename=VeniceSetup-{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; [2026-09-21 owner: "nice looking installer"] Branded wizard art in the website palette:
+; the V mark on the dark canvas as the side image and the small header image. Generated
+; by tools (Pillow) into installer\assets\; guarded so a clone without the bitmaps still
+; compiles with Inno's stock art rather than failing the build.
+#if FileExists(SourcePath + "assets\venice-wizard.bmp")
+  WizardImageFile={#SourcePath}assets\venice-wizard.bmp
+#endif
+#if FileExists(SourcePath + "assets\venice-wizard-small.bmp")
+  WizardSmallImageFile={#SourcePath}assets\venice-wizard-small.bmp
+#endif
 ; Venice branding on the installer itself. Icon comes from the same assets\orion.ico
 ; that OrionNative.exe embeds (blue V), so shortcut + installer + running app all match.
 ; Kept optional-with-fallback because the .ico is gitignored on some clones.
@@ -87,10 +129,18 @@ WizardStyle=modern
 SignTool={#SignToolName}
 SignedUninstaller=yes
 #endif
-UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayIcon={app}\{#LaunchExeName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+; Product copy on the two pages every customer reads. Everything else keeps Inno's defaults.
+WelcomeLabel1=Welcome to Venice
+WelcomeLabel2=Setup will install Venice — jump-shot timing for NBA 2K27 on PS5 — on this PC.%n%nBefore you continue, close any capture software (OBS, your capture card's own viewer) so Venice can use the card, and keep your controller plugged into this PC over USB.%n%nVenice is in beta: PS5 with a capture card is the supported setup.
+FinishedHeadingLabel=Venice is installed
+FinishedLabel=Setup has finished installing Venice on this PC.%n%nOpen Venice, sign in with Discord, and the first-run tour will walk you through connecting your PS5. Your account and settings live on your Discord login, so there is no licence key to keep.
+ClickFinish=Click Finish to leave Setup.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -121,17 +171,18 @@ Source: "redist\HidHide_1.5.230_x64.exe";           DestDir: "{tmp}"; Flags: del
 Source: "redist\vc_redist.x64.exe";    DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsVCRedist
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+; LaunchExeName == OrionActivate.exe for a server-shard build (the broker is the launch
+; entry point), else OrionNative.exe. See the LaunchExeName define above.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#LaunchExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#LaunchExeName}"; Tasks: desktopicon
 
 [Run]
-; --- Driver installs, silent + elevated, BEFORE first launch. Order matters little; both
-;     are idempotent (skip-if-present via the Check functions). ---
-Filename: "{tmp}\ViGEmBus_1.22.0_x64_x86_arm64.exe"; Parameters: "/quiet /norestart"; \
-    StatusMsg: "Installing ViGEmBus virtual-controller driver..."; Flags: waituntilterminated; Check: NeedsViGEmBus
-Filename: "{tmp}\HidHide_1.5.230_x64.exe"; Parameters: "/quiet /norestart"; \
-    StatusMsg: "Installing HidHide controller-cloak driver..."; Flags: waituntilterminated; Check: NeedsHidHide
+; --- Driver installs (ViGEmBus, HidHide) MOVED to [Code] (InstallDriverChecked, run from
+;     CurStepChanged/ssPostInstall) on 2026-09-21: a [Run] entry cannot inspect the exit
+;     code, so a failed or reboot-pending driver install let Setup finish and Venice then
+;     reported only "virtual controller required" at Connect (Astra, bug sweep). Both are
+;     still idempotent (skip-if-present) and still run silently before first launch. ---
 ; VC++ runtime BEFORE first launch (see the [Files] note: the package is /MD with no
 ; app-local CRT, so without this a clean machine cannot start OrionNative.exe at all).
 ; NOTE: installed from [Code] (CurStepChanged/ssPostInstall) instead of here so the
@@ -139,9 +190,10 @@ Filename: "{tmp}\HidHide_1.5.230_x64.exe"; Parameters: "/quiet /norestart"; \
 ; and on a Windows SKU missing Windows Update the redist can fail silently -> msvcp140.dll
 ; won't load -> OrionNative dies at launch with no diagnostic. See InstallVCRedistChecked.
 
-; --- Optional: launch Orion at the end. ---
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; \
-    Flags: nowait postinstall skipifsilent
+; --- Optional: launch Orion at the end (the broker on a server-shard build). ---
+; [COPY-FIX 2026-09-23] Hidden while a driver/runtime restart is pending (RestartPending in [Code]).
+Filename: "{app}\{#LaunchExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; \
+    Flags: nowait postinstall skipifsilent; Check: not RestartPending
 
 [UninstallRun]
 ; Leave the shared drivers installed on uninstall (other software may use ViGEmBus/HidHide).
@@ -226,33 +278,91 @@ end;
   purposes, so we always report True. /F is required because OrionNative may be
   in a non-responsive state (e.g. after the packer-crash class of failures).
   Runs SILENTLY (SW_HIDE) so the user never sees flashing consoles. }
-procedure KillVeniceProcesses;
+{ Is any Venice image running? (tasklist filter; exit code is 0 either way, so parse the
+  output file for the image name.) }
+function VeniceImageRunning(const Image: string): Boolean;
 var
   ResultCode: Integer;
-  Names: array[0..4] of string;
+  Lines: TArrayOfString;
+  TmpFile: string;
   I: Integer;
 begin
+  Result := False;
+  TmpFile := ExpandConstant('{tmp}\venice_tasklist.txt');
+  if Exec(ExpandConstant('{cmd}'), '/C tasklist /FI "IMAGENAME eq ' + Image + '" /NH > "' + TmpFile + '"',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and LoadStringsFromFile(TmpFile, Lines) then
+    for I := 0 to GetArrayLength(Lines) - 1 do
+      if Pos(Lowercase(Image), Lowercase(Lines[I])) > 0 then
+      begin
+        Result := True;
+        Break;
+      end;
+  DeleteFile(TmpFile);
+end;
+
+{ Close Venice before files are replaced. [2026-09-21 beta] This used to be a silent
+  `taskkill /F` on every image, which threw away a customer's last unsaved change and
+  killed any unrelated process that happened to share the name (Astra, bug sweep).
+  Now: ask first, request a graceful close (WM_CLOSE; the app's normal shutdown path
+  writes settings atomically), wait up to ~8 s, and only then force the stragglers.
+  Returns False if the customer chose to cancel. }
+function CloseVeniceProcesses(const Prompt: Boolean): Boolean;
+var
+  ResultCode: Integer;
+  Names: array[0..5] of string;
+  I, Waited: Integer;
+  AnyRunning: Boolean;
+begin
+  Result := True;
   Names[0] := 'OrionNative.exe';
   Names[1] := 'OrionSidecar.exe';
   Names[2] := 'OrionUpdater.exe';
-  Names[3] := 'OrionOwner.exe';    { still killed if leftover from an older install }
+  Names[3] := 'OrionOwner.exe';    { leftover from an older install }
   Names[4] := 'OrionStaff.exe';    { same }
+  Names[5] := 'OrionActivate.exe'; { server-shard activation broker }
+
+  AnyRunning := False;
   for I := 0 to High(Names) do
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM ' + Names[I],
+    if VeniceImageRunning(Names[I]) then AnyRunning := True;
+  if not AnyRunning then
+    Exit;
+
+  if Prompt then
+    if MsgBox('Venice is currently running and needs to close before Setup can continue.'
+              + #13#10 + #13#10 + 'Click OK to close Venice now, or Cancel to finish what '
+              + 'you were doing first.', mbConfirmation, MB_OKCANCEL) <> IDOK then
+    begin
+      Result := False;
+      Exit;
+    end;
+
+  { Graceful first: without /F, taskkill posts WM_CLOSE to the app's windows. }
+  for I := 0 to High(Names) do
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM ' + Names[I],
          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Waited := 0;
+  while (Waited < 8000) and VeniceImageRunning('OrionNative.exe') do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+  { Anything still alive (a hung instance, the console-less sidecar) is forced. }
+  for I := 0 to High(Names) do
+    if VeniceImageRunning(Names[I]) then
+      Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM ' + Names[I],
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { One quick beat so the OS releases the handles before Inno starts copying. }
   Sleep(400);
 end;
 
 function InitializeSetup: Boolean;
 begin
-  { Kill any running Venice from a previous install before we start copying files.
+  { Close any running Venice from a previous install before we start copying files.
     Fixes the "DeleteFile failed; code 5 / Access is denied" prompt on Qt6Core.dll
     and libcrypto-3-x64.dll — those get locked by a running instance and Inno cannot
     replace them, so the user was forced to Skip (which leaves version-mismatched
-    files behind and breaks the install). Silent — no dialog if nothing is running. }
-  KillVeniceProcesses;
-  Result := True;
+    files behind and breaks the install). No dialog if nothing is running. }
+  Result := CloseVeniceProcesses(True);
 end;
 
 function InitializeUninstall: Boolean;
@@ -260,8 +370,7 @@ begin
   { Same reason on the way out: without this, the uninstaller can't delete Qt6Core /
     libcrypto and reports partial-uninstall, then a fresh install hits the same
     DeleteFile failure. }
-  KillVeniceProcesses;
-  Result := True;
+  Result := CloseVeniceProcesses(True);
 end;
 
 // Install the VC++ 2015-2022 x64 runtime with a real exit-code check. Run from the
@@ -273,6 +382,38 @@ end;
 // anything else is a genuine failure the user must be told about. The file is the
 // same {tmp}\vc_redist.x64.exe extracted by the Files section (deleteafterinstall
 // removes it only at the very end of setup, so it is present at ssPostInstall).
+{ [2026-09-21 release gate] FAIL CLOSED. Meter Delay is a headline feature and the CRT is
+  a hard prerequisite; a setup that "succeeds" without either is the 2026-08-08 hazard
+  (fresh installs with Meter Delay dead and nobody told). From ssPostInstall a raised
+  exception marks Setup FAILED (non-zero exit, Finished page not reached). NOTE (Astra,
+  release review): this reports failure but is NOT transactional -- copied files and
+  registrations remain; the transactional service rollback + PrepareToInstall preflight
+  is the tracked follow-up. Declared before its first caller (Pascal Script requires it). }
+procedure FailInstall(const Msg: string);
+begin
+  Log('FATAL: ' + Msg);
+  MsgBox(Msg + #13#10 + #13#10 + 'Setup cannot complete. Re-run this installer as '
+         + 'administrator, or open a ticket with this message.', mbCriticalError, MB_OK);
+  RaiseException(Msg);
+end;
+
+{ Same, but the customer sees PRODUCT copy plus a short support code, while the technical
+  detail (exit codes, sc/registry specifics) goes to the Setup log only (Astra, bug sweep:
+  "sc create exit code" is not a customer message). }
+procedure FailInstallDetailed(const Msg, Code, Detail: string);
+begin
+  Log('FATAL [' + Code + ']: ' + Msg + ' -- ' + Detail);
+  MsgBox(Msg + ' (code ' + Code + ')' + #13#10 + #13#10
+         + 'Setup cannot complete. Re-run this installer as administrator, or open a '
+         + 'ticket in the Venice Discord and quote the code above.', mbCriticalError, MB_OK);
+  RaiseException(Msg + ' [' + Code + '] ' + Detail);
+end;
+
+{ [COPY-FIX 2026-09-23 CW reboot] A 3010 from the VC++ redist is a pending restart too;
+  NeedRestart() below turns either flag into Inno's own "Restart now" Finished page. }
+var
+  VCRedistRestartNeeded: Boolean;
+
 procedure InstallVCRedistChecked;
 var
   ResultCode: Integer;
@@ -283,22 +424,56 @@ begin
           '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then
   begin
     if (ResultCode <> 0) and (ResultCode <> 1638) and (ResultCode <> 3010) then
-      MsgBox('The Microsoft Visual C++ runtime could not be installed (exit code '
-             + IntToStr(ResultCode) + ').' + #13#10 + #13#10
-             + 'Venice may not start until it is installed. Install it manually from'
-             + #13#10 + 'https://aka.ms/vs/17/release/vc_redist.x64.exe and then reopen Venice.',
-             mbError, MB_OK)
+      { [2026-09-21 release gate] fail CLOSED: without the CRT OrionNative.exe cannot start
+        at all, so a "completed" setup here is a broken install with no diagnostic. }
+      FailInstallDetailed('A Windows component Venice needs (the Visual C++ runtime) could not be '
+                          + 'installed. Restart your PC and run Setup again.',
+                          'VCRT-01', 'vc_redist exit code ' + IntToStr(ResultCode))
     else if ResultCode = 3010 then
+    begin
+      VCRedistRestartNeeded := True;
       MsgBox('The Microsoft Visual C++ runtime was installed, but Windows needs a '
              + 'restart to finish. Please restart your PC before opening Venice.',
              mbInformation, MB_OK);
+    end;
   end
   else
-    MsgBox('The Microsoft Visual C++ runtime installer could not be launched (error '
-           + IntToStr(ResultCode) + ').' + #13#10 + #13#10
-           + 'Venice may not start until it is installed manually from'
-           + #13#10 + 'https://aka.ms/vs/17/release/vc_redist.x64.exe.',
-           mbError, MB_OK);
+    FailInstallDetailed('A Windows component Venice needs (the Visual C++ runtime) could not be '
+                        + 'started. Restart your PC and run Setup again.',
+                        'VCRT-02', 'vc_redist launch error ' + IntToStr(ResultCode));
+end;
+
+{ [2026-09-21] Vendor driver installs with a REAL result check (was a fire-and-forget [Run]
+  entry). Exit 0 = installed, 1638 = already present, 3010 = installed but Windows needs a
+  restart; anything else fails Setup. After the installer returns, the driver's SCM key is
+  re-checked so a "successful" run that registered nothing is still caught. A pending
+  restart is remembered and reported once on the Finished page. }
+var
+  DriverRestartNeeded: Boolean;
+
+procedure InstallDriverChecked(const Friendly, ExeName, ServiceName: string);
+var
+  ResultCode: Integer;
+  ExePath: string;
+begin
+  if ServiceInstalled(ServiceName) then
+    Exit;
+  ExePath := ExpandConstant('{tmp}\' + ExeName);
+  if not FileExists(ExePath) then
+    FailInstall('The ' + Friendly + ' driver installer is missing from this Setup package.');
+  if not Exec(ExePath, '/quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    FailInstallDetailed('The ' + Friendly + ' driver could not be started. Restart your PC and '
+                        + 'run Setup again.', 'DRV-01', ExeName + ' launch error ' + IntToStr(ResultCode));
+  if (ResultCode <> 0) and (ResultCode <> 1638) and (ResultCode <> 3010) then
+    FailInstallDetailed('The ' + Friendly + ' driver could not be installed. Venice needs it to '
+                        + 'send controller input to your console. Restart your PC and run Setup again.',
+                        'DRV-02', ExeName + ' exit code ' + IntToStr(ResultCode));
+  if ResultCode = 3010 then
+    DriverRestartNeeded := True
+  else if not ServiceInstalled(ServiceName) then
+    FailInstallDetailed('The ' + Friendly + ' driver installed but Windows has not registered it '
+                        + 'yet. Restart your PC and run Setup again.',
+                        'DRV-03', ServiceName + ' service key absent after ' + ExeName);
 end;
 
 { Run sc.exe hidden and return whether it launched; ResultCode carries sc's own exit code. }
@@ -313,18 +488,28 @@ end;
   the following sc create fails with 1072. cmd /c "sc query X | findstr STOPPED" gives
   exit code 0 only when the state line is present — same poll owner_venice_setup.ps1
   uses, ~10 s worst case. }
-procedure WaitServiceStopped(const ServiceName: string);
+function WaitServiceStopped(const ServiceName: string): Boolean;
 var
   I, ResultCode: Integer;
 begin
-  for I := 0 to 19 do
+  { [2026-09-21] Returns whether the service is stopped or absent. Matches the NUMERIC
+    SCM state (`STATE : 1`) instead of the word STOPPED, which is localized on non-English
+    Windows and made the old poll time out and race the delete (Astra, bug sweep). }
+  Result := False;
+  for I := 0 to 39 do
   begin
     if not ServiceInstalled(ServiceName) then
+    begin
+      Result := True;
       Exit;
+    end;
     if Exec(ExpandConstant('{cmd}'),
-            '/c sc query ' + ServiceName + ' | findstr /C:"STOPPED"',
+            '/c sc query ' + ServiceName + ' | findstr /R /C:"STATE *: *1 "',
             '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+    begin
+      Result := True;
       Exit;
+    end;
     Sleep(500);
   end;
 end;
@@ -338,7 +523,11 @@ begin
   if not ServiceInstalled(ServiceName) then
     Exit;
   RunSc('stop ' + ServiceName, ResultCode);
-  WaitServiceStopped(ServiceName);
+  if not WaitServiceStopped(ServiceName) then
+    { Deleting a still-running service marks it delete-pending and the re-create then
+      fails with 1072 -- a broken upgrade. Stop here instead, with something to act on. }
+    FailInstallDetailed('An earlier Venice service on this PC did not stop in time. Restart your '
+                        + 'PC and run Setup again.', 'VNSVC-04', ServiceName + ' not STOPPED within 20 s');
   RunSc('delete ' + ServiceName, ResultCode);
   Sleep(600);  { let the SCM finish the delete before anything recreates a bridge }
 end;
@@ -373,10 +562,10 @@ begin
   ExePath := ExpandConstant('{app}\packet_bridge\VeniceNetSvc.exe');
   if not FileExists(ExePath) then
   begin
-    { An older/partial package without the bridge. The app's Meter Delay card already
-      reports "not available on this install", so fail soft rather than block setup. }
-    Log('VeniceNetSvc.exe not found in package; skipping packet-bridge registration.');
-    Exit;
+    { build_installer.ps1 already refuses a package without the bridge; reaching this
+      branch means the pipeline was bypassed. Do not ship a silent no-Meter-Delay install. }
+    FailInstall('The Venice network-delay service (packet_bridge\VeniceNetSvc.exe) is missing '
+                + 'from this installer package.');
   end;
 
   { ROLLBACK COMPATIBILITY: an upgrade from a pre-Venice install must remove the legacy
@@ -391,12 +580,8 @@ begin
                + ' start= demand type= own obj= LocalSystem DisplayName= "Venice Packet Service"',
                ResultCode) or (ResultCode <> 0) then
   begin
-    MsgBox('The Venice network-delay service could not be registered (sc create exit code '
-           + IntToStr(ResultCode) + ').' + #13#10 + #13#10
-           + 'Venice will still run, but the Meter Delay feature will show as unavailable '
-           + 'until the service is installed. You can re-run this installer as administrator '
-           + 'to retry.', mbError, MB_OK);
-    Exit;
+    FailInstallDetailed('Venice''s network service could not be set up on this PC.',
+                        'VNSVC-01', 'sc create exit code ' + IntToStr(ResultCode));
   end;
 
   RunSc('description VeniceNetSvc "Privileged WinDivert packet bridge for Venice. Lets '
@@ -412,10 +597,9 @@ begin
                                   'ORION_METER_DELAY_ARMED=1')
      or not RegQueryMultiStringValue(HKLM, EnvKey, 'Environment', ArmRead)
      or (Pos('ORION_METER_DELAY_ARMED=1', ArmRead) = 0) then
-    MsgBox('The Venice network-delay service was installed, but its arm switch could not '
-           + 'be written to the registry. The service will start DISARMED and the Meter '
-           + 'Delay feature will not engage. Re-run this installer as administrator to retry.',
-           mbError, MB_OK);
+    { A service that starts DISARMED is the silent-broken state; never complete setup on it. }
+    FailInstallDetailed('Venice''s network service was installed but could not be configured.',
+                        'VNSVC-02', 'ORION_METER_DELAY_ARMED env write/readback failed under ' + EnvKey);
 
   { Grant Interactive Users SERVICE_START(RP)/STOP(WP)/QUERY so the unelevated app can
     start the demand-start service; SYSTEM/Admins keep full control. Same SDDL as
@@ -423,9 +607,46 @@ begin
   Sddl := 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)'
         + '(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)';
   if not RunSc('sdset VeniceNetSvc ' + Sddl, ResultCode) or (ResultCode <> 0) then
-    MsgBox('The Venice network-delay service was installed, but its start permissions could '
-           + 'not be set (sc sdset exit code ' + IntToStr(ResultCode) + ').' + #13#10 + #13#10
-           + 'Meter Delay may only work when Venice is run as administrator.', mbInformation, MB_OK);
+    { Without the DACL the unelevated app cannot start the service: Meter Delay is dead for
+      every customer who does not run Venice as administrator, i.e. all of them. }
+    FailInstallDetailed('Venice''s network service was installed but could not be given the '
+                        + 'permissions it needs.', 'VNSVC-03', 'sc sdset exit code ' + IntToStr(ResultCode));
+end;
+
+(* SERVER-SHARD only: register the activation broker as the orion:// protocol handler and
+  as the customer launch target. On a shard build the customer clicks
+  orion://activate?code=PAIR-... from the website; that MUST reach the broker
+  (OrionActivate.exe), which performs /api/activate and writes the DPAPI session the
+  bootstrap needs. The broker also self-registers orion:// on every run and accepts
+  --register as an idempotent install hook; it requires the signed
+  release_manifest.json/.sig (shipped in {app}) to satisfy its self-trust gate. The
+  packed inner OrionNative.exe deliberately does NOT re-point orion:// when a sibling
+  broker exists (main.cpp runtime guard), so this registration is stable across launches. *)
+procedure RegisterActivationBroker;
+var
+  BrokerPath: string;
+  ResultCode: Integer;
+begin
+  BrokerPath := ExpandConstant('{app}\OrionActivate.exe');
+  if not FileExists(BrokerPath) then
+    Exit;  { non-shard build: the app registers orion:// itself at runtime }
+  if not Exec(BrokerPath, '--register', ExpandConstant('{app}'), SW_HIDE,
+              ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  begin
+    { --register verifies the signed manifest beside the broker before writing HKCU
+      orion://. On a SHARD build this is FATAL, not advisory: a nonzero exit means the
+      broker's own self-trust gate refused (tampered/incomplete package) or orion://
+      could not be registered - and the customer's only activation path is clicking
+      orion://activate?code=... on the website. Failing the install here is the
+      fail-closed outcome; reporting "installed successfully" and leaving a dead
+      protocol handler is not. }
+    Log('OrionActivate.exe --register returned ' + IntToStr(ResultCode));
+    RaiseException('Activation broker registration failed (OrionActivate.exe --register'
+      + ' exit ' + IntToStr(ResultCode) + ').'#13#10
+      + 'This is a server-shard build: the broker must verify the signed release manifest'
+      + ' and register the orion:// handler before Venice can activate.'#13#10
+      + 'Re-download the installer; if it happens again, contact support.');
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -457,8 +678,28 @@ begin
   if CurStep = ssPostInstall then
   begin
     InstallVCRedistChecked;
+    InstallDriverChecked('ViGEmBus virtual controller', 'ViGEmBus_1.22.0_x64_x86_arm64.exe', 'ViGEmBus');
+    InstallDriverChecked('HidHide controller', 'HidHide_1.5.230_x64.exe', 'HidHide');
     RegisterPacketBridgeService;
+    RegisterActivationBroker;
+    if DriverRestartNeeded then
+      MsgBox('A controller driver was installed and Windows needs a restart to finish. '
+             + 'Please restart your PC before opening Venice.', mbInformation, MB_OK);
   end;
+end;
+
+{ [COPY-FIX 2026-09-23 CW reboot] Inno calls NeedRestart after installing: True makes the
+  Finished page offer "Yes, restart the computer now" instead of letting the customer
+  launch Venice on a driver/runtime that is not live yet. RestartPending also gates the
+  postinstall "Launch Venice" [Run] entry (Check:), belt and braces. }
+function RestartPending: Boolean;
+begin
+  Result := DriverRestartNeeded or VCRedistRestartNeeded;
+end;
+
+function NeedRestart(): Boolean;
+begin
+  Result := RestartPending;
 end;
 
 (* Best-effort stop of the WinDivert kernel driver on uninstall. NORMAL path: the bridge

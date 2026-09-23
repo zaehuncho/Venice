@@ -2,6 +2,12 @@
 
 **Written 2026-08-04. Queued behind the animation-phase predictor and the Red+Purple colour work.**
 
+**Status 2026-09-21:** §1 is IMPLEMENTED — `LeadCalibrationPolicy.h` (bisection, unit-tested sign
+convention) + `OrionAppController::beginLeadCalibration / reportLeadCalibrationVerdict /
+cancelLeadCalibration` (persists every step, refuses under an env lead override or without a
+running session) + the screen in `ShotLeadCard.qml` (Calibrate my lead -> EARLY / GOOD / LATE,
+Skip, Cancel, Done). §2 (startup self-check) is still open.
+
 ## Why these two and not more predictor work
 
 Five predictive hypotheses were measured and killed on 2026-08-04: sub-pixel reads, template

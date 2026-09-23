@@ -366,8 +366,9 @@ def test_static_column_is_locked_at_most_once_until_it_rises(clean_env):
 
 
 def test_static_zone_releases_the_moment_a_meter_rises_there(clean_env):
-    """A real meter renders in a quarantined zone: it rises, so the record is retired and the
-    zone is ordinary again. The cost to a real meter is the frame it takes to gain the rise."""
+    """A real meter renders in a quarantined zone: it rises IN ORDER, so the record is retired
+    and the zone is ordinary again. Idle (no press), the cost is the _fresh_up_req() frames the
+    ordered proof takes; under an armed press it is still the one frame past the first rise."""
     r = _reader()
     r.set_shot_state(False, 0.0, False)
     clk = _Clock()
@@ -383,6 +384,145 @@ def test_static_zone_releases_the_moment_a_meter_rises_there(clean_env):
     assert published, "a rising meter must escape the quarantine"
     assert not r._static_zones                      # record retired
     assert published == sorted(published)
+
+
+def test_static_zone_ignores_one_idle_jitter_read(clean_env):
+    """Live 2026-09-21: five quarantine releases, none of them a meter. One jittery read
+    >= _static_zone_rise_pp above the lock's first read used to "prove a rise" and retire the
+    record; the same spot was re-quarantined 1-2 s later. With no press armed the release now
+    needs the ORDERED proof: _fresh_up_req() consecutive reads each _fresh_up_pp higher."""
+    r = _reader()
+    r.set_shot_state(False, 0.0, False)
+    clk = _Clock()
+    _static_cycle(r, clk)
+    _static_cycle(r, clk)
+    assert r._static_zones and r._static_zones[0]["n"] >= 2
+
+    seen = [_serve(r, clk, frame_with(GHOST_X, pct)) for pct in (30, 33, 30, 30, 33, 30)]
+    assert not any(x.detected for x in seen), [(x.detected, round(float(x.fill_pct), 1))
+                                               for x in seen]
+    assert any(x.rejection_reason == "static_zone_quarantined" for x in seen),         [x.rejection_reason for x in seen]
+    assert r._static_zones, "a jitter read is not a rise: the record must survive"
+
+
+def test_static_zone_releases_for_an_armed_press_on_the_first_rise(clean_env):
+    """A real shot whose meter lands in a quarantined zone pays exactly what it paid before the
+    2026-09-21 tightening: with the physical press armed, the FIRST read >= _static_zone_rise_pp
+    releases the record -- it does not have to spend _fresh_up_req() frames proving order.
+
+    No dead air before the meter renders: 30 consecutive full-frame nofinds DECAY a strike
+    (_note_static_zone_absence), which would lift the quarantine on its own and make this test
+    pass without the armed path ever running. Releasing empties the list; decaying would leave
+    a record at n=1, so the emptiness assert is what separates the two."""
+    r = _reader()
+    r.set_shot_state(False, 0.0, False)
+    clk = _Clock()
+    _static_cycle(r, clk)
+    _static_cycle(r, clk)
+    assert r._static_zones and r._static_zones[0]["n"] >= 2
+
+    r.set_shot_state(True, 1.0, True)
+    r.notify_physical_shot_start(31)
+    # 18% is the first fill the locator proposes a box for; 24% is +5.7pp on it, so the armed
+    # release fires on the SECOND read -- one frame past the rise, as before.
+    # Exactly two frames: long enough for the armed release, far too short for the ordered
+    # proof (_fresh_up_req() == 3 rising reads), so a pass can only come from the armed escape.
+    seen = [_serve(r, clk, frame_with(GHOST_X, pct)) for pct in (18, 24)]
+    first_pub = next((i for i, x in enumerate(seen) if x.detected), None)
+    assert first_pub == 1, \
+        [(x.detected, x.rejection_reason, round(float(x.fill_pct), 1)) for x in seen]
+    assert r._static_zones == [], "the armed release must RETIRE the record, not decay it"
+    assert r._det_lock_up_n < r._fresh_up_req(), \
+        "the ordered proof must not have been satisfied -- this pins the ARMED escape"
+
+
+def test_repeat_offender_zone_keeps_a_longer_quarantine(clean_env):
+    """The left-edge HUD element at (85, 526-557) was quarantined four times in four minutes:
+    the record expired after the base TTL and the object had to be caught lying twice more
+    each time. A repeat offender gets a doubled TTL per prior quarantine of its cell."""
+    r = _reader()
+    r.set_shot_state(False, 0.0, False)
+    clk = _Clock()
+    base = float(r._static_zone_ttl_s)
+    _static_cycle(r, clk)
+    _static_cycle(r, clk)
+    assert r._static_zones and r._static_zones[0]["n"] >= 2
+    assert r._static_zones[0]["ttl"] == pytest.approx(base)     # first offence: base TTL
+
+    clk.tick(int((base + 5.0) * 60))                             # let the record expire
+    _static_cycle(r, clk)
+    _static_cycle(r, clk)
+    assert r._static_zones and r._static_zones[0]["n"] >= 2
+    assert r._static_zones[0]["ttl"] == pytest.approx(2.0 * base)
+
+    clk.tick(int((base + 5.0) * 60))                             # past the BASE ttl only
+    seen = [_serve(r, clk, frame_with(GHOST_X, 30)) for _ in range(4)]
+    assert not any(x.detected for x in seen), "the doubled TTL must still be holding"
+    assert any(x.rejection_reason == "static_zone_quarantined" for x in seen)
+
+    # The ledger forgets a cell after _static_zone_repeat_forget_s; a real meter clears it.
+    cx, cy = r._static_zones[0]["cx"], r._static_zones[0]["cy"]
+    assert r._static_zone_repeat_ttl(cx, cy, clk.t + r._static_zone_repeat_forget_s + 1.0)         == pytest.approx(base)
+    r._static_zone_release(r._static_zones[0], "test")
+    assert r._static_zone_repeat_ttl(cx, cy, clk.t) == pytest.approx(base)
+
+
+def test_repeat_offender_escalation_flag_pins_it_off(clean_env):
+    r = _reader(ORION_READER_STATIC_ZONE_REPEAT_ESCALATE="0")
+    r.set_shot_state(False, 0.0, False)
+    clk = _Clock()
+    base = float(r._static_zone_ttl_s)
+    for _ in range(2):
+        _static_cycle(r, clk)
+        _static_cycle(r, clk)
+        assert r._static_zones and r._static_zones[0]["ttl"] == pytest.approx(base)
+        clk.tick(int((base + 5.0) * 60))
+
+
+def test_idle_proposals_never_meet_the_anchor_and_are_counted(clean_env):
+    """[ANCHOR INSTRUMENT 2026-09-21] _update_anchor is skipped whenever no press is armed, so
+    an idle proposal reaches the reader with no geometric gate at all. The counters make that
+    visible: idle_hit counts those proposals and the anchor_* histogram stays at zero for them;
+    an ARMED evaluation lands in exactly one bucket (this court has no nameplate -> none)."""
+    r = _reader()
+    base = r._meter_detector._base
+    r.set_shot_state(False, 0.0, False)
+    clk = _Clock()
+    for _ in range(3):
+        _serve(r, clk, frame_with(GHOST_X, 30))
+    assert base.stats["idle_hit"] >= 1
+    assert base.stats["idle_hit"] == base.stats["hit"]
+    buckets = ("anchor_none", "anchor_conf_lo", "anchor_conf_mid", "anchor_conf_hi")
+    assert sum(base.stats[k] for k in buckets) == 0, "idle frames must never be evaluated"
+
+    idle_before = base.stats["idle_hit"]
+    r.set_shot_state(True, 1.0, True)
+    r.notify_physical_shot_start(41)
+    for _ in range(3):
+        _serve(r, clk, frame_with(GHOST_X, 30))
+    assert base.stats["idle_hit"] == idle_before, "armed proposals are not idle"
+    assert sum(base.stats[k] for k in buckets) >= 1
+    assert base.stats["anchor_none"] >= 1        # no plate on the synthetic court
+
+    line = r._proposer_stats()
+    for key in ("idle_hit=", "refused_outside=", "anchor_patch_hit=", "anchor_none="):
+        assert key in line, line
+
+
+def test_static_zone_repeat_withholds_are_counted(clean_env):
+    """The proposer handing the same quarantined object back frame after frame (live epoch
+    60: 90 withheld reads, meter sighted 1499 ms late) shows up as staticq_repeat."""
+    r = _reader()
+    r.set_shot_state(False, 0.0, False)
+    clk = _Clock()
+    _static_cycle(r, clk)
+    _static_cycle(r, clk)
+    assert r._static_zones and r._static_zones[0]["n"] >= 2
+    for _ in range(6):
+        _serve(r, clk, frame_with(GHOST_X, 30))
+    assert r._static_zone_withheld >= 4
+    assert r._static_zone_withheld_repeat >= 3
+    assert r._static_zone_withheld_repeat < r._static_zone_withheld
 
 
 def test_static_zone_quarantine_flag_pins_the_layer_off(clean_env):
@@ -637,8 +777,8 @@ def test_health_line_keeps_every_layer_counter_inside_the_relay_trim(clean_env, 
     assert lines, caplog.messages
     line = lines[-1]
     head = line[:RELAY_TRIM - LOG_PREFIX]          # what the native relay actually forwards
-    fields = ["loc_forget=", "reseed_refused=", "staticq=", "idle_unpublished=",
-              "idle_reuse=", "press_fresh_withheld=", "tipless="]
+    fields = ["loc_forget=", "reseed_refused=", "staticq=", "staticq_repeat=", "anchor=",
+              "idle_unpublished=", "idle_reuse=", "press_fresh_withheld=", "tipless="]
     where = [head.index(f) for f in fields]        # ValueError here = trimmed away again
     assert where == sorted(where), list(zip(fields, where))
     assert head.index("provider=") < where[0]

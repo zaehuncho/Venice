@@ -306,7 +306,7 @@ Item {
                 }
                 Item { Layout.fillWidth: true }
                 Text {
-                    text: "Signed updates · Ed25519 verified"
+                    text: "Signed, verified updates"
                     color: Theme.textFaint
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontCaption

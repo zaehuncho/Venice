@@ -5,6 +5,7 @@
 #include "ReleaseMarkerDeliveryGate.h"
 #include "ReleaseMarkerProtocol.h"
 #include "ShotIntentPolicy.h"
+#include "ControllerRoutingPolicy.h"
 #include "SidecarLogRelayPolicy.h"
 #include "SidecarWatchdog.h"
 #include "SquareOutputWatchdog.h"
@@ -14,6 +15,8 @@
 #include <atomic>
 #include <future>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -41,6 +44,78 @@ class OrionInputProtocolTests final : public QObject {
     Q_OBJECT
 
 private slots:
+
+    void digitalRestIgnoresAnalogMovement()
+    {
+        ControllerState moving;
+        moving.leftStickX = 127;
+        moving.leftStickY = -63;
+        moving.rightStickX = -91;
+        moving.rightStickY = 42;
+        QVERIFY(!PreciseFirePolicy::controllerStateFullyNeutral(moving));
+        QVERIFY2(PreciseFirePolicy::controllerDigitalControlsAtRest(moving),
+                 "stick motion must not block repair of a lost button/trigger release");
+
+        moving.buttons = XINPUT_GAMEPAD_A;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalControlsAtRest(moving));
+        moving.buttons = 0;
+        moving.dpad = 2;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalControlsAtRest(moving));
+        moving.dpad = 8;
+        moving.r2 = 1;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalControlsAtRest(moving));
+        moving.r2 = 0;
+        moving.touchpad = true;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalControlsAtRest(moving));
+    }
+
+    void digitalReleaseEdgeCoversButtonsTriggersDpadAndTouchpad()
+    {
+        ControllerState rest;
+        ControllerState previous = rest;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalReleaseEdge(previous, rest));
+
+        previous.buttons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
+        ControllerState oneButtonStillHeld = previous;
+        oneButtonStillHeld.buttons = XINPUT_GAMEPAD_B;
+        QVERIFY(PreciseFirePolicy::controllerDigitalReleaseEdge(
+            previous, oneButtonStillHeld));
+
+        previous = rest;
+        previous.l2 = 255;
+        QVERIFY(PreciseFirePolicy::controllerDigitalReleaseEdge(previous, rest));
+        previous = rest;
+        previous.r2 = 1;
+        QVERIFY(PreciseFirePolicy::controllerDigitalReleaseEdge(previous, rest));
+        previous = rest;
+        previous.dpad = 6;
+        QVERIFY(PreciseFirePolicy::controllerDigitalReleaseEdge(previous, rest));
+        previous.dpad = 1;  // north-east -> east releases north
+        ControllerState east = rest;
+        east.dpad = 2;
+        QVERIFY(PreciseFirePolicy::controllerDigitalReleaseEdge(previous, east));
+        QVERIFY(!PreciseFirePolicy::controllerDigitalReleaseEdge(east, previous));
+        ControllerState invalidHat = rest;
+        invalidHat.dpad = -1;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalReleaseEdge(invalidHat, rest));
+        invalidHat.dpad = 99;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalReleaseEdge(invalidHat, rest));
+        previous = rest;
+        previous.touchpad = true;
+        QVERIFY(PreciseFirePolicy::controllerDigitalReleaseEdge(previous, rest));
+
+        ControllerState triggerTravel = rest;
+        triggerTravel.r2 = 200;
+        ControllerState triggerTravelLower = triggerTravel;
+        triggerTravelLower.r2 = 80;
+        QVERIFY2(!PreciseFirePolicy::controllerDigitalReleaseEdge(
+                     triggerTravel, triggerTravelLower),
+                 "analog travel is not a release until it reaches zero");
+
+        ControllerState pressed = rest;
+        pressed.buttons = XINPUT_GAMEPAD_X;
+        QVERIFY(!PreciseFirePolicy::controllerDigitalReleaseEdge(rest, pressed));
+    }
 
     void squareWatchdogPipeCopies_data()
     {
@@ -567,7 +642,9 @@ private slots:
         QVERIFY(shouldAutoRecoverInputFromTelemetry(
             /*running=*/true, /*recoveryPending=*/false,
             /*hasExplicitInputReady=*/true, /*inputReady=*/false));
-        QVERIFY(shouldAutoRecoverInputFromTelemetry(
+        // [2026-09-22 RED TEAM CL-006] missing telemetry evidence is NOT a verdict: it used to
+        // kill a healthy Chiaki child (10 drops -> 8 recoveries -> 2 sidecar restarts in 22 min).
+        QVERIFY(!shouldAutoRecoverInputFromTelemetry(
             /*running=*/true, /*recoveryPending=*/false,
             /*hasExplicitInputReady=*/false, /*inputReady=*/false));
 
@@ -844,6 +921,267 @@ private slots:
         QVERIFY(failedTiming.writeSampleValid);
         QVERIFY(failedTiming.ackAttempted);
         QVERIFY(failedTiming.ackSampleValid);
+#else
+        QSKIP("direct-input duplex transport is Windows-only");
+#endif
+    }
+
+    void delayedCancelReapNeverBlocksCallerOrDoubleReports()
+    {
+#ifdef _WIN32
+        const QByteArray pipeName = QByteArrayLiteral("\\\\.\\pipe\\orion_input_deferred_cancel_")
+            + QByteArray::number(GetCurrentProcessId()) + '_'
+            + QByteArray::number(GetTickCount64());
+        std::promise<void> readyPromise;
+        auto ready = readyPromise.get_future();
+        std::atomic<int> packets{0};
+        std::thread server([&] {
+            HANDLE pipe = CreateNamedPipeA(
+                pipeName.constData(), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1, sizeof(OrionInputAck) * 4, sizeof(OrionInputPacket), 0, nullptr);
+            readyPromise.set_value();
+            if (pipe == INVALID_HANDLE_VALUE) return;
+            const BOOL connected = ConnectNamedPipe(pipe, nullptr);
+            if (connected || GetLastError() == ERROR_PIPE_CONNECTED) {
+                OrionInputPacket packet{};
+                DWORD read = 0;
+                if (ReadFile(pipe, &packet, sizeof(packet), &read, nullptr)
+                    && read == sizeof(packet)) ++packets;
+                Sleep(180); // peer remains alive past the caller's ACK deadline
+                DisconnectNamedPipe(pipe);
+            }
+            CloseHandle(pipe);
+        });
+        ready.wait();
+        OrionInputClient::configureDeferredCancellationForTesting(true, 250);
+        InputRouteWriteResult result = InputRouteWriteResult::Failed;
+        uint64_t abandonCount = 0;
+        const auto started = std::chrono::steady_clock::now();
+        {
+            OrionInputClient client(QString::fromLatin1(pipeName));
+            client.setEnabled(true);
+            ControllerState state{};
+            result = client.sendDetailed(state, true, true);
+            abandonCount = client.abandonsSent();
+            QVERIFY(!client.connected());
+            QCOMPARE(client.ackFailures(), uint64_t{1});
+        } // client dies while reaper still owns the canceled read buffer
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        QCOMPARE(result, InputRouteWriteResult::WrittenUnconfirmed);
+        QVERIFY2(elapsed < 120, "caller waited for deferred cancel reaping");
+        QVERIFY(abandonCount <= 1);
+        QVERIFY(OrionInputClient::pendingCancellationReapsForTesting() > 0);
+        server.join();
+        Sleep(300);
+        QCOMPARE(OrionInputClient::pendingCancellationReapsForTesting(), 0);
+        QCOMPARE(packets.load(), 1);
+        OrionInputClient::configureDeferredCancellationForTesting(false, 0);
+#else
+        QSKIP("direct-input duplex transport is Windows-only");
+#endif
+    }
+
+    void blockedAbandonWriteCancelsWithoutBlockingOrDoubleReporting()
+    {
+#ifdef _WIN32
+        const QByteArray pipeName = QByteArrayLiteral("\\\\.\\pipe\\orion_input_abandon_blocked_")
+            + QByteArray::number(GetCurrentProcessId()) + '_'
+            + QByteArray::number(GetTickCount64());
+        std::promise<void> readyPromise;
+        auto ready = readyPromise.get_future();
+        std::promise<void> secondAckPromise;
+        auto secondAck = secondAckPromise.get_future();
+        std::atomic<DWORD> serverError{ERROR_SUCCESS};
+        std::atomic<int> packetsRead{0};
+        std::atomic<bool> closeServer{false};
+        std::thread server([&] {
+            HANDLE pipe = CreateNamedPipeA(
+                pipeName.constData(), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1, sizeof(OrionInputAck) * 4, sizeof(OrionInputPacket), 0, nullptr);
+            readyPromise.set_value();
+            if (pipe == INVALID_HANDLE_VALUE) {
+                serverError.store(GetLastError(), std::memory_order_relaxed);
+                secondAckPromise.set_value();
+                return;
+            }
+            if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) {
+                serverError.store(GetLastError(), std::memory_order_relaxed);
+                secondAckPromise.set_value();
+                CloseHandle(pipe);
+                return;
+            }
+            const auto readPacket = [&] {
+                OrionInputPacket packet{};
+                DWORD read = 0;
+                if (!ReadFile(pipe, &packet, sizeof(packet), &read, nullptr)
+                    || read != sizeof(packet) || packet.magic != 0x4E49524FU) {
+                    serverError.store(ERROR_INVALID_DATA, std::memory_order_relaxed);
+                    return uint32_t{0};
+                }
+                packetsRead.fetch_add(1, std::memory_order_relaxed);
+                return packet.seq;
+            };
+            const auto writeAck = [&](uint32_t seq, OrionInputAckStage stage) {
+                OrionInputAck ack{};
+                ack.magic = kOrionInputAckMagic;
+                ack.sourceSeq = seq;
+                ack.stage = static_cast<uint8_t>(stage);
+                DWORD written = 0;
+                if (!WriteFile(pipe, &ack, sizeof(ack), &written, nullptr)
+                    || written != sizeof(ack)) {
+                    serverError.store(GetLastError(), std::memory_order_relaxed);
+                    return false;
+                }
+                return true;
+            };
+            const uint32_t first = readPacket();
+            if (first && writeAck(first, OrionInputAckStage::Enqueued)
+                && writeAck(first, OrionInputAckStage::LocalUdpAccepted)) {
+                const uint32_t second = readPacket();
+                if (second)
+                    (void)writeAck(second, OrionInputAckStage::Enqueued);
+            }
+            secondAckPromise.set_value();
+            const ULONGLONG holdUntil = GetTickCount64() + 250;
+            while (!closeServer.load(std::memory_order_acquire)
+                   && GetTickCount64() < holdUntil)
+                Sleep(1); // peer stays alive beyond ACK plus blocked ABANDON deadlines
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        });
+
+        ready.wait();
+        OrionInputClient client(QString::fromLatin1(pipeName));
+        client.setEnabled(true);
+        ControllerState state{};
+        const InputRouteWriteResult seed = client.sendDetailed(state, true, true);
+        HANDLE fillerPipe = client.duplicatePipeHandleForTesting();
+        std::atomic<bool> fillerBlocked{false};
+        std::atomic<DWORD> fillerError{ERROR_SUCCESS};
+        std::thread filler([&] {
+            secondAck.wait();
+            if (fillerPipe == INVALID_HANDLE_VALUE) return;
+            struct FillerWrite final {
+                HANDLE pipe = INVALID_HANDLE_VALUE;
+                HANDLE event = nullptr;
+                OVERLAPPED overlapped{};
+                OrionInputPacket packet{};
+                ~FillerWrite() {
+                    if (event) CloseHandle(event);
+                    if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+                }
+            };
+            auto op = std::make_unique<FillerWrite>();
+            op->pipe = fillerPipe;
+            op->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!op->event) {
+                fillerError.store(GetLastError(), std::memory_order_relaxed);
+                return;
+            }
+            op->packet.magic = 0x4E49524FU;
+            for (int i = 0; i < 8192; ++i) {
+                ResetEvent(op->event);
+                op->overlapped = {};
+                op->overlapped.hEvent = op->event;
+                DWORD written = 0;
+                const BOOL ok = WriteFile(op->pipe, &op->packet,
+                                          sizeof(op->packet), &written, &op->overlapped);
+                if (ok) continue;
+                const DWORD error = GetLastError();
+                if (error != ERROR_IO_PENDING) {
+                    fillerError.store(error, std::memory_order_relaxed);
+                    break;
+                }
+                if (WaitForSingleObject(op->event, 2) == WAIT_OBJECT_0) {
+                    if (!GetOverlappedResult(op->pipe, &op->overlapped, &written, FALSE)) {
+                        fillerError.store(GetLastError(), std::memory_order_relaxed);
+                        break;
+                    }
+                    continue;
+                }
+                fillerBlocked.store(true, std::memory_order_release);
+                if (WaitForSingleObject(op->event, 400) == WAIT_OBJECT_0) {
+                    (void)GetOverlappedResult(op->pipe, &op->overlapped, &written, FALSE);
+                } else {
+                    (void)CancelIoEx(op->pipe, &op->overlapped);
+                    // The kernel still owns OVERLAPPED storage. Never free its
+                    // event/buffer/handle on a test timeout: a detached reaper
+                    // retains the allocation until cancellation completes.
+                    FillerWrite* retained = op.release();
+                    std::thread([retained] {
+                        if (WaitForSingleObject(retained->event, INFINITE)
+                            != WAIT_OBJECT_0)
+                            return; // deliberately retain on an invalid wait
+                        DWORD ignored = 0;
+                        (void)GetOverlappedResult(retained->pipe,
+                                                  &retained->overlapped, &ignored, FALSE);
+                        delete retained;
+                    }).detach();
+                }
+                break;
+            }
+        });
+
+        OrionInputClient::resetAbandonWriteProbeForTesting();
+        OrionInputClient::configureDeferredCancellationForTesting(true, 250);
+        std::promise<void> senderDonePromise;
+        auto senderDone = senderDonePromise.get_future();
+        InputRouteWriteResult result = InputRouteWriteResult::Failed;
+        std::atomic<int> terminalResults{0};
+        state.buttons = XINPUT_GAMEPAD_A;
+        const auto started = std::chrono::steady_clock::now();
+        std::thread sender([&] {
+            result = client.sendDetailed(state, true, true);
+            terminalResults.fetch_add(1, std::memory_order_relaxed);
+            senderDonePromise.set_value();
+        });
+        const bool bounded = senderDone.wait_for(std::chrono::milliseconds(150))
+            == std::future_status::ready;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const int reapsAtReturn = OrionInputClient::pendingCancellationReapsForTesting();
+        closeServer.store(true, std::memory_order_release);
+        // A broken seed/second write can leave this fixture's synchronous
+        // server read asleep. Teardown must not hide that failure by hanging.
+        (void)CancelSynchronousIo(server.native_handle());
+        server.join();
+        filler.join();
+        sender.join();
+        const uint64_t ackFailures = client.ackFailures();
+        const uint64_t abandonsSent = client.abandonsSent();
+        const int pendingWrites = OrionInputClient::abandonPendingWritesForTesting();
+        const int timedOutWrites = OrionInputClient::abandonTimedOutWritesForTesting();
+        OrionInputClient::configureDeferredCancellationForTesting(false, 0);
+        Sleep(300);
+        const int reapsAfter = OrionInputClient::pendingCancellationReapsForTesting();
+
+        QCOMPARE(seed, InputRouteWriteResult::LocalUdpAccepted);
+        QCOMPARE(serverError.load(std::memory_order_relaxed), DWORD{ERROR_SUCCESS});
+        QCOMPARE(packetsRead.load(std::memory_order_relaxed), 2);
+        QCOMPARE(fillerError.load(std::memory_order_relaxed), DWORD{ERROR_SUCCESS});
+        QVERIFY2(fillerBlocked.load(std::memory_order_acquire),
+                 "real named-pipe ingress must be saturated before ABANDON");
+        QVERIFY2(bounded && elapsed < 150, "blocked ABANDON held the caller");
+        QCOMPARE(result, InputRouteWriteResult::WrittenUnconfirmed);
+        QCOMPARE(terminalResults.load(std::memory_order_relaxed), 1);
+        QCOMPARE(ackFailures, uint64_t{1});
+        QCOMPARE(abandonsSent, uint64_t{0});
+        QCOMPARE(pendingWrites, 1);
+        QCOMPARE(timedOutWrites, 1);
+        QVERIFY(reapsAtReturn > 0);
+        QCOMPARE(reapsAfter, 0);
+        QCOMPARE(client.ackFailures(), uint64_t{1});
+        QCOMPARE(client.abandonsSent(), uint64_t{0});
+        QCOMPARE(terminalResults.load(std::memory_order_relaxed), 1);
+        QVERIFY(!client.connected());
+        qInfo().noquote() << QStringLiteral(
+            "blocked_abandon elapsed_ms=%1 pending_writes=%2 timed_out_writes=%3 "
+            "terminal_results=%4 reaps_after=%5")
+            .arg(elapsed).arg(pendingWrites).arg(timedOutWrites)
+            .arg(terminalResults.load(std::memory_order_relaxed)).arg(reapsAfter);
 #else
         QSKIP("direct-input duplex transport is Windows-only");
 #endif
@@ -1424,6 +1762,263 @@ private slots:
 #endif
     }
 
+    // [CL-006 r2 2026-09-23, Codex] A sidecar that NEVER reports ages after the first-record grace;
+    // one that stops reporting ages after 1 s of silence; an unarmed session ages nothing.
+    void sidecarTelemetrySilenceCoversNeverReported()
+    {
+        // Never armed: nothing to judge.
+        QCOMPARE(sidecarTelemetrySilenceMs(false, 0, -1), qint64{-1});
+        QCOMPARE(silenceAgedHealthMs(12.0, -1), 12.0);
+        // Armed, no record yet, inside the grace: fresh.
+        QCOMPARE(sidecarTelemetrySilenceMs(false, 0, kFirstTelemetryGraceMs - 1), qint64{0});
+        QCOMPARE(silenceAgedHealthMs(12.0, sidecarTelemetrySilenceMs(false, 0, 5000)), 12.0);
+        // Armed, never reported, 30 s after start: 10 s of silence past the grace -> stale.
+        const qint64 never = sidecarTelemetrySilenceMs(false, 0, kFirstTelemetryGraceMs + 10000);
+        QCOMPARE(never, qint64{10000});
+        QCOMPARE(silenceAgedHealthMs(12.0, never), 10000.0);
+        QVERIFY(streamTransportNeedsRestart(silenceAgedHealthMs(0.0, never), false));
+        // Reported, then silent: 1 s is the threshold; 9 s triggers the transport restart.
+        QCOMPARE(silenceAgedHealthMs(12.0, sidecarTelemetrySilenceMs(true, 900, 99999)), 12.0);
+        QCOMPARE(silenceAgedHealthMs(12.0, sidecarTelemetrySilenceMs(true, 1500, 99999)), 1500.0);
+        QVERIFY(streamTransportNeedsRestart(silenceAgedHealthMs(0.0, 9000), false));
+        QVERIFY(!streamTransportNeedsRestart(silenceAgedHealthMs(0.0, 900), false));
+    }
+
+    // [CL2-P4-002 2026-09-22] Holding a trigger must not keep the WHOLE pad forced neutral after
+    // a pad blip (transport recovery / Input-Timed use shotInputControlsNeutral), but a route
+    // recovery must still not re-seed while a trigger is held.
+    void triggerHeldBlocksOnlyRouteRecovery()
+    {
+        ControllerState held{};
+        held.r2 = 255;
+        QVERIFY(shotInputControlsNeutral(held, 0.5, 0.5));
+        QVERIFY(!routeRecoveryShotInputsNeutral(held, 0.5, 0.5));
+        held.r2 = 0;
+        held.l2 = 40;
+        QVERIFY(shotInputControlsNeutral(held, 0.5, 0.5));
+        QVERIFY(!routeRecoveryShotInputsNeutral(held, 0.5, 0.5));
+        ControllerState rest{};
+        QVERIFY(shotInputControlsNeutral(rest, 0.5, 0.5));
+        QVERIFY(routeRecoveryShotInputsNeutral(rest, 0.5, 0.5));
+        ControllerState square{};
+        square.buttons = XINPUT_GAMEPAD_X;
+        QVERIFY(!shotInputControlsNeutral(square, 0.5, 0.5));
+    }
+
+    // [CL2-P4-001 2026-09-22] Dead-man keepalive: while owned and unchanged, the client re-sends
+    // the confirmed state UNFLAGGED at least every kOwnedKeepaliveMs, so the fork can tell a still
+    // player from a stalled launcher. A quick repeat inside the window sends nothing.
+    void ownedUnchangedStateSendsUnflaggedKeepalive()
+    {
+#ifdef _WIN32
+        const QByteArray pipeName = QByteArrayLiteral("\\\\.\\pipe\\orion_input_keepalive_")
+            + QByteArray::number(GetCurrentProcessId()) + '_'
+            + QByteArray::number(GetTickCount64());
+        std::promise<void> readyPromise;
+        std::future<void> ready = readyPromise.get_future();
+        std::atomic<DWORD> serverError{ERROR_SUCCESS};
+        std::vector<OrionInputPacket> wire;
+        std::mutex wireMutex;
+        std::thread server([&]() {
+            HANDLE pipe = CreateNamedPipeA(
+                pipeName.constData(), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1, sizeof(OrionInputAck) * 8, sizeof(OrionInputPacket) * 8, 0, nullptr);
+            if(pipe == INVALID_HANDLE_VALUE)
+            {
+                serverError.store(GetLastError(), std::memory_order_relaxed);
+                readyPromise.set_value();
+                return;
+            }
+            readyPromise.set_value();
+            const BOOL connectOk = ConnectNamedPipe(pipe, nullptr);
+            if(!connectOk && GetLastError() != ERROR_PIPE_CONNECTED)
+            {
+                serverError.store(GetLastError(), std::memory_order_relaxed);
+                CloseHandle(pipe);
+                return;
+            }
+            for(int index = 0; index < 2; ++index)
+            {
+                OrionInputPacket packet{};
+                DWORD read = 0;
+                if(!ReadFile(pipe, &packet, sizeof(packet), &read, nullptr) || read != sizeof(packet))
+                {
+                    serverError.store(ERROR_READ_FAULT, std::memory_order_relaxed);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(wireMutex);
+                    wire.push_back(packet);
+                }
+                if((packet.reserved & OrionInputMustDeliver) != 0)
+                {
+                    for(const OrionInputAckStage stage : {OrionInputAckStage::Enqueued,
+                                                          OrionInputAckStage::LocalUdpAccepted})
+                    {
+                        OrionInputAck ack{};
+                        ack.magic = kOrionInputAckMagic;
+                        ack.sourceSeq = packet.seq;
+                        ack.stage = static_cast<uint8_t>(stage);
+                        DWORD written = 0;
+                        WriteFile(pipe, &ack, sizeof(ack), &written, nullptr);
+                    }
+                    FlushFileBuffers(pipe);
+                }
+            }
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        });
+        ready.wait();
+        if(serverError.load(std::memory_order_relaxed) != ERROR_SUCCESS)
+        {
+            server.join();
+            QFAIL("named-pipe server could not be created");
+        }
+
+        OrionInputClient client(QString::fromLatin1(pipeName));
+        client.setEnabled(true);
+        ControllerState s{};
+        s.r2 = 255;
+        s.leftStickX = 100;
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::LocalUdpAccepted);
+        // Inside the window: nothing on the wire.
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::Unchanged);
+        QCOMPARE(client.ownedKeepalives(), uint64_t{0});
+        Sleep(OrionInputClient::kOwnedKeepaliveMs + 30);
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::Unchanged);
+        server.join();
+        QCOMPARE(serverError.load(std::memory_order_relaxed), DWORD{ERROR_SUCCESS});
+        QCOMPARE(client.ownedKeepalives(), uint64_t{1});
+        std::lock_guard<std::mutex> lock(wireMutex);
+        QCOMPARE(int(wire.size()), 2);
+        QCOMPARE(wire[1].reserved, uint8_t{0});          // unflagged: latest-wins, no ACK wait
+        QCOMPARE(wire[1].own, uint8_t{1});
+        QCOMPARE(wire[1].r2_state, wire[0].r2_state);    // exact confirmed state
+        QCOMPARE(wire[1].left_x, wire[0].left_x);
+        QVERIFY(wire[1].seq > wire[0].seq);
+#else
+        QSKIP("direct-input duplex transport is Windows-only");
+#endif
+    }
+
+    // [CL-003 Codex final gate 2026-09-22] A terminal trigger release that shares a poll with
+    // anything that would stop the fork from copying it (a new press OR the other trigger rising)
+    // goes out first as its own packet built from the LAST CONFIRMED state plus only the
+    // zero-crossing. A trigger release carrying only stick motion is already copyable and is not
+    // split. Inspects the actual wire packets.
+    void triggerReleaseSplitCarriesOnlyTerminalEdges()
+    {
+#ifdef _WIN32
+        const QByteArray pipeName = QByteArrayLiteral("\\\\.\\pipe\\orion_input_trigger_split_")
+            + QByteArray::number(GetCurrentProcessId()) + '_'
+            + QByteArray::number(GetTickCount64());
+        constexpr int kExpectedPackets = 7;
+        std::promise<void> readyPromise;
+        std::future<void> ready = readyPromise.get_future();
+        std::atomic<DWORD> serverError{ERROR_SUCCESS};
+        std::vector<OrionInputPacket> wire;
+        std::mutex wireMutex;
+        std::thread server([&]() {
+            HANDLE pipe = CreateNamedPipeA(
+                pipeName.constData(), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1, sizeof(OrionInputAck) * 8, sizeof(OrionInputPacket) * 8, 0, nullptr);
+            if(pipe == INVALID_HANDLE_VALUE)
+            {
+                serverError.store(GetLastError(), std::memory_order_relaxed);
+                readyPromise.set_value();
+                return;
+            }
+            readyPromise.set_value();
+            const BOOL connectOk = ConnectNamedPipe(pipe, nullptr);
+            if(!connectOk && GetLastError() != ERROR_PIPE_CONNECTED)
+            {
+                serverError.store(GetLastError(), std::memory_order_relaxed);
+                CloseHandle(pipe);
+                return;
+            }
+            for(int index = 0; index < kExpectedPackets; ++index)
+            {
+                OrionInputPacket packet{};
+                DWORD read = 0;
+                if(!ReadFile(pipe, &packet, sizeof(packet), &read, nullptr) || read != sizeof(packet))
+                {
+                    serverError.store(ERROR_READ_FAULT, std::memory_order_relaxed);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(wireMutex);
+                    wire.push_back(packet);
+                }
+                for(const OrionInputAckStage stage : {OrionInputAckStage::Enqueued,
+                                                      OrionInputAckStage::LocalUdpAccepted})
+                {
+                    OrionInputAck ack{};
+                    ack.magic = kOrionInputAckMagic;
+                    ack.sourceSeq = packet.seq;
+                    ack.stage = static_cast<uint8_t>(stage);
+                    DWORD written = 0;
+                    if(!WriteFile(pipe, &ack, sizeof(ack), &written, nullptr) || written != sizeof(ack))
+                        serverError.store(ERROR_WRITE_FAULT, std::memory_order_relaxed);
+                }
+                FlushFileBuffers(pipe);
+            }
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        });
+        ready.wait();
+        if(serverError.load(std::memory_order_relaxed) != ERROR_SUCCESS)
+        {
+            server.join();
+            QFAIL("named-pipe server could not be created");
+        }
+
+        OrionInputClient client(QString::fromLatin1(pipeName));
+        client.setEnabled(true);
+        ControllerState s{};
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::LocalUdpAccepted);   // seed
+        s.r2 = 255;
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::LocalUdpAccepted);   // R2 held
+        // 1) R2 up + L2 rise + Square down in ONE poll -> split.
+        s.r2 = 0;
+        s.l2 = 200;
+        s.buttons = XINPUT_GAMEPAD_X;
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::LocalUdpAccepted);
+        // 2) L2 up + R2 rise (no new digital press) -> still split: the R2 increase blocks the copy.
+        s.l2 = 0;
+        s.r2 = 180;
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::LocalUdpAccepted);
+        // 3) R2 up with only stick motion -> copyable as-is, NOT split.
+        s.r2 = 0;
+        s.rightStickX = 20000;
+        QCOMPARE(client.sendDetailed(s, true), InputRouteWriteResult::LocalUdpAccepted);
+        server.join();
+        QCOMPARE(serverError.load(std::memory_order_relaxed), DWORD{ERROR_SUCCESS});
+        QCOMPARE(client.splitTriggerReleases(), uint64_t{2});
+
+        std::lock_guard<std::mutex> lock(wireMutex);
+        QCOMPARE(int(wire.size()), kExpectedPackets);
+        // Case 1: pre = last confirmed (R2 255, L2 0, no buttons) + only R2 -> 0.
+        QCOMPARE(wire[2].r2_state, uint8_t{0});
+        QCOMPARE(wire[2].l2_state, uint8_t{0});
+        QCOMPARE(wire[2].buttons, uint32_t{0});
+        QVERIFY((wire[2].reserved & OrionInputMustDeliver) != 0);
+        QCOMPARE(wire[3].l2_state, uint8_t{200});
+        QCOMPARE(wire[3].buttons, uint32_t{kSquare});
+        // Case 2: pre keeps Square and the OLD R2 (0), drops only L2.
+        QCOMPARE(wire[4].l2_state, uint8_t{0});
+        QCOMPARE(wire[4].r2_state, uint8_t{0});
+        QCOMPARE(wire[4].buttons, uint32_t{kSquare});
+        QCOMPARE(wire[5].r2_state, uint8_t{180});
+        // Case 3: one packet carrying the release and the stick.
+        QCOMPARE(wire[6].r2_state, uint8_t{0});
+        QVERIFY(wire[6].right_x != 0);
+#else
+        QSKIP("direct-input duplex transport is Windows-only");
+#endif
+    }
+
     // A route/generation transition (resetConnection(), called at every session
     // teardown/restart/connect boundary) must guarantee the first packet afterwards is
     // written even when it is byte-identical to the last confirmed pre-transition state.
@@ -1596,7 +2191,7 @@ private slots:
                 CloseHandle(pipe);
                 return;
             }
-            for(int index = 0; index < 3; ++index)
+            for(int index = 0; index < 5; ++index)
             {
                 OrionInputPacket packet{};
                 DWORD read = 0;
@@ -1607,9 +2202,9 @@ private slots:
                     break;
                 }
                 packetsReceived.store(index + 1, std::memory_order_relaxed);
-                if(index < 2)
+                if(index < 4)
                 {
-                    if(index == 1)
+                    if(index == 3)
                         reassertPacket = packet;
                     if(!writeAck(pipe, packet.seq, OrionInputAckStage::Enqueued)
                         || !writeAck(pipe, packet.seq, OrionInputAckStage::LocalUdpAccepted))
@@ -1621,7 +2216,7 @@ private slots:
                 }
                 else
                 {
-                    // WEDGE: swallow the third transaction without any ACK. The client's
+                    // WEDGE: swallow the fifth transaction without any ACK. The client's
                     // bounded wait must expire and fail the route closed at idle.
                     Sleep(200);
                 }
@@ -1648,14 +2243,25 @@ private slots:
         pressed.buttons = XINPUT_GAMEPAD_X;
         QCOMPARE(client.sendDetailed(pressed, true),
                  InputRouteWriteResult::LocalUdpAccepted);
+        // Release then rapidly re-press before the delayed repair. It must duplicate
+        // the newest confirmation, not the old released payload.
+        ControllerState released{};
+        released.leftStickX = 71;
+        QCOMPARE(client.sendDetailed(released, true, true),
+                 InputRouteWriteResult::LocalUdpAccepted);
+        pressed.r2 = 83;
+        pressed.rightStickY = -41;
+        QCOMPARE(client.sendDetailed(pressed, true, true),
+                 InputRouteWriteResult::LocalUdpAccepted);
         const OrionInputPacket confirmed = client.lastSent();
 
         // (b) healthy route: byte-identical MustDeliver re-assert, snapshot untouched.
         QCOMPARE(client.reassertLastState(), InputRouteWriteResult::LocalUdpAccepted);
-        QCOMPARE(packetsReceived.load(std::memory_order_relaxed), 2);
+        QCOMPARE(packetsReceived.load(std::memory_order_relaxed), 4);
         QCOMPARE(reassertPacket.buttons, confirmed.buttons);
         QCOMPARE(reassertPacket.left_x, confirmed.left_x);
         QCOMPARE(reassertPacket.right_y, confirmed.right_y);
+        QCOMPARE(reassertPacket.r2_state, confirmed.r2_state);
         QCOMPARE(reassertPacket.own, uint8_t{1});
         QVERIFY((reassertPacket.reserved & OrionInputMustDeliver) != 0);
         QVERIFY2(reassertPacket.seq > confirmed.seq,

@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "VeniceOwnerToolsGatewayRoutes",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:GET",
+        "apigateway:POST"
+      ],
+      "Resource": [
+        "arn:aws:apigateway:us-east-1::/apis/v348t5hg3i",
+        "arn:aws:apigateway:us-east-1::/apis/v348t5hg3i/*"
+      ]
+    }
+  ]
+}

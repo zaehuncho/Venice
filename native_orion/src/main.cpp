@@ -1,12 +1,16 @@
+#include "BrokerInstallTrust.h"
 #include "NativeCrashDiagnostics.h"
 #include "OrionAppController.h"
 #include "SidecarReaderProfile.h"
 
 #include <QtCore/QAbstractNativeEventFilter>
+#include <QtCore/QCryptographicHash>
 #include <QtCore/QDir>
 #include <QtCore/QDebug>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonObject>
 #include <QtCore/QSettings>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QTextStream>
@@ -28,6 +32,12 @@
 #include <Windows.h>
 #include <dwmapi.h>
 #include <windowsx.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
+
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 
 namespace {
 // Windows 11 corner-round preference enum (lives in dwmapi.h on newer SDKs but we
@@ -120,11 +130,59 @@ private:
 // broadcast as a deep link ("ORDL" — Orion Deep Link).
 constexpr ULONG_PTR kOrionDeepLinkCopyDataId = 0x4F52444C;
 
+// [Codex finding #2 — 2026-09-20 round 2] The broker-trust logic (Authenticode
+// signer gate + SIGNED release_manifest.json coverage gate) now lives in ONE
+// shared translation unit, native_orion/src/BrokerInstallTrust.cpp, so the packed
+// app (here) and the broker (OrionActivate.cpp) reach the same verdict for the
+// same file and reuse the SAME pinned Ed25519 key + verifier as the updater. The
+// expected Authenticode signer constants (kExpectedBrokerSignerSubstr /
+// kExpectedBrokerSignerThumbprint — OWNER must set the real CN/SHA-1 from
+// Desktop\VeniceSigning) also live there. See BrokerInstallTrust.h.
+// Whether a sibling OrionActivate.exe is a GENUINE server-shard broker — see
+// orion::genuineBrokerInstallPresent (BrokerInstallTrust.{h,cpp}). Resolves the
+// production-build flag and (dev-only) release-manifest test-key override exactly
+// as SecurityManager::verifyReleaseIntegrity does, so the two guards agree.
+bool siblingBrokerIsGenuine()
+{
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QString brokerExe = appDir + QStringLiteral("/OrionActivate.exe");
+#ifdef ORION_PRODUCTION_BUILD
+    constexpr bool productionBuild = true;
+    const QString testId;
+    const QByteArray testKey;
+#else
+    constexpr bool productionBuild = false;
+    const QString testId = qEnvironmentVariable("ORION_RELEASE_MANIFEST_TEST_PUBKEY_ID").trimmed();
+    const QByteArray testKey = qgetenv("ORION_RELEASE_MANIFEST_TEST_PUBKEY_B64").trimmed();
+#endif
+    return orion::genuineBrokerInstallPresent(brokerExe, appDir, productionBuild,
+                                              testId, testKey, nullptr);
+}
+
 // Register the orion:// URL protocol for the CURRENT USER (HKCU — no elevation
 // needed) pointing at this executable. Idempotent: rewrites the same values on
 // every launch so the handler always tracks the installed/updated exe path.
 void registerOrionProtocolHandler()
 {
+    // Server-shard installs ship the signed activation broker (OrionActivate.exe)
+    // beside this payload, and the broker OWNS the orion:// handler: it runs
+    // /api/license/redeem and writes the DPAPI shard session that the packed
+    // bootstrap must read before this app can even start. If we re-registered
+    // orion:// to point at ourselves (as a normal install does on every launch),
+    // the next activation — an hwid reset or a move to a new PC — would bypass the
+    // broker, no session would be written, and the packed build could never fetch
+    // its shard. So when a GENUINE broker is present, leave the handler to it.
+    //
+    // [Codex finding #2] Defer ONLY when the sibling OrionActivate.exe is verified
+    // (Authenticode-signed by Venice OR byte-covered by a SIGNED release_manifest.json,
+    // whose detached Ed25519 signature is checked against the pinned production key)
+    // — never on the mere existence of a file with that name. NOTE: because the
+    // broker is not code-signed yet, in practice this defers via the SIGNED manifest
+    // gate today, and additionally validates the Authenticode signature once signing
+    // exists. Logic + pinned key are shared with the broker via BrokerInstallTrust.
+    if (siblingBrokerIsGenuine()) {
+        return;
+    }
     const QString exe = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
     QSettings cls(QStringLiteral("HKEY_CURRENT_USER\\Software\\Classes\\orion"), QSettings::NativeFormat);
     cls.setValue(QStringLiteral("Default"), QStringLiteral("URL:Orion Protocol"));
@@ -170,6 +228,28 @@ bool forwardDeepLinkToRunningInstance(const QString& uri)
     }
     SendMessageW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds));
     // Bring the running launcher forward so the pre-filled AuthGate is visible.
+    if (IsIconic(target)) {
+        ShowWindow(target, SW_RESTORE);
+    }
+    SetForegroundWindow(target);
+    return true;
+}
+
+// [CL2-P8-001 / GM2-005 / CX P8-03 2026-09-22] A second launcher must never run beside a live
+// one: its Connect kills every OrionStream on the machine (the first instance's live stream
+// included) and both share the input pipe, settings and logs. Bring the verified running
+// window forward instead. Returns true when one was found.
+bool activateRunningInstance()
+{
+    HWND target = FindWindowW(nullptr, L"Venice");
+    if (!target || !IsWindow(target)) {
+        return false;
+    }
+    DWORD verifiedProcessId = 0;
+    if (!orion::deep_link_target_policy::windowOwnedByExecutable(
+            target, QCoreApplication::applicationFilePath(), &verifiedProcessId)) {
+        return false;
+    }
     if (IsIconic(target)) {
         ShowWindow(target, SW_RESTORE);
     }
@@ -284,6 +364,28 @@ int main(int argc, char* argv[])
     HANDLE singletonMutex = CreateMutexW(nullptr, FALSE, L"Local\\OrionNativeLauncher");
     const bool alreadyRunning = (GetLastError() == ERROR_ALREADY_EXISTS);
     if (!deepLinkUri.isEmpty() && alreadyRunning && forwardDeepLinkToRunningInstance(deepLinkUri)) {
+        if (singletonMutex) {
+            CloseHandle(singletonMutex);
+        }
+        return 0;
+    }
+    // [M-08 r2 2026-09-23, Codex] The guard itself failing is not silent: say so and continue (a
+    // missing mutex cannot tell us another copy is running, and refusing to start would lock the
+    // customer out over a Windows resource error).
+    if (!singletonMutex) {
+        qWarning().noquote() << "Single-instance guard unavailable (CreateMutexW failed, error"
+                             << GetLastError() << "); a second Venice window cannot be detected.";
+    }
+    // [CL2-P8-001] Every launch, not just deep links: one launcher per user session. The mutex
+    // still exists while a previous instance is shutting down, so the message tells the user
+    // what to do rather than silently doing nothing.
+    if (alreadyRunning) {
+        if (!activateRunningInstance()) {
+            MessageBoxW(nullptr,
+                        L"Venice is already running (or still closing).\n\n"
+                        L"Switch to the open Venice window, or wait a few seconds and try again.",
+                        L"Venice", MB_OK | MB_ICONINFORMATION);
+        }
         if (singletonMutex) {
             CloseHandle(singletonMutex);
         }

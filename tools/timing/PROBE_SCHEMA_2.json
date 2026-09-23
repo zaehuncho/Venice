@@ -1,0 +1,271 @@
+{
+  "schema": 2,
+  "trace_kind": "timing",
+  "_": "Machine-readable wire schema for the probe measurement gate. PROBE_SCHEMA_2.md is the prose; THIS is the contract a producer targets and the one tests validate against, so the two cannot drift. NO PRODUCER EXISTS YET: the active AutomationEngine.cpp still matches the staged observer transaction's `before` hash.",
+
+  "conventions": {
+    "integers": "Every *_us, *_ns, *_hz, *_seq, *_id, *_revision and *_epoch field is an exact integer. It may be carried as a JSON number or as a decimal STRING (the native container writes 64-bit values as strings); a consumer must accept both and must reject a float with a fractional part, a bool, or a non-numeric string.",
+    "units": "_us = microseconds, _ns = nanoseconds, _hz = ticks per second. A bare _ms field is NOT part of this schema; milliseconds were the source of a unit defect and are not carried.",
+    "clocks": "Every timestamp names its domain by field suffix: _engine_us = engine monotonic microseconds; _ns = Python perf_counter_ns; _epoch_us = Unix epoch microseconds; qpc/_qpc = journal QPC ticks. Microseconds are NEVER added to ticks: conversion scales by the owning journal's qpc_hz.",
+    "sign": "assigned_delta_us POSITIVE means a LATER command. banner_trim_us POSITIVE means an EARLIER command. They have OPPOSITE signs and must never be added.",
+    "probability": "assignment_probability is an exact rational written \"n/d\" (e.g. \"1/3\"). A bare integer has no defined scale and is rejected.",
+    "absent": "A field that is absent is UNKNOWN. It is never zero, never the previous value, and never inferred from a neighbouring record.",
+    "cardinality": "`one` = exactly one per physical shot. `one_per_attempt` = at most one per (shot, attempt). `many` = zero or more. Cardinality violations are AMBIGUOUS, never resolved by last-wins."
+  },
+
+  "identity": {
+    "process": ["capture_id", "role", "pid", "instance"],
+    "physical_shot": ["<native process>", "context", "physical_epoch"],
+    "attempt": ["<physical shot>", "attempt"],
+    "assignment": ["<physical shot>", "assignment_id"],
+    "schedule_operation": ["<engine>", "operation_id"],
+    "worker_execution": ["token", "generation", "operation_id", "target_revision"],
+    "_note": "worker_execution is the FULL scope. A target_revision on its own is not an identity; revision 4 under another token is a different execution."
+  },
+
+  "name_collisions": {
+    "physical_epoch": "the physical SHOT identity. Formerly emitted as `BANNER TRIM release_seq`.",
+    "native_release_seq": "a release counter. Formerly emitted as native `Release delivery identity release_seq`.",
+    "_rule": "A field literally named `release_seq` is REFUSED. The two counters above have historically shared that name and their values coincide."
+  },
+
+  "enums": {
+    "worker_event": {"1": "arm_result", "2": "claimed", "3": "dispatch_complete", "4": "retarget_result"},
+    "arm_result": {"0": "Armed", "1": "EngineDisarmed", "2": "RouteRejected", "3": "WindowRejected", "4": "MailboxBusy"},
+    "retarget_result": {"0": "Retargeted", "1": "EngineDisarmed", "2": "InvalidToken", "3": "WrongToken", "4": "NotWaiting", "5": "OutcomePending", "6": "RouteRejected", "7": "WindowRejected", "8": "EngineRejected"},
+    "dispatch_complete": {"0": "not_confirmed", "1": "confirmed_local_only"},
+    "_accepted": "A revision is ACCEPTED only on result 0 of arm_result or retarget_result. Every other value is a refusal and leaves the previously accepted revision authoritative.",
+    "terminal_state": ["released", "cancelled", "killed", "unanswered", "ungraded"],
+    "verdict": ["EARLY", "EXCELLENT", "LATE", "UNKNOWN"],
+    "attribution": ["attributed", "unresolved", "absent"],
+    "coverage": ["present", "absent", "unreadable"],
+    "ownership_source": ["fresh_accept", "promoted_seed"],
+    "delivery_mode": ["scheduled_worker", "other"],
+    "_coverage_note": "`absent` (the panel has no coverage cell) and `unreadable` (it has one and the reader failed) are DIFFERENT and must not be merged."
+  },
+
+  "stages": {
+    "experiment_manifest": {
+      "cardinality": "one_per_capture",
+      "emit": "before assignment is enabled",
+      "required": {
+        "experiment_id": "string", "protocol_version": "int", "build_hash": "string",
+        "schema_hash": "string", "config_revision": "int", "max_abs_offset_us": "int",
+        "randomisation_seed": "int", "arms_us": "string, comma-separated ints",
+        "learning_freeze_mask": "token list (string of comma-separated tokens, or array)",
+        "eligibility": "string", "stopping_rule": "string", "clock_tolerance_us": "int"
+      },
+      "optional": {"config_snapshot_hash": "string", "assignment_probabilities": "string"},
+      "constraints": [
+        "max_abs_offset_us must be a positive int and MUST NOT exceed 25000 (the devFireOffsetForShotMs hard bound).",
+        "learning_freeze_mask is matched by TOKEN, never substring: `not_banner_trim` contains `banner_trim` and must NOT count as frozen.",
+        "the mask MUST contain `banner_trim` and `oracle`; freezing only the paths the dev hook already fences is not freezing the loop under test.",
+        "repeated manifests must be byte-identical; differing ones are CONTRADICTORY."
+      ]
+    },
+
+    "clock_bridge": {
+      "cardinality": "many", "scope": "engine context (NOT a shot; carries no physical_epoch)",
+      "required": {
+        "sync_id": "int", "engine_us": "int", "qpc": "int",
+        "valid_from_engine_us": "int", "valid_to_engine_us": "int", "uncertainty_us": "int"
+      },
+      "constraints": [
+        "Scoped to (process identity, context). A second process choosing the same context number MUST NOT borrow this segment.",
+        "Conversion requires an APPLICABLE segment whose bracket CONTAINS the timestamp. A nearest segment is not applicable.",
+        "A timestamp between two segments is a CLOCK DISCONTINUITY, a distinct defect from being outside all of them.",
+        "uncertainty_us must be present, non-negative, and <= the manifest's clock_tolerance_us."
+      ]
+    },
+
+    "shot_press": {
+      "cardinality": "one", "emit": "when the native physical edge is committed",
+      "required": {
+        "physical_epoch": "int", "press_engine_us": "int", "press_epoch_us": "int",
+        "press_source": "string", "shot_type": "string", "native_owner": "string"
+      },
+      "constraints": ["A Python message-receipt timestamp MUST NOT substitute for the physical edge."]
+    },
+
+    "native_onset": {
+      "cardinality": "one_per_attempt", "emit": "when native ownership/onset is actually latched",
+      "required": {
+        "physical_epoch": "int", "attempt": "int",
+        "first_fresh_accept_engine_us": "int", "first_meter_seen_engine_us": "int",
+        "native_onset_engine_us": "int", "latched_engine_us": "int", "native_onset_us": "int",
+        "valid": "int 0|1", "ownership_source": "enum ownership_source",
+        "native_session": "int", "processed_seq": "int",
+        "computed_tempo": "string", "effective_tempo": "string", "resolved_trim_key": "string",
+        "banner_trim_us": "int", "effective_lead_us": "int", "config_revision": "int"
+      },
+      "constraints": [
+        "Instrument BOTH ordinary fresh acceptance and the promoted ownership-seed path.",
+        "Record the ORIGINAL seed provenance, not the latest frame at promotion time.",
+        "latched_engine_us is when the onset became KNOWN. first_meter_seen_engine_us may be BACKDATED for a promoted seed, so only latched_engine_us may be compared for ordering.",
+        "native_onset_us must be >= 0 and valid must be 1 for the onset to be usable.",
+        "resolved_trim_key is the key that ACTUALLY supplied the trim. BannerLeadTrim::trimMsForType uses resolvedKey(...), which may fall back to a different key than the requested tempo. `unknown` is refused; a fallback resolution is normal and accepted."
+      ]
+    },
+
+    "reader_onset": {
+      "cardinality": "one", "emitter": "python", "emit": "on a successful ShotRecordWriter.note_onset",
+      "required": {
+        "physical_epoch": "int", "shot_record_seq": "int", "press_epoch_us": "int",
+        "accepted_capture_epoch_us": "int", "reader_onset_us": "int",
+        "reader_processing_ns": "int", "onset_clock": "string", "structure_verified": "int 0|1",
+        "frame": "int", "source_generation": "int", "processed_seq": "int",
+        "acceptance_version": "int",
+        "native_capture_id": "string", "native_pid": "int", "native_instance": "string"
+      },
+      "constraints": [
+        "The native-owner reference is REQUIRED. A Python record describes a NATIVE-owned shot; using the emitting journal's identity files it as a separate Python-owned shot and the cross-process join fails silently.",
+        "Emit only when note_onset accepts the FIRST observation. Never reconstruct from a later native_frame row and never substitute onset_engine_estimate_ms.",
+        "Reader acceptance and native ownership acceptance are DIFFERENT events. Their frames may legitimately differ and neither may be derived from the other."
+      ]
+    },
+
+    "probe_assignment": {
+      "cardinality": "one", "emit": "after eligibility is fixed, before any displaced arm",
+      "required": {
+        "physical_epoch": "int", "assignment_id": "int", "experiment_id": "string",
+        "pre_treatment_native_onset_us": "int", "effective_bucket": "string",
+        "eligible": "int 0|1", "eligibility_reason": "string",
+        "stratum_id": "int", "block_id": "int", "block_position": "int",
+        "arm_id": "string", "assignment_probability": "rational string \"n/d\"",
+        "assigned_delta_us": "int", "assigned_engine_us": "int",
+        "eligibility_fixed_engine_us": "int"
+      },
+      "constraints": [
+        "ONE assignment_id per physical shot. It MUST survive attempt and token changes; the existing hook caches by shot_.armToken, which is not this contract.",
+        "Emit ZERO-offset assignments too, and emit eligibility/accounting records for EXCLUDED shots.",
+        "|assigned_delta_us| must not exceed the manifest's max_abs_offset_us.",
+        "experiment_id must match the manifest.",
+        "Ordering: eligibility_fixed_engine_us >= latched_engine_us, and assigned_engine_us >= eligibility_fixed_engine_us."
+      ]
+    },
+
+    "schedule_plan": {
+      "cardinality": "many", "emit": "inside AutomationEngine::scheduleFire, for EVERY arm / re-arm / retarget",
+      "required": {
+        "physical_epoch": "int", "assignment_id": "int", "attempt": "int", "plan_id": "int",
+        "operation_id": "int", "decision_id": "int", "now_engine_us": "int",
+        "baseline_pre_offset_deadline_us": "int", "assigned_delta_us": "int",
+        "post_offset_deadline_us": "int", "clipped_past_deadline": "int 0|1",
+        "post_phase_lock_deadline_us": "int", "final_requested_deadline_us": "int",
+        "zero_offset_shadow_deadline_us": "int", "handoff_deadline_us": "int",
+        "authority_us": "int", "config_revision": "int", "disposition": "string"
+      },
+      "constraints": [
+        "Capture-phase locking happens AFTER the offset hook and can CLIP an offset targeting the past, so `DEV FIRE OFFSET APPLIED` alone is not sufficient evidence.",
+        "handoff_deadline_us is the value ACTUALLY PASSED TO THE WORKER, after every downstream transformation including tickAlignedFireDeadlineMs, which runs AFTER scheduleFire. The worker's accepted deadline must equal it; a difference with no accounted transformation means the plan does not explain the target that executed.",
+        "scheduleFire is NOT every deadline transition: in-place refinement commits elsewhere and the controller can nudge the deadline again before arming. Every transition must be recorded, not only the ones inside scheduleFire.",
+        "zero_offset_shadow_deadline_us must be computed from the SAME immutable inputs through a PURE transformation. It must NEVER be obtained by re-running mutating controller logic.",
+        "The shadow is a counterfactual for THIS scheduling transformation only. It is not the trajectory the shot would have followed untreated.",
+        "config_revision must match the manifest, or an accounted transition must exist."
+      ]
+    },
+
+    "worker": {
+      "cardinality": "many", "emit": "at mailbox operations, claim and dispatch",
+      "required": {
+        "physical_epoch": "int", "token": "int", "event": "enum worker_event",
+        "operation_id": "int", "plan_id": "int"
+      },
+      "conditional": {
+        "arm_result|retarget_result": {"result": "enum", "requested_deadline_us": "int", "target_revision": "int (on acceptance)", "accepted_deadline_us": "int (ON ACCEPTANCE ONLY)"},
+        "claimed": {"target_revision": "int", "effective_deadline_us": "int", "remaining_us": "int"},
+        "dispatch_complete": {"result": "enum dispatch_complete", "target_revision": "int", "command_us": "int", "complete_us": "int", "route": "int", "delivery_stage": "int"}
+      },
+      "constraints": [
+        "operation_id is returned on REFUSALS too. A refused retarget leaves the previously accepted revision authoritative.",
+        "Copy identifiers from the immutable operation / claimed target, NEVER from mutable current shot state.",
+        "accepted_deadline_us is emitted only on acceptance. A refusal's deadline is the REQUESTED value.",
+        "An accepting record must not appear after the dispatch it would authorise.",
+        "Emit explicit cancellation / abandonment terminal records so a claim without a dispatch stays explainable."
+      ]
+    },
+
+    "release_link": {
+      "cardinality": "one", "emit": "at actual release reporting",
+      "required": {
+        "physical_epoch": "int", "attempt": "int", "assignment_id": "int", "token": "int",
+        "route_generation": "int", "target_revision": "int", "operation_id": "int",
+        "native_release_seq": "int", "local_command_us": "int",
+        "reported_release_epoch_us": "int", "delivery_mode": "enum delivery_mode",
+        "delivery_result": "string"
+      },
+      "constraints": [
+        "A field named `release_seq` is REFUSED; see name_collisions.",
+        "The scope (token, route_generation, operation_id, target_revision) must equal the dispatched scope.",
+        "No record here implies console or game receipt."
+      ]
+    },
+
+    "shot_verdict": {
+      "cardinality": "one", "emitter": "python", "emit": "when the reader accepts and attributes the banner",
+      "required": {
+        "physical_epoch": "int", "shot_record_seq": "int", "verdict_seq": "int",
+        "verdict": "enum verdict", "attribution": "enum attribution", "coverage": "enum coverage",
+        "frame": "int", "observed_ns": "int", "emitted_ns": "int",
+        "native_capture_id": "string", "native_pid": "int", "native_instance": "string"
+      },
+      "constraints": [
+        "The native-owner reference is REQUIRED, for the same reason as reader_onset.",
+        "A MISSING grade is not EXCELLENT. Absence is reported as absence."
+      ]
+    },
+
+    "shot_terminal": {
+      "cardinality": "one", "emit": "when the record closes",
+      "required": {
+        "physical_epoch": "int", "assignment_id": "int",
+        "terminal_state": "enum terminal_state", "close_reason": "string",
+        "terminal_engine_us": "int", "adherence_state": "string"
+      },
+      "constraints": [
+        "A cancellation BEFORE arming owes no dispatch. A shot reported `released` owes press, onset, plan, an accepted-revision worker chain, a release link and a verdict.",
+        "An already-issued command is NOT erased by a later cancellation label, so `killed` still owes its execution evidence.",
+        "Cancelled and clipped assignments remain in the experimental accounting."
+      ]
+    }
+  },
+
+  "derived_measurements": {
+    "native_onset": "first_meter_seen_engine_us - press_engine_us",
+    "command_after_press": "local_command_us - press_engine_us",
+    "command_after_native_onset": "local_command_us - first_meter_seen_engine_us",
+    "scheduling_tardiness": "command_us - the accepted deadline of the DISPATCHED revision",
+    "scheduling_displacement": "final_requested_deadline_us - the SAME PLAN's zero_offset_shadow_deadline_us",
+    "_notes": [
+      "All five are ENGINE-CLOCK ONLY and require no conversion. A missing clock_bridge does not block them.",
+      "scheduling_displacement is a SCHEDULING quantity. It is NOT delivered-command displacement, and neither it nor tardiness supplies a counterfactual command time for an untreated shot.",
+      "Every derived value is WITHHELD when the lineage it rests on is contradictory.",
+      "None implies console or game receipt."
+    ]
+  },
+
+  "thresholds": {
+    "displacement_fidelity_us": {
+      "value": 2000,
+      "applies_to": "scheduling_displacement only",
+      "_note": "This is a TREATMENT FIDELITY threshold. It is NOT a clock tolerance and NOT a requirement that scheduling_tardiness stay under 2 ms. A large, accurately measured tardiness is a FINDING, not a measurement failure."
+    },
+    "hook_bound_us": {"value": 25000, "applies_to": "manifest max_abs_offset_us and every assigned_delta_us"}
+  },
+
+  "consumer_verdicts": {
+    "measurement": ["COMPLETE", "INCOMPLETE"],
+    "adherence": ["ADHERENT", "NONADHERENT", "UNVERIFIABLE"],
+    "outcome": ["GRADED", "UNGRADED", "DISPUTED", "UNKNOWN"],
+    "clock": ["OK", "ENGINE_ONLY", "REFUSED"],
+    "gate": ["PASSED", "WITHHELD"],
+    "_rules": [
+      "The four shot verdicts are reported SEPARATELY and never collapsed into one `valid shot` filter. Collapsing them is how a non-adherent assignment quietly leaves the primary randomised comparison.",
+      "MISSING evidence is UNVERIFIABLE. Only an OBSERVED contradiction is NONADHERENT.",
+      "Non-adherent assignments are reported WITH their arm, dose, block and stratum, never dropped. Intention-to-treat needs the label.",
+      "ENGINE_ONLY is not a failure.",
+      "The gate is CAPTURE-level and separate from every shot verdict. Rows are always preserved; readiness is what gets withheld.",
+      "Exit status 0 means GATE PASSED, not `the report rendered`."
+    ]
+  }
+}

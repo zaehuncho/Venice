@@ -62,6 +62,8 @@ Item {
     // "PRESS UNDELIVERABLE" log line (one source of truth); this page only renders it. Undefined
     // coercion mirrors the noMeterSupported pattern so an unwired build renders nothing new.
     readonly property bool inputDead: orion.inputDeadOverlayActive === true
+    // [CL2-P8-002 2026-09-23] Non-empty while the licence lease blocks shots.
+    readonly property bool leaseBlocked: String(orion.leaseNotice || "").length > 0
     readonly property bool inputDeadCritical: orion.inputDeadCritical === true
     readonly property string inputDeadHeadline: orion.inputDeadHeadline === undefined
                                                 ? "" : String(orion.inputDeadHeadline)
@@ -103,12 +105,44 @@ Item {
         // 5-second preview telemetry arrived. That work runs on the same GUI
         // thread as the SHM notification/presentation timers and showed up as a
         // 32-70 ms video gap even though the capture producer stayed at 60 FPS.
-        function onLogsChanged() { root.syncCaptureLogModel() }
+        // [ORION_PREVIEW_LOG_THROTTLE 2026-09-21] While the Qt Quick render clock
+        // drives the live preview, the 200 ms controller cadence re-ran the whole
+        // 1000-line filter + O(n^2) overlap scan on the GUI thread and starved
+        // FrameAnimation (present_gap_max_ms 261 ms median, worsening over a
+        // session). Coalesce to captureLogThrottle while live; sync immediately
+        // when the preview is not rendering.
+        function onLogsChanged() {
+            if (previewRenderClock.running) {
+                root.captureLogDirty = true
+                if (!captureLogThrottle.running)
+                    captureLogThrottle.start()
+                return
+            }
+            root.syncCaptureLogModel()
+        }
     }
     Timer {
         id: statusDebounce
         interval: 350
         onTriggered: root.stableStatus = root.pendingStatus
+    }
+    // Live-preview activity sync: at most one model sync per interval while the
+    // render clock is running. Shot-abort / watchdog lines still land within
+    // one interval; the video no longer competes with a per-200 ms rebuild.
+    property bool captureLogDirty: false
+    // The exact ring text last synced into captureLogModel; syncCaptureLogModel()
+    // returns early when orion.activityText is identical to it.
+    property string captureLogSyncedText: ""
+    Timer {
+        id: captureLogThrottle
+        interval: 1500
+        repeat: false
+        onTriggered: {
+            if (root.captureLogDirty) {
+                root.captureLogDirty = false
+                root.syncCaptureLogModel()
+            }
+        }
     }
 
     // Filter the global activity log down to live-capture / Remote Play events for the
@@ -157,6 +191,17 @@ Item {
         // 1000-line ring within minutes. The QML filter below stays as the
         // Live-page-specific pass (licence/security/court-IP belong on Profile
         // and Debug, not over the video).
+        // Steady-state exit on the SOURCE STRING, not on count+last-line: at the
+        // 1000-line cap a duplicate trailing line can rotate older entries while
+        // both count and last line stay identical (Astra, release review). An
+        // exact compare of the ring text is ~32 KB of memcmp per tick -- nothing
+        // next to a delegate relayout -- and it can never miss a change.
+        var text = orion.activityText
+        if (text === root.captureLogSyncedText)
+            return
+        root.captureLogSyncedText = text
+        // Filter the CUSTOMER ring (orion.activityText) -- tests/test_venice_ui_contract.py
+        // pins this exact expression as the activity-feed source contract.
         var next = root.filterLogLines(orion.activityText)
         var current = []
         for (var i = 0; i < captureLogModel.count; ++i)
@@ -253,7 +298,15 @@ Item {
         id: previewRenderClock
         running: root.visible && orion.qmlRenderMode
                  && (root.streamLive || root.previewActive)
-        onRunningChanged: orion.setPreviewRenderClockActive(running)
+        onRunningChanged: {
+            orion.setPreviewRenderClockActive(running)
+            // Leaving live preview: flush any activity sync coalesced while rendering.
+            if (!running && root.captureLogDirty) {
+                captureLogThrottle.stop()
+                root.captureLogDirty = false
+                root.syncCaptureLogModel()
+            }
+        }
         onTriggered: {
             orion.advanceRemotePreviewPresentation()
             root.pumpPreviewSerial()
@@ -509,7 +562,8 @@ Item {
                             color: "#F005080D"
                             border.color: tone
                             border.width: level === "maint" ? 2 : 1
-                            visible: orion.motdVisible === true && !root.inputDead
+                            // [CL2-P8-002 2026-09-23] The lease notice below outranks a notice.
+                            visible: orion.motdVisible === true && !root.inputDead && !root.leaseBlocked
                             z: 12
 
                             // Unwrapped width of the notice, measured outside the wrapping Text so
@@ -573,6 +627,72 @@ Item {
                                         onClicked: orion.dismissMotd()
                                     }
                                 }
+                            }
+                        }
+
+                        // ===== [CL2-P8-002 2026-09-23] LICENCE LEASE BANNER ======================
+                        // Shots are paused because the server lease lapsed (offline, after
+                        // sleep, server unreachable, or the PC clock is off). Before this the
+                        // bot silently stopped firing while everything looked Ready. Same
+                        // top-centre slot as the MOTD (which it hides); yields to the
+                        // dead-input banner. Not dismissible: it clears itself when the next
+                        // heartbeat restores the lease. Text comes from the controller.
+                        Rectangle {
+                            id: leaseBanner
+                            objectName: "leaseBanner"
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.top: parent.top
+                            anchors.topMargin: 16
+                            width: Math.min(leaseBannerRow.implicitWidth + 28, parent.width - 32)
+                            height: leaseBannerRow.implicitHeight + 16
+                            radius: 12
+                            color: "#F005080D"
+                            border.color: Theme.warning
+                            border.width: 1
+                            visible: root.leaseBlocked && !root.inputDead
+                            z: 12
+
+                            Row {
+                                id: leaseBannerRow
+                                anchors.centerIn: parent
+                                spacing: 10
+
+                                Rectangle {
+                                    id: leaseTagPill
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: leaseTagText.implicitWidth + 12
+                                    height: 18
+                                    radius: 9
+                                    color: Qt.rgba(Theme.warning.r, Theme.warning.g, Theme.warning.b, 0.18)
+                                    border.color: Theme.warning
+                                    border.width: 1
+                                    Text {
+                                        id: leaseTagText
+                                        anchors.centerIn: parent
+                                        text: "SHOTS PAUSED"
+                                        color: Theme.warning
+                                        font.family: Theme.fontUi; font.pixelSize: 9; font.weight: Font.Bold
+                                        font.letterSpacing: 0.8
+                                    }
+                                }
+
+                                Text {
+                                    id: leaseBannerText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: orion.leaseNotice || ""
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontUi; font.pixelSize: 12; font.weight: Font.DemiBold
+                                    wrapMode: Text.WordWrap
+                                    width: Math.min(leaseMetrics.advanceWidth + 2,
+                                                    Math.max(80, leaseBanner.parent.width - 32 - 28
+                                                                 - leaseTagPill.width - leaseBannerRow.spacing))
+                                }
+                            }
+
+                            TextMetrics {
+                                id: leaseMetrics
+                                font: leaseBannerText.font
+                                text: orion.leaseNotice || ""
                             }
                         }
 

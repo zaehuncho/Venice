@@ -84,7 +84,7 @@ def test_arm_release_and_pickup_produce_one_joined_record(tmp_path, monkeypatch)
     emitted = []
     monkeypatch.setattr(rpo, "emit_stdout_jsonl", emitted.append)
 
-    o.arm_shot_gate("square", 4242, "Standstill", False)
+    o.arm_shot_gate("square", 4242, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     assert reader.armed == [4242]
     # the reader's release hook is what flushes PICKUP, so the orchestrator reads it after
     o.release_shot_gate(4242, 1234.5)
@@ -108,7 +108,7 @@ def test_arm_release_and_pickup_produce_one_joined_record(tmp_path, monkeypatch)
     assert row["source"] == "square" and row["shot_type"] == "Standstill"
     assert row["pickup"]["first_sight_fill"] == 14.0
     assert row["pickup"]["patch_hits"] == 7          # read off the locator's stats
-    assert row["onset_ms"] == 468.0 and row["tempo"] == "normal"
+    assert row["onset_ms"] is None and row["tempo"] == "unknown"
     assert row["oracle"]["gap_px"] == 2.4
     assert row["banner"]["timing"] == "EXCELLENT"
     assert row["outcome"] == "released" and row["closed_reason"] == "complete"
@@ -121,7 +121,7 @@ def test_arm_release_and_pickup_produce_one_joined_record(tmp_path, monkeypatch)
 def test_a_pickup_for_another_press_is_never_borrowed(tmp_path):
     reader = _Reader(pickup=dict(PICKUP, epoch=9999))
     o = _orch(tmp_path, reader)
-    o.arm_shot_gate("square", 4242, "Standstill", False)
+    o.arm_shot_gate("square", 4242, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     o.release_shot_gate(4242, 0.0)
     o._shot_records.close_all("t")
     row = _rows(o)[0]
@@ -131,7 +131,7 @@ def test_a_pickup_for_another_press_is_never_borrowed(tmp_path):
 def test_disarm_closes_the_record_as_disarmed(tmp_path):
     reader = _Reader(pickup=None)
     o = _orch(tmp_path, reader)
-    o.arm_shot_gate("square", 77, "Standstill", False)
+    o.arm_shot_gate("square", 77, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     o.disarm_shot_gate(77, "manual_cancel")
     o._shot_records.close_all("t")
     row = _rows(o)[0]
@@ -140,16 +140,16 @@ def test_disarm_closes_the_record_as_disarmed(tmp_path):
 
 def test_detect_loop_hook_stamps_the_fallback_onset(tmp_path):
     o = _orch(tmp_path, _Reader(pickup=None))
-    o.arm_shot_gate("square", 5, "Standstill", False)
+    o.arm_shot_gate("square", 5, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     press_mono = o._shot_record_press_mono_ms(5)
     assert press_mono is not None
     # two frames: the first with no meter, the second with one -> that is the onset
     o._shot_record_frame_hook(None, SimpleNamespace(detected=False, fill_pct=0.0),
                               (press_mono + 200.0) / 1000.0)
-    o._shot_record_frame_hook(None, SimpleNamespace(detected=True, fill_pct=11.0),
+    o._shot_record_frame_hook(None, SimpleNamespace(detected=True, fill_pct=11.0, gameplay_sample_epoch=o._shot_gate_epoch),
                               (press_mono + 540.0) / 1000.0)
     # a later detection must not move it
-    o._shot_record_frame_hook(None, SimpleNamespace(detected=True, fill_pct=60.0),
+    o._shot_record_frame_hook(None, SimpleNamespace(detected=True, fill_pct=60.0, gameplay_sample_epoch=o._shot_gate_epoch),
                               (press_mono + 900.0) / 1000.0)
     o._shot_records.close_all("t")
     row = _rows(o)[0]
@@ -157,20 +157,21 @@ def test_detect_loop_hook_stamps_the_fallback_onset(tmp_path):
     assert row["onset_ms"] == pytest.approx(540.0, abs=1.0)
     assert row["onset_fill"] == 11.0
     # 540 (capture clock) + 36 (engine accept lag) = 576, still inside the 500..580 band
-    assert row["tempo"] == "normal"
+    assert row["tempo_estimate"] == "normal" and row["tempo"] == "unknown"
 
 
 def test_detect_loop_onset_crosses_the_engine_threshold_correctly(tmp_path):
     o = _orch(tmp_path, _Reader(pickup=None))
-    o.arm_shot_gate("square", 6, "Standstill", False)
+    o.arm_shot_gate("square", 6, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     press_mono = o._shot_record_press_mono_ms(6)
-    o._shot_record_frame_hook(None, SimpleNamespace(detected=True, fill_pct=11.0),
+    o._shot_record_frame_hook(None, SimpleNamespace(detected=True, fill_pct=11.0, gameplay_sample_epoch=o._shot_gate_epoch),
                               (press_mono + 460.0) / 1000.0)
     o._shot_records.close_all("t")
     row = _rows(o)[0]
     # 460 (capture clock) + 36 (engine accept lag) = 496 -> QUICK, not normal
-    assert row["onset_engine_ms"] == pytest.approx(496.0, abs=1.0)
-    assert row["tempo"] == "quick"
+    assert row["onset_engine_estimate_ms"] == pytest.approx(496.0, abs=1.0)
+    assert row["onset_engine_ms"] is None
+    assert row["tempo_estimate"] == "quick" and row["tempo"] == "unknown"
 
 
 def test_press_window_files_join_the_jsonl_by_epoch(tmp_path, monkeypatch):
@@ -178,6 +179,10 @@ def test_press_window_files_join_the_jsonl_by_epoch(tmp_path, monkeypatch):
     import queue
 
     import numpy as np
+
+    gib = 1024 ** 3
+    monkeypatch.setattr(rpo.shutil, "disk_usage", lambda _path:
+                        SimpleNamespace(total=100 * gib, used=gib, free=99 * gib))
 
     monkeypatch.setenv("ORION_FRAMEDUMP_PRESS_WINDOW", "1")
     monkeypatch.setenv("ORION_FRAMEDUMP_DIR", str(tmp_path))
@@ -215,7 +220,7 @@ def test_press_window_files_join_the_jsonl_by_epoch(tmp_path, monkeypatch):
     o._framedump_writer_stop = threading.Event()
     o._framedump_q = queue.Queue(maxsize=o._framedump_queue_depth)
 
-    o.arm_shot_gate("square", 31, "Standstill", False)
+    o.arm_shot_gate("square", 31, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     assert o._framedump_press_epoch == 31
     for i in range(6):
         o._dump_frame(np.zeros((16, 16, 3), dtype=np.uint8),
@@ -278,7 +283,7 @@ def _icon_frame():
 def test_the_press_edge_opens_the_range_window_and_the_record_gets_it(tmp_path, monkeypatch):
     o, lines = _range_orch(tmp_path, monkeypatch)
     monkeypatch.setattr(rpo, "emit_stdout_jsonl", lambda line: None)
-    o.arm_shot_gate("square", 4242, "Left Fade", False)
+    o.arm_shot_gate("square", 4242, "Left Fade", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     assert o._shot_range._epoch == 4242
     press_s = o._shot_range._press_mono_ms / 1000.0
     frame = _icon_frame()
@@ -297,7 +302,7 @@ def test_the_press_edge_opens_the_range_window_and_the_record_gets_it(tmp_path, 
 def test_a_press_that_never_fills_its_window_is_flushed_by_the_close(tmp_path, monkeypatch):
     o, lines = _range_orch(tmp_path, monkeypatch)
     monkeypatch.setattr(rpo, "emit_stdout_jsonl", lambda line: None)
-    o.arm_shot_gate("square", 77, "Right Fade", False)
+    o.arm_shot_gate("square", 77, "Right Fade", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     o.disarm_shot_gate(77, "manual_cancel")
     o._shot_range._worker_drain()
     assert json.loads(lines[0])["range"] == "unknown"
@@ -308,7 +313,7 @@ def test_a_missing_range_reader_costs_the_press_nothing(tmp_path, monkeypatch):
     o = _orch(tmp_path, _Reader(pickup=dict(PICKUP)))
     o._shot_range = None
     monkeypatch.setattr(rpo, "emit_stdout_jsonl", lambda line: None)
-    o.arm_shot_gate("square", 5, "Standstill", False)
+    o.arm_shot_gate("square", 5, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     o.release_shot_gate(5, 700.0)
     o._shot_records.close_all("t")
     assert _rows(o)[0]["range"] == "unknown"
@@ -338,14 +343,14 @@ def test_pickup_read_supports_explicit_reader_layouts_without_mutation(tmp_path,
 
 
 @pytest.mark.parametrize("close_kind", ["release", "disarm"])
-def test_nested_pickup_survives_terminal_join_and_overrides_fallback(tmp_path, close_kind):
+def test_nested_pickup_survives_terminal_join_without_overriding_accepted_onset(tmp_path, close_kind):
     # Epoch 13's locator saw 61% at +815.8 ms; the first published sample arrived later.
     # The diagnostic must retain both distinctions instead of silently losing PICKUP.
     pickup = dict(PICKUP, epoch=13, first_sight_fill=61.0,
                   first_sight_ms_after_press=815.8)
     reader = _NestedPickupReader(pickup=pickup)
     o = _orch(tmp_path, reader)
-    o.arm_shot_gate("square", 13, "Standstill", False)
+    o.arm_shot_gate("square", 13, "Standstill", False, press_ms=rpo.time.time() * 1000.0 - 1.0)
     o._shot_records.note_onset(13, 870.79, fill=78.0, source="detect_loop")
     if close_kind == "release":
         o.release_shot_gate(13, 1500.0)
@@ -355,8 +360,8 @@ def test_nested_pickup_survives_terminal_join_and_overrides_fallback(tmp_path, c
     row = _rows(o)[0]
     assert row["pickup"] is not None
     assert row["pickup"]["first_sight_fill"] == 61.0
-    assert row["onset_ms"] == 815.8
-    assert row["onset_source"] == "pickup"
+    assert row["onset_ms"] == 870.79
+    assert row["onset_source"] == "detect_loop"
     assert row["banner"] is None             # a locator sample is not a game outcome
     assert row["outcome"] == ("released" if close_kind == "release" else "disarmed")
 

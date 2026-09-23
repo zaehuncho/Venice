@@ -19,6 +19,8 @@ OrderedFileLogSink::Options sanitizedOptions(OrderedFileLogSink::Options options
     options.rotationCheckBatches = std::max(1, options.rotationCheckBatches);
     options.maxOutstandingBytes = std::max<qsizetype>(1, options.maxOutstandingBytes);
     options.retryDelayMs = std::max(1, options.retryDelayMs);
+    options.admissionWaitMs = std::max(0, options.admissionWaitMs);
+    options.shutdownGiveUpMs = std::max(0, options.shutdownGiveUpMs);
     return options;
 }
 
@@ -70,6 +72,9 @@ bool OrderedFileLogSink::enqueue(const QStringList& lines)
 
     qsizetype offset = 0;
     bool firstChunk = true;
+    // [M-02 r2 2026-09-23, Codex] ONE admission deadline for the whole batch, not one per chunk.
+    const auto admissionDeadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(options_.admissionWaitMs);
     {
         std::lock_guard stateLock(stateMutex_);
         ++stats_.acceptedBatches;
@@ -78,9 +83,23 @@ bool OrderedFileLogSink::enqueue(const QStringList& lines)
 
     while (offset < payload.size()) {
         std::unique_lock stateLock(stateMutex_);
-        capacityAvailable_.wait(stateLock, [this] {
+        const auto hasCapacity = [this] {
             return stats_.outstandingBytes < options_.maxOutstandingBytes;
-        });
+        };
+        // [M-02] Never block unboundedly: no wait at all while the writer is failing, a bounded
+        // wait while it is healthy. Out of time or faulted -> drop the rest of this batch.
+        const bool admitted = hasCapacity()
+            || (!stats_.storageFault
+                && capacityAvailable_.wait_until(
+                       stateLock, admissionDeadline,
+                       [&] { return hasCapacity() || stats_.storageFault; })
+                && hasCapacity());
+        if (!admitted) {
+            ++stats_.droppedBatches;
+            stats_.droppedLines += static_cast<quint64>(lines.size());
+            stats_.droppedBytes += static_cast<quint64>(payload.size() - offset);
+            return true;
+        }
 
         const qsizetype available = options_.maxOutstandingBytes - stats_.outstandingBytes;
         const qsizetype chunkSize = std::min(available, payload.size() - offset);
@@ -103,10 +122,12 @@ bool OrderedFileLogSink::enqueue(const QStringList& lines)
     return true;
 }
 
-void OrderedFileLogSink::drain()
+bool OrderedFileLogSink::drain(std::chrono::milliseconds timeout)
 {
+    // [M-02 r2 2026-09-23, Codex] Bounded: a dead disk must not freeze the GUI thread in Copy
+    // Activity Log or at shutdown. False = not everything reached the file in time.
     std::unique_lock lock(stateMutex_);
-    drained_.wait(lock, [this] {
+    return drained_.wait_for(lock, timeout, [this] {
         return queue_.empty() && !writeActive_ && stats_.outstandingBytes == 0;
     });
 }
@@ -122,6 +143,7 @@ void OrderedFileLogSink::stopAndDrain()
         std::lock_guard enqueueLock(enqueueOrderMutex_);
         std::lock_guard stateLock(stateMutex_);
         stopping_ = true;
+        stopRequestedAt_ = std::chrono::steady_clock::now();
     }
     workAvailable_.notify_all();
     capacityAvailable_.notify_all();
@@ -164,12 +186,16 @@ void OrderedFileLogSink::run()
         if (chunk.checkRotation) {
             rotateIfNeeded();
         }
-        writeLosslessly(chunk.bytes);
+        const bool written = writeLosslessly(chunk.bytes);
 
         {
             std::lock_guard lock(stateMutex_);
             stats_.outstandingBytes -= chunk.bytes.size();
-            if (chunk.completedBatchLines > 0) {
+            if (!written) {
+                ++stats_.droppedBatches;
+                stats_.droppedBytes += static_cast<quint64>(chunk.bytes.size());
+                stats_.droppedLines += chunk.completedBatchLines;
+            } else if (chunk.completedBatchLines > 0) {
                 ++stats_.writtenBatches;
                 stats_.writtenLines += chunk.completedBatchLines;
             }
@@ -205,19 +231,23 @@ void OrderedFileLogSink::rotateIfNeeded()
     }
 }
 
-void OrderedFileLogSink::writeLosslessly(const QByteArray& bytes)
+bool OrderedFileLogSink::writeLosslessly(const QByteArray& bytes)
 {
     qsizetype offset = 0;
     while (offset < bytes.size()) {
         const QFileInfo info(logPath_);
         if (!QDir().mkpath(info.absolutePath())) {
-            waitBeforeRetry();
+            if (!waitBeforeRetry()) {
+                return false;
+            }
             continue;
         }
 
         QFile file(logPath_);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) {
-            waitBeforeRetry();
+            if (!waitBeforeRetry()) {
+                return false;
+            }
             continue;
         }
 
@@ -229,7 +259,9 @@ void OrderedFileLogSink::writeLosslessly(const QByteArray& bytes)
                 // Preserve any prefix already accepted by this handle before
                 // reopening at EOF for the remainder.
                 while (!file.flush()) {
-                    waitBeforeRetry();
+                    if (!waitBeforeRetry()) {
+                        return false;
+                    }
                 }
                 break;
             }
@@ -238,7 +270,9 @@ void OrderedFileLogSink::writeLosslessly(const QByteArray& bytes)
 
         if (offset < bytes.size()) {
             file.close();
-            waitBeforeRetry();
+            if (!waitBeforeRetry()) {
+                return false;
+            }
             continue;
         }
 
@@ -246,15 +280,45 @@ void OrderedFileLogSink::writeLosslessly(const QByteArray& bytes)
         // temporarily unavailable, retry flush on this handle instead of
         // reopening and duplicating the batch.
         while (!file.flush()) {
-            waitBeforeRetry();
+            if (!waitBeforeRetry()) {
+                return false;
+            }
         }
         file.close();
     }
+    setStorageFault(false);
+    return true;
 }
 
-void OrderedFileLogSink::waitBeforeRetry() const
+bool OrderedFileLogSink::waitBeforeRetry()
 {
+    setStorageFault(true);
+    {
+        std::lock_guard lock(stateMutex_);
+        if (stopping_
+            && std::chrono::steady_clock::now() - stopRequestedAt_
+                   >= std::chrono::milliseconds(options_.shutdownGiveUpMs)) {
+            return false;   // [M-02] a dead disk must not hang shutdown
+        }
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(options_.retryDelayMs));
+    return true;
+}
+
+void OrderedFileLogSink::setStorageFault(bool faulted)
+{
+    bool wake = false;
+    {
+        std::lock_guard lock(stateMutex_);
+        if (faulted && !stats_.storageFault) {
+            ++stats_.storageFaultEpisodes;
+            wake = true;   // producers waiting for capacity must stop waiting and drop
+        }
+        stats_.storageFault = faulted;
+    }
+    if (wake) {
+        capacityAvailable_.notify_all();
+    }
 }
 
 } // namespace orion

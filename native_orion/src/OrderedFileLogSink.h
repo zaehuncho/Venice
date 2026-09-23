@@ -5,6 +5,7 @@
 #include <QtCore/QStringList>
 #include <QtCore/QtTypes>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,13 @@ public:
         int rotationCheckBatches = 300;
         qsizetype maxOutstandingBytes = 8 * 1024 * 1024;
         int retryDelayMs = 25;
+        // [M-02 / CX-015 2026-09-22] Liveness bounds. A producer (the GUI thread, which also carries
+        // the 4 ms input tick) waits at most admissionWaitMs for queue space while storage is
+        // HEALTHY, and not at all while the writer is failing: a full/denied/unplugged disk drops
+        // diagnostic batches (counted) instead of freezing input. Once stopping, the writer gives
+        // up retrying after shutdownGiveUpMs so shutdown cannot hang on a dead disk.
+        int admissionWaitMs = 250;
+        int shutdownGiveUpMs = 2000;
     };
 
     struct Stats {
@@ -36,6 +44,13 @@ public:
         qsizetype maxObservedOutstandingBytes = 0;
         bool workerStarted = false;
         bool workerStopped = false;
+        // [M-02] Storage-fault visibility: the writer is currently retrying a failed
+        // open/write/flush; episodes counted; batches/lines/bytes dropped instead of blocking.
+        bool storageFault = false;
+        quint64 storageFaultEpisodes = 0;
+        quint64 droppedBatches = 0;
+        quint64 droppedLines = 0;
+        quint64 droppedBytes = 0;
     };
 
     explicit OrderedFileLogSink(QString logPath);
@@ -45,10 +60,12 @@ public:
     OrderedFileLogSink(const OrderedFileLogSink&) = delete;
     OrderedFileLogSink& operator=(const OrderedFileLogSink&) = delete;
 
-    // Accepts the whole batch in FIFO order. At the queue byte limit this call
-    // backpressures instead of dropping diagnostic/security lines.
+    // Accepts the whole batch in FIFO order. At the queue byte limit this call backpressures for
+    // at most Options::admissionWaitMs while storage is healthy; while the writer is failing it
+    // drops (and counts) instead of blocking. Returns false only after stop.
     [[nodiscard]] bool enqueue(const QStringList& lines);
-    void drain();
+    // Waits for every accepted byte to reach the file, at most `timeout`. True when drained.
+    bool drain(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
     void stopAndDrain();
     [[nodiscard]] Stats stats() const;
 
@@ -61,8 +78,11 @@ private:
 
     void run();
     void rotateIfNeeded();
-    void writeLosslessly(const QByteArray& bytes);
-    void waitBeforeRetry() const;
+    // False when retries were abandoned (stopping and past shutdownGiveUpMs).
+    bool writeLosslessly(const QByteArray& bytes);
+    // False when the caller must abandon the current write instead of retrying.
+    bool waitBeforeRetry();
+    void setStorageFault(bool faulted);
 
     const QString logPath_;
     const Options options_;
@@ -78,6 +98,7 @@ private:
     std::deque<PendingChunk> queue_;
     Stats stats_;
     bool stopping_ = false;
+    std::chrono::steady_clock::time_point stopRequestedAt_{};
     bool writeActive_ = false;
     int rotationCountdown_ = 0;
     std::thread worker_;

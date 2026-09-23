@@ -491,8 +491,15 @@ class FrameRingBuffer:
             publication_ns = time.perf_counter_ns()
             if self._max_frame_age_ns:
                 capture_ns = int(frame.capture_timestamp_ns or frame.timestamp_ns or 0)
-                if capture_ns <= 0 or publication_ns - capture_ns > self._max_frame_age_ns:
+                age_ns = publication_ns - capture_ns
+                if capture_ns <= 0 or age_ns > self._max_frame_age_ns:
                     self.last_put_rejection = "publication_timestamp_stale"
+                    return False
+                if age_ns < -2_000_000:  # same QPC rounding tolerance as the wire reader
+                    self.last_put_rejection = "publication_timestamp_future"
+                    return False
+                if frame.source_generation < self._ordered_source_generation:
+                    self.last_put_rejection = "publication_source_generation_old"
                     return False
                 # Latest wins means newest SOURCE instant, not whichever copy
                 # happened to finish last. A delayed completion inside the age
@@ -540,8 +547,9 @@ class FrameRingBuffer:
         frame = self._buffer[idx]
         if frame is not None and self._max_frame_age_ns:
             capture_ns = int(frame.capture_timestamp_ns or frame.timestamp_ns or 0)
-            if (capture_ns <= 0
-                    or time.perf_counter_ns() - capture_ns > self._max_frame_age_ns):
+            age_ns = time.perf_counter_ns() - capture_ns
+            if (capture_ns <= 0 or age_ns < -2_000_000
+                    or age_ns > self._max_frame_age_ns):
                 # A scheduling pause AFTER publication still ages the pixels.
                 # Do not pass them to CV, or leave a stale event causing a
                 # wakeup loop. The next put() sets a new wakeup immediately.
@@ -1481,7 +1489,10 @@ class OrionFramePipeBackend:
             logger.warning("OrionFramePipeBackend needs pywin32 (%s)", exc)
             return False
         if self._thread is not None and self._thread.is_alive():
-            return True
+            # stop() has a bounded join. A reader still retiring after that
+            # timeout is not a successful restart; do not clear its stop fence
+            # or tell the caller that a replacement worker was started.
+            return not self._stop_evt.is_set()
         self._ring.clear()
         self._ready_evt.clear()
         self._stop_evt.clear()
@@ -1502,15 +1513,20 @@ class OrionFramePipeBackend:
                 # interruptible 50 ms wait attaches promptly without a busy loop.
                 self._stop_evt.wait(0.05)
                 continue
-            self._reader_loop()
-            self._connected = False
-            self._ready_evt.clear()
-            if self._producer_identity_state == "verified":
-                self._set_producer_identity_state("disconnected", "pipe_disconnected")
-            # Never let a not-yet-consumed frame from a dead connection become the
-            # first frame of the next session.  Freshness is worth more than continuity.
-            self._ring.clear()
-            self._close()
+            try:
+                self._reader_loop()
+            finally:
+                # Unexpected decoder/allocation errors must retire the same
+                # handles, pixels and readiness as an ordinary disconnect.
+                # Propagate the error rather than advertising a dead worker.
+                self._connected = False
+                self._ready_evt.clear()
+                if self._producer_identity_state == "verified":
+                    self._set_producer_identity_state("disconnected", "pipe_disconnected")
+                # Never let pixels from a dead connection become the first frame
+                # of the next session. Freshness is worth more than continuity.
+                self._ring.clear()
+                self._close()
 
     def _connect_once(self) -> bool:
         # Reconnect never inherits readiness from a prior pipe generation.

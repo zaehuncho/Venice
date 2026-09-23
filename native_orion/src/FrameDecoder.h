@@ -53,6 +53,11 @@ public:
     // preview frame it was detected on (FRAME-ID JOIN). -1 when unknown (placeholder frames).
     void submit(QByteArray base64Jpeg, int frameNumber);
 
+    // Retire the previous producer's in-flight and decoded image mailboxes at
+    // a sidecar/source boundary. A queued GUI wake may still run, but it must
+    // find no image from the retired generation.
+    void retirePending();
+
     // Diagnostics. stats() takes one lock so a telemetry sample cannot combine
     // counters from different instants while the worker is completing a decode.
     [[nodiscard]] FrameDecoderStats stats() const noexcept;
@@ -89,6 +94,7 @@ private:
     bool hasReady_ = false;
     bool deliveryScheduled_ = false;
     bool stop_ = false;
+    quint64 generation_ = 0;
     quint64 submitted_ = 0;
     quint64 dropped_ = 0;
     quint64 decoded_ = 0;

@@ -450,6 +450,27 @@ def _device_names() -> Optional[List[str]]:
     return [n.strip() for n in raw.split("|")]
 
 
+def _device_ids() -> Optional[List[str]]:
+    raw = os.environ.get("ORION_VIDEO_DEVICE_IDS", "")
+    if not raw.strip():
+        return None
+    return [value.strip().lower() for value in raw.split("|")]
+
+
+def _explicit_device_matches(index: int, names: Optional[List[str]] = None) -> bool:
+    """An index is a choice only with a matching current moniker identity."""
+    if names is None:
+        names = _device_names()
+    ids = _device_ids()
+    selected = os.environ.get("ORION_CAPTURE_SELECTED_ID", "").strip().lower()
+    prefix = "dshow-moniker-sha256-v1:"
+    return bool(names is not None and ids is not None and len(ids) == len(names)
+                and 0 <= index < len(ids) and selected.startswith(prefix)
+                and len(selected) == len(prefix) + 64
+                and all(ch in "0123456789abcdef" for ch in selected[len(prefix):])
+                and ids[index] == selected)
+
+
 def _classify_name(name: str) -> str:
     low = name.lower()
     # webcam hints win on conflict (e.g. "Elgato Facecam" is a webcam by a card vendor)
@@ -458,6 +479,143 @@ def _classify_name(name: str) -> str:
     if any(h in low for h in _CARD_NAME_HINTS):
         return "card"
     return "unknown"
+
+
+# [CL2-P3-002/004 2026-09-23] CAPTURE QUALIFICATION BY MEASUREMENT, NOT BY NAME.
+# Fire authority used to hinge on the DirectShow name matching _CARD_NAME_HINTS (a card named
+# "USB Video" never fired, silently), while a feed degraded to 34-48 fps with 100-207 ms gaps
+# (live 2026-09-21 23:06) still counted as healthy because is_healthy() only floors at 35 % of
+# the requested rate. The name list is now a tie-breaker for CHOOSING among devices; whether a
+# feed may drive the bot is decided here, from what it actually delivers:
+#   * raw delivery rate  >= 85 % of the requested rate (51 fps at 60). Healthy HD60 X windows
+#     measure 58.8-60.0; the bad 09-21 session bottomed at 34.
+#   * frame-gap p95      <= max(40 ms, 2.4 frame periods). Healthy windows sit at ~17 ms; one
+#     missing frame is 33 ms, so 40 ms tolerates an isolated drop but not a stuttering feed.
+#   * duplicated content: 25-70 % duplicates with unique fps under the rate floor is a card
+#     re-serving each frame twice (a 30 fps picture padded to 60). Above 70 % is a static
+#     screen (menu/loading) and says nothing about the card, so that criterion is skipped.
+# Every threshold is env-tunable so an unusual but good card can be admitted without a build.
+_QUALIFY_MIN_FPS_RATIO = 0.85
+_QUALIFY_MAX_GAP_P95_MS = 40.0
+_QUALIFY_DUP_BAND = (25.0, 70.0)
+
+
+def qualify_capture_feed(raw_fps: float, gap_p95_ms: float, dup_pct: float,
+                         unique_fps: float, requested_fps: float,
+                         samples: int = 0) -> tuple:
+    """Return ``(ok, code, detail)`` for one measured capture window.
+
+    [CL2-P3-002/004 2026-09-23] ``code`` is "" when the window qualifies, else one of
+    ``no_frames`` / ``low_fps`` / ``gappy`` / ``duplicated``; ``detail`` is a short
+    engineering string for the log. Pure, so it is unit-testable without a device.
+    """
+    # [CL2-P3-004 2026-09-23 r2] Every authority-bearing number must be FINITE. NaN compares
+    # False against every threshold, so `nan < min_fps` / `nan > max_gap` silently PASSED and a
+    # corrupt measurement qualified the feed (Codex r1). A non-finite value, or a missing one
+    # (None), now fails closed as "bad_measurement" -- never defaulted to a passing value.
+    def _finite(value):
+        try:
+            out = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return out if math.isfinite(out) else None
+
+    rate = _finite(requested_fps)
+    if rate is None or rate <= 0.0:
+        return False, "bad_measurement", "requested_fps=%r" % (requested_fps,)
+    ratio = _finite(_env_float("ORION_CAPTURE_QUALIFY_MIN_FPS_RATIO", _QUALIFY_MIN_FPS_RATIO))
+    gap_cfg = _finite(_env_float("ORION_CAPTURE_QUALIFY_MAX_GAP_P95_MS",
+                                 _QUALIFY_MAX_GAP_P95_MS))
+    ratio = _QUALIFY_MIN_FPS_RATIO if ratio is None else ratio
+    gap_cfg = _QUALIFY_MAX_GAP_P95_MS if gap_cfg is None else gap_cfg
+    min_fps = rate * max(0.1, min(1.0, ratio))
+    max_gap = max(gap_cfg, 2.4 * 1000.0 / rate)
+    metrics = {"raw_fps": _finite(raw_fps), "gap_p95_ms": _finite(gap_p95_ms),
+               "dup_pct": _finite(dup_pct), "unique_fps": _finite(unique_fps),
+               "samples": _finite(samples)}
+    bad = sorted(k for k, v in metrics.items() if v is None or v < 0.0)
+    if bad:
+        return False, "bad_measurement", "non-finite/invalid: " + ",".join(bad)
+    raw_fps = metrics["raw_fps"]
+    gap_p95_ms = metrics["gap_p95_ms"]
+    dup_pct = metrics["dup_pct"]
+    unique_fps = metrics["unique_fps"]
+    samples = int(metrics["samples"])
+    if samples < 2 or raw_fps <= 0.0:
+        return False, "no_frames", "samples=%d" % samples
+    if raw_fps < min_fps:
+        return False, "low_fps", "raw_fps=%.1f < %.1f" % (raw_fps, min_fps)
+    if gap_p95_ms > max_gap:
+        return False, "gappy", "gap_p95_ms=%.1f > %.1f" % (gap_p95_ms, max_gap)
+    lo, hi = _QUALIFY_DUP_BAND
+    if lo < dup_pct <= hi and unique_fps < min_fps:
+        return False, "duplicated", "dup_pct=%.0f unique_fps=%.0f" % (dup_pct, unique_fps)
+    return True, "", "raw_fps=%.1f gap_p95_ms=%.1f" % (raw_fps, gap_p95_ms)
+
+
+def capture_notice_text(code: str, *, fps: float = 0.0, requested_fps: float = 60.0,
+                        device: str = "", detail: str = "") -> str:
+    """Plain-language, customer-facing text for a capture problem (or its recovery).
+
+    [CL2-P3-005 2026-09-23] ASCII only (the native relay has no /utf-8 build flag). Each
+    message names the cause Venice actually measured and the one thing to do about it; OBS
+    is named ONLY for the busy case, where the device opened and handed over no frames.
+    """
+    try:
+        want = int(round(float(requested_fps))) if float(requested_fps) > 0 else 60
+    except (TypeError, ValueError, OverflowError):
+        want = 60
+    # [CL2-P3-004 2026-09-23 r2] a NaN/inf measurement must still produce its notice.
+    try:
+        got = int(round(float(fps or 0.0)))
+    except (TypeError, ValueError, OverflowError):
+        got = 0
+    dev = (" (%s)" % device[:48]) if device else ""
+    if code == "low_fps":
+        return ("Capture: Your capture device is sending %d fps (Venice needs a steady %d). "
+                "The bot will not shoot until it does. Set it to 1080p60 or 720p60, or "
+                "plug it into a USB 3.0 port." % (got, want))
+    if code == "gappy":
+        return ("Capture: Your capture device is dropping frames (the picture keeps "
+                "stuttering), so the bot will not shoot. Plug it into a USB 3.0 port "
+                "directly on the PC, close other heavy apps, and set it to 1080p60 or 720p60.")
+    if code == "duplicated":
+        return ("Capture: Your capture device is repeating frames (only about %d real fps "
+                "of the %d Venice needs), so the bot will not shoot. Set it to 1080p60 or "
+                "720p60, or use a USB 3.0 port." % (got, want))
+    if code == "no_frames":
+        return ("Capture: No picture is arriving from your capture card%s, so the bot will "
+                "not shoot. Check that the console is on and the HDMI cable is in." % dev)
+    if code == "unidentified":
+        # [CL2-P3-001 2026-09-23 r2]
+        return ("Capture: Venice cannot confirm which device is your capture card%s, so the "
+                "bot will not shoot. Pick your card in Stream Setup and press Refresh." % dev)
+    if code == "bad_measurement":
+        # [CL2-P3-004 2026-09-23 r2]
+        return ("Capture: Venice cannot measure your capture feed right now, so the bot will "
+                "not shoot. Reconnect, and if this keeps happening set the card to 1080p60 "
+                "or 720p60 on a USB 3.0 port.")
+    if code == "busy":
+        return ("Capture: Your capture card%s is busy or has no picture. Close OBS or other "
+                "apps using it, and check that the console is awake. Venice keeps retrying "
+                "on its own." % dev)
+    if code == "absent":
+        return ("Capture: Venice cannot find your capture card%s. Check the USB cable, then "
+                "pick your card in Stream Setup and press Refresh." % dev)
+    if code == "invalid":
+        detail = {"undersized": "smaller than 720p", "aspect": "not 16:9",
+                  "channels": "not a colour picture"}.get(detail, detail)
+        return ("Capture: Your capture device%s is sending the wrong picture size (%s). "
+                "Venice needs 1080p or 720p at 16:9: set the console and card to 1080p60 "
+                "or 720p60." % (dev, detail or "not 16:9 HD"))
+    if code == "not_card":
+        return ("Capture: Venice is reading a camera that isn't your capture card%s, so the "
+                "bot will not shoot. Pick your card in Stream Setup. Venice will keep "
+                "retrying your card." % dev)
+    if code == "ok":
+        return ("Capture: Your capture card is steady at %d fps again. The bot can shoot."
+                % max(got, 1))
+    return "Capture: There is a problem with your capture card (%s)." % (code or "unknown")
 
 
 def _load_cached_index() -> int:
@@ -509,7 +667,8 @@ class CaptureCardBackend:
         self._wedged_cap = None
         self._api_name = ""
         # [ORION_ROUTE_ADOPT 2026-08-17] WHY the resolved index was chosen, for the orchestrator's
-        # route guard. "configured" = it is the configured index; "card_name" = the name-gated
+        # route guard. "configured" = selected stable ID matches this configured index;
+        # "card_name" = the name-gated
         # candidate walk resolved a DIFFERENT index whose DirectShow name classifies as a capture
         # card (identity evidence: same physical card, enumeration drift); "uncertain" = any other
         # basis (cached index without a name list, unknown-named device, legacy brightness scan).
@@ -600,6 +759,9 @@ class CaptureCardBackend:
         self._reopen_grace_ns = 0
         # Set by _open() on failure: "busy" (node opened, no frames) vs "absent" (no node).
         self._open_diag = ""
+        # [CL2-P3-005 2026-09-23] Why the LAST start() failed, for the customer notice:
+        # (code, device_name, detail) with code "busy" | "absent" | "invalid" | "".
+        self._last_start_failure = ("", "", "")
         self._buffersize = max(1, int(_env_float("ORION_CAPTURE_BUFFERSIZE", 1.0)))
         self._negotiated_width = 0
         self._negotiated_height = 0
@@ -699,6 +861,46 @@ class CaptureCardBackend:
         """
         return str(self._route_basis or "uncertain")
 
+    def identity_verified(self) -> bool:
+        """True only when the open device is IDENTIFIED as the customer's capture card.
+
+        [CL2-P3-001 2026-09-23 r2] Fire authority needs an explicit identity, not just a live
+        picture: native must have supplied an aligned DirectShow inventory with valid, unique
+        moniker IDs, the resolved index must be the configured, stable-ID-matched choice or a
+        card-NAMED resolution, and its name must not be a webcam. A names-only timeout fallback,
+        cached/scan hit ("uncertain"), or webcam name -> False.
+        """
+        names = _device_names()
+        if names is None:
+            return False
+        ids = _device_ids()
+        prefix = "dshow-moniker-sha256-v1:"
+        if (ids is None or len(ids) != len(names) or len(set(ids)) != len(ids)
+                or any(not value.startswith(prefix)
+                       or len(value) != len(prefix) + 64
+                       or any(ch not in "0123456789abcdef" for ch in value[len(prefix):])
+                       for value in ids)):
+            return False
+        idx = int(self._device_index)
+        if not (0 <= idx < len(names)) or not names[idx]:
+            return False
+        name_class = _classify_name(names[idx])
+        if name_class == "webcam":
+            return False
+        basis = str(self._route_basis or "")
+        return ((basis == "configured" and _explicit_device_matches(idx, names))
+                or (basis == "card_name" and name_class == "card"))
+
+    def last_start_failure(self):
+        """``(code, device_name, detail)`` of the last failed start(); code "" after success.
+
+        [CL2-P3-005 2026-09-23] code is "busy" (opened, no frames: another app holds the card
+        or there is no HDMI picture), "absent" (nothing answered) or "invalid" (wrong picture
+        size/aspect; detail names the contract reason).
+        """
+        code, dev, detail = self._last_start_failure
+        return str(code or ""), str(dev or ""), str(detail or "")
+
     def active_route(self):
         """Return ``(actual_api, resolved_index)`` for warm-cache authority.
 
@@ -793,6 +995,7 @@ class CaptureCardBackend:
                 "samples": len(arrivals),
                 "fps": 0.0,
                 "max_gap_ms": 0.0,
+                "gap_p95_ms": 0.0,   # [CL2-P3-004 2026-09-23]
                 "late_gaps": 0,
                 "worst_gap_frame_number": 0,
                 "worst_gap_event_ns": 0,
@@ -840,6 +1043,9 @@ class CaptureCardBackend:
             "samples": len(arrivals),
             "fps": (len(arrivals) - 1) / covered_s,
             "max_gap_ms": max(gaps) / 1e6,
+            # [CL2-P3-004 2026-09-23] the qualification gate's jitter figure: the max alone
+            # is one outlier, the p95 says whether the feed is stuttering as a habit.
+            "gap_p95_ms": sorted(gaps)[min(len(gaps) - 1, int(0.95 * len(gaps)))] / 1e6,
             "late_gaps": sum(1 for gap in gaps if gap > nominal_ns * 1.5),
             "worst_gap_frame_number": worst_frame_number,
             "worst_gap_event_ns": worst_event_ns,
@@ -979,8 +1185,9 @@ class CaptureCardBackend:
 
     def _candidate_indices(self) -> List[int]:
         """Ordered candidate device indices with webcam-named entries EXCLUDED. Configured index
-        first (explicit user choice from the named picker), then the persisted last-good index,
-        then name-matched capture cards, then unknown-named devices. Never a webcam name."""
+        first only after a stable-ID picker choice, then the persisted last-good index,
+        then name-matched capture cards. Never a webcam name, and never an unknown-named
+        device the customer did not pick [CL2-P3-001 2026-09-23]."""
         names = _device_names()
         cand: List[int] = []
 
@@ -991,14 +1198,26 @@ class CaptureCardBackend:
                     return
                 cand.append(i)
 
-        add(self._device_index)
-        add(_load_cached_index())
+        # The compiled index default is zero, not an explicit pick. A generic name
+        # is eligible only when this launch's stable ID matches the saved choice.
+        # Without enumeration, retaining the old index permits preview only; it
+        # cannot earn identity/fire authority.
+        if names is None or _explicit_device_matches(self._device_index, names):
+            add(self._device_index)
+        # [CL2-P3-001 2026-09-23] Automatic fallbacks never include an unknown-named device.
+        # "Microsoft Camera Front", "Insta360 Link", "NVIDIA Broadcast" all classify unknown;
+        # the old walk opened them whenever the real card was busy/asleep, accepted the
+        # camera's 1080p picture and stayed on it for the whole session (webcam LED on, bot
+        # benched, and the only message wrongly blamed OBS). The cached index is only a
+        # fallback when its CURRENT name still looks like a card (or no names are known).
+        # [CL2-P3-001 2026-09-23 r2] With NO enumeration (names is None) nothing but the
+        # configured index is ever opened: a cached index then carries no identity at all.
+        cached = _load_cached_index()
+        if names is not None and 0 <= cached < len(names) and _classify_name(names[cached]) == "card":
+            add(cached)
         if names is not None:
             for i, n in enumerate(names):
                 if _classify_name(n) == "card":
-                    add(i)
-            for i, n in enumerate(names):
-                if _classify_name(n) == "unknown":
                     add(i)
         return cand
 
@@ -1022,6 +1241,7 @@ class CaptureCardBackend:
         # "absent" index must not overwrite the fact that the real card opened-but-would-not-stream.
         any_busy = False
         configured_index = self._device_index
+        self._open_diag = ""   # [CL2-P3-001 2026-09-23 r2] no stale diag from a prior start()
         for idx in self._candidate_indices():
             self._open_diag = ""
             cap, api_name = self._open(idx)
@@ -1034,7 +1254,7 @@ class CaptureCardBackend:
                 # Only a name-verified CARD earns "card_name": the walk may also have reached
                 # this index from the persisted cache or as an unknown-named candidate, and
                 # neither is evidence about WHAT is on the index.
-                if idx == configured_index:
+                if idx == configured_index and _explicit_device_matches(idx, names):
                     self._route_basis = "configured"
                 elif (names is not None and 0 <= idx < len(names)
                       and _classify_name(names[idx]) == "card"):
@@ -1044,7 +1264,13 @@ class CaptureCardBackend:
                 break
             if self._open_diag == "busy":
                 any_busy = True
-        if cap is None and names is None and not _BRUTE_SCANNED:
+        # [CL2-P3-001 2026-09-23 r2] The one-shot brightness scan opens EVERY video device
+        # (webcam included) and can settle on whichever has a bright picture: it is identity-free
+        # by construction, so it is now a developer opt-in only (ORION_CAPTURE_LEGACY_SCAN=1),
+        # and anything it finds stays "uncertain" and never earns fire authority
+        # (identity_verified() is False without an enumeration).
+        if (cap is None and names is None and not _BRUTE_SCANNED
+                and _env_flag("ORION_CAPTURE_LEGACY_SCAN", False)):
             _BRUTE_SCANNED = True
             best = self._find_best_device_index()                # one-shot legacy brightness scan
             if best >= 0:
@@ -1056,6 +1282,19 @@ class CaptureCardBackend:
                 self._route_basis = ("configured" if best == configured_index else "uncertain")
                 cap, api_name = self._open(best)
         if cap is None:
+            # [CL2-P3-005 2026-09-23] Remember the failure class for a plain-language notice.
+            _fail_dev = (names[self._device_index]
+                         if names is not None and 0 <= self._device_index < len(names) else "")
+            if _fail_dev and _classify_name(_fail_dev) == "webcam" and not any_busy                     and not str(self._open_diag):
+                # [CL2-P3-001 2026-09-23 r2] The PICKED device is a webcam and no card answered:
+                # say so instead of "cannot find your card".
+                self._last_start_failure = ("not_card", _fail_dev, "")
+            elif str(self._open_diag).startswith("invalid:"):
+                self._last_start_failure = ("invalid", _fail_dev, self._open_diag.split(":", 1)[1])
+            elif any_busy or self._open_diag == "busy":
+                self._last_start_failure = ("busy", _fail_dev, "")
+            else:
+                self._last_start_failure = ("absent", _fail_dev, "")
             # "no live device" is NOT one failure -- it is two, with opposite fixes. Say which.
             #   busy   : the device node OPENED but never handed over a frame. Another process owns
             #            the card exclusively (OBS with a Video Capture Device source is the usual
@@ -1090,6 +1329,7 @@ class CaptureCardBackend:
                 logger.warning("CaptureCard backend: no live device (index %d, DSHOW/MSMF) — no remote-play "
                                "fallback; caller will retry", self._device_index)
             return False
+        self._last_start_failure = ("", "", "")   # [CL2-P3-005 2026-09-23]
         _save_cached_index(self._device_index,
                            (names[self._device_index]
                             if names is not None and self._device_index < len(names) else ""))

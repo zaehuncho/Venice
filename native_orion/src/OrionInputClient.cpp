@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <thread>
 
 namespace orion {
 
@@ -78,9 +80,138 @@ constexpr DWORD kWriteTimeoutMs = 3;
 // written. The final window starts only after the matching ENQUEUED proof. Both remain short and an
 // unconfirmed packet still fails closed; no input packet is ever retried here.
 constexpr DWORD kEnqueuedAckTimeoutMs = 25;
-// Must exceed the bridge's bounded 25 ms local-delivery wait plus pipe wakeup.
-// This is only a failure ceiling; healthy ACKs still return immediately.
-constexpr DWORD kFinalDeliveryAckTimeoutMs = 50;
+// Must exceed the bridge's bounded local-delivery wait (40 ms since 2026-09-22, was 25) plus pipe
+// wakeup. This is only a failure ceiling; healthy ACKs still return immediately.
+constexpr DWORD kFinalDeliveryAckTimeoutMs = 65;
+
+// Every overlapped operation owns its buffer, event and duplicate pipe handle.
+// After a deadline the caller cancels and returns; a separate reaper retains
+// the storage until the kernel signals completion. Reconnection is capped while
+// too many stuck cancellations are outstanding, bounding retained resources.
+constexpr int kMaxPendingIoReaps = 8;
+std::atomic<int> pendingIoReaps{0};
+#ifdef ORION_INPUT_TEST_HOOKS
+std::atomic<bool> forceDeferredCancelReapForTesting{false};
+std::atomic<DWORD> cancelReapDelayMsForTesting{0};
+std::atomic<int> gAbandonPendingWritesForTesting{0};
+std::atomic<int> gAbandonTimedOutWritesForTesting{0};
+#endif
+
+struct OwnedPipeIo final {
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    HANDLE event = nullptr;
+    OVERLAPPED overlapped{};
+    OrionInputPacket packet{};
+    OrionInputAck ack{};
+    ~OwnedPipeIo()
+    {
+        if (event) CloseHandle(event);
+        if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+    }
+};
+
+struct PipeIoOutcome final {
+    bool success = false;
+    bool issued = false;
+    DWORD error = ERROR_SUCCESS;
+    DWORD bytes = 0;
+    OrionInputAck ack{};
+};
+
+void reapPendingPipeIo(std::unique_ptr<OwnedPipeIo> operation) noexcept
+{
+    pendingIoReaps.fetch_add(1, std::memory_order_acq_rel);
+    OwnedPipeIo* const retained = operation.release();
+    try {
+        std::thread([retained]() {
+            std::unique_ptr<OwnedPipeIo> op(retained);
+#ifdef ORION_INPUT_TEST_HOOKS
+            const DWORD delay = cancelReapDelayMsForTesting.load(std::memory_order_acquire);
+            if (delay) Sleep(delay);
+#endif
+            if (WaitForSingleObject(op->event, INFINITE) != WAIT_OBJECT_0) {
+                // An invalid wait is not proof that the kernel stopped using
+                // the OVERLAPPED storage. Retain it and refuse reconnection
+                // once the global outstanding cap is reached.
+                (void)op.release();
+                return;
+            } // never the caller/fire thread
+            DWORD ignored = 0;
+            (void)GetOverlappedResult(op->pipe, &op->overlapped, &ignored, FALSE);
+            op.reset();
+            pendingIoReaps.fetch_sub(1, std::memory_order_acq_rel);
+        }).detach();
+    } catch (...) {
+        // Thread creation failed. The kernel may still reference the storage:
+        // intentionally retain this one allocation until process exit rather
+        // than free it, and the outstanding cap refuses further transactions.
+        (void)retained;
+    }
+}
+
+PipeIoOutcome runOwnedPipeIo(HANDLE sourcePipe, bool readAck,
+                             const OrionInputPacket* packet, DWORD timeoutMs)
+{
+    PipeIoOutcome outcome;
+    if (sourcePipe == INVALID_HANDLE_VALUE
+        || pendingIoReaps.load(std::memory_order_acquire) >= kMaxPendingIoReaps) {
+        outcome.error = ERROR_NOT_READY;
+        return outcome;
+    }
+    auto op = std::make_unique<OwnedPipeIo>();
+    op->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!op->event || !DuplicateHandle(GetCurrentProcess(), sourcePipe,
+                                      GetCurrentProcess(), &op->pipe, 0, FALSE,
+                                      DUPLICATE_SAME_ACCESS)) {
+        outcome.error = GetLastError();
+        return outcome;
+    }
+    op->overlapped.hEvent = op->event;
+    if (packet) op->packet = *packet;
+    const BOOL issuedOk = readAck
+        ? ReadFile(op->pipe, &op->ack, sizeof(op->ack), nullptr, &op->overlapped)
+        : WriteFile(op->pipe, &op->packet, sizeof(op->packet), nullptr, &op->overlapped);
+    const DWORD issueError = issuedOk ? ERROR_SUCCESS : GetLastError();
+#ifdef ORION_INPUT_TEST_HOOKS
+    const bool abandonWrite = !readAck && packet
+        && (packet->reserved & OrionInputAbandon) != 0;
+    if (abandonWrite && !issuedOk && issueError == ERROR_IO_PENDING)
+        gAbandonPendingWritesForTesting.fetch_add(1, std::memory_order_relaxed);
+#endif
+    outcome.issued = issuedOk || issueError == ERROR_IO_PENDING;
+    if (!outcome.issued) {
+        outcome.error = issueError;
+        return outcome;
+    }
+    if (!issuedOk) {
+        const DWORD waited = WaitForSingleObject(op->event, timeoutMs);
+        if (waited != WAIT_OBJECT_0) {
+#ifdef ORION_INPUT_TEST_HOOKS
+            if (abandonWrite && waited == WAIT_TIMEOUT)
+                gAbandonTimedOutWritesForTesting.fetch_add(1, std::memory_order_relaxed);
+#endif
+            const DWORD waitError = waited == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+            (void)CancelIoEx(op->pipe, &op->overlapped);
+            bool deferCompletion = WaitForSingleObject(op->event, 0) != WAIT_OBJECT_0;
+#ifdef ORION_INPUT_TEST_HOOKS
+            deferCompletion = deferCompletion
+                || forceDeferredCancelReapForTesting.load(std::memory_order_acquire);
+#endif
+            if (deferCompletion) {
+                outcome.error = waitError;
+                reapPendingPipeIo(std::move(op));
+                return outcome;
+            }
+        }
+    }
+    if (GetOverlappedResult(op->pipe, &op->overlapped, &outcome.bytes, FALSE)) {
+        outcome.success = true;
+        if (readAck) outcome.ack = op->ack;
+    } else {
+        outcome.error = GetLastError();
+    }
+    return outcome;
+}
 
 CheckedElapsedMicros qpcElapsedUs(
     BOOL startOk, const LARGE_INTEGER& start,
@@ -111,14 +242,49 @@ void updateMax(std::atomic<uint64_t>& target, uint64_t value)
 #endif
 } // namespace
 
+#ifdef ORION_INPUT_TEST_HOOKS
+void OrionInputClient::configureDeferredCancellationForTesting(
+    bool forceDeferred, DWORD reapDelayMs)
+{
+    forceDeferredCancelReapForTesting.store(forceDeferred, std::memory_order_release);
+    cancelReapDelayMsForTesting.store(reapDelayMs, std::memory_order_release);
+}
+
+int OrionInputClient::pendingCancellationReapsForTesting()
+{
+    return pendingIoReaps.load(std::memory_order_acquire);
+}
+
+void OrionInputClient::resetAbandonWriteProbeForTesting()
+{
+    gAbandonPendingWritesForTesting.store(0, std::memory_order_release);
+    gAbandonTimedOutWritesForTesting.store(0, std::memory_order_release);
+}
+
+int OrionInputClient::abandonPendingWritesForTesting()
+{
+    return gAbandonPendingWritesForTesting.load(std::memory_order_acquire);
+}
+
+int OrionInputClient::abandonTimedOutWritesForTesting()
+{
+    return gAbandonTimedOutWritesForTesting.load(std::memory_order_acquire);
+}
+
+HANDLE OrionInputClient::duplicatePipeHandleForTesting() const
+{
+    std::lock_guard<std::mutex> lock(ioMutex_);
+    HANDLE duplicate = INVALID_HANDLE_VALUE;
+    if (pipe_ != INVALID_HANDLE_VALUE)
+        (void)DuplicateHandle(GetCurrentProcess(), pipe_, GetCurrentProcess(),
+                              &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    return duplicate;
+}
+#endif
+
 OrionInputClient::OrionInputClient(QString pipeName)
     : pipeName_(std::move(pipeName))
 {
-#ifdef _WIN32
-    // Manual-reset completion event, created once and reused for every overlapped write.
-    writeEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    readEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-#endif
 }
 
 OrionInputClient::~OrionInputClient()
@@ -127,18 +293,6 @@ OrionInputClient::~OrionInputClient()
         std::lock_guard<std::mutex> lock(ioMutex_);
         closePipe();
     }
-#ifdef _WIN32
-    if(writeEvent_)
-    {
-        CloseHandle(writeEvent_);
-        writeEvent_ = nullptr;
-    }
-    if(readEvent_)
-    {
-        CloseHandle(readEvent_);
-        readEvent_ = nullptr;
-    }
-#endif
 }
 
 bool OrionInputClient::connected() const
@@ -195,6 +349,8 @@ void OrionInputClient::closePipe()
 
 bool OrionInputClient::ensureConnected()
 {
+    if (pendingIoReaps.load(std::memory_order_acquire) >= kMaxPendingIoReaps)
+        return false;
     if(pipe_ != INVALID_HANDLE_VALUE)
         return true;
     // Throttle reconnect attempts (chiaki's pipe server may not be up yet).
@@ -262,81 +418,22 @@ InputRouteWriteResult OrionInputClient::waitForDeliveryAck(uint32_t sourceSeq, b
         return InputRouteWriteResult::WrittenUnconfirmed;
     };
 
-    if(pipe_ == INVALID_HANDLE_VALUE || !readEvent_)
+    if(pipe_ == INVALID_HANDLE_VALUE)
         return fail(ERROR_INVALID_HANDLE, 0, nullptr);
 
     ULONGLONG deadline = GetTickCount64() + kEnqueuedAckTimeoutMs;
     bool enqueuedObserved = false;
     while(GetTickCount64() <= deadline)
     {
-        OrionInputAck ack{};
-        DWORD read = 0;
-        DWORD readError = ERROR_SUCCESS;
-        OVERLAPPED ov{};
-        ov.hEvent = readEvent_;
-        ResetEvent(readEvent_);
-        bool readOk = false;
-        if(ReadFile(pipe_, &ack, sizeof(ack), nullptr, &ov))
-        {
-            if(GetOverlappedResult(pipe_, &ov, &read, FALSE))
-            {
-                readOk = read == sizeof(ack);
-                if(!readOk)
-                    readError = ERROR_INVALID_DATA;
-            }
-            else
-            {
-                readError = GetLastError();
-            }
-        }
-        else
-        {
-            readError = GetLastError();
-            if(readError == ERROR_IO_PENDING)
-            {
-                const ULONGLONG now = GetTickCount64();
-                const DWORD remaining = now >= deadline
-                    ? 0 : static_cast<DWORD>(deadline - now);
-                const DWORD waitResult = WaitForSingleObject(readEvent_, remaining);
-                if(waitResult == WAIT_OBJECT_0)
-                {
-                    if(GetOverlappedResult(pipe_, &ov, &read, FALSE))
-                    {
-                        readOk = read == sizeof(ack);
-                        readError = readOk ? ERROR_SUCCESS : ERROR_INVALID_DATA;
-                    }
-                    else
-                    {
-                        readError = GetLastError();
-                    }
-                }
-                else
-                {
-                    const DWORD waitError = waitResult == WAIT_TIMEOUT
-                        ? ERROR_TIMEOUT : GetLastError();
-                    // Drain cancellation before the stack ACK buffer goes away. If completion won
-                    // the timeout/cancel race, GetOverlappedResult still returns the exact ACK and
-                    // it is safe to validate it. A genuinely canceled/failed read remains ambiguous.
-                    CancelIoEx(pipe_, &ov);
-                    if(WaitForSingleObject(readEvent_, INFINITE) == WAIT_OBJECT_0
-                        && GetOverlappedResult(pipe_, &ov, &read, FALSE))
-                    {
-                        readOk = read == sizeof(ack);
-                        readError = readOk ? ERROR_SUCCESS : ERROR_INVALID_DATA;
-                    }
-                    else
-                    {
-                        const DWORD completionError = GetLastError();
-                        readError = completionError == ERROR_OPERATION_ABORTED
-                            ? waitError : completionError;
-                    }
-                }
-            }
-            else
-            {
-                readOk = false;
-            }
-        }
+        const ULONGLONG now = GetTickCount64();
+        const DWORD remaining = now >= deadline
+            ? 0 : static_cast<DWORD>(deadline - now);
+        const PipeIoOutcome io = runOwnedPipeIo(pipe_, true, nullptr, remaining);
+        const OrionInputAck ack = io.ack;
+        const DWORD read = io.bytes;
+        const bool readOk = io.success && read == sizeof(ack);
+        const DWORD readError = readOk ? ERROR_SUCCESS
+            : (io.success ? ERROR_INVALID_DATA : io.error);
 
         if(!readOk)
             return fail(readError, read, haveObservedAck ? &lastObservedAck : nullptr);
@@ -382,8 +479,6 @@ InputRouteWriteResult OrionInputClient::sendDetailed(
         return InputRouteWriteResult::Failed;
     if(!ensureConnected())
         return InputRouteWriteResult::Failed;
-    if(!writeEvent_ || !readEvent_)  // bounded duplex completion unavailable -> fail closed
-        return InputRouteWriteResult::Failed;
 
     const bool routeWasOwned = haveLast_ && last_.own != 0;
 
@@ -409,6 +504,47 @@ InputRouteWriteResult OrionInputClient::sendDetailed(
     if(forceWrite)
         p.reserved |= OrionInputMustDeliver; // recovery proof requires downstream local acceptance
 
+    // [2026-09-22 RED TEAM CL-003] A trigger release that shares a 4 ms poll with a NEW button press
+    // is one packet on the wire, and the fork's release redundancy refuses to copy a packet that
+    // contains a press (a duplicated press would be a phantom input). That left L2/R2 releases as
+    // the one input class with no repair: one lost datagram and sprint stays down (the owner's
+    // "R2 clamps down"). Send the trigger release FIRST as its own transaction - buttons exactly as
+    // the console last saw them - so it qualifies as a pure release and gets the twin + echo; the
+    // press follows as the next transaction. Both are MustDeliver, so ordering is proven, and the
+    // console sees exactly the same two edges it would have merged.
+    // [CL-003 Codex final gate 2026-09-22] `pre` is built from the LAST CONFIRMED packet plus only
+    // terminal edges (trigger zero-crossings and digital releases), never from `p`: copying `p`
+    // carried any simultaneous opposite-trigger increase into `pre`, and the fork refuses to copy
+    // a release that contains a trigger increase (orioninput.c chiaki_orion_input_is_pure_button_
+    // release), so R2-up + L2-rise still went out with no redundancy. The split runs whenever `p`
+    // itself would NOT qualify as a copyable release (a new press OR a trigger increase); a trigger
+    // release accompanied only by stick motion already qualifies on its own and is not split.
+    if(own && haveLast_ && !forceWrite && last_.own == p.own)
+    {
+        const bool l2Released = last_.l2_state != 0 && p.l2_state == 0;
+        const bool r2Released = last_.r2_state != 0 && p.r2_state == 0;
+        const uint32_t newlyPressed = p.buttons & ~last_.buttons;
+        const bool triggerIncreased = p.l2_state > last_.l2_state || p.r2_state > last_.r2_state;
+        if((l2Released || r2Released) && (newlyPressed != 0 || triggerIncreased))
+        {
+            OrionInputPacket pre = last_;
+            pre.buttons = last_.buttons & p.buttons;   // releases only; never a new press
+            if(l2Released)
+                pre.l2_state = 0;
+            if(r2Released)
+                pre.r2_state = 0;
+            pre.reserved = classifyOrionInputPacketFlags(&last_, pre) | OrionInputMustDeliver;
+            const InputRouteWriteResult preResult = transmitLocked(pre, own, routeWasOwned);
+            if(preResult == InputRouteWriteResult::Failed
+                || preResult == InputRouteWriteResult::WrittenUnconfirmed)
+                return preResult;
+            last_ = pre;
+            haveLast_ = true;
+            splitTriggerReleases_.fetch_add(1, std::memory_order_relaxed);
+            p.reserved = classifyOrionInputPacketFlags(&last_, p);
+        }
+    }
+
     // De-dupe: only write when the mapped packet actually changes (a button press / stick move / an
     // ownership flip). Orion drives CONTINUOUS ownership (own=1 every tick: the patched chiaki doesn't
     // pump SDL, so its own=0/ViGEm-mirror path is dead -- see OrionAppController), and chiaki holds the
@@ -427,7 +563,28 @@ InputRouteWriteResult OrionInputClient::sendDetailed(
     //    instead of at the player's next press.
     // No optimisation here may ever suppress a state change the console has not provably received.
     if(!forceWrite && haveLast_ && sameInput(last_, p))
+    {
+        // [CL2-P4-001 2026-09-22] Dead-man keepalive. An unchanged owned state sends nothing, so
+        // the fork cannot tell "the player is holding still" from "the launcher's input loop has
+        // stalled" - and a stall used to leave the console holding the last input indefinitely.
+        // While owned, re-send the exact confirmed state UNFLAGGED at least every
+        // kOwnedKeepaliveMs; the fork neutralises after 400 ms of silence. Unflagged = latest-wins,
+        // no ACK wait, console-visible state unchanged. This runs on the input tick itself, so it
+        // stops exactly when that tick stops. last_ is untouched (it already holds this state).
+        if(own && last_.own != 0
+            && std::chrono::steady_clock::now() - lastWireWriteAt_
+                   >= std::chrono::milliseconds(kOwnedKeepaliveMs))
+        {
+            OrionInputPacket keepalive = last_;
+            keepalive.reserved = 0;
+            const InputRouteWriteResult kaResult = transmitLocked(keepalive, own, routeWasOwned);
+            if(kaResult == InputRouteWriteResult::Failed
+                || kaResult == InputRouteWriteResult::WrittenUnconfirmed)
+                return kaResult;
+            ownedKeepalives_.fetch_add(1, std::memory_order_relaxed);
+        }
         return InputRouteWriteResult::Unchanged;
+    }
 
     const InputRouteWriteResult result = transmitLocked(p, own, routeWasOwned);
     if(transactionTiming)
@@ -446,7 +603,7 @@ OrionInputClient::SquareWatchdogReleaseResult OrionInputClient::releaseSquareFor
     SquareWatchdogReleaseResult outcome;
     constexpr uint32_t kSquareBit = 1u << 2;
     if (!enabled_.load(std::memory_order_acquire)
-        || pipe_ == INVALID_HANDLE_VALUE || !writeEvent_ || !readEvent_
+        || pipe_ == INVALID_HANDLE_VALUE
         || !haveLast_ || last_.own == 0 || (last_.buttons & kSquareBit) == 0)
         return outcome;
     for (int copy = 0; copy < 2; ++copy) {
@@ -471,7 +628,7 @@ InputRouteWriteResult OrionInputClient::reassertLastState()
     // Liveness proof of an ESTABLISHED, previously-confirmed route only. Never connect or seed
     // here: a replacement OrionStream must receive its first owned packet through the ordinary
     // send path once its session is provably Running (see ensureConnected/resetConnection).
-    if(pipe_ == INVALID_HANDLE_VALUE || !writeEvent_ || !readEvent_)
+    if(pipe_ == INVALID_HANDLE_VALUE)
         return InputRouteWriteResult::Failed;
     if(!haveLast_ || last_.own == 0)
         return InputRouteWriteResult::Unchanged;
@@ -496,47 +653,19 @@ InputRouteWriteResult OrionInputClient::transmitLocked(
     OrionInputPacket& p, bool own, bool routeWasOwned)
 {
     p.seq = ++seq_;
+    lastWireWriteAt_ = std::chrono::steady_clock::now();   // [CL2-P4-001] keepalive clock
     lastTransactionTiming_.begin(p.seq);
     lastWriteUs_.store(0, std::memory_order_relaxed);
     DWORD written = 0;
     LARGE_INTEGER start{}, end{};
     const BOOL startOk = QueryPerformanceCounter(&start);
 
-    // Overlapped write with a bounded timeout: the caller is the TIME_CRITICAL fire thread, so a wedged
-    // reader must never block it. Normal writes complete in microseconds. If an operation may have been
-    // accepted but does not finish inside the budget, the route becomes ambiguous: close the pipe, keep
-    // ViGEm neutral, and let OrionStream's duplex-loss fence stop the session. `p` outlives every path
-    // below because cancellation is drained before return, avoiding async use-after-scope.
-    OVERLAPPED ov{};
-    ov.hEvent = writeEvent_;
-    ResetEvent(writeEvent_);
-    bool writeOk = false;
-    bool writeMayHaveBeenAccepted = false;
-    if(WriteFile(pipe_, &p, sizeof(p), nullptr, &ov))
-    {
-        writeMayHaveBeenAccepted = true;
-        writeOk = GetOverlappedResult(pipe_, &ov, &written, FALSE) && written == sizeof(p);
-    }
-    else if(GetLastError() == ERROR_IO_PENDING)
-    {
-        writeMayHaveBeenAccepted = true;
-        if(WaitForSingleObject(writeEvent_, kWriteTimeoutMs) == WAIT_OBJECT_0)
-        {
-            writeOk = GetOverlappedResult(pipe_, &ov, &written, FALSE) && written == sizeof(p);
-        }
-        else
-        {
-            // Reader stalled past the budget -> cancel and DRAIN (blocks until the op stops touching
-            // &p). Cancellation can lose the exact-boundary race to a successful write. Once the
-            // event is signaled, query the terminal result: only an exact completed packet is accepted;
-            // ERROR_OPERATION_ABORTED and every partial/failed completion remain ambiguous/fail-closed.
-            CancelIoEx(pipe_, &ov);
-            if(WaitForSingleObject(writeEvent_, INFINITE) == WAIT_OBJECT_0)
-                writeOk = GetOverlappedResult(pipe_, &ov, &written, FALSE)
-                    && written == sizeof(p);
-        }
-    }
-    // else: immediate failure (not pending) -> writeOk stays false.
+    // A timed-out operation retains its own OVERLAPPED/buffer/handle in an
+    // asynchronous reaper. The fire caller never waits for cancellation.
+    const PipeIoOutcome io = runOwnedPipeIo(pipe_, false, &p, kWriteTimeoutMs);
+    written = io.bytes;
+    const bool writeOk = io.success && written == sizeof(p);
+    const bool writeMayHaveBeenAccepted = io.issued;
 
     const BOOL endOk = QueryPerformanceCounter(&end);
     const CheckedElapsedMicros elapsed = qpcElapsedUs(startOk, start, endOk, end);
@@ -566,14 +695,35 @@ InputRouteWriteResult OrionInputClient::transmitLocked(
         if(result == InputRouteWriteResult::WrittenUnconfirmed)
         {
             // Do not race an immediate ViGEm fallback against a possibly queued direct packet.
-            // Closing the duplex client makes OrionStream terminate the ambiguous session.
+            // [CL2-P2-003] Announce the abandonment first, so OrionStream can tell "the launcher
+            // gave up on seq N" (soft, bounded, session kept) from "the launcher died" (fatal).
+            sendAbandonLocked(p.seq, own);
             closePipe();
         }
     }
     return result;
 }
+
+void OrionInputClient::sendAbandonLocked(uint32_t abandonedSeq, bool own)
+{
+    if(pipe_ == INVALID_HANDLE_VALUE)
+        return;
+    OrionInputPacket abandon{};
+    if(haveLast_)
+        abandon = last_;   // last CONFIRMED state: harmless to a fork that ignores the flag
+    abandon.magic = kMagic;
+    abandon.own = own ? 1 : 0;
+    abandon.seq = abandonedSeq;
+    abandon.reserved = OrionInputAbandon;
+    const PipeIoOutcome io = runOwnedPipeIo(pipe_, false, &abandon, kWriteTimeoutMs);
+    // A timed-out notice is terminally unconfirmed; the background reaper never
+    // increments this counter even if completion wins later.
+    if(io.success && io.bytes == sizeof(abandon))
+        abandonsSent_.fetch_add(1, std::memory_order_relaxed);
+}
 #else
 void OrionInputClient::closePipe() {}
+void OrionInputClient::sendAbandonLocked(uint32_t, bool) {}
 bool OrionInputClient::ensureConnected() { return false; }
 bool OrionInputClient::send(const ControllerState&, bool) { return false; }
 OrionInputClient::SquareWatchdogReleaseResult OrionInputClient::releaseSquareForWatchdog() { return {}; }

@@ -555,6 +555,7 @@ class BannerVerdictLive:
         self.verdicts = 0             # panel appearances graded (forwarded + unattributed)
         self.verdicts_forwarded = 0
         self.verdicts_unattributed = 0
+        self.verdicts_ambiguous = 0
         self.repeats_suppressed = 0   # same panel, still on screen
         self.releases_seen = 0
         self.dropped = 0              # samples overwritten because the worker was busy
@@ -682,24 +683,23 @@ class BannerVerdictLive:
             return False
 
     def _match_release(self, appear_ms):
-        """-> the release record behind the panel that appeared at ``appear_ms``, or None.
+        """Return the sole eligible release, or None when absent/ambiguous."""
+        return self._match_release_with_candidates(appear_ms)[0]
 
-        The most RECENT unused release inside the window wins.  Nothing is consumed here:
-        a verdict that turns out to be a re-read of a panel already reported must not burn
-        the release its first report was bound to.
+    def _match_release_with_candidates(self, appear_ms):
+        """Return (unique release, count). Never guess between overlapping windows.
+
+        Nothing is consumed here: a re-read or ambiguous panel must not burn a
+        release that a later, independently timed panel can still claim.
         """
         try:
             t = float(appear_ms)
         except (TypeError, ValueError):
-            return None
+            return None, 0
         with self._rel_lock:
-            for r in reversed(self._releases):
-                if r['used']:
-                    continue
-                d = t - r['ms']
-                if self._attr_min_ms <= d <= self._attr_max_ms:
-                    return r
-        return None
+            eligible = [r for r in self._releases if not r['used']
+                        and self._attr_min_ms <= t - r['ms'] <= self._attr_max_ms]
+        return (eligible[0] if len(eligible) == 1 else None), len(eligible)
 
     def _last_release_age_ms(self, now_ms) -> float:
         with self._rel_lock:
@@ -905,7 +905,7 @@ class BannerVerdictLive:
         # panel far more likely to still be up when the next release fired.
         appear_ms = self._appear_ms or float(ev['frame_epoch_ms'])
         emit_lag_ms = max(0.0, float(now_ms) - appear_ms)
-        rel = self._match_release(appear_ms)
+        rel, eligible_count = self._match_release_with_candidates(appear_ms)
         # The distance the APPEARANCE agreed on, not the best sample's -- see _arm().
         dist_text, dist_ft = (ev.get('distance') or ''), ev.get('distance_ft')
         if self._dist is not None:
@@ -972,6 +972,16 @@ class BannerVerdictLive:
             'onset_ms': round(float(appear_ms), 1),
             'emit_latency_ms': round(emit_lag_ms, 1),
         }
+        if eligible_count > 1:
+            # Both shots are plausible on the observed onset clock. Neither may
+            # teach trim or increment the native tally/shot-record join.
+            self.verdicts_ambiguous += 1
+            self._log.error(
+                'BANNER VERDICT AMBIGUOUS: timing=%s seq=%d frame_seq=%d '
+                'onset_ms=%.0f eligible_releases=%d attributed=0 (not forwarded)',
+                payload['timing'], payload['seq'], payload['frame_seq'],
+                payload['onset_ms'], eligible_count)
+            return payload
         if not attributed and self._require_release:
             # Nobody shot this panel: a replay/feedback screen the game is sitting on, or a
             # shot the OWNER took by hand. It must not reach the native (activity line +
@@ -1036,9 +1046,10 @@ class BannerVerdictLive:
             t.join(timeout=max(0.0, float(timeout)))
         if self.worker_calls:
             self._log.info('banner verdict reader: %d verdicts (%d forwarded, %d '
-                           'unattributed), %d repeat samples suppressed, %d releases, '
+                           'unattributed, %d ambiguous), %d repeat samples suppressed, %d releases, '
                            '%d panel samples, %d frames sampled, %d dropped, %.3f ms/sample',
                            self.verdicts, self.verdicts_forwarded,
-                           self.verdicts_unattributed, self.repeats_suppressed,
+                           self.verdicts_unattributed, self.verdicts_ambiguous,
+                           self.repeats_suppressed,
                            self.releases_seen, self.panel_samples, self.frames_sampled,
                            self.dropped, self.worker_ms_total / self.worker_calls)

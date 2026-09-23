@@ -17,52 +17,58 @@ Item {
         secretField.text = ""
     }
 
+    // Two soft accent discs behind the card: the only decoration on the gate, and it is the
+    // brand colour doing the work rather than a picture.
+    Rectangle {
+        anchors.centerIn: parent
+        anchors.horizontalCenterOffset: -140
+        anchors.verticalCenterOffset: -60
+        width: 640; height: 640; radius: 320
+        color: Theme.accent
+        opacity: 0.075
+    }
+    Rectangle {
+        anchors.centerIn: parent
+        anchors.horizontalCenterOffset: 180
+        anchors.verticalCenterOffset: 120
+        width: 420; height: 420; radius: 210
+        color: Theme.accent
+        opacity: 0.05
+    }
+
     AdminCard {
         id: card
-        width: 520
+        width: 480
         anchors.centerIn: parent
-        padding: 24
+        padding: 26
         contentSpacing: 14
-        color: "#0B1019"
         border.color: Theme.borderStrong
 
         RowLayout {
             Layout.fillWidth: true
-            spacing: 14
+            spacing: 16
 
-            Rectangle {
-                Layout.preferredWidth: 52
-                Layout.preferredHeight: 52
-                radius: 16
-                color: "#0B0F14"
-                border.color: Theme.accentBorder
-                border.width: 1
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 24
-                    height: 24
-                    radius: 12
-                    color: "transparent"
-                    border.color: Theme.accent
-                    border.width: 2
-                }
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 11
-                    height: 11
-                    radius: 5.5
-                    color: Theme.accent
-                }
+            AdminBrandMark {
+                Layout.alignment: Qt.AlignTop
+                size: 58
             }
 
             ColumnLayout {
                 Layout.fillWidth: true
-                spacing: 2
+                spacing: 3
                 Text {
-                    text: admin.ownerMode ? "Orion Owner" : "Orion Staff"
+                    text: admin.ownerMode ? "OWNER CONSOLE" : "STAFF CONSOLE"
+                    color: Theme.accentBorder
+                    font.pixelSize: Theme.fontMicro
+                    font.weight: Font.Bold
+                    font.letterSpacing: 1.6
+                }
+                Text {
+                    text: Theme.productName
                     color: Theme.textPrimary
-                    font.pixelSize: Theme.fontHeading
-                    font.weight: Font.DemiBold
+                    font.pixelSize: 28
+                    font.weight: Font.Bold
+                    font.letterSpacing: -0.6
                 }
                 Text {
                     Layout.fillWidth: true
@@ -90,10 +96,11 @@ Item {
 
             AdminField {
                 id: secretField
-                label: "Admin secret (SSM /orion/admin_secret)"
+                label: "Admin secret"
                 iconText: "*"
                 echoMode: TextInput.Password
-                placeholderText: "paste the secret value, not the aws command"
+                placeholderText: "paste the secret value"
+                hint: "The value of SSM /orion/admin_secret - the secret itself, not the aws command."
                 onAccepted: root.submitOwner()
             }
 

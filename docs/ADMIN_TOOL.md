@@ -43,6 +43,15 @@ otherwise.
 button stays disabled until the reason field is valid; in the CLI `--reason` is
 mandatory and destructive commands additionally prompt for confirmation.
 
+## Branding (2026-09-21)
+
+The consoles are customer-facing-styled **Venice** tools: window titles "Venice Owner" / "Venice
+Staff", the Venice V mark (`AdminBrandMark.qml`, drawn in QML, no asset needed), the launcher's
+panel surfaces and blue accent for the owner (violet for staff, so the two are never confused),
+and a Venice version resource + embedded icon on both exes. The FILENAMES stay `OrionOwner.exe` /
+`OrionStaff.exe` and every route, env var and SSM path keeps its `orion` slug - those are
+engineering identifiers the packager, audit and backend pin, not brand.
+
 ## OrionOwner.exe
 
 Login: admin secret + TOTP code (§5 — the code is required once

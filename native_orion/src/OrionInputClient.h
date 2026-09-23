@@ -12,6 +12,7 @@
 #include <QString>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -43,6 +44,13 @@ enum OrionInputPacketFlag : uint8_t {
     OrionInputMustDeliver = 1u << 0,
     OrionInputShotRelease = 1u << 1,
     OrionInputRedundantFlick = 1u << 2,
+    // [CL2-P2-003 2026-09-22] "The launcher gave up waiting for the ACK of packet `seq`, and is
+    // about to close the pipe." Sent once, unacknowledged, immediately before a client-side ACK
+    // timeout closes the pipe, so OrionStream can take its bounded SOFT path (drop the unsent
+    // queue, keep the ownership latch, re-listen) instead of treating the close as a dead launcher
+    // and stopping the console session. Carries the last CONFIRMED state, so a fork that predates
+    // the flag sees an equal-state re-assert and nothing else.
+    OrionInputAbandon = 1u << 3,
 };
 
 constexpr uint32_t kOrionInputAckMagic = 0x4B43414FU; // 'OACK'
@@ -198,9 +206,14 @@ struct OrionInputTransactionTiming final {
         flags |= OrionInputMustDeliver;
     }
 
+    // [2026-09-22 RED TEAM CL-010] Only a trigger ZERO-CROSSING is an edge the console must not
+    // miss (pressed <-> released). Intermediate analog travel is latest-wins like the sticks: the
+    // fork still forwards every step, but without a synchronous local-delivery ACK per step, which
+    // under an L2/R2 ramp was a burst of blocking transactions feeding the 25 ms budget.
+    const bool l2Crossing = (previous->l2_state == 0) != (current.l2_state == 0);
+    const bool r2Crossing = (previous->r2_state == 0) != (current.r2_state == 0);
     const bool buttonOrTriggerEdge = previous->buttons != current.buttons
-        || previous->l2_state != current.l2_state
-        || previous->r2_state != current.r2_state;
+        || l2Crossing || r2Crossing;
     if (buttonOrTriggerEdge) {
         flags |= OrionInputMustDeliver;
         // Chiaki's Square/BOX bit is bit 2. Other button/trigger releases still
@@ -259,6 +272,24 @@ public:
     [[nodiscard]] OrionInputTransactionTiming lastTransactionTiming() const;
     [[nodiscard]] uint64_t writeCount() const { return writeCount_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t writeFailures() const { return writeFailures_.load(std::memory_order_relaxed); }
+    uint64_t splitTriggerReleases() const noexcept { return splitTriggerReleases_.load(std::memory_order_relaxed); }
+    // [CL2-P4-001 2026-09-22] owned keepalives sent while the state was unchanged (diagnostic).
+    uint64_t ownedKeepalives() const noexcept { return ownedKeepalives_.load(std::memory_order_relaxed); }
+    // [CL2-P2-003] abandon notices sent before a client-side ACK-timeout close (diagnostic).
+    uint64_t abandonsSent() const noexcept { return abandonsSent_.load(std::memory_order_relaxed); }
+    // The fork neutralises an owned route after this much pipe silence, so the launcher must write
+    // at least this often while it owns input (dead-man switch, fork half in orioninputbridge.cpp).
+    static constexpr int kOwnedKeepaliveMs = 100;
+#ifdef ORION_INPUT_TEST_HOOKS
+    static void configureDeferredCancellationForTesting(bool forceDeferred, DWORD reapDelayMs);
+    [[nodiscard]] static int pendingCancellationReapsForTesting();
+    // Real named-pipe saturation fixture only: duplicate the established client
+    // endpoint without transferring ownership from this instance.
+    [[nodiscard]] HANDLE duplicatePipeHandleForTesting() const;
+    static void resetAbandonWriteProbeForTesting();
+    [[nodiscard]] static int abandonPendingWritesForTesting();
+    [[nodiscard]] static int abandonTimedOutWritesForTesting();
+#endif
     [[nodiscard]] uint64_t lastWriteUs() const { return lastWriteUs_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t maxWriteUs() const { return maxWriteUs_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t ackFailures() const { return ackFailures_.load(std::memory_order_relaxed); }
@@ -317,6 +348,8 @@ public:
 private:
     bool ensureConnected();
     void closePipe();
+    // [CL2-P2-003] One unacknowledged OrionInputAbandon packet, then the caller closes. ioMutex_ held.
+    void sendAbandonLocked(uint32_t abandonedSeq, bool own);
 #ifdef _WIN32
     InputRouteWriteResult waitForDeliveryAck(uint32_t sourceSeq, bool ownedPacket);
     // Sequence-stamp + bounded overlapped write + exact ACK wait for one packet.
@@ -327,7 +360,7 @@ private:
 
     QString pipeName_;
     // A write and both of its ACK reads are one transaction. Protect the shared
-    // sequence, named-pipe handle, OVERLAPPED events, and last-state snapshot so
+    // sequence, named-pipe handle, and last-state snapshot so
     // a second caller can never consume or cancel the first caller's ACK.
     mutable std::mutex ioMutex_;
     std::atomic<bool> enabled_{false};
@@ -337,6 +370,11 @@ private:
     OrionInputTransactionTiming lastTransactionTiming_{};
     std::atomic<uint64_t> writeCount_{0};
     std::atomic<uint64_t> writeFailures_{0};
+    // [2026-09-22 CL-003] trigger releases sent ahead of a simultaneous press (diagnostic).
+    std::atomic<uint64_t> splitTriggerReleases_{0};
+    std::atomic<uint64_t> ownedKeepalives_{0};
+    std::atomic<uint64_t> abandonsSent_{0};
+    std::chrono::steady_clock::time_point lastWireWriteAt_{};   // guarded by ioMutex_
     std::atomic<uint64_t> lastWriteUs_{0};
     std::atomic<uint64_t> maxWriteUs_{0};
     std::atomic<uint64_t> ackFailures_{0};
@@ -352,8 +390,6 @@ private:
     std::atomic<uint64_t> clockSampleFailures_{0};
 #ifdef _WIN32
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
-    HANDLE writeEvent_ = nullptr;   // overlapped-write completion event (P4: bounded, non-blocking write)
-    HANDLE readEvent_ = nullptr;    // independent overlapped ACK completion event
     double lastConnectAttemptMs_ = -1.0;
 #endif
 };

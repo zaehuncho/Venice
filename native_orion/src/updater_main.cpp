@@ -17,19 +17,27 @@
 
 #include "UpdateManifest.h"
 #include "UpdaterArchive.h"
+#include "UpdaterTrust.h"
+#include "SecurityManager.h"
 
 #include <QtCore/QCommandLineOption>
 #include <QtCore/QCommandLineParser>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDateTime>
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QEventLoop>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QCryptographicHash>
+#include <QtCore/QJsonArray>
+#include <QtCore/QSaveFile>
+#include <QtCore/QStandardPaths>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QProcess>
 #include <QtCore/QStringList>
+#include <QtCore/QThread>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QTextStream>
 #include <QtCore/QTimer>
@@ -48,6 +56,7 @@
 
 #ifdef Q_OS_WIN
 #include <Windows.h>
+#include <TlHelp32.h>
 #endif
 
 using namespace orion;
@@ -61,59 +70,223 @@ constexpr int kLauncherWaitMs = 30'000;
 struct UpdaterConfig {
     QString manifestUrl;
     QString manifestFile;   // local manifest source (testing / offline)
+    QString artifactFile;   // local artifact source (development fixture only)
     QString installDir;
     QString relaunchExe = QStringLiteral("OrionNative.exe");
     QString currentVersion;
     QString pubkeysFile;
     qint64 launcherPid = 0;
+    qint64 bootstrapPid = 0;
     bool dryRun = false;
     bool relaunch = true;
+    bool exitOnComplete = false;
+    bool injectFailureAfterPrune = false; // development fixture only
+    bool stagedHelper = false;
 };
 
+#if defined(ORION_PRODUCTION_BUILD)
+constexpr bool kProductionBuild = true;
+#else
+constexpr bool kProductionBuild = false;
+#endif
+
 // Resolve a trusted Ed25519 PUBLIC key for the manifest's public_key_id. Public
-// keys are not secret: they come from an optional compile-time embedded default
-// and/or a shipped update_pubkeys.json ({"keys": {"<id>": "<hex|base64>"}}).
-// No shared secret / HMAC key is ever required (fail closed on an unknown id).
-QByteArray resolvePublicKey(const QString& keyId, const UpdaterConfig& cfg)
+// keys are not secret. The compile-time embedded key is the trust root; in
+// development builds a shipped update_pubkeys.json ({"keys": {"<id>": "<hex|base64>"}})
+// may add rotated keys. PRODUCTION trusts only the embedded key -- see
+// UpdaterTrust.h for why every external source is refused there. No shared
+// secret / HMAC key is ever required (fail closed on an unknown id).
+// The keys compiled into this binary: the primary, plus an optional second one that
+// exists only during a planned rotation (docs/UPDATER_CLIENT.md "Key rotation").
+QList<updater::EmbeddedKey> embeddedKeys()
 {
-    if (keyId.trimmed().isEmpty()) {
+    QList<updater::EmbeddedKey> keys;
+#if defined(ORION_UPDATE_ED25519_PUBKEY_ID) && defined(ORION_UPDATE_ED25519_PUBKEY)
+    keys.append({QStringLiteral(ORION_UPDATE_ED25519_PUBKEY_ID),
+                 decodeEd25519PublicKey(QStringLiteral(ORION_UPDATE_ED25519_PUBKEY))});
+#endif
+#if defined(ORION_UPDATE_ED25519_PUBKEY2_ID) && defined(ORION_UPDATE_ED25519_PUBKEY2)
+    keys.append({QStringLiteral(ORION_UPDATE_ED25519_PUBKEY2_ID),
+                 decodeEd25519PublicKey(QStringLiteral(ORION_UPDATE_ED25519_PUBKEY2))});
+#endif
+    return keys;
+}
+
+updater::TrustRootDecision resolvePublicKey(const QString& keyId, const UpdaterConfig& cfg)
+{
+    updater::TrustRootSources sources;
+    sources.cliPubkeysFile = cfg.pubkeysFile;
+    sources.envPubkeysFile = QString::fromLocal8Bit(qgetenv("ORION_UPDATE_PUBKEYS"));
+    sources.installDir = cfg.installDir;
+    sources.applicationDir = QCoreApplication::applicationDirPath();
+    return updater::resolveTrustRoot(keyId, embeddedKeys(), sources, kProductionBuild,
+                                     [](const QString& encoded) { return decodeEd25519PublicKey(encoded); });
+}
+
+// [Codex F1] Build attestation for the packager: what this binary was compiled as.
+// Written as a file (this is a WIN32 GUI executable; stdout is not dependable).
+bool writeBuildProfile(const QString& path)
+{
+    QJsonObject obj;
+    obj.insert(QStringLiteral("profile"), kProductionBuild ? QStringLiteral("production")
+                                                           : QStringLiteral("development"));
+    obj.insert(QStringLiteral("version"), QStringLiteral(ORION_NATIVE_VERSION));
+    QJsonArray ids;
+    QJsonArray keys;
+    for (const updater::EmbeddedKey& k : embeddedKeys()) {
+        if (k.key.size() == 32) {
+            ids.append(k.id);
+            // [Codex r3 F1] Bind the id to the BYTES: the packager compares this
+            // fingerprint against the pinned production public key, so a binary that
+            // reports the right id over different key material is refused.
+            QJsonObject entry;
+            entry.insert(QStringLiteral("id"), k.id);
+            entry.insert(QStringLiteral("sha256"), QString::fromLatin1(
+                QCryptographicHash::hash(k.key, QCryptographicHash::Sha256).toHex()));
+            keys.append(entry);
+        }
+    }
+    obj.insert(QStringLiteral("embedded_key_ids"), ids);
+    obj.insert(QStringLiteral("embedded_keys"), keys);
+    obj.insert(QStringLiteral("local_manifest_allowed"), updater::localManifestAllowed(kProductionBuild));
+    // [Codex r2] Constrained target + atomic write: never an arbitrary-file-write primitive.
+    QString why;
+    const QString target = updater::buildProfileOutputPath(
+        path, QStandardPaths::writableLocation(QStandardPaths::TempLocation), &why);
+    if (target.isEmpty()) {
+        return false;
+    }
+    QSaveFile f(target);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    f.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    return f.commit();
+}
+
+QJsonObject verifiedReleaseFiles(const QString& root, QString* error)
+{
+    const QString manifestPath = QDir(root).absoluteFilePath(QStringLiteral("release_manifest.json"));
+    if (!QFileInfo(manifestPath).isFile()) {
+        if (error) *error = QStringLiteral("Signed release manifest is missing from the exact install/stage root");
         return {};
     }
-#if defined(ORION_UPDATE_ED25519_PUBKEY_ID) && defined(ORION_UPDATE_ED25519_PUBKEY)
-    if (keyId == QStringLiteral(ORION_UPDATE_ED25519_PUBKEY_ID)) {
-        const QByteArray embedded = decodeEd25519PublicKey(QStringLiteral(ORION_UPDATE_ED25519_PUBKEY));
-        if (embedded.size() == 32) {
-            return embedded;
-        }
+    QFile before(manifestPath);
+    if (!before.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("Could not read release manifest before verification");
+        return {};
     }
-#endif
-    QStringList candidates;
-    if (!cfg.pubkeysFile.isEmpty()) {
-        candidates << cfg.pubkeysFile;
+    const QByteArray bytesBefore = before.readAll();
+    before.close();
+    SecurityManager verifier(root);
+    if (!verifier.verifyReleaseIntegrity(error, /*exactRoot*/ true)) return {};
+    QFile manifestFile(manifestPath);
+    if (!manifestFile.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("Could not reopen verified release manifest");
+        return {};
     }
-    const QByteArray envPath = qgetenv("ORION_UPDATE_PUBKEYS");
-    if (!envPath.isEmpty()) {
-        candidates << QString::fromLocal8Bit(envPath);
+    const QByteArray bytesAfter = manifestFile.readAll();
+    if (bytesAfter != bytesBefore) {
+        if (error) *error = QStringLiteral("Release manifest changed during verification");
+        return {};
     }
-    candidates << cfg.installDir + QStringLiteral("/update_pubkeys.json");
-    candidates << QCoreApplication::applicationDirPath() + QStringLiteral("/update_pubkeys.json");
-    for (const QString& path : candidates) {
-        QFile f(path);
-        if (!f.open(QIODevice::ReadOnly)) {
-            continue;
-        }
-        const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
-        const QJsonObject keys = root.value(QStringLiteral("keys")).toObject();
-        const QString encoded = keys.value(keyId).toString();
-        if (!encoded.isEmpty()) {
-            const QByteArray decoded = decodeEd25519PublicKey(encoded);
-            if (decoded.size() == 32) {
-                return decoded;
-            }
-        }
-    }
-    return {};
+    const QJsonObject files = QJsonDocument::fromJson(bytesAfter).object()
+                                  .value(QStringLiteral("files")).toObject();
+    if (files.isEmpty() && error) *error = QStringLiteral("Verified release manifest has no files");
+    return files;
 }
+
+#ifdef Q_OS_WIN
+bool waitForPidExit(qint64 pid, QString* error)
+{
+    if (pid <= 0) return true;
+    HANDLE handle = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (!handle) {
+        if (GetLastError() == ERROR_INVALID_PARAMETER) return true; // already exited
+        if (error) *error = QStringLiteral("Cannot inspect update owner process %1").arg(pid);
+        return false;
+    }
+    const DWORD result = WaitForSingleObject(handle, kLauncherWaitMs);
+    CloseHandle(handle);
+    if (result == WAIT_OBJECT_0) return true;
+    if (error) *error = QStringLiteral("Update owner process %1 did not exit within 30 seconds").arg(pid);
+    return false;
+}
+
+bool installOwnersGone(const QString& installDir, QString* error)
+{
+    const QString root = QDir::cleanPath(QDir(installDir).absolutePath()) + QLatin1Char('/');
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (;;) {
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            if (error) *error = QStringLiteral("Cannot inspect install-local processes");
+            return false;
+        }
+        bool liveOwner = false;
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        if (Process32FirstW(snapshot, &entry)) {
+            do {
+                if (entry.th32ProcessID == GetCurrentProcessId()) continue;
+                const QString name = QString::fromWCharArray(entry.szExeFile).toLower();
+                const bool knownOwner = name == QLatin1String("orionnative.exe")
+                    || name == QLatin1String("orionupdater.exe")
+                    || name == QLatin1String("orionsidecar.exe")
+                    || name == QLatin1String("orionstream.exe")
+                    || name == QLatin1String("venicenet.exe");
+                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                                             FALSE, entry.th32ProcessID);
+                if (!process) {
+                    if (knownOwner) liveOwner = true; // cannot prove it is outside install
+                    continue;
+                }
+                wchar_t path[MAX_PATH * 4]{};
+                DWORD capacity = static_cast<DWORD>(sizeof(path) / sizeof(path[0]));
+                if (QueryFullProcessImageNameW(process, 0, path, &capacity)) {
+                    const QString executable = QDir::fromNativeSeparators(QString::fromWCharArray(path, capacity));
+                    if (executable.startsWith(root, Qt::CaseInsensitive)
+                        && WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
+                        liveOwner = true;
+                    }
+                } else if (knownOwner) {
+                    liveOwner = true;
+                }
+                // A process launched elsewhere can still map an install-local
+                // DLL. Include its module list, not just the executable path.
+                if (!liveOwner && WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
+                    HANDLE modules = CreateToolhelp32Snapshot(
+                        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, entry.th32ProcessID);
+                    if (modules != INVALID_HANDLE_VALUE) {
+                        MODULEENTRY32W module{};
+                        module.dwSize = sizeof(module);
+                        if (Module32FirstW(modules, &module)) {
+                            do {
+                                const QString modulePath = QDir::fromNativeSeparators(
+                                    QString::fromWCharArray(module.szExePath));
+                                if (modulePath.startsWith(root, Qt::CaseInsensitive)) {
+                                    liveOwner = true;
+                                    break;
+                                }
+                            } while (Module32NextW(modules, &module));
+                        }
+                        CloseHandle(modules);
+                    }
+                }
+                CloseHandle(process);
+            } while (Process32NextW(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+        if (!liveOwner) return true;
+        if (elapsed.elapsed() >= kLauncherWaitMs) {
+            if (error) *error = QStringLiteral("Install-local process/service did not exit within 30 seconds");
+            return false;
+        }
+        QThread::msleep(200);
+    }
+}
+#endif
 
 } // namespace
 
@@ -191,10 +364,13 @@ public:
         }
 
         step(QStringLiteral("Waiting for Venice to close..."), 5);
-        waitForLauncherExit();
+        QString err;
+        if (!waitForLauncherExit(&err)) {
+            fail(QStringLiteral("Install ownership barrier failed: %1").arg(err));
+            return;
+        }
 
         step(QStringLiteral("Fetching update manifest..."), 10);
-        QString err;
         const QByteArray manifestBytes = fetchManifest(&err);
         if (manifestBytes.isEmpty()) {
             fail(QStringLiteral("Could not retrieve update manifest: %1").arg(err));
@@ -217,11 +393,17 @@ public:
             fail(QStringLiteral("Manifest is missing public_key_id. Refusing."));
             return;
         }
-        const QByteArray publicKey = resolvePublicKey(manifest.publicKeyId, cfg_);
+        const updater::TrustRootDecision trust = resolvePublicKey(manifest.publicKeyId, cfg_);
+        for (const QString& ignored : trust.ignored) {
+            log(QStringLiteral("Ignored external public-key source (production trusts only the embedded key): %1")
+                    .arg(ignored));
+        }
+        const QByteArray publicKey = trust.publicKey;
         if (publicKey.size() != 32) {
             fail(QStringLiteral("No trusted public key for public_key_id '%1'. Refusing.").arg(manifest.publicKeyId));
             return;
         }
+        log(QStringLiteral("Trust root: %1").arg(trust.source));
         if (!verifyManifestSignature(manifest, publicKey)) {
             fail(QStringLiteral("Manifest signature verification FAILED. Refusing update."));
             return;
@@ -247,7 +429,21 @@ public:
         }
 
         step(QStringLiteral("Downloading update..."), 35);
-        const QByteArray artifact = downloadBytes(QUrl(manifest.url), kArtifactTimeoutMs, &err, /*track*/ true);
+        QByteArray artifact;
+        if (!cfg_.artifactFile.isEmpty()) {
+            if (!updater::localManifestAllowed(kProductionBuild)) {
+                fail(QStringLiteral("Local artifact files are forbidden in production."));
+                return;
+            }
+            QFile local(cfg_.artifactFile);
+            if (!local.open(QIODevice::ReadOnly) || local.size() > 1024LL * 1024LL * 1024LL) {
+                fail(QStringLiteral("Local development artifact is unreadable or too large."));
+                return;
+            }
+            artifact = local.readAll();
+        } else {
+            artifact = downloadBytes(QUrl(manifest.url), kArtifactTimeoutMs, &err, /*track*/ true);
+        }
         if (artifact.isEmpty()) {
             fail(QStringLiteral("Artifact download failed: %1").arg(err));
             return;
@@ -288,11 +484,32 @@ public:
         }
         log(QStringLiteral("Extracted %1 files.").arg(extracted.files.size()));
 
+        // Verify both complete, signed runtime inventories before touching the
+        // install. This also binds the old-minus-new retirement list to two
+        // authenticated manifests rather than untrusted ZIP filenames.
+        const QJsonObject oldFiles = verifiedReleaseFiles(cfg_.installDir, &err);
+        if (oldFiles.isEmpty()) {
+            fail(QStringLiteral("Installed runtime integrity failed: %1").arg(err));
+            return;
+        }
+        const QJsonObject newFiles = verifiedReleaseFiles(stageDir, &err);
+        if (newFiles.isEmpty()) {
+            fail(QStringLiteral("Staged runtime integrity failed: %1").arg(err));
+            return;
+        }
+
         if (cfg_.dryRun) {
             log(QStringLiteral("Dry run: skipping backup/replace/relaunch."));
             succeedNoChange();
             return;
         }
+
+#ifdef Q_OS_WIN
+        if (!installOwnersGone(cfg_.installDir, &err)) {
+            fail(QStringLiteral("Install ownership barrier failed before backup: %1").arg(err));
+            return;
+        }
+#endif
 
         step(QStringLiteral("Backing up current install..."), 80);
         const QString backupDir = QDir::cleanPath(cfg_.installDir + QStringLiteral("/../.orion_update_backup"));
@@ -315,18 +532,66 @@ public:
             return;
         }
 
-        // Sanity check: the relaunch target must exist post-apply, else roll back.
-        const QString relaunchPath = cfg_.installDir + QLatin1Char('/') + cfg_.relaunchExe;
-        if (!QFileInfo::exists(relaunchPath)) {
-            log(QStringLiteral("Updated install is missing %1. Rolling back...").arg(cfg_.relaunchExe));
+        if (!updater::pruneRetiredRuntimeFiles(cfg_.installDir, oldFiles, newFiles, &err)) {
+            log(QStringLiteral("Retired-runtime prune failed (%1). Rolling back...").arg(err));
             QString restoreErr;
-            updater::restoreTree(backupDir, cfg_.installDir, &restoreErr);
-            fail(QStringLiteral("Update incomplete; rolled back to previous version."));
+            if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
+                fail(QStringLiteral("Update failed and was rolled back to the previous version."));
+            } else {
+                fail(QStringLiteral("Update failed AND rollback failed (%1). Reinstall may be required.").arg(restoreErr));
+            }
+            return;
+        }
+
+        if (cfg_.injectFailureAfterPrune) {
+            QString restoreErr;
+            if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
+                fail(QStringLiteral("Injected development fault; exact rollback restored the previous version."));
+            } else {
+                fail(QStringLiteral("Injected development fault AND rollback failed (%1).").arg(restoreErr));
+            }
+            return;
+        }
+
+        QString installedIntegrity;
+        SecurityManager installedVerifier(cfg_.installDir);
+        if (!installedVerifier.verifyReleaseIntegrity(&installedIntegrity, /*exactRoot*/ true)) {
+            log(QStringLiteral("Post-update integrity failed (%1). Rolling back...").arg(installedIntegrity));
+            QString restoreErr;
+            if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
+                fail(QStringLiteral("Update failed integrity validation and was rolled back."));
+            } else {
+                fail(QStringLiteral("Update integrity failed AND rollback failed (%1). Reinstall may be required.").arg(restoreErr));
+            }
+            return;
+        }
+
+        // Sanity check: the relaunch target must exist post-apply, else roll back.
+        QString relaunchWhy;
+        const QString relaunchPath = updater::safeRelaunchPath(cfg_.installDir, cfg_.relaunchExe, &relaunchWhy);
+        if (relaunchPath.isEmpty()) {
+            log(QStringLiteral("Updated install has no launchable %1 (%2). Rolling back...")
+                    .arg(cfg_.relaunchExe, relaunchWhy));
+            QString restoreErr;
+            // [Codex r4] The rollback's own result is the truth here: a restore that failed
+            // is reported as a failed update, never as a successful rollback.
+            if (updater::restoreTree(backupDir, cfg_.installDir, &restoreErr)) {
+                fail(QStringLiteral("Update incomplete; rolled back to previous version."));
+            } else {
+                fail(QStringLiteral("Update incomplete AND rollback failed (%1). Reinstall may be required.")
+                         .arg(restoreErr));
+            }
             return;
         }
 
         log(QStringLiteral("Applied %1 files.").arg(applied.size()));
-        QDir(backupDir).removeRecursively();
+        {
+            QString cleanupErr;
+            if (!updater::removeTreeSafely(backupDir, &cleanupErr)) {
+                log(QStringLiteral("Backup cleanup left something behind (%1); the install is complete regardless.")
+                        .arg(cleanupErr));
+            }
+        }
 
         if (cfg_.relaunch) {
             step(QStringLiteral("Relaunching Venice..."), 100);
@@ -369,14 +634,20 @@ private:
             window_->finish(true);
         }
         log(message);
+        scheduleStageCleanup();
         emit finished(0);
     }
 
     void succeedNoChange()
     {
-        const QString relaunchPath = cfg_.installDir + QLatin1Char('/') + cfg_.relaunchExe;
-        if (cfg_.relaunch && !cfg_.dryRun && QFileInfo::exists(relaunchPath)) {
-            QProcess::startDetached(relaunchPath, {}, cfg_.installDir);
+        QString relaunchWhy;
+        const QString relaunchPath = updater::safeRelaunchPath(cfg_.installDir, cfg_.relaunchExe, &relaunchWhy);
+        if (cfg_.relaunch && !cfg_.dryRun) {
+            if (!relaunchPath.isEmpty()) {
+                QProcess::startDetached(relaunchPath, {}, cfg_.installDir);
+            } else {
+                log(QStringLiteral("Not relaunching: %1").arg(relaunchWhy));
+            }
         }
         succeed(QStringLiteral("No update applied."));
     }
@@ -389,29 +660,43 @@ private:
             window_->finish(false);
         }
         log(QStringLiteral("ERROR: ") + message);
+        scheduleStageCleanup();
         emit finished(1);
     }
 
-    void waitForLauncherExit()
+    void scheduleStageCleanup()
+    {
+        if (!cfg_.stagedHelper) return;
+        const QString installedUpdater = QDir(cfg_.installDir).absoluteFilePath(QStringLiteral("OrionUpdater.exe"));
+        if (!QFileInfo(installedUpdater).isFile()) return;
+        const QStringList args = {
+            QStringLiteral("--cleanup-stage"), QCoreApplication::applicationDirPath(),
+            QStringLiteral("--wait-pid"), QString::number(QCoreApplication::applicationPid())};
+        if (!QProcess::startDetached(installedUpdater, args, cfg_.installDir)) {
+            log(QStringLiteral("Could not schedule staged-helper cleanup; remove the verified sibling stage later."));
+        }
+    }
+
+    bool waitForLauncherExit(QString* error)
     {
 #ifdef Q_OS_WIN
-        if (cfg_.launcherPid <= 0) {
-            return;
-        }
-        HANDLE handle = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(cfg_.launcherPid));
-        if (!handle) {
-            return; // already gone
-        }
-        WaitForSingleObject(handle, kLauncherWaitMs);
-        CloseHandle(handle);
+        if (!waitForPidExit(cfg_.launcherPid, error)
+            || !waitForPidExit(cfg_.bootstrapPid, error)) return false;
+        return installOwnersGone(cfg_.installDir, error);
 #else
         Q_UNUSED(cfg_);
+        Q_UNUSED(error);
+        return true;
 #endif
     }
 
     QByteArray fetchManifest(QString* err)
     {
         if (!cfg_.manifestFile.isEmpty()) {
+            if (!updater::localManifestAllowed(kProductionBuild)) {
+                if (err) *err = QStringLiteral("a local manifest file is not permitted in production builds");
+                return {};
+            }
             QFile f(cfg_.manifestFile);
             if (!f.open(QIODevice::ReadOnly)) {
                 if (err) *err = QStringLiteral("cannot read manifest file");
@@ -485,35 +770,186 @@ int main(int argc, char* argv[])
     parser.addHelpOption();
     const QCommandLineOption manifestUrlOpt(QStringLiteral("manifest-url"), QStringLiteral("HTTPS manifest URL."), QStringLiteral("url"));
     const QCommandLineOption manifestFileOpt(QStringLiteral("manifest-file"), QStringLiteral("Local manifest file (testing)."), QStringLiteral("path"));
+    const QCommandLineOption artifactFileOpt(QStringLiteral("artifact-file"),
+        QStringLiteral("Development fixture only: local artifact file."), QStringLiteral("path"));
     const QCommandLineOption installDirOpt(QStringLiteral("install-dir"), QStringLiteral("Orion install directory."), QStringLiteral("path"));
     const QCommandLineOption pidOpt(QStringLiteral("launcher-pid"), QStringLiteral("PID of OrionNative to wait for."), QStringLiteral("pid"));
+    const QCommandLineOption stagedHelperOpt(QStringLiteral("staged-helper"),
+        QStringLiteral("Internal: executing the verified updater closure outside the install tree."));
+    const QCommandLineOption bootstrapPidOpt(QStringLiteral("bootstrap-pid"),
+        QStringLiteral("Internal: first-stage updater PID to wait for."), QStringLiteral("pid"));
+    const QCommandLineOption stageRuntimeOpt(QStringLiteral("stage-runtime"),
+        QStringLiteral("Development fixture: exercise the production staged-helper flow."));
+    const QCommandLineOption exitOnCompleteOpt(QStringLiteral("exit-on-complete"),
+        QStringLiteral("Development fixture: close the updater when complete."));
+    const QCommandLineOption injectFailureOpt(QStringLiteral("inject-failure-after-prune"),
+        QStringLiteral("Development fixture: force rollback after applying and pruning."));
+    const QCommandLineOption cleanupStageOpt(QStringLiteral("cleanup-stage"),
+        QStringLiteral("Internal: remove a completed sibling updater stage."), QStringLiteral("path"));
+    const QCommandLineOption waitPidOpt(QStringLiteral("wait-pid"),
+        QStringLiteral("Internal: wait for the staged updater to exit before cleanup."), QStringLiteral("pid"));
     const QCommandLineOption relaunchOpt(QStringLiteral("relaunch"), QStringLiteral("Executable to relaunch."), QStringLiteral("exe"), QStringLiteral("OrionNative.exe"));
     const QCommandLineOption versionOpt(QStringLiteral("current-version"), QStringLiteral("Installed Orion version."), QStringLiteral("ver"));
     const QCommandLineOption pubkeysOpt(QStringLiteral("pubkeys-file"), QStringLiteral("Path to trusted Ed25519 public keys JSON."), QStringLiteral("path"));
     const QCommandLineOption dryRunOpt(QStringLiteral("dry-run"), QStringLiteral("Verify and extract but do not replace files."));
     const QCommandLineOption noRelaunchOpt(QStringLiteral("no-relaunch"), QStringLiteral("Do not relaunch after updating."));
-    parser.addOptions({manifestUrlOpt, manifestFileOpt, installDirOpt, pidOpt, relaunchOpt, versionOpt, pubkeysOpt, dryRunOpt, noRelaunchOpt});
+    const QCommandLineOption buildProfileOpt(QStringLiteral("build-profile"),
+        QStringLiteral("Write this binary's build attestation (profile, embedded key ids) as JSON to <path> and exit."),
+        QStringLiteral("path"));
+    parser.addOptions({manifestUrlOpt, manifestFileOpt, artifactFileOpt, installDirOpt, pidOpt,
+                       stagedHelperOpt, bootstrapPidOpt, stageRuntimeOpt, exitOnCompleteOpt, injectFailureOpt,
+                       cleanupStageOpt, waitPidOpt,
+                       relaunchOpt, versionOpt, pubkeysOpt, dryRunOpt, noRelaunchOpt, buildProfileOpt});
     parser.process(app);
+
+    if (parser.isSet(buildProfileOpt)) {
+        return writeBuildProfile(parser.value(buildProfileOpt)) ? 0 : 2;
+    }
+    if (parser.isSet(cleanupStageOpt)) {
+        QString cleanupError;
+        const QString install = updater::bindInstallRoot({}, QCoreApplication::applicationDirPath(),
+                                                          kProductionBuild, &cleanupError);
+        const QString stage = parser.value(cleanupStageOpt);
+        if (install.isEmpty()
+            || updater::bindStagedInstallRoot(install, stage, kProductionBuild, &cleanupError).isEmpty()) {
+            return 2;
+        }
+        const qint64 ownerPid = parser.value(waitPidOpt).toLongLong();
+        if (!parser.isSet(waitPidOpt) || ownerPid <= 0) return 2;
+#ifdef Q_OS_WIN
+        if (!waitForPidExit(ownerPid, &cleanupError)) return 2;
+#endif
+        return updater::removeTreeSafely(stage, &cleanupError) ? 0 : 2;
+    }
+    if (kProductionBuild && (parser.isSet(artifactFileOpt) || parser.isSet(stageRuntimeOpt)
+                             || parser.isSet(exitOnCompleteOpt) || parser.isSet(injectFailureOpt))) {
+        return 2;
+    }
 
     UpdaterConfig cfg;
     cfg.manifestUrl = parser.value(manifestUrlOpt);
     cfg.manifestFile = parser.value(manifestFileOpt);
-    cfg.installDir = parser.isSet(installDirOpt)
-        ? QDir(parser.value(installDirOpt)).absolutePath()
-        : QCoreApplication::applicationDirPath();
-    cfg.relaunchExe = parser.value(relaunchOpt);
+    cfg.artifactFile = parser.value(artifactFileOpt);
+    {
+        // [Codex F2] Bind the install root before anything else can be written.
+        QString rootError;
+        cfg.installDir = parser.isSet(stagedHelperOpt)
+            ? updater::bindStagedInstallRoot(
+                  parser.isSet(installDirOpt) ? parser.value(installDirOpt) : QString(),
+                  QCoreApplication::applicationDirPath(), kProductionBuild, &rootError)
+            : updater::bindInstallRoot(
+                  parser.isSet(installDirOpt) ? parser.value(installDirOpt) : QString(),
+                  QCoreApplication::applicationDirPath(), kProductionBuild, &rootError);
+        if (cfg.installDir.isEmpty()) {
+            // Audit trail for a refused root goes to the updater's OWN directory (never
+            // the requested one, which is exactly what we refused to write into).
+            QFile audit(QCoreApplication::applicationDirPath() + QStringLiteral("/orion_updater.log"));
+            if (audit.open(QIODevice::Append | QIODevice::Text)) {
+                QTextStream(&audit) << QDateTime::currentDateTimeUtc().toString(Qt::ISODate)
+                                    << QStringLiteral(" ERROR: install root refused: ") << rootError << Qt::endl;
+            }
+            UpdaterWindow window;
+            window.show();
+            window.setStatus(QStringLiteral("Update failed"));
+            window.appendLog(rootError);
+            window.finish(false);
+            return app.exec(), 1;
+        }
+    }
+    {
+        // [Codex r3 F7] Production ignores --relaunch; development accepts a bare name only.
+        bool ignoredOverride = false;
+        QString relaunchError;
+        cfg.relaunchExe = updater::relaunchExecutableName(parser.value(relaunchOpt), kProductionBuild,
+                                                          &ignoredOverride, &relaunchError);
+        if (cfg.relaunchExe.isEmpty()) {
+            UpdaterWindow window;
+            window.show();
+            window.setStatus(QStringLiteral("Update failed"));
+            window.appendLog(relaunchError);
+            window.finish(false);
+            return app.exec(), 1;
+        }
+        if (ignoredOverride) {
+            QFile audit(QCoreApplication::applicationDirPath() + QStringLiteral("/orion_updater.log"));
+            if (audit.open(QIODevice::Append | QIODevice::Text)) {
+                QTextStream(&audit) << QDateTime::currentDateTimeUtc().toString(Qt::ISODate)
+                                    << QStringLiteral(" WARNING: --relaunch override ignored (production relaunches OrionNative.exe only)")
+                                    << Qt::endl;
+            }
+        }
+    }
     cfg.currentVersion = parser.value(versionOpt);
     cfg.pubkeysFile = parser.value(pubkeysOpt);
     cfg.launcherPid = parser.isSet(pidOpt) ? parser.value(pidOpt).toLongLong() : 0;
+    cfg.bootstrapPid = parser.isSet(bootstrapPidOpt) ? parser.value(bootstrapPidOpt).toLongLong() : 0;
     cfg.dryRun = parser.isSet(dryRunOpt);
     cfg.relaunch = !parser.isSet(noRelaunchOpt);
+    cfg.exitOnComplete = !kProductionBuild && parser.isSet(exitOnCompleteOpt);
+    cfg.injectFailureAfterPrune = !kProductionBuild && parser.isSet(injectFailureOpt);
+    cfg.stagedHelper = parser.isSet(stagedHelperOpt);
+
+    if (kProductionBuild || parser.isSet(stageRuntimeOpt) || parser.isSet(stagedHelperOpt)) {
+        QString stageError;
+        const QJsonObject oldFiles = verifiedReleaseFiles(cfg.installDir, &stageError);
+        bool stageOk = !oldFiles.isEmpty();
+        if (stageOk && parser.isSet(stagedHelperOpt)) {
+            stageOk = updater::verifyStagedUpdaterRuntime(
+                cfg.installDir, QCoreApplication::applicationDirPath(), oldFiles, &stageError);
+        }
+        if (!stageOk) {
+            UpdaterWindow window;
+            window.show();
+            window.setStatus(QStringLiteral("Update failed"));
+            window.appendLog(QStringLiteral("Updater runtime attestation failed: %1").arg(stageError));
+            window.finish(false);
+            app.exec();
+            return 1;
+        }
+        if (!parser.isSet(stagedHelperOpt)) {
+            // The installed updater is only a bootstrap. It must exit before
+            // any destination file changes, including its own EXE and DLLs.
+            const QString parent = QFileInfo(cfg.installDir).dir().absolutePath();
+            QTemporaryDir privateStage(parent + QStringLiteral("/.orion_updater_stage-XXXXXX"));
+            if (!privateStage.isValid()
+                || !updater::stageUpdaterRuntime(cfg.installDir, privateStage.path(), oldFiles, &stageError)) {
+                UpdaterWindow window;
+                window.show();
+                window.setStatus(QStringLiteral("Update failed"));
+                window.appendLog(QStringLiteral("Could not stage updater outside install: %1").arg(stageError));
+                window.finish(false);
+                app.exec();
+                return 1;
+            }
+            const QString stagedExe = privateStage.filePath(QStringLiteral("OrionUpdater.exe"));
+            QStringList childArgs = app.arguments().mid(1);
+            childArgs << QStringLiteral("--staged-helper") << QStringLiteral("--bootstrap-pid")
+                      << QString::number(QCoreApplication::applicationPid());
+            privateStage.setAutoRemove(false);
+            if (!QProcess::startDetached(stagedExe, childArgs, privateStage.path())) {
+                QString cleanup;
+                updater::removeTreeSafely(privateStage.path(), &cleanup);
+                UpdaterWindow window;
+                window.show();
+                window.setStatus(QStringLiteral("Update failed"));
+                window.appendLog(QStringLiteral("Could not start staged updater."));
+                window.finish(false);
+                app.exec();
+                return 1;
+            }
+            return 0;
+        }
+    }
 
     UpdaterWindow window;
     window.show();
 
     UpdateRunner runner(cfg, &window);
     int exitCode = 0;
-    QObject::connect(&runner, &UpdateRunner::finished, &app, [&exitCode](int code) { exitCode = code; });
+    QObject::connect(&runner, &UpdateRunner::finished, &app, [&exitCode, &app, exitOnComplete = cfg.exitOnComplete](int code) {
+        exitCode = code;
+        if (exitOnComplete) app.quit();
+    });
     QTimer::singleShot(0, &runner, &UpdateRunner::run);
 
     app.exec();

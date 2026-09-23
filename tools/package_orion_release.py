@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import getpass
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -35,6 +37,7 @@ try:
         is_crown_jewel_python,
         is_debug_dll,
         is_forbidden_file_name,
+        is_release_admitted_executable,
         is_stale_binary_name,
         is_unapproved_model_path,
     )
@@ -49,6 +52,7 @@ except ModuleNotFoundError:  # Imported by path from the repository root in test
         is_crown_jewel_python,
         is_debug_dll,
         is_forbidden_file_name,
+        is_release_admitted_executable,
         is_stale_binary_name,
         is_unapproved_model_path,
     )
@@ -145,6 +149,29 @@ ESSENTIAL_FILES = {
 
 # Internal-only executables must be absent from customer packages and manifests.
 # The installer exclusion remains defence in depth for older package archives.
+# [ORION_QT_STYLE_PRUNE 2026-09-21] The Qt style allowlist is canonical in release_filter_policy
+# so the packager's prune and the independent audit read ONE policy.
+try:
+    from release_filter_policy import (
+        QT_QUICK_KNOWN_STYLES,
+        QT_QUICK_NATIVE_STYLE_CONSUMER,
+        QT_QUICK_STYLE_ROOTS,
+        QT_QUICK_STYLE_SHARED_DIRS,
+        qt_quick_style_allowed_root_dlls,
+        qt_quick_style_requirements_missing,
+        qt_quick_style_violations,
+    )
+except ModuleNotFoundError:  # imported by path from the repository root
+    from tools.release_filter_policy import (
+        QT_QUICK_KNOWN_STYLES,
+        QT_QUICK_NATIVE_STYLE_CONSUMER,
+        QT_QUICK_STYLE_ROOTS,
+        QT_QUICK_STYLE_SHARED_DIRS,
+        qt_quick_style_allowed_root_dlls,
+        qt_quick_style_requirements_missing,
+        qt_quick_style_violations,
+    )
+
 CUSTOMER_EXCLUDED_FILES = {"OrionOwner.exe", "OrionStaff.exe"}
 
 
@@ -165,17 +192,26 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def should_copy_top_file(path: Path) -> bool:
+def should_copy_top_file(path: Path, *, server_shard: bool = False) -> bool:
     name = path.name
     if is_forbidden_file_name(name):
         # Forbidden beats essential: a name on both lists must never ship silently.
+        # This now also drops lab/check binaries (GreenWindowMathChecks.exe) and any
+        # stray *.packed.exe (except the one permitted server-shard payload name).
         return False
     if is_debug_dll(path):
         # MSVC debug DLL twin (opencv_world4110d.dll, Qt6Cored.dll, ...): never ships.
         return False
     if name in ESSENTIAL_FILES:
         return True
-    return path.suffix.lower() in {".exe", ".dll", ".json"}
+    suffix = path.suffix.lower()
+    if suffix == ".exe":
+        # Release blocker FIX: NEVER admit an arbitrary top-level .exe. Only the
+        # per-profile executable allowlist ships; every unrecognized exe in the build
+        # dir (a lab/check binary, a stray packer output, a one-off tool) is dropped
+        # here and separately flagged by the security audit, instead of leaking in.
+        return is_release_admitted_executable(name, server_shard=server_shard)
+    return suffix in {".dll", ".json"}
 
 
 def _copy_tree_ignore(src: str, names: list[str]) -> set[str]:
@@ -547,6 +583,17 @@ def copy_runtime(sidecar_dist: Path | None = None,
     write_security_policy(package_dir)
     write_runtime_readme(package_dir)
     strip_app_qml_source(package_dir)
+    # [ORION_QT_STYLE_PRUNE 2026-09-21] A root whose SOURCE deploys Qt must have it staged.
+    required_roots = set()
+    if (BUILD_DIR / "qml" / "QtQuick" / "Controls").is_dir():
+        required_roots.add(".")
+    # The stream runtime is copied whole by copy_chiaki_runtime(); a copied tree that lost its
+    # Controls is a broken stream. (A fixture that stubs the copy has no stream dir at all, and
+    # a missing OrionStream.exe is refused by copy_chiaki_runtime and the audit's essentials.)
+    if ((CHIAKI_RUNTIME_SOURCE / "qml" / "QtQuick" / "Controls").is_dir()
+            and (package_dir / CHIAKI_PACKAGE_RELATIVE_DIR).is_dir()):
+        required_roots.add(CHIAKI_PACKAGE_RELATIVE_DIR.as_posix())
+    prune_unused_quick_styles(package_dir, required_roots=frozenset(required_roots))
 
 
 def scan_forbidden(package_dir: Path) -> list[str]:
@@ -653,6 +700,73 @@ def publish_staged_package(staging_dir: Path,
     return archived
 
 
+def publish_release_unit(staging_dir: Path, staged_archive: Path, staged_manifest: Path,
+                         package_dir: Path, archive_path: Path, manifest_path: Path,
+                         *, require_signature: bool = True,
+                         archive_dir: Path | None = None) -> None:
+    """Commit one preverified release unit, restoring every previous output on failure.
+
+    Windows has no atomic rename of three independent paths. All three are built and
+    verified privately first; same-volume renames form a rollback-capable commit. A
+    failed commit leaves the prior triple byte-for-byte intact. Consumers must not
+    upload from these paths until this function returns successfully.
+    """
+    staging_dir, package_dir = _validate_staging_path(staging_dir, package_dir)
+    validate_staged_package_for_publish(staging_dir, require_signature=require_signature)
+    archive_path = Path(archive_path).resolve()
+    manifest_path = Path(manifest_path).resolve()
+    staged_archive = Path(staged_archive).resolve()
+    staged_manifest = Path(staged_manifest).resolve()
+    if not staged_archive.is_file() or not staged_manifest.is_file():
+        raise FileNotFoundError("Staged archive or update manifest is missing")
+    targets = ((staging_dir, package_dir),
+               (staged_archive, archive_path),
+               (staged_manifest, manifest_path))
+    if len({str(target).lower() for _, target in targets}) != 3:
+        raise ValueError("Release publication targets must be distinct")
+    token = uuid.uuid4().hex
+    backups: list[tuple[Path, Path]] = []
+    installed: list[tuple[Path, Path]] = []
+    try:
+        for _, target in targets:
+            if target.exists():
+                backup = target.with_name(f".{target.name}.previous-{token}")
+                target.replace(backup)
+                backups.append((backup, target))
+        for source, target in targets:
+            source.replace(target)
+            installed.append((source, target))
+    except BaseException:
+        # Reverse new publications before restoring any old name. Keep the staged
+        # files available to the caller's cleanup even on a partially failed swap.
+        for source, target in reversed(installed):
+            if target.exists():
+                target.replace(source)
+        for backup, target in reversed(backups):
+            if backup.exists():
+                backup.replace(target)
+        raise
+    for backup, original in backups:
+        if original == package_dir and archive_dir is not None:
+            archive_dir = Path(archive_dir).resolve()
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            archived = archive_dir / f"orion-package-{stamp}"
+            try:
+                backup.replace(archived)
+                _write_archive_manifest(archived, package_dir)
+            except BaseException as exc:
+                # The coherent newly published unit is already selected. Retain
+                # the old backup under its private sibling name if archiving
+                # fails; never falsely report a failed publication after commit.
+                print(f"[orion-package] WARNING: previous package archive incomplete: {exc}")
+            continue
+        if backup.is_dir():
+            shutil.rmtree(backup)
+        else:
+            backup.unlink()
+
+
 def strip_app_qml_source(package_dir: Path) -> None:
     """Remove copied Orion QML source; the app loads compiled QML resources."""
     qml_dir = package_dir / "qml"
@@ -666,6 +780,81 @@ def strip_app_qml_source(package_dir: Path) -> None:
         target = package_dir / module_dir
         if target.exists():
             shutil.rmtree(target)
+
+
+# [ORION_QT_STYLE_PRUNE 2026-09-21] Qt Quick Controls ships one directory per visual style, and
+# windeployqt copies every one of them because the style is picked at runtime, not by an import
+# it can scan. Each app in this package pins exactly one (the allowlist and the reasoning live in
+# release_filter_policy.QT_QUICK_STYLE_ROOTS), so the rest is dead weight: FluentWinUI3 alone is
+# ~840 PNG/QML files per copy, and the package carries two Qt runtimes (OrionNative +
+# OrionStream), so the unused styles were 2,272 of the 2,940 packaged files (2026-09-21 count).
+#
+# FAIL-CLOSED, three ways (2026-09-21 Codex review):
+#   * a root the SOURCE build deploys Qt for (`required_roots`) must have a Controls tree in the
+#     staged package -- a silent no-op on a real build would ship a launcher with no UI;
+#   * a pinned style must be COMPLETE (qmldir, its QML plugin, its paired StyleImpl DLL, the
+#     shared impl plugin and the two core DLLs) -- a present-but-empty style directory renders an
+#     empty window, not a crash;
+#   * after pruning, release_filter_policy.qt_quick_style_violations() -- the same check the
+#     independent audit runs -- must come back empty.
+def prune_unused_quick_styles(package_dir: Path,
+                              required_roots: frozenset[str] = frozenset()) -> dict[str, int]:
+    """Drop every Qt Quick Controls style no packaged app selects (plus its DLLs and selectors).
+
+    Returns {"styles": <style dirs removed>, "files": <files removed>}. A root with no Qt
+    deployment is left alone unless it is in `required_roots`.
+    """
+    removed_styles = 0
+    removed_files = 0
+    for rel_root, keep in QT_QUICK_STYLE_ROOTS:
+        app_root = package_dir / rel_root
+        controls = app_root / "qml" / "QtQuick" / "Controls"
+        if not controls.is_dir():
+            if rel_root in required_roots:
+                raise SystemExit(
+                    f"[orion-package] REFUSED: {rel_root!r} has no qml/QtQuick/Controls tree in "
+                    f"the staged package although the source build deploys one")
+            continue
+        missing = qt_quick_style_requirements_missing(app_root, keep)
+        if missing:
+            raise SystemExit(
+                f"[orion-package] REFUSED: pinned Qt Quick Controls style(s) {sorted(keep)} under "
+                f"{rel_root!r} are incomplete; missing: {', '.join(missing)}")
+        doomed: list[Path] = []
+        for entry in sorted(controls.iterdir()):
+            if entry.is_dir() and entry.name not in keep and entry.name not in QT_QUICK_STYLE_SHARED_DIRS:
+                doomed.append(entry)
+        allowed_dlls = qt_quick_style_allowed_root_dlls(keep)
+        for dll in sorted(app_root.glob("Qt6QuickControls2*.dll")):
+            if dll.name not in allowed_dlls:
+                doomed.append(dll)
+        # Qt Quick Dialogs ships a `+<Style>` file-selector folder per style; one for a style the
+        # app can never select is unreachable, and pruning it makes that unreachability a fact
+        # the audit can check rather than a property of Qt's selector logic.
+        for style in sorted(QT_QUICK_KNOWN_STYLES - keep):
+            for selector in sorted((app_root / "qml").rglob("+" + style)):
+                if selector.is_dir():
+                    doomed.append(selector)
+        native_style = app_root / "qml" / "QtQuick" / "NativeStyle"
+        if QT_QUICK_NATIVE_STYLE_CONSUMER not in keep and native_style.is_dir():
+            doomed.append(native_style)
+        for target in doomed:
+            if target.is_dir():
+                removed_files += sum(1 for f in target.rglob("*") if f.is_file())
+                shutil.rmtree(target)
+                if target.parent == controls:
+                    removed_styles += 1
+            elif target.is_file():
+                removed_files += 1
+                target.unlink()
+    leftovers = qt_quick_style_violations(package_dir)
+    if leftovers:
+        raise SystemExit(
+            "[orion-package] REFUSED: Qt Quick style content survived the prune: "
+            + ", ".join(leftovers))
+    print(f"[orion-package] pruned {removed_styles} unused Qt Quick Controls styles "
+          f"({removed_files} files) - each app keeps only the style it pins")
+    return {"styles": removed_styles, "files": removed_files}
 
 
 def write_runtime_readme(package_dir: Path) -> None:
@@ -778,16 +967,20 @@ def create_archive(package_dir: Path, version: str, out_dir: Path | None = None)
     out_dir = out_dir or RELEASE_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"orion-package-{version}.zip"
-    if zip_path.exists():
-        zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(p for p in package_dir.rglob("*") if p.is_file()):
-            rel = path.relative_to(package_dir).as_posix()
-            info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
-            zf.writestr(info, path.read_bytes())
-    return zip_path, sha256_file(zip_path)
+    temporary = zip_path.with_name(f".{zip_path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(p for p in package_dir.rglob("*") if p.is_file()):
+                rel = path.relative_to(package_dir).as_posix()
+                info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o644 << 16
+                zf.writestr(info, path.read_bytes())
+        digest = sha256_file(temporary)
+        temporary.replace(zip_path)
+        return zip_path, digest
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def canonical_signing_payload(manifest: dict) -> bytes:
@@ -839,6 +1032,29 @@ def decode_ed25519_public_key(encoded: str) -> bytes:
     return b""
 
 
+# [2026-09-21] The signing key may stay ENCRYPTED on disk (PKCS8 "ENCRYPTED PRIVATE KEY" or a
+# legacy "Proc-Type: 4,ENCRYPTED" PEM). The passphrase is taken from this environment variable
+# or, when nothing is set and the run is interactive, from a hidden prompt. It is never
+# accepted on the command line (process lists, shell history), never logged, and the key is
+# decrypted in memory only -- no plaintext copy is ever written.
+SIGNING_KEY_PASSPHRASE_ENV = "ORION_UPDATE_SIGNING_KEY_PASSPHRASE"
+
+
+def _signing_key_passphrase(pem: bytes) -> bytes | None:
+    encrypted = b"ENCRYPTED" in pem
+    supplied = os.environ.get(SIGNING_KEY_PASSPHRASE_ENV)
+    if supplied:
+        return supplied.encode("utf-8")
+    if not encrypted:
+        return None
+    if sys.stdin is not None and sys.stdin.isatty():
+        return getpass.getpass("Update signing-key passphrase (not echoed): ").encode("utf-8")
+    raise SystemExit(
+        "[orion-package] REFUSED: the signing key is encrypted; set "
+        f"{SIGNING_KEY_PASSPHRASE_ENV} in the environment (never on the command line) or run "
+        "interactively to be prompted")
+
+
 def load_signing_key(key_path: Path, package_dir: Path | None = None):
     """Load a LOCAL Ed25519 private key PEM. The key must live OUTSIDE the package tree and
     outside the repo's shippable dirs — it is read, used, and never copied anywhere."""
@@ -849,21 +1065,39 @@ def load_signing_key(key_path: Path, package_dir: Path | None = None):
     forbidden_package_dir = (package_dir or PACKAGE_DIR).resolve()
     if key_path == forbidden_package_dir or forbidden_package_dir in key_path.parents:
         raise SystemExit(f"REFUSED: signing key must not live inside the package dir: {key_path}")
-    key = load_pem_private_key(key_path.read_bytes(), password=None)
+    pem = key_path.read_bytes()
+    try:
+        key = load_pem_private_key(pem, password=_signing_key_passphrase(pem))
+    except (ValueError, TypeError) as exc:
+        # cryptography's messages name the condition, never the passphrase; keep it that way.
+        raise SystemExit(
+            "[orion-package] REFUSED: could not decrypt the signing key with the supplied "
+            f"passphrase ({exc.__class__.__name__}: {exc})")
     if not isinstance(key, Ed25519PrivateKey):
         raise SystemExit(f"REFUSED: {key_path} is not an Ed25519 private key")
     return key
 
 
-def require_trusted_production_signing_key(key_path: Path,
-                                           package_dir: Path | None = None) -> None:
-    """Ensure production output is signed by the key the native binaries trust."""
+def is_trusted_production_signing_key(key_path: Path,
+                                      package_dir: Path | None = None) -> bool:
+    """Return whether *key_path* IS the production key the shipped binaries trust.
+
+    The non-raising twin of require_trusted_production_signing_key(): release gates use
+    it to tell a production run from a test build, so a relaxation (dirty packer tree,
+    unpinned packer commit) can be refused for the production key specifically.
+    """
     expected = decode_ed25519_public_key(ED25519_PUBLIC_KEY_B64)
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
     key = load_signing_key(key_path, package_dir=package_dir)
     actual = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    if len(expected) != 32 or actual != expected:
+    return len(expected) == 32 and actual == expected
+
+
+def require_trusted_production_signing_key(key_path: Path,
+                                           package_dir: Path | None = None) -> None:
+    """Ensure production output is signed by the key the native binaries trust."""
+    if not is_trusted_production_signing_key(key_path, package_dir=package_dir):
         raise SystemExit(
             "[orion-package] REFUSED: --signing-key does not match the embedded "
             f"trusted Ed25519 key id {ED25519_KEY_ID}"
@@ -956,6 +1190,109 @@ def require_production_build() -> None:
     )
 
 
+# [2026-09-21 Codex r3 F1] Every key id a production updater may embed, with the SHA-256 of
+# its 32 raw public-key bytes. Rotation adds the new pair here in the SAME change that
+# embeds it (docs/UPDATER_CLIENT.md "Key rotation"); an id that is not listed, or a listed
+# id over different bytes, refuses the package.
+def _key_fingerprint_b64(encoded_b64: str) -> str:
+    return hashlib.sha256(base64.b64decode(encoded_b64)).hexdigest()
+
+
+APPROVED_UPDATE_KEYS: dict[str, str] = {
+    ED25519_KEY_ID: _key_fingerprint_b64(ED25519_PUBLIC_KEY_B64),
+}
+
+# sha256 of the OrionUpdater.exe bytes that produced the accepted attestation; the staged
+# copy must match it, or a binary swapped between attestation and staging would ship.
+_ATTESTED_UPDATER_SHA256: str | None = None
+
+
+def check_updater_build_profile(profile: dict, approved: dict[str, str]) -> None:
+    """Pure policy over the attestation JSON (unit-tested)."""
+    if profile.get("profile") != "production":
+        raise SystemExit(
+            f"[orion-package] REFUSED: OrionUpdater.exe reports profile={profile.get('profile')!r}; "
+            "rebuild the Release tree with -DORION_PRODUCTION=ON (the binary, not just the cache)")
+    if profile.get("local_manifest_allowed") is not False:
+        raise SystemExit("[orion-package] REFUSED: OrionUpdater.exe still honours --manifest-file")
+    keys = profile.get("embedded_keys")
+    if not isinstance(keys, list) or not keys:
+        raise SystemExit("[orion-package] REFUSED: OrionUpdater.exe attests no embedded keys with fingerprints")
+    seen: dict[str, str] = {}
+    for entry in keys:
+        key_id = str(entry.get("id", ""))
+        fingerprint = str(entry.get("sha256", "")).lower()
+        if key_id not in approved:
+            raise SystemExit(
+                f"[orion-package] REFUSED: OrionUpdater.exe embeds an unapproved update-signing key id {key_id!r}")
+        if fingerprint != approved[key_id]:
+            raise SystemExit(
+                f"[orion-package] REFUSED: OrionUpdater.exe embeds key id {key_id!r} over DIFFERENT key bytes "
+                "than the pinned production public key")
+        seen[key_id] = fingerprint
+    if ED25519_KEY_ID not in seen:
+        raise SystemExit(
+            f"[orion-package] REFUSED: OrionUpdater.exe does not embed the production key id {ED25519_KEY_ID!r}")
+
+
+def require_staged_updater_matches_attestation(staging_dir: Path) -> None:
+    """[Codex r3 F1] The bytes that attested must be the bytes that ship."""
+    if _ATTESTED_UPDATER_SHA256 is None:
+        return
+    staged = staging_dir / "OrionUpdater.exe"
+    if not staged.is_file():
+        raise SystemExit("[orion-package] REFUSED: staged package has no OrionUpdater.exe")
+    actual = sha256_file(staged)
+    if actual != _ATTESTED_UPDATER_SHA256:
+        raise SystemExit(
+            "[orion-package] REFUSED: staged OrionUpdater.exe differs from the binary that attested "
+            f"(attested {_ATTESTED_UPDATER_SHA256[:16]}…, staged {actual[:16]}…)")
+    print(f"[orion-package] staged OrionUpdater.exe matches attestation ({actual[:16]}…)")
+
+
+def require_production_updater_binary() -> None:
+    """[2026-09-21 Codex F1] The CMake cache says how the tree was CONFIGURED; it says
+    nothing about the bytes in Release/. A stale or dev-built OrionUpdater.exe next to a
+    production cache would ship with its external key overrides and --manifest-file
+    intact. Ask the binary itself: `--build-profile <json>` is written by the compiled
+    code and reports the profile and the embedded key ids."""
+    global _ATTESTED_UPDATER_SHA256
+    exe = BUILD_DIR / "OrionUpdater.exe"
+    if not exe.exists():
+        raise SystemExit(f"[orion-package] REFUSED: {exe} is missing")
+    before = sha256_file(exe)
+    with tempfile.TemporaryDirectory(prefix="orion-build-profile-") as tmp:
+        out = Path(tmp) / "build_profile.json"
+        env = dict(os.environ)
+        # --build-profile exits before any window is constructed.  Forcing Qt's
+        # offscreen platform on Windows can hang during QApplication startup when
+        # the plugin is absent or quarantined, which turns a valid production
+        # attestation into a 60-second packaging failure.  Let the native Windows
+        # platform initialize normally and explicitly discard a caller-provided
+        # override so this security gate is deterministic.
+        env.pop("QT_QPA_PLATFORM", None)
+        try:
+            result = subprocess.run([str(exe), "--build-profile", str(out)], env=env,
+                                    capture_output=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(f"[orion-package] REFUSED: could not read the updater's build profile: {exc}")
+        if result.returncode != 0 or not out.exists():
+            raise SystemExit(
+                f"[orion-package] REFUSED: OrionUpdater.exe --build-profile exited {result.returncode}; "
+                "an updater that cannot attest its build profile is not a production updater")
+        try:
+            profile = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"[orion-package] REFUSED: unreadable build profile: {exc}")
+    check_updater_build_profile(profile, APPROVED_UPDATE_KEYS)
+    after = sha256_file(exe)
+    if after != before:
+        raise SystemExit("[orion-package] REFUSED: OrionUpdater.exe changed while it was being attested")
+    _ATTESTED_UPDATER_SHA256 = after
+    print(f"[orion-package] updater build profile OK: production, keys={sorted(APPROVED_UPDATE_KEYS)} "
+          f"sha256={after[:16]}…")
+
+
 def require_pinned_production_libcrypto() -> None:
     """Bind packaged libcrypto bytes to SecurityCore's compile-time trust pin."""
     cache = BUILD_DIR.parent / "CMakeCache.txt"
@@ -1039,6 +1376,7 @@ def main() -> int:
             )
         require_trusted_production_signing_key(signing_key_path)
         require_pinned_production_libcrypto()
+        require_production_updater_binary()
     elif signing_key_path is not None:
         # Fail before archiving/copying when a developer supplied an unusable key.
         load_signing_key(signing_key_path)
@@ -1049,9 +1387,18 @@ def main() -> int:
     )
 
     version = args.version or default_version()
+    # Reject late metadata errors before any published path can change.
+    if not args.skip_archive:
+        _validate_artifact_url(args.artifact_url)
     staging_dir = create_package_staging_dir(PACKAGE_DIR)
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+    release_stage = Path(tempfile.mkdtemp(prefix=".orion-release-stage-", dir=RELEASE_DIR))
+    update_manifest_path: Path | None = None
+    artifact_path: Path | None = None
     try:
         copy_runtime(selected_sidecar_dist, package_dir=staging_dir)
+        if not args.allow_dev_build:
+            require_staged_updater_matches_attestation(staging_dir)
         if args.customer:
             strip_customer_excluded_files(staging_dir)
         write_release_manifest(
@@ -1088,59 +1435,72 @@ def main() -> int:
                 print("[orion-package] FAIL: staged integrity gate failed; published package unchanged.")
                 return 4
 
-        publish_staged_package(
-            staging_dir,
-            PACKAGE_DIR,
-            ARCHIVE_DIR,
-            require_signature=not args.allow_dev_build,
-        )
+        staged_manifest: Path | None = None
+        staged_artifact: Path | None = None
+        if not args.skip_archive:
+            staged_artifact, digest = create_archive(staging_dir, version, release_stage)
+            manifest = build_update_manifest(
+                version=version,
+                artifact_sha256=digest,
+                artifact_url=args.artifact_url,
+                min_version=args.min_version,
+                mandatory=args.mandatory,
+                allow_rollback=args.allow_rollback,
+                release_notes=args.release_notes,
+            )
+            if signing_key_path is not None:
+                manifest = sign_update_manifest(manifest, signing_key_path)
+                staged_manifest = release_stage / "update_manifest.json"
+                update_manifest_path = RELEASE_DIR / "update_manifest.json"
+            else:
+                staged_manifest = release_stage / "update_manifest.unsigned.json"
+                update_manifest_path = RELEASE_DIR / "update_manifest.unsigned.json"
+            staged_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            artifact_path = RELEASE_DIR / staged_artifact.name
+            # Even development output must bind the staged ZIP bytes to the staged
+            # manifest before publication. The signed path additionally runs the
+            # exact independent release verifier below.
+            if sha256_file(staged_artifact) != manifest["sha256"]:
+                raise RuntimeError("Staged archive/manifest SHA-256 mismatch")
+
+        if not args.skip_verify:
+            cmd = [sys.executable, str(ROOT / "tools" / "verify_release_integrity.py"),
+                   "--package", str(staging_dir)]
+            if staged_manifest is not None and staged_manifest.name == "update_manifest.json":
+                cmd += ["--update-manifest", str(staged_manifest),
+                        "--artifact", str(staged_artifact)]
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                print("[orion-package] FAIL: staged release unit integrity gate failed; published output unchanged.")
+                return 4
+
+        if args.skip_archive:
+            publish_staged_package(
+                staging_dir, PACKAGE_DIR, ARCHIVE_DIR,
+                require_signature=not args.allow_dev_build,
+            )
+        else:
+            publish_release_unit(
+                staging_dir, staged_artifact, staged_manifest,
+                PACKAGE_DIR, artifact_path, update_manifest_path,
+                require_signature=not args.allow_dev_build,
+                archive_dir=ARCHIVE_DIR,
+            )
     finally:
         # A successful publish moves the tree, so this is then a no-op. Every
         # failure removes only the derived private staging directory.
         if staging_dir.exists():
             cleanup_package_staging_dir(staging_dir, PACKAGE_DIR)
+        shutil.rmtree(release_stage, ignore_errors=True)
 
     print(f"[orion-package] wrote {PACKAGE_DIR}")
     print(f"[orion-package] manifest files: {len(json.loads((PACKAGE_DIR / RELEASE_MANIFEST_NAME).read_text(encoding='utf-8'))['files'])}")
     print(f"[orion-package] manifest signature: "
           f"{'signed' if (PACKAGE_DIR / RELEASE_MANIFEST_SIG_NAME).is_file() else 'UNSIGNED DEV OUTPUT'}")
 
-    update_manifest_path: Path | None = None
-    artifact_path: Path | None = None
-    if not args.skip_archive:
-        artifact_path, digest = create_archive(PACKAGE_DIR, version)
-        print(f"[orion-package] artifact: {artifact_path} sha256={digest}")
-        manifest = build_update_manifest(
-            version=version,
-            artifact_sha256=digest,
-            artifact_url=args.artifact_url,
-            min_version=args.min_version,
-            mandatory=args.mandatory,
-            allow_rollback=args.allow_rollback,
-            release_notes=args.release_notes,
-        )
-        if signing_key_path is not None:
-            manifest = sign_update_manifest(manifest, signing_key_path)
-            update_manifest_path = RELEASE_DIR / "update_manifest.json"
-            print(f"[orion-package] update manifest signed (key id {manifest['public_key_id']})")
-        else:
-            update_manifest_path = RELEASE_DIR / "update_manifest.unsigned.json"
-            print("[orion-package] update manifest UNSIGNED — publish via POST /api/update "
-                  "(server signs with the SSM Ed25519 key), or re-run with --signing-key.")
-        update_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if artifact_path is not None:
+        print(f"[orion-package] artifact: {artifact_path} sha256={sha256_file(artifact_path)}")
         print(f"[orion-package] update manifest: {update_manifest_path}")
-
-    if not args.skip_verify:
-        cmd = [sys.executable, str(ROOT / "tools" / "verify_release_integrity.py"),
-               "--package", str(PACKAGE_DIR)]
-        if update_manifest_path is not None and update_manifest_path.name == "update_manifest.json":
-            cmd += ["--update-manifest", str(update_manifest_path)]
-            if artifact_path is not None:
-                cmd += ["--artifact", str(artifact_path)]
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            print("[orion-package] FAIL: verify_release_integrity gate failed — do NOT ship this package.")
-            return 4
 
     return 0
 

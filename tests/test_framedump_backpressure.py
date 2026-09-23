@@ -5,6 +5,7 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import remote_play_orchestrator as rpo
 
@@ -107,6 +108,43 @@ def test_disk_floor_uses_larger_of_absolute_and_volume_percentage(tmp_path, monk
     assert error == ""
 
 
+@pytest.mark.parametrize("offset,allowed", [(-1, False), (0, True), (1, True)])
+def test_disk_floor_exact_boundary(tmp_path, monkeypatch, offset, allowed):
+    orch = _bare_orchestrator(tmp_path)
+    orch._framedump_min_free_bytes = 10 * _GIB
+    orch._framedump_min_free_pct = 20.0
+    floor = 20 * _GIB
+    monkeypatch.setattr(
+        rpo.shutil, "disk_usage",
+        lambda _path: SimpleNamespace(total=100 * _GIB, used=80 * _GIB - offset,
+                                      free=floor + offset),
+    )
+
+    ok, free_bytes, floor_bytes, error = orch._framedump_disk_status()
+
+    assert ok is allowed
+    assert free_bytes == floor + offset
+    assert floor_bytes == floor
+    assert error == ""
+
+
+def test_disk_query_failure_disables_diagnostic_writer(tmp_path, monkeypatch):
+    orch = _bare_orchestrator(tmp_path)
+    orch._framedump_min_free_bytes = 10 * _GIB
+    monkeypatch.setattr(rpo.shutil, "disk_usage", lambda _path: (_ for _ in ()).throw(OSError("query failed")))
+
+    ok, free_bytes, floor_bytes, error = orch._framedump_disk_status()
+
+    assert not ok
+    assert free_bytes is None
+    assert floor_bytes == 10 * _GIB
+    assert "query failed" in error
+    monkeypatch.setattr(rpo.cv2, "imwrite", lambda *_a, **_kw: pytest.fail("disk query failure wrote pixels"))
+    assert not orch._framedump_write_item((0, np.zeros((8, 8, 3), dtype=np.uint8), _info()))
+    assert not orch._framedump_enabled
+    assert orch._framedump_disabled_reason == "disk_check_failed"
+
+
 def test_low_disk_disables_before_any_png_write(tmp_path, monkeypatch):
     orch = _bare_orchestrator(tmp_path)
     orch._framedump_disk_status = lambda: (False, 5 * _GIB, 10 * _GIB, "")
@@ -142,4 +180,3 @@ def test_failed_raw_write_does_not_create_csv_index_row(tmp_path, monkeypatch):
 def test_writer_cooldown_caps_average_duty_cycle():
     # 50 ms of PNG work at a 25% duty limit must yield for 150 ms off-thread.
     assert rpo.RemotePlayOrchestrator._framedump_cooldown_s(0.050, 0.25) == 0.15000000000000002
-

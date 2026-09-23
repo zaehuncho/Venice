@@ -79,7 +79,7 @@ def test_tempo_thresholds_match_the_engine(shot_type, onset_engine_ms, expected)
     assert shot_records.tempo_for(shot_type, onset_engine_ms) == expected
 
 
-def test_tempo_uses_the_engine_frame_not_the_capture_frame(tmp_path):
+def test_fixed_lag_tempo_is_an_estimate_not_native_truth(tmp_path):
     """The engine's onset is the sidecar's first sight + the 36 ms accept lag.
 
     470 ms of capture-clock onset is 506 ms to the engine, which is NORMAL, not QUICK --
@@ -88,26 +88,29 @@ def test_tempo_uses_the_engine_frame_not_the_capture_frame(tmp_path):
     rec, _ = _recorder(tmp_path)
     rec.note_press(77, shot_type="Standstill")
     rec.note_pickup(77, dict(PICKUP, first_sight_ms_after_press=470.0))
+    rec.note_onset(77, 470.0, fill=12.5)
     rec.note_release(77, release_ms=0.0)
     rec.close_all("t")
     rec.drain()
     row = _lines(rec)[0]
     assert row["onset_ms"] == 470.0
     assert row["onset_lag_ms"] == 36.0
-    assert row["onset_engine_ms"] == 506.0
-    assert row["tempo"] == "normal"
-    assert row["tempo_key"] == "Standstill/normal"
+    assert row["onset_engine_estimate_ms"] == 506.0
+    assert row["tempo_estimate"] == "normal"
+    assert row["onset_engine_ms"] is None and row["tempo"] == "unknown"
+    assert row["tempo_key"] == "Standstill/unknown"
 
 
 def test_onset_lag_is_configurable_and_recorded(tmp_path):
     rec, _ = _recorder(tmp_path, onset_lag_ms=0.0)
     rec.note_press(77, shot_type="Standstill")
     rec.note_pickup(77, dict(PICKUP, first_sight_ms_after_press=470.0))
+    rec.note_onset(77, 470.0, fill=12.5)
     rec.close_all("t")
     rec.drain()
     row = _lines(rec)[0]
-    assert row["onset_lag_ms"] == 0.0 and row["onset_engine_ms"] == 470.0
-    assert row["tempo"] == "quick"
+    assert row["onset_lag_ms"] == 0.0 and row["onset_engine_estimate_ms"] == 470.0
+    assert row["tempo_estimate"] == "quick" and row["tempo"] == "unknown"
 
 
 # --------------------------------------------------------------------------- assembly
@@ -117,6 +120,7 @@ def test_full_synthetic_shot_yields_one_complete_record(tmp_path):
     rec.note_press(77, ts_ms=press_ms, mono_ms=5.0, source="square",
                    shot_type="Standstill", rhythm=False)
     rec.note_pickup(77, PICKUP)
+    rec.note_onset(77, 468.0, fill=12.5)
     clock.advance(651.0)
     rec.note_release(77, release_ms=press_ms + 651.0)
     clock.advance(500.0)
@@ -140,8 +144,9 @@ def test_full_synthetic_shot_yields_one_complete_record(tmp_path):
     assert row["release_after_press_ms"] == 651.0
     assert row["pickup"]["first_sight_fill"] == 12.5
     assert row["pickup"]["patch_hits"] == 12
-    assert row["onset_ms"] == 468.0 and row["onset_source"] == "pickup"
-    assert row["onset_engine_ms"] == 504.0 and row["tempo"] == "normal"
+    assert row["onset_ms"] == 468.0 and row["onset_source"] == "detect_loop"
+    assert row["onset_engine_estimate_ms"] == 504.0 and row["tempo_estimate"] == "normal"
+    assert row["onset_engine_ms"] is None and row["tempo"] == "unknown"
     assert row["oracle"]["gap_px"] == 2.1
     assert row["oracle"]["verdict_proxy"] == "green"
     assert row["oracle"]["settled_fill"] == 90.1
@@ -170,7 +175,7 @@ def test_press_with_no_release_is_unanswered(tmp_path):
     assert row["closed_reason"] == "timeout"
     assert row["release_ms"] is None and row["release_after_press_ms"] is None
     # a press that never picked a meter up still records that fact
-    assert row["onset_ms"] is None and row["tempo"] == "normal"
+    assert row["onset_ms"] is None and row["tempo"] == "unknown"
     assert row["banner"] is None and row["oracle"] is None
 
 
@@ -207,6 +212,7 @@ def test_type_upgrade_keeps_one_record_and_rebuckets(tmp_path):
     rec, clock = _recorder(tmp_path)
     rec.note_press(31, ts_ms=1000.0, source="square", shot_type="Standstill")
     rec.note_pickup(31, dict(PICKUP, epoch=31, first_sight_ms_after_press=800.0))
+    rec.note_onset(31, 800.0, fill=12.5)
     assert rec.snapshot()["presses"] == 1
     rec.note_press(31, ts_ms=9999.0, source="type_upgrade", shot_type="Left Fade")
     assert rec.snapshot()["presses"] == 1
@@ -218,8 +224,8 @@ def test_type_upgrade_keeps_one_record_and_rebuckets(tmp_path):
     assert rows[0]["shot_type"] == "Standstill"
     assert rows[0]["shot_type_upgraded"] == "Left Fade"
     # 800 + 36 = 836 -> a fade at 836 ms is NORMAL; the same onset on a Standstill is SLOW
-    assert rows[0]["tempo"] == "normal"
-    assert rows[0]["tempo_key"] == "Left Fade/normal"
+    assert rows[0]["tempo_estimate"] == "normal"
+    assert rows[0]["tempo_key"] == "Left Fade/unknown"
 
 
 def test_unattributed_banner_and_orphans_never_join(tmp_path):
@@ -235,17 +241,17 @@ def test_unattributed_banner_and_orphans_never_join(tmp_path):
     assert _lines(rec)[0]["banner"] is None
 
 
-def test_pickup_beats_the_detect_loop_fallback(tmp_path):
+def test_pickup_never_overwrites_the_reader_accepted_onset(tmp_path):
     rec, _ = _recorder(tmp_path)
     rec.note_press(8, shot_type="Standstill")
     assert rec.note_onset(8, 610.0, fill=9.0) is True
     rec.note_pickup(8, dict(PICKUP, epoch=8, first_sight_ms_after_press=468.0))
-    # the pickup record is authoritative; a later fallback cannot overwrite it
+    # Neither a proposal nor a later accepted sample replaces the first accepted sample.
     assert rec.note_onset(8, 999.0) is False
     rec.close_all("t")
     rec.drain()
     row = _lines(rec)[0]
-    assert row["onset_ms"] == 468.0 and row["onset_source"] == "pickup"
+    assert row["onset_ms"] == 610.0 and row["onset_source"] == "detect_loop"
 
 
 def test_detect_loop_onset_is_used_when_there_is_no_pickup_record(tmp_path):
@@ -256,7 +262,8 @@ def test_detect_loop_onset_is_used_when_there_is_no_pickup_record(tmp_path):
     rec.drain()
     row = _lines(rec)[0]
     assert row["onset_ms"] == 610.0 and row["onset_source"] == "detect_loop"
-    assert row["tempo"] == "slow"          # 610 + 36 = 646 > 580
+    assert row["tempo_estimate"] == "slow"  # approximation only: native onset is unknown
+    assert row["tempo"] == "unknown"
     assert row["pickup"] is None
 
 
@@ -421,7 +428,9 @@ def test_the_summary_line_carries_the_range(tmp_path, caplog):
     # `dist=` is APPENDED after `range=` ([ORION_BANNER_DISTANCE 2026-09-17]), so the
     # assertion is on the field, not on the end of the line.
     assert line and "range=three" in line[0]
-    assert line[0].endswith("dist=-")          # no banner -> no distance, never a guess
+    # `court_*` is APPENDED after `dist=` ([ORION_ONSET_FF 2026-09-21]), so this too is an
+    # assertion on the field: no banner -> no distance, never a guess.
+    assert " dist=- " in line[0] or line[0].endswith("dist=-")
 
 
 def test_the_banner_block_carries_the_games_own_distance(tmp_path):
@@ -455,3 +464,186 @@ def test_an_unread_distance_is_null_not_zero(tmp_path):
     rec.drain()
     b = _lines(rec)[-1]["banner"]
     assert b["distance"] is None and b["distance_ft"] is None
+
+
+# Regressions from the 2026-09-20 bounded local fault-injection sweep.
+def test_bug_sweep_overflow_never_calls_logger_on_control_thread(tmp_path):
+    class TrapLogger:
+        def error(self, *args, **kwargs):
+            raise AssertionError('control-thread diagnostic I/O')
+    rec, clock = _recorder(tmp_path, log=TrapLogger(), queue_size=8)
+    for epoch in range(1, 17):
+        rec.note_press(epoch)
+        rec.close_all('injected_overload')
+    assert rec.records_dropped == 8
+    assert rec._q.qsize() == 8
+
+
+def test_bug_sweep_stop_timeout_keeps_single_writer_and_off_caller(tmp_path, monkeypatch):
+    import threading
+    rec, _ = _recorder(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    caller = threading.get_ident()
+    def slow_write(row):
+        calls.append((row['epoch'], threading.get_ident()))
+        if row['epoch'] == 1:
+            entered.set()
+            release.wait(2.0)
+        return True
+    monkeypatch.setattr(rec, '_write', slow_write)
+    rec.note_press(1); rec.close_all('injected_io')
+    rec.start()
+    assert entered.wait(1.0)
+    worker = rec._thread
+    rec.note_press(2); rec.close_all('injected_io')
+    try:
+        result = rec.stop(timeout=.01)
+        assert rec._thread is worker and worker.is_alive()
+        assert result is False
+        assert all(tid != caller for _, tid in calls)
+        rec.start()  # must not clear stop and launch another writer during the join
+        assert rec._thread is worker
+    finally:
+        release.set()
+        worker.join(2.0)
+        if rec._thread is not None and rec._thread is not worker:
+            rec.stop(timeout=.5)
+    assert sorted(ep for ep, _ in calls) == [1, 2]
+    assert all(tid == worker.ident for _, tid in calls)
+    assert rec.stop(timeout=.5) is True
+
+
+def test_bug_sweep_stop_without_existing_worker_does_not_drain_on_caller(tmp_path, monkeypatch):
+    import threading
+    rec, _ = _recorder(tmp_path)
+    caller = threading.get_ident(); calls = []
+    monkeypatch.setattr(rec, '_write', lambda row: calls.append(threading.get_ident()))
+    rec.note_press(1)
+    result = rec.stop(timeout=1.0)
+    assert calls and caller not in calls
+    assert result is True
+
+
+def test_bug_sweep_duplicate_release_preserves_first_stamp_and_deadline(tmp_path):
+    rec, clock = _recorder(tmp_path)
+    rec.note_press(1, ts_ms=clock.t)
+    rec.note_release(1, clock.advance(650.0))
+    before = dict(rec._open[1])
+    rec.note_release(1, clock.advance(150.0))
+    assert rec._open[1] == before
+
+
+def test_bug_sweep_cleanup_disarm_never_erases_accepted_release(tmp_path):
+    rec, clock = _recorder(tmp_path)
+    rec.note_press(1, ts_ms=clock.t)
+    rec.note_release(1, clock.advance(650.0))
+    before = dict(rec._open[1])
+    rec.note_disarm(1, 'cleanup_after_release')
+    assert rec._open[1] == before
+
+
+def test_bug_sweep_duplicate_disarm_does_not_keep_cancelled_record_alive(tmp_path):
+    rec, clock = _recorder(tmp_path)
+    rec.note_press(1)
+    rec.note_disarm(1, 'first_reason')
+    before = dict(rec._open[1])
+    clock.advance(100.0)
+    rec.note_disarm(1, 'duplicate_cleanup')
+    assert rec._open[1] == before
+
+
+@pytest.mark.parametrize('epoch', [True, 1.0, 1.9, '01', '+1', ' 1', '1 '])
+def test_bug_sweep_invalid_epoch_does_not_alias_an_open_shot(tmp_path, epoch):
+    rec, _ = _recorder(tmp_path)
+    rec.note_press(1)
+    before = dict(rec._open[1])
+    assert rec.note_release(epoch, 1000001.0) is False
+    assert rec.note_disarm(epoch, 'wrong_epoch') is False
+    assert rec._open[1] == before
+
+
+def test_bug_sweep_uint64_epoch_remains_exact(tmp_path):
+    rec, _ = _recorder(tmp_path)
+    ep=(1 << 53) + 7
+    assert rec.note_press(str(ep))
+    assert not rec.note_release(str(ep+1), 1000001.0)
+    assert rec.note_release(str(ep), 1000001.0)
+    assert rec._open[ep]['epoch'] == ep
+
+
+
+def test_bug_sweep_overflow_notice_is_coalesced_and_reported_off_control(tmp_path):
+    import threading
+    caller=threading.get_ident(); messages=[]
+    class Log:
+        def error(self, *args):messages.append((threading.get_ident(), args))
+        def warning(self, *args):pass
+    rec, _ = _recorder(tmp_path, log=Log(), queue_size=8)
+    for ep in range(1, 1001):
+        rec.note_press(ep);rec.close_all('overload')
+    assert not messages
+    assert rec.records_dropped == 992
+    assert rec.stop(timeout=2.0)
+    drops=[(tid,args) for tid,args in messages if 'DROPPED' in args[0]]
+    assert len(drops) == 1
+    assert drops[0][0] != caller and drops[0][1][-1] == 992
+
+
+def test_bug_sweep_retired_recorder_rejects_new_press_and_restart(tmp_path):
+    rec, _ = _recorder(tmp_path)
+    assert rec.stop(timeout=1.0)
+    assert rec.note_press(5) is False
+    assert rec.start() is False
+    assert rec.snapshot()['open'] == 0
+
+
+def test_bug_sweep_manual_drain_never_joins_slow_worker(tmp_path, monkeypatch):
+    import threading
+    rec, _ = _recorder(tmp_path)
+    entered, release=threading.Event(), threading.Event(); calls=[]
+    def write(row):
+        calls.append((row['epoch'],threading.get_ident()))
+        entered.set();release.wait(2.0)
+    monkeypatch.setattr(rec,'_write',write)
+    rec.note_press(1);rec.close_all('one');rec.start()
+    assert entered.wait(1.0)
+    rec.note_press(2);rec.close_all('two')
+    worker=rec._thread
+    try:
+        assert rec.drain() == 0
+        assert len(calls) == 1
+    finally:
+        release.set();rec.stop(timeout=1.0)
+    assert [ep for ep,_ in calls] == [1,2]
+    assert all(tid == worker.ident for _,tid in calls)
+
+
+def test_the_summary_line_carries_the_court_rtt_stamped_at_the_press(tmp_path, caplog):
+    """[ORION_ONSET_FF 2026-09-21] The court RTT the sampler held at the press rides the record
+    and the summary line, APPENDED after dist=, and reads '-' when nothing was stamped."""
+    rec, clock = _recorder(tmp_path)
+    rec.note_press(4, ts_ms=clock.t, mono_ms=0.0, shot_type="Standstill")
+    assert rec.note_network(4, court_rtt_ms=38.4, court_jitter_ms=2.1, court_ready=1)
+    assert not rec.note_network(99, court_rtt_ms=1.0)      # unknown epoch: refused, no record
+    rec.note_release(4, clock.advance(640))
+    with caplog.at_level("ERROR", logger="ShotRecords"):
+        rec.close_all("test")
+        rec.drain()
+    line = [r.getMessage() for r in caplog.records if "SHOT RECORD:" in r.getMessage()]
+    assert line and "court_rtt_ms=38.4 court_jitter_ms=2.1 court_ready=1" in line[0]
+    assert " dist=- " in line[0]
+    rows = _lines(rec)
+    assert rows and rows[0]["network"] == {"court_rtt_ms": 38.4, "court_jitter_ms": 2.1,
+                                           "court_ready": 1}
+
+
+def test_the_summary_line_reads_dash_when_no_network_was_stamped(tmp_path, caplog):
+    rec, clock = _recorder(tmp_path)
+    rec.note_press(5, ts_ms=clock.t, mono_ms=0.0, shot_type="Standstill")
+    rec.note_release(5, clock.advance(640))
+    with caplog.at_level("ERROR", logger="ShotRecords"):
+        rec.close_all("test")
+        rec.drain()
+    line = [r.getMessage() for r in caplog.records if "SHOT RECORD:" in r.getMessage()]
+    assert line and line[0].endswith("court_rtt_ms=- court_jitter_ms=- court_ready=-")

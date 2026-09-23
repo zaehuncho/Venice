@@ -1,0 +1,62 @@
+PILL BETA PICKUP — VERIFIED LOCAL TRANSACTION
+Working directory for every command: C:\Users\aaron\Desktop\NexusVision
+Changed branch/field: simple_meter_reader.py Pill/YOLO per-press pickup; first_sight_fill and first_sight_ms_after_press now record the first valid measured Pill fill on the frame clock. CV detection, acceptance, and Pill ruler code are unchanged by this patch.
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE: C:\Users\aaron\Desktop\NexusVision\simple_meter_reader.py
+DIFF_FILE: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\DIFF_FILE.patch
+VERIFICATION.txt: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\VERIFICATION.txt
+ROLLBACK.sh: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\ROLLBACK.sh
+Original preserved: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\ORIGINAL_simple_meter_reader.py
+Review: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\PILL_BETA_REVIEW.md
+Synthetic tests: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\test_pill_pickup.py
+Rollback test target: C:\Users\aaron\Desktop\NexusVision\docs\pill_beta_pickup_evidence\ROLLBACK_TEST_COPY\simple_meter_reader.py
+
+SHA-256 original 31255CB3F554D96CAB64B093DAD9D264131134F7FA9F185BEF1517DB1BED5065
+SHA-256 modified 54BDEBA785A42C703BCF7903245B60F1DBADDEFAB0D91875F08E3365831FEA21
+SHA-256 diff 2C18B7D1385797AD2EFF9D9D3A864A7E7CF8EDBFA9716ACB36D91167A4643F27
+
+BASELINE
+Input: original in-place simple_meter_reader.py at SHA-256 31255CB3...; pre-existing Pill/ruler/player-anchor/shot-record tests.
+Exact PowerShell command (executed before source modification):
+  $py = if(Test-Path '.venv/Scripts/python.exe'){'.venv/Scripts/python.exe'}else{'C:\Python314\python.exe'}; & $py -m pytest tests/test_pill_fill_ruler.py tests/test_player_anchor.py tests/test_shot_records_wiring.py -q -o cache_dir=D:/NexusVision/pytest_cache/pill_pickup_baseline --basetemp=D:/NexusVision/pytest_tmp/pill_pickup_baseline
+Literal result: 116 passed in 5.47s
+Exit status: 0
+Baseline pickup behavior command (executed against preserved exact original):
+  .venv/Scripts/python.exe docs/pill_beta_pickup_evidence/check_pickup_state.py docs/pill_beta_pickup_evidence/ORIGINAL_simple_meter_reader.py no_op
+Literal result: YOLO_PICKUP=no_op
+Exit status: 0
+
+MODIFIED
+Input: in-place simple_meter_reader.py at SHA-256 54BDEBA7... and synthetic test_pill_pickup.py.
+Exact PowerShell command:
+  .venv/Scripts/python.exe -m pytest docs/pill_beta_pickup_evidence/test_pill_pickup.py tests/test_pill_fill_ruler.py tests/test_player_anchor.py tests/test_shot_records_wiring.py -q -o cache_dir=D:/NexusVision/pytest_cache/pill_pickup_final_focused --basetemp=D:/NexusVision/pytest_tmp/pill_pickup_final_focused
+Literal result: 119 passed in 5.98s
+Exit status: 0
+Broad regression exact PowerShell command:
+  $files = @(rg -l -i 'pill|meter.style' tests -g '*.py'); .venv/Scripts/python.exe -m pytest @files docs/pill_beta_pickup_evidence/test_pill_pickup.py -q -o cache_dir=D:/NexusVision/pytest_cache/pill_pickup_final --basetemp=D:/NexusVision/pytest_tmp/pill_pickup_final
+Literal result: 1064 passed, 2 skipped, 5 xfailed, 2 xpassed in 68.02s (0:01:08)
+Exit status: 0
+Modified pickup behavior command:
+  .venv/Scripts/python.exe docs/pill_beta_pickup_evidence/check_pickup_state.py simple_meter_reader.py record_open
+Literal result: YOLO_PICKUP=record_open
+Exit status: 0
+Compile command: .venv/Scripts/python.exe -m py_compile simple_meter_reader.py
+Literal result: no output
+Exit status: 0
+
+ROLLBACK ON ANOTHER COPY (live MODIFIED_FILE deliberately left changed)
+Input: ROLLBACK_TEST_COPY/simple_meter_reader.py copied from modified source, SHA-256 54BDEBA7...; original exact copy SHA-256 31255CB3...; DIFF_FILE SHA-256 2C18B7D1....
+Exact PowerShell command:
+  & 'C:\Program Files\Git\bin\bash.exe' 'docs/pill_beta_pickup_evidence/ROLLBACK.sh' 'docs/pill_beta_pickup_evidence/ROLLBACK_TEST_COPY/simple_meter_reader.py'
+Literal output:
+  RESTORED_SHA256=31255cb3f554d96cab64b093dad9d264131134f7fa9f185bef1517db1bed5065
+  PILL_PICKUP_HOOK=absent
+Exit status: 0
+Restored behavior command:
+  .venv/Scripts/python.exe docs/pill_beta_pickup_evidence/check_pickup_state.py docs/pill_beta_pickup_evidence/ROLLBACK_TEST_COPY/simple_meter_reader.py no_op
+Literal result: YOLO_PICKUP=no_op
+Exit status: 0
+Restored status: rollback copy SHA-256 31255CB3F554D96CAB64B093DAD9D264131134F7FA9F185BEF1517DB1BED5065 and original YOLO pickup no-op; live MODIFIED_FILE SHA-256 54BDEBA785A42C703BCF7903245B60F1DBADDEFAB0D91875F08E3365831FEA21, still modified.
+
+This is source/test verification. No app build, app launch, new Pill shot, or framedump was run.

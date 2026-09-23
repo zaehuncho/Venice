@@ -69,7 +69,7 @@ class TestPurchase:
             assert banned not in blob, f"/purchase still shows {banned!r}"
 
     def test_it_points_at_the_free_trial(self):
-        assert "3-day trial" in json.dumps(purchase())
+        assert "7-day trial" in json.dumps(purchase())
 
     def test_store_url_wins_over_the_legacy_gumroad_base(self):
         r = purchase(env=dict(ENV, GUMROAD_BASE="https://seller.gumroad.com/l"))

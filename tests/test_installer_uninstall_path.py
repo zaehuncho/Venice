@@ -75,7 +75,14 @@ def test_remove_bridge_service_orders_stop_poll_delete():
 
 def test_stopped_poll_actually_polls_the_scm():
     body = _block("WaitServiceStopped")
-    assert 'findstr /C:"STOPPED"' in body
+    # [2026-09-21] The poll matches the NUMERIC SCM state ("STATE : 1"), not the word
+    # STOPPED: `sc query` localizes that word on non-English Windows, so the old text match
+    # timed out and raced the service delete (Astra, bug sweep). It also returns Boolean so
+    # RemoveBridgeService can fail closed on a timeout instead of deleting a running service.
+    assert 'findstr /R /C:"STATE *: *1 "' in body
+    assert '/C:"STOPPED"' not in body, "localized SCM text must never be the stop signal"
+    assert "function WaitServiceStopped(const ServiceName: string): Boolean;" in body
+    assert "ServiceInstalled(ServiceName)" in body   # absent service == stopped
     assert "sc query" in body
     assert "Sleep(" in body
 
@@ -181,11 +188,25 @@ def test_silent_uninstall_never_deletes_user_data():
     assert "MaybeRemoveUserData;" in _block("CurUninstallStepChanged")
 
 
-def test_running_processes_are_killed_before_uninstall():
+def test_running_processes_are_closed_before_uninstall():
     # Without this the uninstaller cannot delete Qt6Core/libcrypto and reports
     # partial-uninstall (files left behind, service already gone).
+    # [2026-09-21] "Kill" became "Close": the uninstaller asks (OK/Cancel), posts WM_CLOSE via
+    # `taskkill /IM` so the launcher shuts down cleanly (a force-kill mid-write corrupts
+    # settings.json), waits a bounded 8 s, and only THEN forces stragglers. Its Boolean result
+    # gates the uninstall, so Cancel really cancels.
     body = _block("InitializeUninstall")
-    assert "KillVeniceProcesses" in body
+    assert "Result := CloseVeniceProcesses(True);" in body
+    assert "KillVeniceProcesses" not in body
+
+    close = _block("CloseVeniceProcesses")
+    assert "MB_OKCANCEL" in close
+    graceful = close.index("'/IM ' + Names[I]")
+    forced = close.index("'/F /IM ' + Names[I]")
+    assert graceful < forced, "graceful WM_CLOSE pass must come before the forced pass"
+    assert "Waited < 8000" in close and "VeniceImageRunning('OrionNative.exe')" in close
+    for name in ("OrionNative.exe", "OrionSidecar.exe", "OrionUpdater.exe", "OrionActivate.exe"):
+        assert name in close
 
 
 # --------------------------------------------------------------------------- #

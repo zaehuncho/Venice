@@ -275,6 +275,17 @@ QString licenseErrorUserText(const LicenseResult& result, const QString& fallbac
             : QStringLiteral("Update required — this version is no longer allowed (minimum version %1).")
                   .arg(minimum);
     }
+    // [CL2-P8-006 2026-09-23] The server rejects a request_timestamp more than 300 s
+    // off with the bare code and no message; the parser then shows `timestamp_expired`
+    // verbatim. The code itself stays in result.error for the log line.
+    if (code == QLatin1String("timestamp_expired")) {
+        return QStringLiteral("Your PC clock is off. Turn on 'Set time automatically' in Windows Date & Time settings, then restart Venice.");
+    }
+    // [CL2-P8-008 2026-09-23] Activation's device_mismatch carries no message (the
+    // heartbeat's does); one plain line for both so a PC rename / second PC is clear.
+    if (code == QLatin1String("device_mismatch")) {
+        return QStringLiteral("This licence is linked to a different PC. Use /hwid_reset in Discord or open a ticket.");
+    }
     // Every other code: the server's prose. The parsers fall back to the bare code
     // when the server sent no `message`, which is still better than silence.
     if (!result.message.trimmed().isEmpty()) {
@@ -649,9 +660,22 @@ void LicenseClient::getUpdate(QString currentVersion, QString channel)
             // deployed) must not block the app. Report ok == false so the caller
             // can fall back to the backend health check.
             UpdateManifest soft;
-            soft.message = reply->property("orion_pin_failed").toBool()
-                ? QStringLiteral("Pinned server certificate did not match.")
-                : QStringLiteral("Update check unavailable: %1").arg(reply->errorString());
+            if (reply->property("orion_pin_failed").toBool()) {
+                soft.message = QStringLiteral("Pinned server certificate did not match.");
+            } else {
+                // [2026-09-21] A 4xx/5xx with a JSON envelope is the SERVER talking
+                // (e.g. 404 {"ok":false,"error":"no manifest published"} before the
+                // first release). Log its reason instead of Qt's truncated
+                // "Error transferring ... server replied:", which reads like an outage.
+                const UpdateManifest envelope = parseUpdateManifest(reply->readAll());
+                const bool serverSpoke = !envelope.ok && !envelope.message.isEmpty()
+                    && envelope.message != QStringLiteral("Update manifest is not valid JSON.");
+                soft.message = serverSpoke
+                    ? QStringLiteral("Update check: server says \"%1\" (HTTP %2)")
+                          .arg(envelope.message)
+                          .arg(reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt())
+                    : QStringLiteral("Update check unavailable: %1").arg(reply->errorString());
+            }
             emit updateCheckFinished(soft);
             return;
         }

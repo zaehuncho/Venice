@@ -52,7 +52,8 @@ public:
     [[nodiscard]] SecurityStatus evaluate();
     [[nodiscard]] bool validateLicenseKeyFormat(const QString& key) const;
     [[nodiscard]] bool verifySettingsSignature() const;
-    [[nodiscard]] bool verifyReleaseIntegrity(QString* detail = nullptr) const;
+    [[nodiscard]] bool verifyReleaseIntegrity(QString* detail = nullptr,
+                                              bool exactRoot = false) const;
     [[nodiscard]] bool vmOrSandboxObserved() const;
     [[nodiscard]] bool analysisToolRunning() const;
     [[nodiscard]] bool timingAnomalyDetected() const;

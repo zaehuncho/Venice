@@ -104,10 +104,30 @@ Item {
                 }
             }
 
+            // [2026-09-21 beta] Continue is gated on a usable video route. A clean PC with
+            // the default capture-card source and no card plugged in used to sail through
+            // to Live with no video and no recovery step (Astra, bug sweep). The native
+            // side re-checks in markStreamSetupComplete(); this is the visible half.
+            readonly property bool captureRouteReady:
+                orion.remotePlayConsole === "Xbox"
+                    ? (orion.xboxUntestedAcknowledged && orion.xboxRemotePlayWindowTitle.length > 0)
+                    : (orion.videoSource !== "capture_card" || orion.captureCardSelected)
+            Text {
+                visible: !parent.captureRouteReady
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: orion.remotePlayConsole === "Xbox"
+                      ? "To continue, acknowledge the Xbox notice above and select the Remote Play window."
+                      : "Select your capture card above (refresh the list if needed), or switch Video source to PS5 Remote Play."
+                color: Theme.warning
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSmall
+            }
             PrimaryButton {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 46
                 text: "Continue to Venice"
+                enabled: parent.captureRouteReady
                 onClicked: orion.markStreamSetupComplete()
             }
         }

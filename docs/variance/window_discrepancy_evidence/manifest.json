@@ -1,0 +1,22 @@
+[
+  {
+    "path": "docs/variance/PREREGISTRATION_OFFSET_SWEEP.md",
+    "before_sha256": "B0B1034B64603A875A1107300CB3C3A34423F4EDA6DE8E49D161F53C40601339",
+    "after_sha256": "B9AB53DB2F6E9C79289A275FD70AE36649F8402203DF1F55B970E26AB7F6985E"
+  },
+  {
+    "path": "docs/variance/WINDOW_DISCREPANCY.md",
+    "before_sha256": null,
+    "after_sha256": "3CA9996F7A2B5033F1537D61813856FD27FA30D1069974755F746BEAD6669474"
+  },
+  {
+    "path": "tools/timing/sweep_analysis.py",
+    "before_sha256": null,
+    "after_sha256": "F0AD84B5D43F22514BB19B410A30E58B524BDB7A7DA832A21A9510B5BAFE4A49"
+  },
+  {
+    "path": "tools/timing/test_sweep_analysis.py",
+    "before_sha256": null,
+    "after_sha256": "7A6D8FA5F4701CBAD371762030AAD028F2B94CC91E6E1696A5D0588C77690DFD"
+  }
+]

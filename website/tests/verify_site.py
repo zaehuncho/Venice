@@ -20,7 +20,14 @@ def main() -> int:
     text = index.read_text(encoding="utf-8", errors="replace")
     required = {
         "venice_brand": "VENICE",
-        "monthly_price": "Get Venice — $25/mo",
+        # [2026-09-21 owner] $19.99/mo, final. Keep this marker in step with the price on
+        # purpose so an ACCIDENTAL drift still fails. The prices this product has ever shown are
+        # listed as legacy below, so a stale copy cannot quietly come back.
+        # THE STRIPE PRICE IS THE CONTRACT, NOT THIS STRING: the pinned STRIPE_PRICE_IDs further
+        # down must be the $19.99 recurring price. Stripe prices are immutable, so changing the
+        # amount means a NEW price object in Stripe and new ids here and in wrangler.jsonc. Never
+        # ship copy that advertises a different number than the price the Worker charges.
+        "monthly_price": "Get Venice — $19.99/mo",
         "buy_route": 'href="/buy"',
         "discord_route": 'href="/discord"',
         "trial_copy": "Try it free for 7 days",
@@ -36,7 +43,7 @@ def main() -> int:
     for name, marker in required.items():
         if marker not in text:
             return fail(f"missing_{name}")
-    if any(price in text for price in ("$7.99", "$19.99", "$49.99", "$199.99")):
+    if any(price in text for price in ("$7.99", "$15", "$20", "$25", "$49.99", "$199.99")):
         return fail("legacy_price_visible")
     if "Something powerful is on the way" in text or "ZaeOrion" in text:
         return fail("coming_soon_copy_present")
@@ -124,7 +131,7 @@ def main() -> int:
         return fail("stripe_provider_not_enabled")
     if not config["vars"]["STRIPE_PUBLISHABLE_KEY"].startswith("pk_test_"):
         return fail("stripe_test_publishable_key_missing")
-    if config["vars"]["STRIPE_PRICE_ID"] != "price_1UGAOmGniZwGqtXLa9iDiEtk":
+    if config["vars"]["STRIPE_PRICE_ID"] != "price_1UIHuRGniZwGqtXLKKpOr5dH":
         return fail("stripe_price_not_pinned")
     if config["env"]["production"]["name"] != "venice-site-production":
         return fail("production_name")
@@ -135,11 +142,11 @@ def main() -> int:
     production = config["env"]["production"]["vars"]
     if production.get("STRIPE_MODE") != "live" or not production["STRIPE_PUBLISHABLE_KEY"].startswith("pk_live_"):
         return fail("production_live_key_missing")
-    if production.get("STRIPE_PRICE_ID") != "price_1UGaaRGniZwGqtXLwQV7OLRY":
+    if production.get("STRIPE_PRICE_ID") != "price_1UIHrNGniZwGqtXL2b5zfS1M":
         return fail("production_live_price_missing")
     digest = hashlib.sha256(index.read_bytes()).hexdigest().upper()
     print(
-        "VERIFY_OK=single_plan_25_month,plain_storefront,no_synthetic_preview,no_invented_social_proof,"
+        "VERIFY_OK=single_plan_19_99_month,plain_storefront,no_synthetic_preview,no_invented_social_proof,"
         "header_account_control,inline_css_in_sync,30fps_canvas,optimized_logo,"
         f"tab_favicon,stripe_live_production_checkout,discord_identity,security_headers,assets,legal,index_sha256:{digest}"
     )

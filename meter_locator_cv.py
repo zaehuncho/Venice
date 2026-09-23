@@ -72,6 +72,25 @@ def _fenv(name: str, default: float) -> float:
         return float(default)
 
 
+class _CandidateHsv:
+    """Read-only HSV rectangle access over this scan's BGR pixels.
+
+    Gates only inspect small tip/ring/track rectangles. Converting the entire
+    search band eagerly makes a tiny candidate pay for hundreds of thousands
+    of unused pixels. BGR-to-HSV is pointwise, so slicing BEFORE conversion
+    preserves those exact pixels, including strided ROIs and clipped bounds.
+    This view lives only for one synchronous _find call; nothing is cached
+    across candidates, frames, or ownership epochs.
+    """
+
+    def __init__(self, bgr):
+        self._bgr = bgr
+        self.shape = bgr.shape
+
+    def __getitem__(self, rectangle):
+        return cv2.cvtColor(self._bgr[rectangle], cv2.COLOR_BGR2HSV)
+
+
 class MeterContourLocator:
     """Pure-CV meter proposer with the MeterYoloLocator interface."""
 
@@ -82,6 +101,12 @@ class MeterContourLocator:
         self._prep_sess = None
         self._prep_disabled = "n/a (pure CV)"
         self._infer_lock = threading.Lock()
+        # Reader-owned quarantine is only a ranking hint. Equal-confidence candidates
+        # outside a known static zone beat it on area; no candidate loses eligibility.
+        self.static_rank = _fenv("ORION_CV_STATIC_RANK", 1.0) > 0.0
+        self._static_rank_zones = ()
+        self._scan_static_rank_zones = ()
+        self._scan_static_rank_now = 0.0
         # Same fraction-of-frame plausibility gate as the YOLO locator (region + size).
         self._band_top = _fenv("ORION_METER_BAND_TOP", 0.20)
         self._band_bot = _fenv("ORION_METER_BAND_BOTTOM", 0.95)
@@ -207,14 +232,13 @@ class MeterContourLocator:
         # gate 9's tip-spill ring (~29 x 12 px) -- be taken from the parent frame instead of
         # being clamped to the sub-image's first row. Cost when a candidate's tip prior is
         # inside the sub-image (every candidate in the normal population): one float compare.
-        # DEFAULT OFF so the concurrent re-encode replay keeps the shipped behaviour; flip to 1
-        # once both studies are in.
-        # Default OFF (2026-09-14 evening): the offline validation (0/12,000 court frames changed,
-        # 61/80 real meters recovered at box top 8..40 px, cost-neutral) is real, but it went live
-        # in the same launches as two other regressions and could not be cleared by a controlled
-        # live A/B before the ship. Re-enable with ORION_METER_TOP_STRIP=1 after a live A/B on a
-        # Rec court (compare ownership `break_geometry` counts and abort rate against the clamp).
-        self.top_strip = _fenv("ORION_METER_TOP_STRIP", 0.0) > 0.0
+        # [ORION_HIGH_SCREEN_PICKUP 2026-09-21] Read those existing landmark windows from the
+        # full frame by default. A crop boundary must not erase real cap pixels or shift the
+        # fill ruler. This changes neither the scan band nor the acceptance/ownership gates.
+        # Explicit ORION_METER_TOP_STRIP=0 retains the prior clamp for a controlled A/B.
+        # The candidate still needs live high-screen/fade validation; offline pickup is not a
+        # guarantee of a timed release or a made shot.
+        self.top_strip = _fenv("ORION_METER_TOP_STRIP", 1.0) > 0.0
         # [ORION_ANCHORED_SEARCH / ORION_EXPECTATION_WINDOW 2026-09-15] "know WHERE and
         # WHEN to look". Gate 9's 14 px floor (above) is what makes the first accepted fill
         # ~18 % on the owner's court and ~22 % elsewhere: below that the chevron notch makes
@@ -320,6 +344,17 @@ class MeterContourLocator:
                       "shape_bridged": 0, "shape_error": 0, "top_strip": 0, "error": 0,
                       "shape_abstain": 0,
                       "anchor_hit": 0, "anchor_patch_hit": 0, "refused_outside": 0,
+                      # [ANCHOR INSTRUMENT 2026-09-21] Diagnostic only. `idle_hit` = a box
+                      # proposed with NO press armed: _update_anchor is skipped on those frames
+                      # by design ("outside a shot the meter cannot exist"), so every idle
+                      # proposal reaches the reader without the one GEOMETRIC gate we have.
+                      # The anchor_* buckets are the ARMED-frame confidence histogram against
+                      # ORION_ANCHOR_REFUSE_CONF: `hi` is the only bucket that may refuse.
+                      # Live 2026-09-21: 65 idle proposals never led to a shot, and
+                      # refused_outside was 0 on every pickup -- these say which of "the anchor
+                      # is never asked" and "the anchor is asked but not confident" it is.
+                      "idle_hit": 0, "anchor_none": 0,
+                      "anchor_conf_lo": 0, "anchor_conf_mid": 0, "anchor_conf_hi": 0,
                       "expect_pending": 0, "expect_accept": 0,
                       "tipless_pending": 0, "tipless_accept": 0, "tipless_track": 0,
                       "idle_reuse": 0}
@@ -390,6 +425,8 @@ class MeterContourLocator:
     def reset(self) -> None:
         """Forget the temporal state (source change / clock restart); the wrapper calls it."""
         with self._infer_lock:
+            self._static_rank_zones = ()
+            self._scan_static_rank_zones = ()
             self._last_box = None
             self._last_ts = -1.0e9
             self._tip_pending = None
@@ -527,6 +564,36 @@ class MeterContourLocator:
             self._idle_cache.clear()
             return tuple(kept)
 
+    def set_static_rank_zones(self, zones) -> None:
+        """Publish a bounded immutable snapshot without blocking the capture callback.
+
+        Coordinates are FULL-frame (cx, cy, radius_x, radius_y, start_s, end_s).
+        Only the inference thread reads it into its scan-local state/cache. This never
+        clears temporal confirmation pairs or changes the reader's quarantine record.
+        """
+        clean = []
+        try:
+            for zone in zones:
+                values = tuple(float(v) for v in zone)
+                if (len(values) == 6 and all(np.isfinite(v) for v in values)
+                        and values[2] > 0 and values[3] > 0 and values[5] >= values[4]):
+                    clean.append(values)
+                if len(clean) >= 16:
+                    break
+        except (TypeError, ValueError, OverflowError):
+            clean = []
+        self._static_rank_zones = tuple(clean)
+
+    def _static_rank_penalty(self, box, origin=(0, 0)) -> bool:
+        if not self.static_rank or box is None:
+            return False
+        x, y, w, h = box[:4]
+        cx = x + w * 0.5 + origin[0]
+        cy = y + h * 0.5 + origin[1]
+        now = self._scan_static_rank_now
+        return any(start <= now <= end and abs(cx - zx) <= rx and abs(cy - zy) <= ry
+                   for zx, zy, rx, ry, start, end in self._scan_static_rank_zones)
+
     def detect_box(self, frame_bgr, ts: Optional[float] = None) -> Optional[Tuple[int, int, int, int, float]]:
         if not self.ok or frame_bgr is None:
             return None
@@ -610,6 +677,18 @@ class MeterContourLocator:
         self._anchor_ts = now
         if a is not None:
             self.stats["anchor_hit"] += 1
+        # [ANCHOR INSTRUMENT] one bucket per FRESH armed evaluation (memo hits above skip it)
+        try:
+            if a is None or not a.valid():
+                self.stats["anchor_none"] += 1
+            else:
+                _fe = getattr(_pa, "_fenv", None)
+                _hi = float(_fe("ORION_ANCHOR_REFUSE_CONF", 0.75)) if callable(_fe) else 0.75
+                _c = float(a.conf)
+                self.stats["anchor_conf_hi" if _c >= _hi else
+                           "anchor_conf_mid" if _c >= 0.5 else "anchor_conf_lo"] += 1
+        except Exception:
+            pass
         return a
 
     def open_pickup_record(self, epoch) -> None:
@@ -675,7 +754,12 @@ class MeterContourLocator:
         pixels 60 times a second. Reuse is refused outright while a press is armed, so the
         scan a real shot depends on is never skipped, never delayed and never stale.
         """
-        if not self._idle_reuse:
+        snapshot = self._static_rank_zones if self.static_rank else ()
+        if snapshot != self._scan_static_rank_zones:
+            self._idle_cache.clear()
+        self._scan_static_rank_zones = snapshot
+        self._scan_static_rank_now = float(ts) if ts is not None else time.monotonic()
+        if not self._idle_reuse or snapshot:
             return self._detect_scan(img, offset, plaus_size, ts, full_img)
         t0 = time.perf_counter()
         now = float(ts) if (ts is not None and ts == ts) else time.monotonic()
@@ -749,7 +833,10 @@ class MeterContourLocator:
             anch = self._update_anchor(full_img if full_img is not None else img, now, armed)
             # Roaming ROI (gate 6): a margin around the last hit for a short hold.
             roi = None
-            if self._last_box is not None and 0.0 <= (now - self._last_ts) <= self.roi_hold_s and not plaus_size:
+            static_roi = self._static_rank_penalty(self._last_box)
+            if static_roi:
+                self.stats["static_roi_bypass"] = self.stats.get("static_roi_bypass", 0) + 1
+            if self._last_box is not None and not static_roi and 0.0 <= (now - self._last_ts) <= self.roi_hold_s and not plaus_size:
                 lx, ly, lw, lh = self._last_box
                 rx0 = int(max(0, lx - self.roi_pad_x * s)); ry0 = int(max(0, ly - self.roi_pad_y * s))
                 rx1 = int(min(W, lx + lw + self.roi_pad_x * s)); ry1 = int(min(H, ly + lh + self.roi_pad_y * s))
@@ -757,6 +844,7 @@ class MeterContourLocator:
                     roi = (rx0, ry0, rx1, ry1)
             by0 = int(max(0, (self._band_top - 0.12) * H)); by1 = int(min(H, (self._band_bot + 0.03) * H))
             used_roi = roi is not None
+            roaming_roi = roi
             if roi is None:
                 roi = (0, by0, W, by1)
                 self.stats["full"] += 1
@@ -803,7 +891,8 @@ class MeterContourLocator:
                     wfloor = self.col_w_min_armed if armed else self.col_w_min
                     best = self._find(img[py0:py1, px0:px1], s, sub_bridge(px0, py0),
                                       (img, px0, py0), min_h=floor, w_min=wfloor,
-                                      tipless=tipless)
+                                      tipless=tipless, origin=(px0 + offset[0], py0 + offset[1]),
+                                      anchor_bounds=anch)
                     if best is not None and not anch.contains_box(
                             best[0] + px0 + offset[0], best[1] + py0 + offset[1],
                             best[2], best[3]):
@@ -816,16 +905,52 @@ class MeterContourLocator:
                             px0 + offset[0], py0 + offset[1])
                         if not expect_hit:
                             best = None
+            if (best is not None and patch is not None
+                    and self._static_rank_penalty(best, (rx0 + offset[0], ry0 + offset[1]))
+                    and not (_pa is not None and _pa.PlayerAnchor.refuse_ok(anch))):
+                # An advisory anchor may steer the search, never confine it. Its
+                # quarantined winner used to end the scan before a real meter in
+                # the band got a look, defeating the roaming-ROI bypass above.
+                # Preserve the patch result and its evidence unless the ordinary
+                # full-band gates find a clean candidate at least as confident.
+                patch_col, patch_tipless = self._find_col, self._find_tipless
+                alternative = None
+                ax0, ay0, ax1, ay1 = roaming_roi or (0, by0, W, by1)
+                # Once a real alternative has been acquired, its existing roaming
+                # ROI is the cheap next look. Keep the normal crop-context checks;
+                # a clipped candidate or a miss still opens the band this frame.
+                scopes = [(ax0, ay0, ax1, ay1, roaming_roi is not None)]
+                if roaming_roi is not None:
+                    scopes.append((0, by0, W, by1, False))
+                for ax0, ay0, ax1, ay1, local in scopes:
+                    alternative = self._find(
+                        img[ay0:ay1, ax0:ax1], s, sub_bridge(ax0, ay0), parent(ax0, ay0),
+                        tipless=tipless, origin=(ax0 + offset[0], ay0 + offset[1]),
+                        crop_edges=((ax0 > 0, ay0 > 0, ax1 < W, ay1 < H) if local else None))
+                    if not local:
+                        self.stats["full"] += 1
+                    if (alternative is not None and alternative[4] >= best[4]
+                            and not self._static_rank_penalty(
+                                alternative, (ax0 + offset[0], ay0 + offset[1]))):
+                        break
+                    alternative = None
+                self.stats["static_anchor_bypass"] = self.stats.get("static_anchor_bypass", 0) + 1
+                if alternative is not None:
+                    best = alternative
+                    rx0, ry0, used_roi = ax0, ay0, local
+                else:
+                    self._find_col, self._find_tipless = patch_col, patch_tipless
             if best is None and patch is None:
                 best = self._find(img[ry0:ry1, rx0:rx1], s, sub_bridge(rx0, ry0), parent(rx0, ry0),
                                   tipless=tipless,
+                                  origin=(rx0 + offset[0], ry0 + offset[1]),
                                   crop_edges=((rx0 > 0, ry0 > 0, rx1 < W, ry1 < H)
                                               if used_roi else None))
                 if best is None and used_roi:
                     # miss inside the ROI: re-open the band once
                     rx0, ry0 = 0, by0
                     best = self._find(img[by0:by1, 0:W], s, sub_bridge(0, by0), parent(0, by0),
-                                      tipless=tipless)
+                                      tipless=tipless, origin=(offset[0], by0 + offset[1]))
                     self.stats["full"] += 1
             elif best is None:
                 # The patch missed. A CONFIDENT anchor now owns the frame: either the band is
@@ -836,7 +961,7 @@ class MeterContourLocator:
                 if not (may_refuse and self.refuse_mode == 0):
                     rx0, ry0 = 0, by0
                     best = self._find(img[by0:by1, 0:W], s, sub_bridge(0, by0), parent(0, by0),
-                                      tipless=tipless)
+                                      tipless=tipless, origin=(offset[0], by0 + offset[1]))
                     self.stats["full"] += 1
                     if best is not None and may_refuse:
                         _bx = best[0] + rx0 + offset[0]; _by = best[1] + ry0 + offset[1]
@@ -920,6 +1045,8 @@ class MeterContourLocator:
             if now >= self._last_ts:                # an older frame landing late may not regress the clock
                 self._last_box = (x + offset[0], y + offset[1], w, h); self._last_ts = now
             self.stats["hit"] += 1
+            if not armed:
+                self.stats["idle_hit"] += 1     # [ANCHOR INSTRUMENT] proposed with no gate
             _box = (int(x + offset[0]), int(y + offset[1]), int(w), int(h))
             if _pa is not None and _pa.enabled():
                 # per-shot pickup forensics (the reader emits one PICKUP: line per press)
@@ -1126,6 +1253,54 @@ class MeterContourLocator:
             self.stats["shape_error"] += 1
             return False   # a failed measurement is not positive meter evidence
 
+    def _tipless_track_supported(self, hsv, cx, gtop, s, parent=None) -> bool:
+        """Require current track borders before inventing a missing green apex.
+
+        A sleeve/hood can grow as the player gathers, and proximity to the last
+        meter can bypass the column-shape check. Neither proves a new meter.
+        Its two dim vertical borders are independent evidence, including when
+        the cap has no green pixels. Check above the early fill, not through the
+        white component that nominated the candidate. Never bridge this proof
+        from a previous frame or accept only one nearby court line.
+        """
+        try:
+            x0, x1 = int(np.floor(cx - 18 * s)), int(np.ceil(cx + 18 * s))
+            y0 = int(np.floor(gtop + 0.08 * self.tip_gap * s))
+            y1 = int(np.ceil(gtop + 0.54 * self.tip_gap * s))
+            H, W = hsv.shape[:2]
+            if 0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H:
+                patch = hsv[y0:y1, x0:x1]
+            elif parent is not None:
+                # The ROI is an implementation detail, not an image boundary.
+                img, ox, oy = parent
+                px0, px1 = x0 + int(ox), x1 + int(ox)
+                py0, py1 = y0 + int(oy), y1 + int(oy)
+                if not (0 <= px0 < px1 <= img.shape[1]
+                        and 0 <= py0 < py1 <= img.shape[0]):
+                    return False
+                patch = cv2.cvtColor(img[py0:py1, px0:px1], cv2.COLOR_BGR2HSV)
+            else:
+                return False
+            if patch.shape[0] < max(12, int(20 * s)):
+                return False
+            neutral = (patch[:, :, 1] <= 65) & (patch[:, :, 2] >= 80)
+            center = cx - x0
+            radius = max(1, int(round(s)))
+            for lo, hi in ((-18, -5), (5, 18)):
+                a = max(0, int(np.floor(center + lo * s)))
+                b = min(neutral.shape[1], int(np.ceil(center + hi * s)))
+                if b - a < 3:
+                    return False
+                # A consistent vertical edge, with one-pixel anti-alias jitter;
+                # different bright pixels in each row do not form a track.
+                band = cv2.dilate(neutral[:, a:b].astype(np.uint8),
+                                  np.ones((1, 2 * radius + 1), np.uint8))
+                if float(band.mean(axis=0).max()) < 0.55:
+                    return False
+            return True
+        except (AttributeError, TypeError, ValueError, IndexError, OverflowError, cv2.error):
+            return False
+
     def _compact_tip(self, hsv, cx, gtop, conf, s, parent=None) -> bool:
         """Current compact-green evidence; past box proximity cannot replace it.
 
@@ -1175,7 +1350,7 @@ class MeterContourLocator:
             return False
 
     def _find(self, sub, s, bridge=None, parent=None, min_h=None, w_min=None, tipless=False,
-              crop_edges=None):
+              crop_edges=None, origin=(0, 0), anchor_bounds=None):
         """`parent` is (image, ox, oy) -- the pixels `sub` was sliced out of and its origin in
         them -- or None. It is used ONLY by [ORION_METER_TOP_STRIP], and only for the tip
         window / tip-spill ring of a candidate whose head sits above `sub`'s first row.
@@ -1186,7 +1361,10 @@ class MeterContourLocator:
         ranking at the tipless confidence; False (the default) is the shipped behaviour.
         `crop_edges` marks artificial left/top/right/bottom roaming boundaries.
         An ambiguous component there abstains so the caller scans the full band
-        on this SAME frame; crop geometry is never evidence of meter geometry."""
+        on this SAME frame; crop geometry is never evidence of meter geometry.
+        `anchor_bounds` applies the patch's existing landmark boundary BEFORE ranking.
+        Side padding remains in the pixels and component table for the lone-column
+        gate, but a padding-only candidate cannot hide an eligible in-patch meter."""
         self._find_col = None
         self._find_tipless = False
         if sub.size == 0:
@@ -1223,6 +1401,7 @@ class MeterContourLocator:
         wmax = self.col_w_max * s
         tip_gap = self.tip_gap * s
         best = None
+        best_rank = None
         best_col = None
         best_tipless = False
         # [2026-09-13] Component table as arrays. The old per-candidate Python loop over every
@@ -1236,6 +1415,28 @@ class MeterContourLocator:
         keep_mask[0] = False
         keep_idx = np.flatnonzero(keep_mask)
         cand_idx = keep_idx[(cw_all[keep_idx] >= wmin) & (cw_all[keep_idx] <= wmax)]
+        if anchor_bounds is not None and cand_idx.size:
+            # Spend the bounded shape/tip budget on possible owner-meter boxes,
+            # not larger glyphs in the patch's context pixels. Filtering only
+            # inside the loop below was too late: twelve out-of-band components
+            # hid a smaller early fade before it could be judged at all.
+            # These are the SAME centre/bottom landmarks as contains_box. The
+            # bottom gets one pixel of conservative rounding slack because by
+            # and bh are rounded separately after the tip is measured. The exact
+            # contains_box check below remains authoritative. Keep the COMPLETE
+            # component table for the lone-column gate: excluded glyphs can
+            # still disqualify an adjacent candidate as a scoreboard/jersey twin.
+            box_w = int(round(self.box_w * s))
+            centres = (np.rint(cx_all[cand_idx] + cw_all[cand_idx] * .5 - box_w * .5)
+                       + box_w * .5 + origin[0])
+            bottoms = (cy_all[cand_idx] + ch_all[cand_idx]
+                       + self.box_pad_bot * s + origin[1])
+            eligible = ((centres >= anchor_bounds.cx_lo) & (centres <= anchor_bounds.cx_hi)
+                        & (bottoms + 1.0 >= anchor_bounds.bot_lo)
+                        & (bottoms - 1.0 <= anchor_bounds.bot_hi))
+            self.stats["anchor_budget_skip"] = self.stats.get("anchor_budget_skip", 0) + int(
+                np.count_nonzero(~eligible))
+            cand_idx = cand_idx[eligible]
         order = cand_idx[np.argsort(-ca_all[cand_idx], kind="stable")][:12]
         kx, ky, kw, kh = cx_all[keep_idx], cy_all[keep_idx], cw_all[keep_idx], ch_all[keep_idx]
         for i in order:
@@ -1306,8 +1507,8 @@ class MeterContourLocator:
                 gm = cv2.inRange(cv2.cvtColor(pimg[py0:py1, px0:px1], cv2.COLOR_BGR2HSV),
                                  self._GREEN_LO, self._GREEN_HI)
                 self.stats["top_strip"] = self.stats.get("top_strip", 0) + 1
-                if hsv is None:                 # gate 9 reads it below
-                    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+                if hsv is None:                 # gate 9 reads local rectangles below
+                    hsv = _CandidateHsv(sub)
             tip_clamped = False
             if gm is None:
                 # The tip prior may sit ABOVE this sub-image (the ROI is a tight box around the
@@ -1319,7 +1520,7 @@ class MeterContourLocator:
                 if ty1 - ty0 < 3:
                     continue
                 if hsv is None:
-                    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+                    hsv = _CandidateHsv(sub)
                 gm = cv2.inRange(hsv[ty0:ty1, tx0:tx1], self._GREEN_LO, self._GREEN_HI)
             conf = 0.90
             cand_tipless = False
@@ -1357,11 +1558,21 @@ class MeterContourLocator:
             else:
                 self.stats["no_tip"] += 1
                 continue
+            # Capless first sight needs the current HUD track, even when a
+            # previous nearby box would otherwise bridge the shape/rise gates.
+            # Refuse inside the candidate loop so a real smaller meter can win.
+            if cand_tipless and not self._tipless_track_supported(hsv, cx, gtop, s, parent):
+                self.stats["tipless_no_track"] = self.stats.get("tipless_no_track", 0) + 1
+                continue
             # box from the two landmarks
             bw = int(round(self.box_w * s))
             bx = int(round(cx - bw * 0.5))
             by = int(round(gtop - self.box_pad_top * s))
             bh = int(round((wbot - gtop) + self.box_pad_top * s + self.box_pad_bot * s))
+            if anchor_bounds is not None and not anchor_bounds.contains_box(
+                    bx + origin[0], by + origin[1], bw, bh):
+                self.stats["anchor_padding_skip"] = self.stats.get("anchor_padding_skip", 0) + 1
+                continue
             # gate 9 (2026-09-12): first sight must have the meter's shape; a candidate at the
             # place of the box accepted a moment ago is tracking, not first sight. Refusing here,
             # inside the loop, is what lets the real meter win when a jersey out-ranks it on area.
@@ -1390,8 +1601,13 @@ class MeterContourLocator:
                 elif not self._meter_shaped(labels, i, x, y, w, h, area, hsv, cx, gtop, conf, s,
                                             parent, min_h):
                     continue
-            # a confirmed tip (0.90) out-ranks the meter-tall fallback (0.75); area breaks ties
-            if best is None or (conf, area) > (best[4], best[-1]):
+            # Confidence still wins. Only within the SAME evidence tier does a known
+            # static object's area stop monopolizing the scan. If all candidates are
+            # quarantined (or it is the sole candidate), the original winner survives.
+            penalized = self._static_rank_penalty((bx, by, bw, bh), origin)
+            rank = (conf, not penalized, area)
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
                 best = (bx, by, bw, bh, conf, area)
                 # the WHITE run behind the winning box, in `sub` coordinates: the expectation
                 # window judges the fill's own height, not the landmark box's

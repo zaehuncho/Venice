@@ -1,0 +1,47 @@
+{
+  "_meta": {
+    "status": "DRAFT 2026-09-22 - NOT POSTED. Owner picks the channel and posts; nothing sends this automatically.",
+    "suggested_channel": "#setup-guide (as a second embed) or an announcements post",
+    "evidence": "docs/variance/OFFSET_SWEEP_RESULT_2026-09-22.md, docs/variance/SESSION_CENTRE_TRACKING_DESIGN_2026-09-22.md, memory long-range-misses-are-window-width. Numbers are from the owner's own online test sessions 09-15..09-22; keep them hedged as 'in our testing'.",
+    "do_not_claim": "a guaranteed make rate; that the lates are fixed; that it is definitely 2K's servers (we have ruled out the PC, the home network and the server->console direction, not the console->server leg)"
+  },
+  "message": {
+    "embeds": [
+      {
+        "title": "Online timing: why you still see the odd LATE",
+        "color": 2450411,
+        "description": "Venice times every shot off the meter it sees. Online, your release also has to travel from your console to 2K's servers, and that trip is not the same length every shot. Venice can't see it before the shot, so no tool can remove it completely. Here's what we've measured and what helps.",
+        "fields": [
+          {
+            "name": "What to expect",
+            "value": "In our own online testing, open standstills from normal range green roughly **7 in 10**, and more on a good connection. Offline modes are much more consistent, because there's no server leg to vary.",
+            "inline": false
+          },
+          {
+            "name": "Late streaks are the connection, not your settings",
+            "value": "When a shot comes back LATE, the next one is more likely to be late too, and it usually clears within a few seconds. Venice fires at the same point on the meter every time. What changes is how long your release takes to land. **Don't move Shot Lead after one or two lates.** It resets what Venice has learned and usually makes the next session worse.",
+            "inline": false
+          },
+          {
+            "name": "Deep shots have smaller windows",
+            "value": "From 30 ft and beyond, 2K shrinks the green window a lot. Venice still picks up the meter the same way, but a smaller target means more early *and* late misses. Higher 3PT and Mid-Range ratings widen the window.",
+            "inline": false
+          },
+          {
+            "name": "What helps",
+            "value": "• **Wired Ethernet** for the console (and the PC if you use Remote Play). Avoid Wi-Fi.\n• Pause downloads, streams and big uploads on your network while you play.\n• After a LATE, take a beat before the next shot.\n• Keep your capture at 60 Hz and leave Shot Lead alone once it's tuned.",
+            "inline": false
+          },
+          {
+            "name": "What we're working on",
+            "value": "We're testing a correction that uses the late streak itself: after a LATE, Venice nudges the next shot slightly earlier. It ships only if our testing proves it helps.",
+            "inline": false
+          }
+        ],
+        "footer": {
+          "text": "Venice • numbers are from our own online testing, not a guarantee"
+        }
+      }
+    ]
+  }
+}

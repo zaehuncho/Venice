@@ -5,6 +5,7 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QLatin1Char>
 #include <QtCore/QString>
+#include <cmath>
 
 namespace orion {
 
@@ -67,7 +68,7 @@ namespace orion {
 // refreshes the type on WITHOUT moving the press timestamp.
 [[nodiscard]] inline QJsonObject makeShotGateArmCommand(
     const QString& source, quint64 physicalShotEpoch,
-    const QString& shotType = QString(), bool rhythm = false)
+    const QString& shotType = QString(), bool rhythm = false, double pressWallMsEpoch = 0.0)
 {
     QJsonObject command{
         {QStringLiteral("cmd"), QStringLiteral("shot_gate_arm")},
@@ -81,6 +82,11 @@ namespace orion {
         command.insert(QStringLiteral("shot_type"), encodedType);
     }
     command.insert(QStringLiteral("rhythm"), rhythm ? 1 : 0);
+    // Diagnostic only: observed physical edge, not delayed sidecar receipt.
+    // Missing/invalid stamps remain unknown on old or probe-only paths.
+    if (std::isfinite(pressWallMsEpoch) && pressWallMsEpoch > 0.0) {
+        command.insert(QStringLiteral("press_ms"), pressWallMsEpoch);
+    }
     return command;
 }
 

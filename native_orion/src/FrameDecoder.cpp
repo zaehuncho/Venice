@@ -52,6 +52,20 @@ void FrameDecoder::submit(QByteArray base64Jpeg, int frameNumber)
     cv_.notify_one();
 }
 
+void FrameDecoder::retirePending()
+{
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++generation_;
+    hasPending_ = false;
+    pending_.clear();
+    pendingFrame_ = -1;
+    hasReady_ = false;
+    readyImage_ = QImage{};
+    readyFrame_ = -1;
+    // Keep deliveryScheduled_: an already-queued GUI wake safely observes the
+    // empty mailbox, or a new producer's image if one arrives first.
+}
+
 FrameDecoderStats FrameDecoder::stats() const noexcept
 {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -94,6 +108,7 @@ void FrameDecoder::threadLoop()
     for (;;) {
         QByteArray b64;
         int frameNumber = -1;
+        quint64 generation = 0;
         {
             std::unique_lock<std::mutex> lk(mutex_);
             cv_.wait(lk, [this]() { return hasPending_ || stop_; });
@@ -102,6 +117,7 @@ void FrameDecoder::threadLoop()
             }
             b64 = std::move(pending_);
             frameNumber = pendingFrame_;
+            generation = generation_;
             hasPending_ = false;
         }
 
@@ -123,6 +139,9 @@ void FrameDecoder::threadLoop()
             // QObject invocation once the destructor has asked the worker to stop.
             if (stop_) {
                 return;
+            }
+            if (generation != generation_) {
+                continue;
             }
             ++decoded_;
             if (hasReady_) {

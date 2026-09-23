@@ -57,5 +57,21 @@ Button {
             return Theme.borderStrong
         }
         border.width: 1
+
+        // The website's primary button carries a one-pixel inner highlight; so does this one.
+        Rectangle {
+            visible: control.isPrimary && control.enabled
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 1
+            height: Math.round(parent.height * 0.5)
+            radius: parent.radius
+            gradient: Gradient {
+                orientation: Gradient.Vertical
+                GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.16) }
+                GradientStop { position: 1.0; color: "transparent" }
+            }
+        }
     }
 }

@@ -100,17 +100,30 @@ of 22`; production native `100% tests passed out of 22` (incl. `OrionShotVerdict
 
 ## Step 2 — Build the required Lethe server-shard package
 
-> **BLOCKED (2026-09-19):** `--server-shard` deliberately refuses before it
-> copies the package. The current app learns its customer session only after
-> `OrionNative.exe` runs, while the shard bootstrap needs that session before it
-> can decrypt and run `OrionNative.exe`. A signed outer activation broker must
-> first create the DPAPI `shard_session.dat` and launch the bootstrap. Do not
-> bypass this gate or publish an unpacked fallback; see
-> `docs/SERVER_SHARD_2026-09-19.md` D2/D3.
+> **ASSEMBLING + VERIFYING, fail-closed (2026-09-20 packer hardening).** The
+> activation broker exists (round 3). `--server-shard` now ASSEMBLES the three-exe
+> chain — Lethe-pack the app to `OrionNative.packed.exe`, stage the verified
+> `LetheShardBootstrap.exe` as `OrionNative.exe`, stage the UNPACKED broker as
+> `OrionActivate.exe` — signs the customer manifest, and the gate VERIFIES every
+> shard essential is present AND manifest-covered, failing closed on any gap. The
+> owner is **cert-free**: the broker is not Authenticode-signed; the Ed25519-signed
+> release manifest that covers `OrionActivate.exe` is a package-INTEGRITY record and
+> **NOT a sufficient sole bootstrap trust anchor** — a replacement broker can simply omit the self-check, and Windows loads the broker's app-local imports before its code runs (red team 2026-09-20; see the OPEN blocker in `docs/PACKING_RUNBOOK.md`). See
+> `docs/SERVER_SHARD_2026-09-19.md` and `docs/ACTIVATION_BROKER_2026-09-19.md`.
+>
+> **RIG prerequisites** (do these before the shard pack): build
+> `LetheShardBootstrap.exe` and the packed app on a **pinned clean Lethe commit**
+> (the wrapper records packer provenance and REFUSES a dirty tree — pin with
+> `--expected-packer-commit`), build the round-3 `OrionActivate.exe`, and provide
+> the `VeniceSigning` Ed25519 key. Point the wrapper at these with
+> `--bootstrap-exe`, `--broker-exe` (or the `LETHE_SHARD_BOOTSTRAP` /
+> `ORION_ACTIVATE_BROKER` env vars). Shard/edge/TOTP secrets are supplied via the
+> environment only (`LETHE_SHARD_ADMIN_SECRET`, `LETHE_SHARD_EDGE_AUTH`,
+> `LETHE_SHARD_ADMIN_TOTP`, `LETHE_SHARD_PIN_PEM`) — never on the command line.
 
 The release command is shard-enabled so omission cannot silently ship the
-unprotected executable. Until the broker exists, its expected result is the
-explicit blocker above and **no output package mutation**.
+unprotected executable. On a machine missing any chain input, the expected result
+is the explicit fail-closed refusal and **no output package mutation**.
 
 ### Option B — Lethe-pack first (extra tamper-resistance)
 The pack wrapper's own smokes launch `OrionOwner.exe`/`OrionStaff.exe`, so it must run against
@@ -128,10 +141,39 @@ behind. Regenerate the full package, then pack it:
   --signing-key "C:\Users\aaron\Desktop\VeniceSigning\venice_update_signing.pem"
 ```
 
-**After the signed broker is implemented and the gate is replaced by its tested
-three-stage package assembly, success must print:** `[orion-pack] tamper refusal OK` then `[orion-pack] OK`, and write
-`release\orion-package-packed\` (packed `OrionOwner/OrionStaff/OrionNative/OrionUpdater`,
-re-signed manifest) plus `release\orion-packing-report.json`.
+On a complete rig (chain inputs present + `VeniceSigning` key), success prints the
+internal admin OK, `[orion-pack] customer startup integrity OK`, `[orion-pack] tamper
+refusal OK: ...` for each class, then `[orion-pack] OK`, and atomically promotes
+`release\orion-package-packed\` (packed inner `OrionNative.packed.exe`, bootstrap staged
+as `OrionNative.exe`, unpacked `OrionActivate.exe`, signed **customer** manifest with
+Owner/Staff stripped) plus `release\orion-package-packed-<v>.zip`,
+`release\update_manifest.json`, and the REDACTED `release\orion-packing-report.json`.
+
+Shard pack command (rig):
+
+```powershell
+"C:\...\python.exe" tools\security\pack_lethe_release.py `
+  --server-shard `
+  --bootstrap-exe C:\Users\aaron\Desktop\Lethe\bootstrap\build\Release\LetheShardBootstrap.exe `
+  --broker-exe native_orion\build_prod_codex\Release\OrionActivate.exe `
+  --expected-packer-commit <pinned-clean-lethe-commit> `
+  --signing-key "C:\Users\aaron\Desktop\VeniceSigning\venice_update_signing.pem"
+```
+
+`--expected-packer-commit` is **mandatory** for a production (production-key) pack, and
+`--allow-dirty-packer` is refused there; both relaxations require
+`--non-production-build`, which refuses the production key and stamps
+`"production": false` into the report. Re-check a finished package read-only with:
+
+```powershell
+"C:\...\python.exe" tools\security\pack_lethe_release.py --verify-only `
+  --input release\orion-package-packed --server-shard
+```
+
+which enforces the full customer acceptance test (zero unmanifested files,
+audience=customer, no Owner/Staff, fail-closed `security_policy.json`, profile-aware
+executable admission) on top of the signature/hash check. The installer build runs the
+same gate before ISCC and refuses to compile from an unverified package.
 
 **Gotchas / mismatches to know:**
 * Default pack targets are `OrionOwner,OrionStaff,OrionNative,OrionUpdater` — present only in

@@ -2,6 +2,7 @@
 
 #include "AppConfig.h"
 #include "BannerLeadTrim.h"
+#include "OnsetFeedforward.h"
 #include "GameFramePhase.h"
 #include "FadePhaseCatchup.h"
 #include "OrionExports.h"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <random>
 
 class AutomationEngineTests;
 
@@ -173,9 +175,10 @@ struct RemapConfig {
     int sprintReleaseR2Threshold = 200;
     // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] The corrected fix: LATCH the output R2 at its
     // edge value for this long after a deep-held Square press, so the player's own trigger release
-    // cannot land in the same game frame as the button. 0 = inert. See
+    // cannot land in the same game frame as the button. 0 = inert and is the shipped default;
+    // the live feature remains available only as an explicit A/B. See
     // AppConfigData::squarePressR2HoldMs.
-    double squarePressR2HoldMs = 50.0;
+    double squarePressR2HoldMs = 0.0;
     // No-Dip shot mode: a no-dip jumpshot skips the gather/dip, so it releases earlier. When on,
     // add noDipLeadMs to the release lead (live-tuned; default 0 = inert).
     bool noDipEnabled = false;
@@ -360,6 +363,13 @@ struct RemapConfig {
     // banner_trim_bias_votes = 0 disables it and restores the 2026-09-17 loop byte-for-byte.
     int bannerTrimBiasWindow = 12;
     int bannerTrimBiasVotes = 0;   // ships OFF; see AppConfigData::bannerTrimBiasVotes
+    // [ORION_ONSET_FF 2026-09-21] The per-shot onset feedforward limits (OnsetFeedforward.h),
+    // copied from AppConfigData with the env overrides applied in applyConfig.
+    double onsetFeedforwardGain = 0.2;
+    double onsetFeedforwardClampMs = 10.0;
+    int onsetFeedforwardWindow = 10;
+    int onsetFeedforwardMinSamples = 4;
+    bool onsetFeedforwardOneSided = true;
     // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16 owner] The FIXED per-shot-type addition to the Shot
     // Lead, in ms, keyed on the same four buckets BannerLeadTrim uses so the constant offset and
     // the closed loop can never disagree about what a fade is. Positive = a larger lead = fire
@@ -3409,6 +3419,10 @@ public:
     [[nodiscard]] quint64 tempoMovementCommitGeneration() const noexcept;
     void confirmTempoMovementCommit(quint64 generation, bool accepted);
     void reset();
+    // [ORION_ONSET_FF 2026-09-21] A context change the engine cannot see itself (the court IP
+    // lives in RemotePlaySession): drops the onset feedforward's reference so the next shots
+    // start cold. Wired from OrionAppController on RemotePlaySession::courtChanged.
+    void noteContextChanged(const QString& reason);
     // User-driven per-type calibration (launcher Calibrate/Lock panel). Recalibrate drops a type back
     // to ACQUIRE (re-converge); Lock freezes its dialed clock (micro-trim only). Both persist via
     // calPhaseUpdated.
@@ -4620,6 +4634,15 @@ private:
                                double onsetMs,
                                orion::BannerLeadTrim::Range range
                                    = orion::BannerLeadTrim::Range::Unknown);
+    // [ORION_ONSET_FF 2026-09-21] Feed the feedforward's reference ring with a completed shot's
+    // onset. Called from noteBannerTrimRelease so the stamp is the one the trim already trusts.
+    void noteOnsetFeedforwardRelease(quint64 physicalShotEpoch, const QString& shotType,
+                                     double onsetMs);
+    // [ORION_LATE_CARRY 2026-09-22] The attributed verdict of a release, for the late carry.
+    void noteLateCarryVerdict(quint64 physicalShotEpoch, const QString& timing);
+    // [ORION_LATE_CARRY 2026-09-22] How many ms earlier THIS shot fires because the previous one
+    // was graded LATE (0 = no carry). One decision per physical shot; logs `LATE CARRY:`.
+    [[nodiscard]] double lateCarryForShotMs(double now);
     // [ORION_BANNER_TRIM_TEMPO 2026-09-16] The LIVE shot's meter onset -- firstMeterSeenMs (the
     // first GENUINE fresh accept, the same instant Release timing's appearToRelMs is measured
     // from) minus the physical Square edge. -1 whenever either end is missing, which every
@@ -4637,7 +4660,8 @@ private:
                                             orion::BannerLeadTrim::Range* range = nullptr) const;
     [[nodiscard]] bool consumeBannerTrimRelease(quint64 physicalShotEpoch, QString& shotType,
                                                double& onsetMs,
-                                               orion::BannerLeadTrim::Range* range = nullptr);
+                                               orion::BannerLeadTrim::Range* range = nullptr,
+                                                double* onsetFfMs = nullptr);
     // Apply every parked oracle whose banner grace has expired. Cheap no-op when nothing is
     // parked, which is the state on every tick that is not within 2.6 s of a release.
     void flushExpiredReleaseOracles(double atMs);
@@ -5653,6 +5677,12 @@ private:
     // schedFireDeadlineMs_ directly (tick-lock nudge write-back, test state placement) keeps the
     // pair coherent; with the hook disarmed this is 0.0 and the comparisons are bit-identical.
     double schedFireAppliedDevOffsetMs_ = 0.0;
+    // [ORION_ONSET_FF 2026-09-21] The onset feedforward displacement carried by the armed token,
+    // on the same derived-not-stored contract as the dev offset above: the undisplaced deadline
+    // is (schedFireDeadlineMs_ - dev - this), and every lease bound that admits a positive dev
+    // displacement admits the SUM. 0.0 whenever the term did not apply.
+    double schedFireAppliedOnsetFfMs_ = 0.0;
+    double lastReleaseOnsetFfMs_ = 0.0;    // displacement carried by the token that actually fired
     // [ORION_DEV_FIRE_OFFSET] Dev-only commanded per-shot fire-time displacement, for the sweep
     // experiment that grades displaced fires with the game's own banner (the only instrument a
     // capture-side observation grid cannot contaminate). Compiled out of production builds and
@@ -6194,6 +6224,15 @@ private:
     // and, verbatim, as the `backstop=` field on the unanswered-press abort line, so the next
     // diagnosis is READ rather than inferred.
     [[nodiscard]] QString meterBlindBackstopBlockReason(double now) const;
+public:
+    // [CL2-P9-001 2026-09-23] Set by the controller while meter detection is unavailable (3 armed
+    // shots in a row with no genuine detection; cleared only after 2 OWNED shots). While set, the
+    // blind backstop never releases: the player's own Square passes through untouched, exactly as
+    // with ORION_METER_BLIND_BACKSTOP=0. A timer shot on patch day looks like a broken bot.
+    void setDetectionUnavailable(bool unavailable) noexcept { detectionUnavailable_ = unavailable; }
+    [[nodiscard]] bool detectionUnavailable() const noexcept { return detectionUnavailable_; }
+private:
+    bool detectionUnavailable_ = false;
     // Is there a meter candidate on screen for the CURRENTLY PENDING press that is still climbing
     // toward its tip? The meter-path twin of noMeterVisionCandidateRising(), asking the same
     // question of the only evidence that exists before ownership: the pending ownership episode.
@@ -6268,6 +6307,8 @@ private:
     // epoch rather than cleared per press, so a stale latch can never be read as this press's
     // evidence (a new press carries a new, larger epoch).
     quint64 pendingMeterFirstSeenEpoch_ = 0;
+    quint64 ownershipTraceEpoch_ = 0;
+    int ownershipTraceSamples_ = 0;
     double pendingMeterFirstSeenMs_ = -1.0;
     // === [ORION_NO_METER_V2 2026-09-14] the hold learner ==================================
     // One accepted VISION-path landing -> one observation of that type's press->release hold.
@@ -6418,6 +6459,34 @@ private:
     // the save path, exactly as the NO METER hold's does), the Shot Lead the trim belongs to, and
     // the small ring of recent releases a verdict is attributed against.
     orion::BannerLeadTrim bannerLeadTrim_;
+    // [ORION_ONSET_FF 2026-09-21] The per-shot onset feedforward (OnsetFeedforward.h). Its
+    // reference ring is fed at the release, from the same stamp the banner trim's ring uses.
+    orion::OnsetFeedforward onsetFeedforward_;
+    quint64 onsetFeedforwardLastEpoch_ = 0;                // one observation per physical epoch
+    // [2026-09-22 VARIANCE HUNT] per-shot randomised feedforward arms (ORION_ONSET_FF_AB); empty = off.
+    QVector<orion::OnsetFeedforwardArm> onsetFfAbArms_;
+    quint64 onsetFfAbKey_ = ~quint64{0};
+    int onsetFfAbArm_ = -1;
+    std::mt19937 onsetFfAbRng_{std::random_device{}()};
+    // [ORION_LATE_CARRY 2026-09-22] docs/variance/SESSION_CENTRE_TRACKING_DESIGN_2026-09-22.md.
+    // A LATE verdict predicts the NEXT shot is late too (P(LATE) 11% -> 43% at a median onset,
+    // one shot deep), so the next shot fires lateCarry ms earlier. Dev-only for now: the carry is
+    // armed solely by ORION_DEV_LATE_CARRY_AB (randomised K per eligible shot) until the
+    // pre-registered A/B says what K ships; a production build never arms it.
+    QVector<double> lateCarryAbArmsMs_;               // empty = off
+    quint64 lateCarryPrevEpoch_ = 0;                  // the most recent release
+    QString lateCarryPrevBucket_;
+    double lateCarryPrevReleaseMs_ = -1.0;            // nowMs() at that release
+    int lateCarryPrevVerdict_ = 0;                    // 0 unknown, 1 LATE, 2 other
+    quint64 lateCarryShotKey_ = ~quint64{0};
+    double lateCarryShotMs_ = 0.0;
+    int lateCarryShotArm_ = -1;
+    QString lateCarryShotReason_;
+    std::mt19937 lateCarryRng_{std::random_device{}()};
+    static constexpr double kLateCarryWindowMs = 7000.0;   // previous release -> this shot
+    static constexpr double kLateCarryMaxMs = 15.0;
+    quint64 onsetFeedforwardLoggedToken_ = ~quint64{0};    // one ONSET FF line per arm token
+    QString onsetFeedforwardLoggedReason_;
     bool bannerLeadTrimLoaded_ = false;
     double bannerTrimUserLeadMs_ = std::numeric_limits<double>::quiet_NaN();
     // === [ORION_LEAD_AUTO_SEED 2026-09-15] the plug-and-play Shot Lead's own state ============
@@ -6447,6 +6516,10 @@ private:
         // and shot_ is a different shot (or idle) by then -- the same reason the shot TYPE is
         // carried on this ring.
         double onsetMs = -1.0;
+        // [ORION_ONSET_FF 2026-09-21] The feedforward displacement this release actually fired
+        // with (0 when none). A displaced release is not evidence about the lead, so its verdict
+        // and its oracle are refused by the trim exactly as a contested one is.
+        double onsetFfMs = 0.0;   // [ORION_ONSET_FF]
         // [ORION_BANNER_TRIM_RANGE 2026-09-17] ...and for the identical reason, the RANGE the
         // press was read at. A verdict must be filed in the bucket the shot spent, not in the
         // bucket whatever is on screen three seconds later would key.

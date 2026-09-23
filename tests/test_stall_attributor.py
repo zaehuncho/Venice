@@ -150,7 +150,17 @@ def test_a_heavy_collection_logs_a_gc_line(attrib_on, caplog):
         del junk
         with caplog.at_level(logging.WARNING, logger="stall_attrib"):
             gc.collect(2)
-            a.drain_once()
+            # The watchdog may take the queued gen-2 event before this thread's
+            # explicit drain. Its log call then races our caplog snapshot, so
+            # wait for the observable record rather than assuming one drain is
+            # a synchronous logging barrier across both threads.
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline:
+                a.drain_once()
+                if any("gen=2" in r.getMessage() for r in caplog.records
+                       if r.getMessage().startswith("GC:")):
+                    break
+                time.sleep(0.005)
         lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("GC:")]
         assert lines, [r.getMessage() for r in caplog.records]
         # gc_ms=0.0 here, so incidental gen-0/1 sweeps log too; the gen-2 one is the subject.

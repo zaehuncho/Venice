@@ -68,3 +68,73 @@ def test_reader_retires_connection_at_rejection_limit(monkeypatch, reason):
     assert len(chunks) == 2  # The old connection is not resumed after the latch.
     assert not b._ready_evt.is_set()
     assert b._wire_pts_last == 10_000
+
+
+@pytest.mark.parametrize('future_ns', [2_000_001, 500_000_000, 10_000_000_000])
+def test_bug_sweep_future_frame_cannot_poison_publication_order(monkeypatch, future_ns):
+    import numpy as np
+    from chiaki_backend import FrameData, FrameRingBuffer
+    now=1_000_000_000
+    monkeypatch.setattr('chiaki_backend.time.perf_counter_ns', lambda: now)
+    ring=FrameRingBuffer(max_frame_age_ns=50_000_000)
+    def frame(t):
+        return FrameData(np.zeros((2, 2, 3), dtype=np.uint8), capture_timestamp_ns=t,
+                         timestamp_ns=t, source_generation=1)
+    first=frame(now-1_000_000)
+    assert ring.put(first)
+    assert not ring.put(frame(now+future_ns))
+    assert ring.last_put_rejection == 'publication_timestamp_future'
+    assert ring.get_latest_nonblocking() is first
+    assert ring.put(frame(now))  # rejected future must not poison high-water state
+
+
+def test_bug_sweep_future_rounding_tolerance_matches_decoder(monkeypatch):
+    import numpy as np
+    from chiaki_backend import FrameData, FrameRingBuffer
+    monkeypatch.setattr('chiaki_backend.time.perf_counter_ns', lambda: 1_000_000_000)
+    ring=FrameRingBuffer(max_frame_age_ns=50_000_000)
+    frame=FrameData(np.zeros((2, 2, 3), dtype=np.uint8), capture_timestamp_ns=1_002_000_000)
+    assert ring.put(frame)
+    assert ring.get_latest_nonblocking() is frame
+
+
+def test_bug_sweep_old_generation_completion_does_not_replace_new_pixels(monkeypatch):
+    import numpy as np
+    from chiaki_backend import FrameData, FrameRingBuffer
+    now=1_000_000_000
+    monkeypatch.setattr('chiaki_backend.time.perf_counter_ns', lambda: now)
+    ring=FrameRingBuffer(max_frame_age_ns=50_000_000)
+    new=FrameData(np.zeros((2, 2, 3), dtype=np.uint8), capture_timestamp_ns=now-10,
+                  source_generation=2)
+    old=FrameData(np.ones((2, 2, 3), dtype=np.uint8), capture_timestamp_ns=now-1,
+                  source_generation=1)
+    assert ring.put(new)
+    assert not ring.put(old)
+    assert ring.last_put_rejection == 'publication_source_generation_old'
+    assert ring.get_latest_nonblocking() is new
+    ring.clear()
+    assert ring.put(old)  # explicit lifecycle reset permits a new numbering domain
+
+
+
+def test_bug_sweep_future_frame_is_also_rejected_at_consumption(monkeypatch):
+    import numpy as np
+    from chiaki_backend import FrameData,FrameRingBuffer
+    now=1_000_000_000
+    monkeypatch.setattr('chiaki_backend.time.perf_counter_ns',lambda:now)
+    ring=FrameRingBuffer(max_frame_age_ns=50_000_000)
+    f=FrameData(np.zeros((2,2,3),dtype=np.uint8),capture_timestamp_ns=now)
+    assert ring.put(f)
+    now -= 3_000_000  # inconsistent clock domain must not look permanently fresh
+    assert ring.get_latest_nonblocking() is None
+    assert not ring._event.is_set()
+
+
+def test_bug_sweep_legacy_ring_has_no_new_clock_or_generation_requirement(monkeypatch):
+    import numpy as np
+    from chiaki_backend import FrameData,FrameRingBuffer
+    ring=FrameRingBuffer()
+    first=FrameData(np.zeros((2,2,3),dtype=np.uint8),source_generation=9)
+    last=FrameData(np.ones((2,2,3),dtype=np.uint8),source_generation=0)
+    assert ring.put(first) and ring.put(last)
+    assert ring.get_latest_nonblocking() is last

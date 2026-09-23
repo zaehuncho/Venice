@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "AppConfig.h"
 #include "LeadCalibrationPolicy.h"
 #include "ApplicationShutdownPolicy.h"
@@ -9,6 +11,7 @@
 #include "ControllerDeviceSelector.h"
 #include "InputSessionRetryPolicy.h"
 #include "LeaseGate.h"
+#include "LicenseHeartbeatPolicy.h"   // [CL2-P8-002 2026-09-23]
 #include "LatencyRouteAttestationHandshake.h"
 #include "LicenseClient.h"
 #include "LiveMeterHudPolicy.h"
@@ -34,6 +37,7 @@
 #include <QtCore/QVariantList>
 #include <QtCore/QObject>
 #include <QtCore/QAbstractNativeEventFilter>
+#include <QtCore/QElapsedTimer>   // [CL2-P8-002 2026-09-23]
 #include <QtCore/QHash>
 #include <QtCore/QRect>
 #include <QtCore/QSize>
@@ -165,6 +169,11 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(QString motdLevel READ motdLevel NOTIFY motdChanged)   // info | warn | maint
     Q_PROPERTY(double motdUntil READ motdUntil NOTIFY motdChanged)    // Unix seconds; 0 == no expiry
     Q_PROPERTY(bool motdVisible READ motdVisible NOTIFY motdChanged)
+    // [CL2-P8-002 2026-09-23] Plain customer copy while the fire lease blocks
+    // automation for a signed-in user (offline, after sleep, server unreachable,
+    // PC clock off). Empty when shots are allowed. RemotePlayPage shows it in the
+    // top-centre banner slot (outranks the MOTD); TopStatusBar shows "Reconnecting".
+    Q_PROPERTY(QString leaseNotice READ leaseNotice NOTIFY leaseNoticeChanged)
     // ── Licence / profile facts (bound by the Sidebar licence strip + flyout) ─────────────────────────────────
     // The backend's `profile` block on /api/activate + every /api/license/check
     // heartbeat (LicenseProfile, LicenseClient.h), refreshed on both. The CURRENT
@@ -289,6 +298,8 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(QString consoleIp READ consoleIp WRITE setConsoleIp NOTIFY settingsChanged)
     Q_PROPERTY(QString remotePlayConsole READ remotePlayConsole WRITE setRemotePlayConsole NOTIFY settingsChanged)
     Q_PROPERTY(QString xboxRemotePlayWindowTitle READ xboxRemotePlayWindowTitle WRITE setXboxRemotePlayWindowTitle NOTIFY settingsChanged)
+    // [2026-09-21 beta] One-time "Xbox timing is untested" acknowledgement; gates Xbox session start.
+    Q_PROPERTY(bool xboxUntestedAcknowledged READ xboxUntestedAcknowledged WRITE setXboxUntestedAcknowledged NOTIFY settingsChanged)
     Q_PROPERTY(bool streamSetupComplete READ streamSetupComplete NOTIFY settingsChanged)
     // First-run preflight wizard (capture card / Remote Play / test shot) finished or
     // skipped once. AppShell auto-opens the wizard while this is false.
@@ -296,6 +307,7 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(bool legalAccepted READ legalAccepted NOTIFY settingsChanged)
     Q_PROPERTY(QString videoSource READ videoSource WRITE setVideoSource NOTIFY settingsChanged)
     Q_PROPERTY(int captureCardIndex READ captureCardIndex WRITE setCaptureCardIndex NOTIFY settingsChanged)
+    Q_PROPERTY(bool captureCardSelected READ captureCardSelected NOTIFY captureDevicesChanged)
     // [ORION_CAPTURE_FPS 2026-09-14] Capture-card refresh rate. The setter SNAPS to {30, 60, 120}
     // (AppConfigData::snappedCaptureCardFps), so QML can only ever persist a rate the card can be
     // asked for. Reaches the sidecar as ORION_CAPTURE_FPS.
@@ -893,6 +905,7 @@ public:
     // Hides the current MOTD for this process only; the next notice with a
     // different text shows again.
     Q_INVOKABLE void dismissMotd();
+    [[nodiscard]] QString leaseNotice() const { return leaseNotice_; }   // [CL2-P8-002 2026-09-23]
     // ── Profile page accessors (see the Q_PROPERTY block above) ──────────────
     [[nodiscard]] bool profileKnown() const noexcept { return profile_.known; }
     [[nodiscard]] QString profileDiscordId() const noexcept { return profile_.discordUserId; }
@@ -957,6 +970,7 @@ public:
     // inverted in UI copy before, and inverting it makes the calibration DIVERGE).
     LeadCalibrationState leadCal_{};
     bool leadCalActive_ = false;
+    double leadCalStartLeadMs_ = 0.0;   // restored on Cancel (CL/GM-006, CX-007)
     // [ORION_UPDATE_NO_LOCKOUT] A failed update must never be worse than no update. These record
     // the target version of an attempt in the per-user data dir, so a ForceUpdate gate that
     // cannot apply (typically: install dir in Program Files, updater launched unelevated) is
@@ -1025,6 +1039,8 @@ public:
     [[nodiscard]] QString remotePlayConsole() const noexcept { return config_.data().remotePlayConsole; }
     [[nodiscard]] QString xboxRemotePlayWindowTitle() const { return config_.data().xboxRemotePlayWindowTitle; }
     void setXboxRemotePlayWindowTitle(const QString& value);
+    [[nodiscard]] bool xboxUntestedAcknowledged() const noexcept { return config_.data().xboxUntestedAcknowledged; }
+    void setXboxUntestedAcknowledged(bool value);
     Q_INVOKABLE QStringList xboxRemotePlayWindows() const;
     Q_INVOKABLE void openXboxRemotePlay();
     [[nodiscard]] bool streamSetupComplete() const noexcept { return config_.data().streamSetupComplete; }
@@ -1036,6 +1052,12 @@ public:
     }
     [[nodiscard]] QString videoSource() const noexcept { return isXboxRemotePlay(config_.data()) ? QStringLiteral("wgc") : config_.data().videoSource; }
     [[nodiscard]] int captureCardIndex() const noexcept { return config_.data().captureCardIndex; }
+    [[nodiscard]] bool captureCardSelected() const noexcept {
+        const auto& data = config_.data();
+        return data.captureCardIndex >= 0 && data.captureCardIndex < captureDeviceIds_.size()
+            && !data.captureCardDeviceId.isEmpty()
+            && captureDeviceIds_[data.captureCardIndex] == data.captureCardDeviceId;
+    }
     [[nodiscard]] int captureCardFps() const noexcept { return config_.data().captureCardFps; }
     [[nodiscard]] QStringList captureDeviceList() const { return captureDeviceList_; }
     [[nodiscard]] bool hardwareDecode() const noexcept { return config_.data().hardwareDecode; }
@@ -1171,8 +1193,11 @@ public:
     // directly above this line, so naming them is the whole instruction.
     [[nodiscard]] QString meterBlindHint() const
     {
+        // [CL2-P9-001 2026-09-23] Say what the bot is DOING first: the old text sent customers into
+        // settings that were already correct while shots kept releasing on a timer.
         return QStringLiteral(
-            "Check the Style and Color settings match your in-game meter.");
+            "Meter detection unavailable. Venice is not timing your shots until it sees the meter "
+            "again. Check the in-game meter is Arrow2 / White.");
     }
     [[nodiscard]] QString detectorHealthLine() const { return detectorHealthLine_; }
     [[nodiscard]] QString detectorProvider() const { return detectorProvider_; }
@@ -1870,6 +1895,7 @@ public slots:
 
 signals:
     void authChanged();
+    void leaseNoticeChanged();   // [CL2-P8-002 2026-09-23]
     void motdChanged();
     // Profile block refreshed (activation or heartbeat). Its own low-fanout
     // notifier: the Profile page must not re-evaluate on every broad status tick.
@@ -2222,10 +2248,20 @@ private:
     // tick only, so no atomicity needed). writeCount/failures otherwise surface only on a release
     // tick, so a mid-session silent fallback to ViGEm would be invisible until the next shot.
     qint64 lastHookHeartbeatMs_ = 0;
-    // Require a sustained physically/output-neutral interval before the
-    // synchronous liveness ACK. Engine Idle alone includes Square debounce and
-    // pass-through gestures; probing there stalls their first input samples.
-    qint64 hookIdleNeutralSinceMs_ = -1;
+    // Require a sustained digital-rest interval before the periodic synchronous liveness ACK.
+    // Sticks are deliberately excluded: keeping a stick in motion must not prevent detection
+    // of a wedged client-to-OrionStream route after a button/trigger release.
+    qint64 hookDigitalRestSinceMs_ = -1;
+    // [ORION_INPUT_RELEASE_REPAIR 2026-09-21] Every generated digital release schedules one
+    // fresh-sequence MustDeliver route recheck after the primary packet, not a new logical
+    // edge or console ACK: the re-assert uses the latest confirmed complete state.
+    ControllerState hookReleaseRepairPreviousOutput_{};
+    bool hookReleaseRepairHavePreviousOutput_ = false;
+    qint64 hookReleaseRepairDueMs_ = -1;
+    // [2026-09-22 RED TEAM CL-004] 24 -> 60 ms: the fork spaces a release's redundant copies at
+    // +3 ms and +40 ms; a probe inside that window was the transaction that timed out in 2 of 10
+    // incidents. 60 clears the echo with margin and is still well inside a human re-press.
+    static constexpr qint64 kHookReleaseRepairDelayMs_ = 60;
     // Input-link recovery watchdog. Consecutive 1/s heartbeats seen with a Running
     // stream but no direct hook first trigger three input-child-only recoveries,
     // then one contained full restart after a final grace. A verified pipe write
@@ -2242,6 +2278,10 @@ private:
     // Detector frame/pixel age remains fail-closed automation authority, never process-lifecycle
     // authority because static/loading content is valid.
     int hookDownHeartbeats_ = 0;
+    // [CL2-P4-001 / CL2-P5-001 2026-09-22] Input-tick liveness: the 4 ms physical poll runs on the
+    // GUI thread; the worst gap since the last heartbeat is logged so a stall is visible.
+    std::chrono::steady_clock::time_point inputTickLastAt_{};
+    double inputTickGapMaxMs_ = 0.0;
     int hookRecoveryAttempts_ = 0;
     // A contained full restart is the terminal automatic recovery for one user
     // session. Keep this latch across the restart's transient state changes.
@@ -2440,7 +2480,7 @@ private:
     // One-shot controller reason consumed by the next engine status signal so cancel/disconnect
     // produces one coherent notification instead of a transient generic "Paused" state.
     QString latencyCalibrationStatusOverride_;
-    QString authMessage_ = QStringLiteral("Enter a license key to unlock Venice.");
+    QString authMessage_ = QStringLiteral("Paste the one-time code from zaeorion.com/connect, then press Unlock.");
     QString licenseState_ = QStringLiteral("Locked");
     QString authLicenseKey_;   // stashed on activation, used by the license heartbeat
     QString pendingActivationKey_;   // orion://activate deep-link key awaiting AuthGate pickup
@@ -2458,6 +2498,21 @@ private:
     LicenseMotd motd_;
     bool motdDismissed_ = false;
     QTimer motdExpiryTimer_;
+    // [CL2-P8-002 2026-09-23] Heartbeat recovery (LicenseHeartbeatPolicy.h).
+    // [round 2] heartbeatCoordinator_ owns every decision: 15/30/60 s ladder after
+    // failures (else 5 min), the debounce for event-driven heartbeats (resume,
+    // network online, lease lapsed) on heartbeatMonotonic_, and the one pending
+    // re-run for an event that lands while a request is in flight. The controller
+    // only executes HeartbeatActions. None of this touches leaseGate_: only a
+    // verified ok server heartbeat refreshes it.
+    LicenseHeartbeatCoordinator heartbeatCoordinator_;
+    QElapsedTimer heartbeatMonotonic_;
+    LeaseNoticeKind leaseNoticeKind_ = LeaseNoticeKind::None;
+    QString leaseNotice_;
+    QTimer leaseNoticeTimer_;
+    void requestImmediateLicenseHeartbeat(const QString& reason);
+    void applyHeartbeatAction(const HeartbeatAction& action);
+    void refreshLeaseNotice();
     void applyServerMotd(const LicenseMotd& motd);
     // Profile page state (LicenseProfile). Written only by applyLicenseProfile()
     // from an activation or a heartbeat that actually carried a `profile`; a
@@ -2490,6 +2545,7 @@ private:
     QString currentPage_ = QStringLiteral("remotePlay");
     QString remoteState_ = QStringLiteral("Disconnected");
     QStringList captureDeviceList_;   // DirectShow video devices for the capture-card picker
+    QStringList captureDeviceIds_;    // index-aligned opaque moniker IDs from the same enumeration
     QString remoteStatus_ = QStringLiteral("Disconnected");
     QString controllerStatus_ = QStringLiteral("No controller plugged in");
     QString controllerInputSource_ = QStringLiteral("None");
@@ -2581,6 +2637,14 @@ private:
     // Three whole shots with zero genuine detections. High enough that an occluded or
     // off-screen meter cannot trip it, low enough that a wrong colour is caught in seconds.
     static constexpr int kMeterBlindStreakTrip_ = 3;
+    // [CL2-P9-001 2026-09-23] Latched when the blind warning trips; it drives the engine's
+    // detection_unavailable gate. Unlike the display warning (which one raw detection clears) it
+    // clears only after kDetectionRecoveryOwnedShots_ shots the bot actually OWNED, so a single
+    // false lock on a jersey or court line cannot re-enable timer shots.
+    bool detectionUnavailable_ = false;
+    int detectionRecoveryOwnedShots_ = 0;
+    quint64 detectionRecoveryLastEpoch_ = 0;
+    static constexpr int kDetectionRecoveryOwnedShots_ = 2;
     // ---- reader detector health (Meter Detection card, presentation only) ----
     // Empty until the sidecar's first detector_health line; cleared when the sidecar exits.
     QString detectorHealthLine_;

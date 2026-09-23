@@ -44,6 +44,7 @@ ENV_KNOBS = (
     "ORION_METER_PROPOSER", "ORION_METER_DETECTOR_MIN_INTERVAL_MS", "ORION_METER_DETECTOR_SYNC",
     "ORION_METER_BAND_TOP", "ORION_METER_GATE_TOP", "ORION_METER_BAND_BOTTOM", "ORION_METER_W_MIN_FRAC",
     "ORION_METER_W_MAX_FRAC", "ORION_METER_H_MIN_FRAC", "ORION_METER_H_MAX_FRAC",
+    "ORION_METER_TOP_STRIP",
 )
 
 
@@ -581,7 +582,7 @@ def test_async_worker_passes_the_frame_ts_to_the_base(clean_env):
 # 57.6, i.e. box top ~4) would have taken it. Measured on 245,821 detected boxes across 18
 # detframes sessions the box-top histogram is censored exactly there (223 boxes at y 70-79,
 # 4 at 60-69, 0 at 50-59). ORION_METER_TOP_STRIP reads those two small windows from the
-# parent frame instead; it scans no extra pixels and is default-OFF.
+# parent frame instead; it scans no extra band pixels and defaults ON in the pickup candidate.
 # Empirical (parameter sweep, 2 px steps): the shipped locator is BLIND for a track top
 # <= 40 (box top <= 44) and, between 44 and 48, still finds the meter but seats the box
 # up to 5 px low and 5 px short -- a silently wrong fill denominator. Exact from 50 up.
@@ -606,10 +607,10 @@ def clamped_locator(clean_env, monkeypatch):
     return loc
 
 
-def test_top_strip_knob_defaults_off(locator):
-    # Offline-validated (0/12,000 frames changed, 61/80 recovered) but kept opt-in until a live
-    # A/B clears it: it shipped alongside two other regressions on 2026-09-14 (see the locator).
-    assert locator.top_strip is False
+def test_top_strip_knob_defaults_on(locator):
+    # A real image landmark must not be clipped by the implementation's search crop.
+    # clamped_locator retains the explicit OFF branch for A/B and rollback evidence.
+    assert locator.top_strip is True
 
 
 @pytest.mark.parametrize("track_top", [4, 10, 25, 34, 40])
@@ -664,9 +665,9 @@ def test_knob_does_not_lift_the_acceptance_gate(top_strip_locator):
 
 @pytest.mark.parametrize("track_top,fill", [(300, 15.0), (300, 40.0), (300, 90.0),
                                             (120, 40.0), (60, 40.0)])
-def test_knob_is_a_no_op_on_a_normal_height_meter(locator, top_strip_locator, track_top, fill):
+def test_knob_is_a_no_op_on_a_normal_height_meter(clamped_locator, top_strip_locator, track_top, fill):
     frame, _ = meter_frame(y=track_top, fill_pct=fill)
-    assert locator.detect_box(frame, ts=1.0) == top_strip_locator.detect_box(frame, ts=1.0)
+    assert clamped_locator.detect_box(frame, ts=1.0) == top_strip_locator.detect_box(frame, ts=1.0)
 
 
 def test_knob_does_not_open_the_known_false_locks(top_strip_locator):
@@ -693,10 +694,10 @@ def test_knob_does_not_open_the_known_false_locks(top_strip_locator):
     assert top_strip_locator.stats["hit"] == 0
 
 
-def test_knob_costs_nothing_on_an_idle_frame(locator, top_strip_locator):
+def test_knob_costs_nothing_on_an_idle_frame(clamped_locator, top_strip_locator):
     """No candidate -> the parent-frame path is never reached: same work, same time."""
     frame = court()
-    for loc in (locator, top_strip_locator):
+    for loc in (clamped_locator, top_strip_locator):
         for _ in range(3):
             loc.detect_box(frame, ts=0.0)          # warm
     def median_ms(loc):
@@ -705,9 +706,9 @@ def test_knob_costs_nothing_on_an_idle_frame(locator, top_strip_locator):
             loc.detect_box(frame, ts=float(i))
             t.append(loc.last_ms)
         return sorted(t)[len(t) // 2]
-    off_ms, on_ms = median_ms(locator), median_ms(top_strip_locator)
+    off_ms, on_ms = median_ms(clamped_locator), median_ms(top_strip_locator)
     assert on_ms <= off_ms + 1.5, f"idle cost {on_ms:.2f} ms vs {off_ms:.2f} ms"
-    assert locator.stats["col_cands"] == top_strip_locator.stats["col_cands"]
+    assert clamped_locator.stats["col_cands"] == top_strip_locator.stats["col_cands"]
 
 
 def test_top_strip_counter_only_moves_when_the_path_fires(top_strip_locator):
@@ -730,6 +731,30 @@ def test_tile_scan_also_recovers_the_high_meter(clamped_locator, top_strip_locat
 
 
 # ------------------------------------------------- 11. ORION_CV_GREEN_S_MIN (decoder route)
+@pytest.mark.parametrize("scale", [0.5, 1.0, 1.5, 2.0])
+def test_default_high_screen_pickup_scales_with_capture_resolution(locator, scale):
+    frame, lm = meter_frame(x=620, y=20, fill_pct=40.0)
+    expected = tuple(round(v * scale) for v in expected_box(locator, lm))
+    resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+    assert_box_close(locator.detect_box(resized, ts=1.0), expected,
+                     tol=max(2, int(2 * scale)))
+
+
+def test_default_pickup_tracks_fade_motion_across_scan_boundary(locator):
+    # Temporal path: rise above and return below the band boundary without moving the ruler.
+    for i, y in enumerate((70, 58, 46, 34, 22, 10, 22, 34, 46, 58, 70)):
+        frame, lm = meter_frame(x=560 + 4 * i, y=y, fill_pct=20.0 + 4 * i)
+        box = locator.detect_box(frame, ts=1.0 + i * FRAME_DT)
+        assert_box_close(box, expected_box(locator, lm))
+        assert box[4] == pytest.approx(0.90)
+
+
+def test_top_strip_environment_does_not_leak_into_default_fixture(locator):
+    # clean_env clears an inherited A/B override; default coverage must really test defaults.
+    assert "ORION_METER_TOP_STRIP" not in os.environ
+    assert locator.top_strip
+
+
 def test_green_saturation_floor_defaults_to_the_capture_card_value(locator):
     assert locator._GREEN_LO == (38, 90, 90)
 
@@ -1141,3 +1166,93 @@ def test_full_body_proof_does_not_take_a_sparkle_as_its_arrow_top(locator):
     cv2.rectangle(frame, (x - 30, gtop - 7), (x + 11, gtop - 1), GREEN, -1)
     assert locator.detect_box(frame, ts=1.0 + FRAME_DT) is not None
     assert locator.stats.get("shape_full_body_bridged", 0) > 0
+
+
+# Captured 2026-09-20: a moving white hoodie was promoted as a capless meter
+# during continuous Square holds (physical epochs 8 and 31). Growth and recent
+# box proximity are not independent evidence of a rendered meter track.
+@pytest.mark.parametrize("name,bridge", [
+    ("epoch8", None),
+    ("epoch8", (102.0, 147.0, 35.0)),
+    ("epoch31", (112.0, 157.0, 35.0)),
+])
+def test_pump_fake_recorded_hoodie_is_not_a_capless_track(locator, name, bridge):
+    from pathlib import Path
+    fixture = Path(__file__).parent / "fixtures/meter/pump_fake_hoodie.npz"
+    with np.load(fixture, allow_pickle=False) as data:
+        patch = data[name]
+    assert locator._find(patch, 1.0, bridge=bridge, tipless=True) is None
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_pump_fake_growth_and_position_do_not_replace_current_track(locator, arm, warm):
+    arm("Standstill")
+    t = T0 + 0.20
+    if warm:
+        first, _ = meter_frame(fill_pct=28.0)
+        assert locator.detect_box(first, ts=t - FRAME_DT) is not None
+    for i, fill in enumerate((32.0, 37.0, 42.0, 47.0)):
+        impostor, _ = meter_frame(fill_pct=fill, tip="absent", outline=False)
+        assert locator.detect_box(impostor, ts=t + i * FRAME_DT) is None
+
+
+@pytest.mark.parametrize("light", [85, 110, 190])
+def test_pump_fake_fix_keeps_dim_outlined_greenless_rises(locator, arm, light):
+    arm("Standstill")
+    found = []
+    for i, fill in enumerate((24.0, 30.0, 36.0)):
+        frame, lm = meter_frame(fill_pct=fill, tip="absent")
+        for dx in OUTLINE_DX:
+            frame[lm["y"]:lm["y"] + TRACK_H, lm["x"] + dx] = (light,) * 3
+        found.append(locator.detect_box(frame, ts=T0 + 0.20 + i * FRAME_DT))
+    assert found[0] is None
+    assert_box_close(found[1], expected_box(locator, lm))
+    assert_box_close(found[2], expected_box(locator, lm))
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_pump_fake_one_nearby_court_edge_is_not_a_track(locator, arm, side):
+    arm("Standstill")
+    for i, fill in enumerate((32.0, 38.0, 44.0)):
+        frame, lm = meter_frame(fill_pct=fill, tip="absent", outline=False)
+        dx = OUTLINE_DX[0 if side == "left" else 1]
+        frame[lm["y"]:lm["y"] + TRACK_H, lm["x"] + dx] = OUTLINE
+        assert locator.detect_box(frame, ts=T0 + 0.20 + i * FRAME_DT) is None
+
+
+def test_pump_fake_guard_searches_past_larger_unoutlined_candidate(locator):
+    frame, lm = meter_frame(x=450, y=270, fill_pct=25.0, tip="absent")
+    draw_meter(frame, x=780, y=270, fill_pct=45.0, tip="absent", outline=False)
+    assert_box_close(locator._find(frame, 1.0, tipless=True), expected_box(locator, lm))
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.0, 1.5])
+@pytest.mark.parametrize("interpolation", [cv2.INTER_AREA, cv2.INTER_LINEAR])
+def test_pump_fake_greenless_track_gate_scales_with_frame(locator, scale, interpolation):
+    frame, lm = meter_frame(fill_pct=40.0, tip="absent")
+    resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=interpolation)
+    assert_box_close(locator._find(resized, scale, tipless=True),
+                     expected_box(locator, lm, scale), tol=3)
+
+
+def test_pump_fake_missing_border_is_not_restored_by_resize_assumptions(locator):
+    frame, _ = meter_frame(fill_pct=40.0, tip="absent")
+    # Nearest-neighbor at this fractional origin removes one 1px border entirely.
+    # The remaining white body is deliberately insufficient capless evidence.
+    aliased = cv2.resize(frame, None, fx=0.75, fy=0.75, interpolation=cv2.INTER_NEAREST)
+    assert locator._find(aliased, 0.75, tipless=True) is None
+    assert locator.stats.get("tipless_no_track", 0) > 0
+
+
+def test_pump_fake_track_support_uses_parent_pixels_beyond_roi(locator):
+    frame, lm = meter_frame(fill_pct=40.0, tip="absent")
+    x0, y0 = 605, 340
+    hsv = cv2.cvtColor(frame[y0:450, x0:625], cv2.COLOR_BGR2HSV)
+    args = (hsv, lm["cx"] - x0, lm["gtop"] - y0, 1.0)
+    assert not locator._tipless_track_supported(*args)
+    assert locator._tipless_track_supported(*args, parent=(frame, x0, y0))
+
+
+@pytest.mark.parametrize("bad", [None, np.empty((0, 0, 3), np.uint8), np.zeros((80, 40), np.uint8)])
+def test_pump_fake_invalid_track_pixels_do_not_prove_a_meter(locator, bad):
+    assert not locator._tipless_track_supported(bad, 20.0, 0.0, 1.0)

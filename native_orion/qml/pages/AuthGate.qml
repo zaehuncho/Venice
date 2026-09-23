@@ -21,23 +21,46 @@ Item {
     // True once the user attempted a connection — gates the error card.
     property bool attempted: false
 
-    // Map the raw backend message onto an actionable next step (onboarding.md §4).
-    readonly property string errorHint: {
-        var m = (orion.authMessage || "").toLowerCase()
-        if (/machine|device|another|bound|hwid/.test(m))
-            return "This account is linked to another PC. Run /hwid_reset in Discord, then connect this PC again. If that was not you, open a ticket."
-        if (/expire/.test(m))
-            return "Your trial or subscription has ended. Run /status in Discord or renew on the Venice website."
-        if (/discord_signin|required/.test(m))
-            return "Sign in with the Discord account that owns your trial or subscription, then use a fresh one-time code."
-        if (/invalid|unknown|not found|format/.test(m))
-            return "That one-time code is invalid, expired, or already used. Open Connect Discord again for a fresh code."
-        if (/timed out|timeout|network|connect|offline|unreach|tls|certificate/.test(m))
-            return "Couldn't reach the license server. Check your internet connection and try again in a moment."
-        if (/rate limit/.test(m))
+    // Map the failure message onto ONE actionable next step (onboarding.md §4).
+    // [COPY-FIX 2026-09-23] The old regexes matched loose words in order, so the
+    // Discord-ID paste ("...Select Connect Discord...") showed the network hint,
+    // "This device is blocked." showed /hwid_reset, "Update required" showed the
+    // Discord sign-in hint and "Machine fingerprint" showed "linked to another PC".
+    // The error CODE is not exposed to QML; authMessage is either mapped copy
+    // (licenseErrorUserText) or the server's prose / bare code, so every rule below
+    // matches both the mapped sentence and the raw code. Order is load-bearing:
+    // the most specific rule wins. tests/test_venice_ui_contract.py runs this
+    // function under node against every known message.
+    // HINT-FN-BEGIN
+    function hintFor(message) {
+        var m = (message || "").toLowerCase()
+        if (m.length === 0)
+            return ""
+        // The message already says exactly what to do: no second line.
+        if (/discord id is public|clock is off|timestamp_expired|paused|frozen|contact support/.test(m))
+            return ""
+        if (/update required|version_blocked|no longer (allowed|supported)/.test(m))
+            return "Restart Venice to update, or reinstall from #downloads."
+        if (/\bblocked\b|blacklisted/.test(m))
+            return "Open a ticket in the Venice Discord."
+        if (/fingerprint|machine_id/.test(m))
+            return "Restart Venice; if it repeats, open a ticket."
+        if (/rate limit|rate_limited|too many/.test(m))
             return "Too many attempts in a row — wait a moment, then try the connection once."
+        if (/different pc|another pc|device_mismatch|hwid/.test(m))
+            return "This account is linked to another PC. Run /hwid_reset in Discord, then connect this PC again. If that was not you, open a ticket."
+        if (/subscription_required|subscription tied|discord_signin|connect your discord account/.test(m))
+            return "Sign in with the Discord account that owns your trial or subscription, then use a fresh one-time code."
+        if (/sign-in link|one-time code|did not return a valid|pair_invalid|invalid_key|invalid key|key format|replay/.test(m))
+            return "That one-time code is invalid, expired, or already used. Open Connect Discord again for a fresh code."
+        if (/expire|trial_used|revoked/.test(m))
+            return "Your trial or subscription has ended. Run /status in Discord or renew on the Venice website."
+        if (/timed out|timeout|network|could not connect|couldn't connect|connection (refused|closed|reset|failed)|host .*not found|offline|unreach|tls|ssl|certificate|could not be checked|entitlement_unavailable|internal_error|service_disabled/.test(m))
+            return "Couldn't reach Venice's servers. Check your internet connection and try again in a moment."
         return ""
     }
+    // HINT-FN-END
+    readonly property string errorHint: hintFor(orion.authMessage)
 
     function tryUnlock() {
         if (orion.authBusy)
@@ -256,7 +279,7 @@ Item {
             PrimaryButton {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 46
-                text: orion.authBusy ? "Verifying license…" : "Unlock"
+                text: orion.authBusy ? "Verifying…" : "Unlock"
                 enabled: root.ready
                 onClicked: root.tryUnlock()
             }

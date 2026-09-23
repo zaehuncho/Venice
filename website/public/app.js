@@ -3,15 +3,52 @@ const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const DISCORD_INVITE = 'https://discord.gg/yTuekgdgEN';
 const SIGN_IN_URL = `/auth/discord?return_to=${encodeURIComponent('/#pricing')}`;
 
+// ---------- Entrance reveal ----------
+// Progressive: [data-reveal] elements are only hidden once this runs, and only when motion is
+// allowed and IntersectionObserver exists. Without JS, or under reduced motion, the page is fully
+// visible with nothing to reveal — so a below-the-fold section can never get stuck hidden.
+if (!reducedMotion && 'IntersectionObserver' in window) {
+  const revealables = document.querySelectorAll('[data-reveal]');
+  if (revealables.length) {
+    document.documentElement.classList.add('reveal-ready');
+    const revealer = new IntersectionObserver((entries, observer) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        entry.target.classList.add('is-in');
+        observer.unobserve(entry.target);
+      }
+    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+    revealables.forEach((node) => revealer.observe(node));
+  }
+}
+
 // ---------- Star texture ----------
-// Painted once, then redrawn only while the pointer parallax is settling: capped at 30 fps with the
-// pixel ratio capped at 1.25, and completely idle at rest (no per-frame work, no layout reads).
+// A faint sky that drifts upward, BLINKS and flickers, capped at 30 fps with the pixel ratio at 1.25
+// and paused whenever the tab is hidden. Under reduced motion or Save-Data it is painted once and
+// left completely still — no drift, no blink, no parallax, no constellation, no per-frame work.
+//
+// [2026-09-21 owner: "blinking and flickering stars"] Two motions, not one. Every star carries a
+// slow twinkle AND a fast, small flicker on top, so the sky shimmers instead of breathing. One in
+// six is a BLINKER: the same wave cubed, which holds it dim for most of its cycle and snaps it
+// bright for a moment — that reads as a blink, where a plain sine only reads as a pulse.
+//
+// With a fine pointer the nearest few stars to the cursor chain into a small constellation that
+// forms and dissolves as the pointer moves. It is deliberately dim and short-range: the hero and
+// the pricing card stay the brightest things on the page.
 const canvas = document.getElementById('starfield');
 if (canvas instanceof HTMLCanvasElement) {
   const context = canvas.getContext('2d', { alpha: false });
   const saveData = navigator.connection?.saveData === true;
-  const parallax = matchMedia('(pointer: fine)').matches && !reducedMotion && !saveData;
+  const still = reducedMotion || saveData;
+  const parallax = matchMedia('(pointer: fine)').matches && !still;
   const pointer = { x: 0, y: 0, targetX: 0, targetY: 0 };
+  // Cursor in CSS pixels, plus an eased presence so the constellation fades in and out instead of
+  // snapping when the pointer enters or leaves the window.
+  const cursor = { x: 0, y: 0, here: 0, target: 0 };
+  const LINK_RADIUS = 170;   // px: how far from the cursor a star can be and still join
+  const LINK_MAX = 6;        // at most this many points in one constellation
+  const LINK_SPAN = 150;     // px: longest line drawn between two joined stars
+  const near = [];           // scratch list, reused every frame (no per-frame allocation)
   let width = 0;
   let height = 0;
   let count = 0;
@@ -24,14 +61,73 @@ if (canvas instanceof HTMLCanvasElement) {
     seed = (seed * 16807) % 2147483647;
     return (seed - 1) / 2147483646;
   };
-  const stars = Array.from({ length: 140 }, (_, index) => ({
+  const stars = Array.from({ length: 190 }, (_, index) => ({
     x: random(),
     y: random(),
     z: 0.25 + random() * 0.75,
-    size: 0.35 + random() * 0.5,
-    alpha: 0.09 + random() * 0.2,
-    blue: index % 6 === 0,
+    size: 0.42 + random() * 0.58,
+    alpha: 0.22 + random() * 0.38,
+    blue: index % 5 === 0,
+    rise: 0.006 + random() * 0.015,   // normalised units per second, upward (scaled by depth)
+    twPhase: random() * Math.PI * 2,  // twinkle offset so they don't pulse in unison
+    twRate: 0.55 + random() * 0.95,   // twinkle speed
+    flPhase: random() * Math.PI * 2,  // flicker offset (fast, small, independent of the twinkle)
+    flRate: 3.6 + random() * 4.2,     // flicker speed — several times the twinkle
+    blink: index % 6 === 3,           // a sixth of the sky blinks instead of pulsing
+    tw: 1,                            // current brightness multiplier (1 when still)
   }));
+
+  // One source of truth for where a star is on screen, so the links land exactly on the dots.
+  const screenX = (star) => star.x * width + pointer.x * 8 * star.z;
+  const screenY = (star) => star.y * height + pointer.y * 6 * star.z;
+
+  // Collect the stars around the cursor, nearest first, and chain them: each step hops to the
+  // closest point not yet used. That reads as a constellation rather than a fan of spokes.
+  const linkStars = () => {
+    near.length = 0;
+    if (cursor.here < 0.01) return;
+    for (let index = 0; index < count; index += 1) {
+      const star = stars[index];
+      const sx = screenX(star);
+      const sy = screenY(star);
+      const d2 = (sx - cursor.x) ** 2 + (sy - cursor.y) ** 2;
+      if (d2 <= LINK_RADIUS * LINK_RADIUS) near.push({ star, sx, sy, d2 });
+    }
+    near.sort((a, b) => a.d2 - b.d2);
+    near.length = Math.min(near.length, LINK_MAX);
+    if (near.length < 2) return;
+
+    context.lineWidth = 1;
+    context.strokeStyle = '#6fb4ff';
+    for (let i = 0; i < near.length - 1; i += 1) {
+      // Nearest remaining neighbour to the current point becomes the next link in the chain.
+      let best = i + 1;
+      let bestD2 = Infinity;
+      for (let j = i + 1; j < near.length; j += 1) {
+        const d2 = (near[j].sx - near[i].sx) ** 2 + (near[j].sy - near[i].sy) ** 2;
+        if (d2 < bestD2) { bestD2 = d2; best = j; }
+      }
+      if (best !== i + 1) { const swap = near[i + 1]; near[i + 1] = near[best]; near[best] = swap; }
+      const span = Math.sqrt(bestD2);
+      if (span > LINK_SPAN) break;   // a lone far star ends the chain instead of stretching to it
+      // Fade with how far the pair sits from the cursor and how long the line is.
+      const reach = Math.sqrt(near[i].d2) / LINK_RADIUS;
+      context.globalAlpha = cursor.here * 0.30 * (1 - reach) * (1 - span / LINK_SPAN);
+      context.beginPath();
+      context.moveTo(near[i].sx, near[i].sy);
+      context.lineTo(near[i + 1].sx, near[i + 1].sy);
+      context.stroke();
+    }
+    // Lift the joined points so the constellation has visible nodes, not just lines.
+    context.fillStyle = '#9fd0ff';
+    for (let i = 0; i < near.length; i += 1) {
+      const reach = Math.sqrt(near[i].d2) / LINK_RADIUS;
+      context.globalAlpha = cursor.here * 0.55 * (1 - reach);
+      context.beginPath();
+      context.arc(near[i].sx, near[i].sy, Math.max(0.9, near[i].star.size * near[i].star.z * 1.8), 0, Math.PI * 2);
+      context.fill();
+    }
+  };
 
   const paint = () => {
     if (!context) return;
@@ -39,27 +135,52 @@ if (canvas instanceof HTMLCanvasElement) {
     context.fillRect(0, 0, width, height);
     for (let index = 0; index < count; index += 1) {
       const star = stars[index];
-      context.globalAlpha = star.alpha;
+      context.globalAlpha = star.alpha * star.tw;
       context.fillStyle = star.blue ? '#6fb4ff' : '#e6f1ff';
       context.beginPath();
-      context.arc(star.x * width + pointer.x * 8 * star.z, star.y * height + pointer.y * 6 * star.z, Math.max(0.4, star.size * star.z), 0, Math.PI * 2);
+      context.arc(screenX(star), screenY(star), Math.max(0.4, star.size * star.z), 0, Math.PI * 2);
       context.fill();
     }
+    if (parallax) linkStars();
     context.globalAlpha = 1;
+  };
+
+  // Advance the drift and twinkle by dt seconds. Nearer stars (higher z) drift a little faster.
+  const advance = (dt) => {
+    for (let index = 0; index < count; index += 1) {
+      const star = stars[index];
+      star.y -= star.rise * star.z * dt;
+      if (star.y < -0.02) { star.y += 1.04; star.x = (star.x + 0.37) % 1; }
+      star.twPhase += star.twRate * dt;
+      star.flPhase += star.flRate * dt;
+      // 0..1 twinkle, cubed for blinkers so they sit dim and flash rather than breathe.
+      const wave = 0.5 + 0.5 * Math.sin(star.twPhase);
+      const shaped = star.blink ? wave * wave * wave : wave;
+      // The flicker is deliberately small: it should shimmer, never strobe.
+      const flicker = 1 + 0.16 * Math.sin(star.flPhase);
+      star.tw = (star.blink ? 0.05 + 1.25 * shaped : 0.40 + 0.75 * shaped) * flicker;
+    }
   };
 
   const draw = (now = 0) => {
     frame = 0;
-    if (now - previous < 33) {
+    if (now - previous < 33) {   // ~30 fps ceiling
       frame = requestAnimationFrame(draw);
       return;
     }
+    const dt = previous ? Math.min((now - previous) / 1000, 0.05) : 0;
     previous = now;
-    pointer.x += (pointer.targetX - pointer.x) * 0.08;
-    pointer.y += (pointer.targetY - pointer.y) * 0.08;
+    if (parallax) {
+      pointer.x += (pointer.targetX - pointer.x) * 0.08;
+      pointer.y += (pointer.targetY - pointer.y) * 0.08;
+      cursor.here += (cursor.target - cursor.here) * 0.12;
+    }
+    if (!still) advance(dt);
     paint();
-    const settling = Math.abs(pointer.targetX - pointer.x) > 0.002 || Math.abs(pointer.targetY - pointer.y) > 0.002;
-    if (settling && !document.hidden) frame = requestAnimationFrame(draw);
+    const settling = Math.abs(pointer.targetX - pointer.x) > 0.002 || Math.abs(pointer.targetY - pointer.y) > 0.002
+      || Math.abs(cursor.target - cursor.here) > 0.01;
+    // Keep animating while the sky drifts, or while a pointer nudge settles.
+    if ((!still || settling) && !document.hidden) frame = requestAnimationFrame(draw);
   };
   const wake = () => {
     if (!frame && !document.hidden) frame = requestAnimationFrame(draw);
@@ -74,7 +195,7 @@ if (canvas instanceof HTMLCanvasElement) {
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
     context?.setTransform(scale, 0, 0, scale, 0, 0);
-    count = saveData ? 40 : Math.min(stars.length, Math.max(48, Math.round((width * height) / 11000)));
+    count = saveData ? 40 : Math.min(stars.length, Math.max(64, Math.round((width * height) / 8200)));
     paint();
   };
 
@@ -87,16 +208,28 @@ if (canvas instanceof HTMLCanvasElement) {
     addEventListener('pointermove', (event) => {
       pointer.targetX = event.clientX / width - 0.5;
       pointer.targetY = event.clientY / height - 0.5;
+      cursor.x = event.clientX;
+      cursor.y = event.clientY;
+      cursor.target = 1;
       wake();
     }, { passive: true });
+    // Pointer gone (left the window, or switched to touch): let the constellation dissolve.
+    addEventListener('pointerout', (event) => {
+      if (event.relatedTarget) return;
+      cursor.target = 0;
+      wake();
+    }, { passive: true });
+    addEventListener('blur', () => { cursor.target = 0; wake(); }, { passive: true });
   }
   document.addEventListener('visibilitychange', () => {
     cancelAnimationFrame(frame);
     frame = 0;
-    if (!document.hidden && parallax) wake();
+    previous = 0;
+    if (!document.hidden && !still) wake();
   });
-  // First paint rides the first animation frame, so the page's own first layout is not forced into this script's task.
-  requestAnimationFrame(resize);
+  // First paint rides the first animation frame, so the page's own first layout is not forced into
+  // this script's task; the drift loop then starts (unless the sky is meant to stay still).
+  requestAnimationFrame(() => { resize(); if (!still) wake(); });
 }
 
 // ---------- Purchase gate ----------

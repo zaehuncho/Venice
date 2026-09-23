@@ -4,6 +4,7 @@
 #include "RemotePlayExecutablePolicy.h"
 
 #include <QtCore/QCoreApplication>
+#include <QtCore/QDateTime>
 #include <QtCore/QDebug>
 #include <QtCore/QDir>
 #include <QtCore/QFile>
@@ -84,6 +85,35 @@ QJsonObject readObject(const QString& path)
     }
     const auto doc = QJsonDocument::fromJson(file.readAll());
     return doc.isObject() ? doc.object() : QJsonObject{};
+}
+
+// [2026-09-22 RED TEAM GM-002 / CX-001] readObject() cannot tell "no file" from "a file that is
+// zero bytes, truncated or not JSON". For learning data that difference is the whole bug: a
+// corrupt file loaded as {} became defaults, and the next save overwrote the customer's tuned
+// profile with those defaults, silently. This variant reports which case it is.
+enum class ObjectReadStatus { Missing, Invalid, Ok };
+
+ObjectReadStatus readObjectStatus(const QString& path, QJsonObject* out)
+{
+    QFile file(path);
+    if (!file.exists()) {
+        return ObjectReadStatus::Missing;
+    }
+    if (!file.open(QIODevice::ReadOnly)) {
+        return ObjectReadStatus::Invalid;
+    }
+    const QByteArray raw = file.readAll();
+    if (raw.trimmed().isEmpty()) {
+        return ObjectReadStatus::Invalid;
+    }
+    const auto doc = QJsonDocument::fromJson(raw);
+    if (!doc.isObject()) {
+        return ObjectReadStatus::Invalid;
+    }
+    if (out) {
+        *out = doc.object();
+    }
+    return ObjectReadStatus::Ok;
 }
 
 double perLevelNudge(const QJsonObject& perLevel, const QString& key)
@@ -232,13 +262,44 @@ QString AppConfig::learningPath() const
     return dataDir + QStringLiteral("/learning.") + slug + QStringLiteral(".json");
 }
 
+QString AppConfig::learningBackupPath() const
+{
+    return learningPath() + QStringLiteral(".bak");
+}
+
 void AppConfig::reloadLearning()
 {
     learning_ = LearningData{};
-    const auto learningJson = readObject(learningPath());
-    if (!learningJson.isEmpty()) {
-        loadLearningObject(learningJson);
+    learningLoadNote_.clear();
+    QJsonObject learningJson;
+    const ObjectReadStatus status = readObjectStatus(learningPath(), &learningJson);
+    if (status == ObjectReadStatus::Ok) {
+        if (!learningJson.isEmpty()) {
+            loadLearningObject(learningJson);
+        }
+        return;
     }
+    if (status == ObjectReadStatus::Missing) {
+        return;   // a true first run: defaults are correct
+    }
+    // The file exists but cannot be read. Keep the evidence, try the last-good copy, and never
+    // let a later save overwrite the corrupt original as if it had been an empty first run.
+    const QString quarantine = learningPath() + QStringLiteral(".corrupt-")
+        + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+    QFile::rename(learningPath(), quarantine);
+    QJsonObject backup;
+    if (readObjectStatus(learningBackupPath(), &backup) == ObjectReadStatus::Ok && !backup.isEmpty()) {
+        loadLearningObject(backup);
+        QFile::copy(learningBackupPath(), learningPath());
+        learningLoadNote_ = QStringLiteral(
+            "learning.json was unreadable; restored the previous good copy from learning.json.bak "
+            "(the damaged file was kept as %1).").arg(QFileInfo(quarantine).fileName());
+    } else {
+        learningLoadNote_ = QStringLiteral(
+            "learning.json was unreadable and no backup existed; learned timing starts from defaults "
+            "(the damaged file was kept as %1).").arg(QFileInfo(quarantine).fileName());
+    }
+    qWarning().noquote() << learningLoadNote_;
 }
 
 const QList<AppConfig::SettingsMigration>& AppConfig::settingsMigrations()
@@ -394,10 +455,9 @@ bool AppConfig::load()
         loadSettingsObject(effective);
     }
 
-    const auto learningJson = readObject(learningPath());
-    if (!learningJson.isEmpty()) {
-        loadLearningObject(learningJson);
-    }
+    // [2026-09-22 GM-002 / CX-001] one loader: reloadLearning() distinguishes a missing file from
+    // a damaged one, restores the last-good copy and records what it did (learningLoadNote()).
+    reloadLearning();
 
     // One-time migration: the global early_late_offset_ms knob is retired. Fold any persisted
     // value into the per-type learned offsets, then zero AND persist BOTH files in the same
@@ -485,10 +545,27 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     data.bannerTrimBiasVotes = std::clamp(data.bannerTrimBiasVotes,
                                           AppConfigData::kBannerTrimBiasVotesMin,
                                           AppConfigData::kBannerTrimBiasVotesMax);
+    // [ORION_ONSET_FF 2026-09-21] Same policy: no write path may persist a gain, clamp, window
+    // or sample floor outside its band, and a non-finite magnitude falls back to the compiled
+    // default rather than to something a clamp would invent.
+    data.onsetFeedforwardGain = std::isfinite(data.onsetFeedforwardGain)
+        ? std::clamp(data.onsetFeedforwardGain, AppConfigData::kOnsetFeedforwardGainMin,
+                     AppConfigData::kOnsetFeedforwardGainMax)
+        : 0.2;
+    data.onsetFeedforwardClampMs = std::isfinite(data.onsetFeedforwardClampMs)
+        ? std::clamp(data.onsetFeedforwardClampMs, AppConfigData::kOnsetFeedforwardClampMinMs,
+                     AppConfigData::kOnsetFeedforwardClampMaxMs)
+        : 10.0;
+    data.onsetFeedforwardWindow = std::clamp(data.onsetFeedforwardWindow,
+                                             AppConfigData::kOnsetFeedforwardWindowMin,
+                                             AppConfigData::kOnsetFeedforwardWindowMax);
+    data.onsetFeedforwardMinSamples = std::clamp(data.onsetFeedforwardMinSamples,
+                                                 AppConfigData::kOnsetFeedforwardMinSamplesMin,
+                                                 AppConfigData::kOnsetFeedforwardMinSamplesMax);
     // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] Same policy, and for the same reason the banner
     // trim's clamp exists: no write path may persist a per-type offset outside the band, because
     // the band is what keeps this a per-type correction rather than a second Shot Lead.
-    data.leadOffsetLeftFadeMs = clampedLeadOffsetMs(data.leadOffsetLeftFadeMs, 8.0);
+    data.leadOffsetLeftFadeMs = clampedLeadOffsetMs(data.leadOffsetLeftFadeMs, -6.0);
     data.leadOffsetRightFadeMs = clampedLeadOffsetMs(data.leadOffsetRightFadeMs, 8.0);
     data.leadOffsetStandstillMs = clampedLeadOffsetMs(data.leadOffsetStandstillMs, 0.0);
     data.leadOffsetOtherMs = clampedLeadOffsetMs(data.leadOffsetOtherMs, 0.0);
@@ -566,13 +643,12 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     data.sprintReleaseR2Threshold = std::clamp(data.sprintReleaseR2Threshold,
                                                AppConfigData::kSprintReleaseR2ThresholdMin,
                                                AppConfigData::kSprintReleaseR2ThresholdMax);
-    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16] Same policy: no write path may persist a hold
-    // outside the band, because 0 IS the kill switch and the ceiling is what keeps the latch from
-    // outliving the frame it exists to protect. A non-finite value falls back to the shipped 50.
-    data.squarePressR2HoldMs = std::isfinite(data.squarePressR2HoldMs)
-        ? std::clamp(data.squarePressR2HoldMs, AppConfigData::kSquarePressR2HoldMinMs,
-                     AppConfigData::kSquarePressR2HoldMaxMs)
-        : 50.0;
+    // [R2_HOLD_DEFAULT_INERT 2026-09-21] [R2_HOLD_PERSISTED_FENCE] The write half of the
+    // pass-through fence. A prior build may have persisted the old implicit 50 ms value; merely
+    // changing the struct default would let that stale file keep inventing R2 holds forever.
+    // Scrub the hidden setting to zero. A diagnostic A/B remains available only through the
+    // explicit ORION_SQUARE_PRESS_R2_HOLD_MS process environment override.
+    data.squarePressR2HoldMs = 0.0;
     data.meterEnabled = true;
     data.noMeterEnabled = false;
     normalizeRemotePlayBackend(data, rootDir_);
@@ -600,7 +676,9 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("active_profile"), data.activeProfile);
     obj.insert(QStringLiteral("profiles"), profiles_);
     obj.insert(QStringLiteral("meter_color"), data.meterColor);
-    obj.insert(QStringLiteral("meter_style"), data.meterStyle);
+    // Normalised on SAVE as well as on load: the generic save API must not be able to
+    // persist a raw withdrawn style even if a caller hands it unsanitised data (Astra).
+    obj.insert(QStringLiteral("meter_style"), normalizedMeterStyle(data.meterStyle));
     obj.insert(QStringLiteral("meter_proposer"), normalizedMeterProposer(data.meterProposer));
     // [ORION_PILL_YOLO_ROUTE 2026-09-17] Written on every save so the key exists in
     // an installed settings.json and an owner can take the route down by hand.
@@ -609,11 +687,13 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("remote_play_console"), data.remotePlayConsole);
     if (!data.xboxRemotePlayWindowTitle.isEmpty())
         obj.insert(QStringLiteral("xbox_remote_play_window_title"), data.xboxRemotePlayWindowTitle);
+    obj.insert(QStringLiteral("xbox_untested_ack"), data.xboxUntestedAcknowledged);
     obj.insert(QStringLiteral("stream_setup_complete"), data.streamSetupComplete);
     obj.insert(QStringLiteral("preflight_complete"), data.preflightComplete);
     obj.insert(QStringLiteral("legal_accepted_version"), data.legalAcceptedVersion);
     obj.insert(QStringLiteral("video_source"), data.videoSource);
     obj.insert(QStringLiteral("capture_card_index"), data.captureCardIndex);
+    obj.insert(QStringLiteral("capture_card_device_id"), data.captureCardDeviceId);
     // [ORION_CAPTURE_FPS 2026-09-14] Persisted already-snapped, so the file never carries a rate
     // the card was not actually asked for.
     obj.insert(QStringLiteral("capture_card_fps"), snappedCaptureCardFps(data.captureCardFps));
@@ -836,11 +916,30 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     obj.insert(QStringLiteral("banner_trim_bias_votes"),
                std::clamp(data.bannerTrimBiasVotes, AppConfigData::kBannerTrimBiasVotesMin,
                           AppConfigData::kBannerTrimBiasVotesMax));
+    // [ORION_ONSET_FF 2026-09-21] Persisted already-clamped, like the trim limits above.
+    obj.insert(QStringLiteral("onset_ff_gain"),
+               std::clamp(data.onsetFeedforwardGain, AppConfigData::kOnsetFeedforwardGainMin,
+                          AppConfigData::kOnsetFeedforwardGainMax));
+    obj.insert(QStringLiteral("onset_ff_clamp_ms"),
+               std::clamp(data.onsetFeedforwardClampMs,
+                          AppConfigData::kOnsetFeedforwardClampMinMs,
+                          AppConfigData::kOnsetFeedforwardClampMaxMs));
+    obj.insert(QStringLiteral("onset_ff_window"),
+               std::clamp(data.onsetFeedforwardWindow, AppConfigData::kOnsetFeedforwardWindowMin,
+                          AppConfigData::kOnsetFeedforwardWindowMax));
+    obj.insert(QStringLiteral("onset_ff_min_samples"),
+               std::clamp(data.onsetFeedforwardMinSamples,
+                          AppConfigData::kOnsetFeedforwardMinSamplesMin,
+                          AppConfigData::kOnsetFeedforwardMinSamplesMax));
+    obj.insert(QStringLiteral("onset_ff_one_sided"), data.onsetFeedforwardOneSided);
     // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16] The fixed per-shot-type addition to the Shot Lead,
     // in ms. Persisted already-clamped, exactly like console_frame_ms: the band is what keeps a
     // per-type correction from becoming a second lead control.
     obj.insert(QStringLiteral("lead_offset_left_fade_ms"),
-               clampedLeadOffsetMs(data.leadOffsetLeftFadeMs, 8.0));
+               clampedLeadOffsetMs(data.leadOffsetLeftFadeMs, -6.0));
+    // [ORION_LEFT_FADE_LATER 2026-09-22] Revision 2 = the value above is post-migration, so a +8 the
+    // owner sets deliberately later is never rewritten again.
+    obj.insert(QStringLiteral("lead_offset_left_fade_rev"), 2);
     obj.insert(QStringLiteral("lead_offset_right_fade_ms"),
                clampedLeadOffsetMs(data.leadOffsetRightFadeMs, 8.0));
     obj.insert(QStringLiteral("lead_offset_standstill_ms"),
@@ -1156,6 +1255,12 @@ bool AppConfig::saveLearning(const LearningData& data, QString* error)
         }
         obj.insert(QStringLiteral("banner_lead_trim_by_type"), bt);
     }
+    // [2026-09-22 GM-002 / CX-001] Keep a last-good generation: only a VALID current file is
+    // promoted to .bak, so a corrupt file can never overwrite a good backup.
+    if (readObjectStatus(learningPath(), nullptr) == ObjectReadStatus::Ok) {
+        QFile::remove(learningBackupPath());
+        QFile::copy(learningPath(), learningBackupPath());
+    }
     QSaveFile file(learningPath());
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (error) {
@@ -1255,15 +1360,12 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     {
         // Unknown style/colour -> the current certified shipped defaults. A
         // valid explicit value in settings.json still wins.
-        const QString style = data_.meterStyle.trimmed().toLower();
-        if (style != QLatin1String("arrow")
-            && style != QLatin1String("arrow2")
-            && style != QLatin1String("dial")
-            && style != QLatin1String("pill")
-            && style != QLatin1String("straight")
-            && style != QLatin1String("sword")) {
-            data_.meterStyle = QStringLiteral("Arrow2");
-        }
+        // [ORION_PILL_REMOVED 2026-09-21 owner] "pill" is no longer accepted: a
+        // persisted Pill (beta) install loads as Arrow2, exactly as a 2K26 style
+        // does. The Pill -> yolo launch route stays compiled but unreachable.
+        // The rule itself lives in normalizedMeterStyle() (AppConfig.h) -- shared
+        // with save(), setMeterStyle() and switchProfile().
+        data_.meterStyle = normalizedMeterStyle(data_.meterStyle);
         const QString color = data_.meterColor.trimmed().toLower();
         if (color != QLatin1String("purple")
             && color != QLatin1String("white")
@@ -1286,6 +1388,7 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         const QString console = cleanText(obj, "remote_play_console", data_.remotePlayConsole, 16).trimmed().toLower();
         data_.remotePlayConsole = (console == QLatin1String("xbox")) ? QStringLiteral("Xbox") : QStringLiteral("PS5");
         data_.xboxRemotePlayWindowTitle = cleanText(obj, "xbox_remote_play_window_title", QString(), 512).trimmed();
+        data_.xboxUntestedAcknowledged = cleanBool(obj, "xbox_untested_ack", data_.xboxUntestedAcknowledged);
     }
     data_.streamSetupComplete = cleanBool(obj, "stream_setup_complete", data_.streamSetupComplete);
     data_.preflightComplete = cleanBool(obj, "preflight_complete", data_.preflightComplete);
@@ -1303,6 +1406,8 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
                                 ? QStringLiteral("capture_card") : QStringLiteral("decoder");
     }
     data_.captureCardIndex = cleanInt(obj, "capture_card_index", data_.captureCardIndex, 0, 16);
+    data_.captureCardDeviceId = cleanText(
+        obj, "capture_card_device_id", QString(), 96).trimmed().toLower();
     // [ORION_CAPTURE_FPS 2026-09-14] A missing or non-numeric key keeps the compiled default
     // (60 — exactly what every build before this one hard-coded, so an existing install is
     // unchanged); any number present is SNAPPED to {30, 60, 120}. cleanInt's band is deliberately
@@ -1585,13 +1690,20 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
         cleanInt(obj, "sprint_release_r2_threshold", 200,
                  AppConfigData::kSprintReleaseR2ThresholdMin,
                  AppConfigData::kSprintReleaseR2ThresholdMax);
-    // [ORION_SQUARE_PRESS_R2_HOLD 2026-09-16 owner] Non-numeric leaves the compiled default
-    // standing (cleanDouble's fallback), numeric is CLAMPED into the band rather than rejected --
-    // an out-of-band value is a typo, not a request to hold the trigger for a quarter of a second.
-    data_.squarePressR2HoldMs =
-        cleanDouble(obj, "square_press_r2_hold_ms", data_.squarePressR2HoldMs,
+    // [R2_HOLD_PERSISTED_FENCE 2026-09-21] The read half. Preserve visibility of a stale value in
+    // the warning, but never let a hidden settings file override the new faithful-pass-through
+    // default. AutomationEngine's explicit environment knob is the only remaining A/B door.
+    const double persistedSquarePressR2HoldMs =
+        cleanDouble(obj, "square_press_r2_hold_ms", 0.0,
                     AppConfigData::kSquarePressR2HoldMinMs,
                     AppConfigData::kSquarePressR2HoldMaxMs);
+    data_.squarePressR2HoldMs = 0.0;
+    if (persistedSquarePressR2HoldMs > 0.0) {
+        qWarning().noquote()
+            << QStringLiteral("R2 HOLD: persisted %1 ms ignored (pass-through fence 2026-09-21;"
+                              " env ORION_SQUARE_PRESS_R2_HOLD_MS to re-enable for testing)")
+                   .arg(persistedSquarePressR2HoldMs, 0, 'f', 1);
+    }
     data_.noDipEnabled = cleanBool(obj, "no_dip_enabled", data_.noDipEnabled);
     data_.noDipLeadMs = cleanDouble(obj, "no_dip_lead_ms", data_.noDipLeadMs, -150.0, 150.0);
     // [ORION_USER_LEAD] accepted set is {0} u [150, 800]: 0 means "not configured yet" (the
@@ -1783,15 +1895,42 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
     data_.bannerTrimBiasVotes = cleanInt(obj, "banner_trim_bias_votes", 0,
                                          AppConfigData::kBannerTrimBiasVotesMin,
                                          AppConfigData::kBannerTrimBiasVotesMax);
+    // [ORION_ONSET_FF 2026-09-21 owner] The feedforward's limits, CLAMPED into their bands rather
+    // than rejected, exactly like banner_trim_step_ms: 0 gain is a valid request ("keep the
+    // reference, move nothing") and the ceilings are safety properties. A settings.json written
+    // before this key existed simply keeps the compiled defaults.
+    data_.onsetFeedforwardGain = cleanDouble(obj, "onset_ff_gain", data_.onsetFeedforwardGain,
+                                             AppConfigData::kOnsetFeedforwardGainMin,
+                                             AppConfigData::kOnsetFeedforwardGainMax);
+    data_.onsetFeedforwardClampMs = cleanDouble(obj, "onset_ff_clamp_ms",
+                                                data_.onsetFeedforwardClampMs,
+                                                AppConfigData::kOnsetFeedforwardClampMinMs,
+                                                AppConfigData::kOnsetFeedforwardClampMaxMs);
+    data_.onsetFeedforwardWindow = cleanInt(obj, "onset_ff_window", data_.onsetFeedforwardWindow,
+                                            AppConfigData::kOnsetFeedforwardWindowMin,
+                                            AppConfigData::kOnsetFeedforwardWindowMax);
+    data_.onsetFeedforwardMinSamples = cleanInt(obj, "onset_ff_min_samples",
+                                                data_.onsetFeedforwardMinSamples,
+                                                AppConfigData::kOnsetFeedforwardMinSamplesMin,
+                                                AppConfigData::kOnsetFeedforwardMinSamplesMax);
+    data_.onsetFeedforwardOneSided = cleanBool(obj, "onset_ff_one_sided",
+                                               data_.onsetFeedforwardOneSided);
     // [ORION_LEAD_OFFSET_BY_TYPE 2026-09-16 owner] The fixed per-shot-type addition to the Shot
     // Lead. CLAMPED into the band rather than rejected, exactly like banner_trim_step_ms: 0 is a
     // valid request on every bucket (and zeroing all four restores the 2026-09-16 baseline lead
     // byte-for-byte) while the +-40 ceiling is a safety property. An existing settings.json
     // without the keys adopts the 8/8/0/0 defaults, which IS the behaviour change the owner asked
     // for -- fades fire 8 ms earlier, standstills are untouched.
-    data_.leadOffsetLeftFadeMs = cleanDouble(obj, "lead_offset_left_fade_ms", 8.0,
+    data_.leadOffsetLeftFadeMs = cleanDouble(obj, "lead_offset_left_fade_ms", -6.0,
                                              AppConfigData::kLeadOffsetByTypeMinMs,
                                              AppConfigData::kLeadOffsetByTypeMaxMs);
+    // [ORION_LEFT_FADE_LATER 2026-09-22 owner] One-time migration: every install before this change
+    // persisted the old +8 default. A pre-revision-2 file that still holds exactly +8 adopts the new
+    // default; any other value (a deliberate owner choice) is kept. The next save writes rev 2.
+    if (obj.value(QStringLiteral("lead_offset_left_fade_rev")).toInt(1) < 2
+        && std::abs(data_.leadOffsetLeftFadeMs - 8.0) < 1e-9) {
+        data_.leadOffsetLeftFadeMs = -6.0;
+    }
     data_.leadOffsetRightFadeMs = cleanDouble(obj, "lead_offset_right_fade_ms", 8.0,
                                               AppConfigData::kLeadOffsetByTypeMinMs,
                                               AppConfigData::kLeadOffsetByTypeMaxMs);

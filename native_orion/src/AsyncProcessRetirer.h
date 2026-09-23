@@ -13,18 +13,28 @@ namespace orion {
 // Child cleanup is supplied by the owner (a generation-specific Windows job).
 class AsyncProcessRetirer final : public QObject {
 public:
+    struct TerminationTrace {
+        enum Kind { GracefulRequested, ForcedRequested, ObservedExit } kind;
+        qint64 pid = 0;
+        bool forced = false;
+        int exitCode = 0;
+        QProcess::ExitStatus exitStatus = QProcess::NormalExit;
+    };
+
     AsyncProcessRetirer(QProcess* process, QObject* parent,
                         std::function<void()> releaseChildren,
                         std::function<void(bool)> completed,
-                        std::function<void(QProcess*)> claimProcess = {})
+                        std::function<void(QProcess*)> claimProcess = {},
+                        std::function<void(const TerminationTrace&)> terminationTrace = {})
         : QObject(parent), process_(process), releaseChildren_(std::move(releaseChildren)),
-          completed_(std::move(completed)), claimProcess_(std::move(claimProcess))
+          completed_(std::move(completed)), claimProcess_(std::move(claimProcess)),
+          terminationTrace_(std::move(terminationTrace))
     {
         if (process_) {
             process_->disconnect();
             process_->setParent(this);
             connect(process_, &QProcess::finished, this,
-                    [this](int, QProcess::ExitStatus) { finish(); });
+                    [this](int code, QProcess::ExitStatus status) { finish(code, status); });
             connect(process_, &QProcess::errorOccurred, this,
                     [this](QProcess::ProcessError error) {
                         if (error == QProcess::FailedToStart) finish();
@@ -46,6 +56,7 @@ public:
         if (process_) {
             process_->disconnect();
             if (process_->state() != QProcess::NotRunning) {
+                trace(TerminationTrace::ForcedRequested);
                 claimProcess();
                 releaseChildren();
                 process_->kill();
@@ -88,6 +99,7 @@ private:
         if (done_ || shutdownSent_ || !process_ || process_->state() != QProcess::Running) return;
         claimProcess();
         shutdownSent_ = true;
+        trace(TerminationTrace::GracefulRequested);
         process_->write("{\"cmd\":\"shutdown\"}\n");
         process_->closeWriteChannel();
         // Do not send WM_CLOSE here: let the sidecar close its console session first.
@@ -109,15 +121,30 @@ private:
         if (done_) return;
         forced_ = true;
         claimProcess();
+        trace(TerminationTrace::ForcedRequested);
         releaseChildren();
         if (process_ && process_->state() != QProcess::NotRunning) process_->kill();
         else finish();
     }
-    void finish()
+    void trace(TerminationTrace::Kind kind, int exitCode = 0,
+               QProcess::ExitStatus status = QProcess::NormalExit)
+    {
+        if (process_ && process_->processId() != 0)
+            pid_ = static_cast<qint64>(process_->processId());
+        if (terminationTrace_)
+            terminationTrace_({kind, pid_, forced_, exitCode, status});
+    }
+    void finish(int exitCode = 0,
+                QProcess::ExitStatus status = QProcess::NormalExit)
     {
         if (done_) return;
         done_ = true;
         grace_.stop();
+        if (process_ && process_->state() == QProcess::NotRunning) {
+            exitCode = process_->exitCode();
+            status = process_->exitStatus();
+        }
+        trace(TerminationTrace::ObservedExit, exitCode, status);
         releaseChildren();
         auto completed = std::exchange(completed_, {});
         deleteLater();
@@ -129,6 +156,8 @@ private:
     std::function<void()> releaseChildren_;
     std::function<void(bool)> completed_;
     std::function<void(QProcess*)> claimProcess_;
+    std::function<void(const TerminationTrace&)> terminationTrace_;
+    qint64 pid_ = 0;
     bool shutdownSent_ = false;
     bool forced_ = false;
     bool done_ = false;

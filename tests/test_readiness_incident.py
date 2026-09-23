@@ -127,8 +127,10 @@ def test_native_stop_intent_is_logged_before_recovery_state_is_cleared():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     text = (root / 'native_orion/src/RemotePlaySession.cpp').read_text(encoding='utf-8')
-    stop = text[text.index('void RemotePlaySession::stop()'):]
+    stop_start = text.index('void RemotePlaySession::stop(const QString& initiator)')
+    stop = text[stop_start:text.index('void RemotePlaySession::triggerGotoShot()', stop_start)]
     assert stop.index('Remote Play stop requested:') < stop.index('inputRecoveryPending_ = false;')
+    assert stop.index('sidecarStopInitiator_ = initiator;') < stop.index('stopSidecar();')
     teardown = text[text.index('void RemotePlaySession::stopSidecar()'):]
     assert teardown.index('Sidecar shutdown requested asynchronously:') < teardown.index('new AsyncProcessRetirer')
     assert teardown.index('new AsyncProcessRetirer') < teardown.index('retiringSidecar_->start(')

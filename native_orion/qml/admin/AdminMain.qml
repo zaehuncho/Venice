@@ -13,13 +13,15 @@ ApplicationWindow {
     minimumWidth: 1080
     minimumHeight: 700
     visible: true
-    title: admin.ownerMode ? "Orion Owner" : "Orion Staff"
+    title: admin.ownerMode ? "Venice Owner" : "Venice Staff"
     flags: Qt.Window | Qt.FramelessWindowHint
     color: "transparent"
     font.family: Theme.fontUi
     font.pixelSize: Theme.fontBody
 
-    readonly property color toolAccent: admin.ownerMode ? "#4F8CFF" : "#7C3AED"
+    // Owner = the Venice blue the launcher and site use; staff keeps violet so the two consoles
+    // are never mistaken for each other at a glance.
+    readonly property color toolAccent: admin.ownerMode ? Theme.brandAccent : "#7C3AED"
     readonly property bool canAct: admin.authenticated && !admin.busy && !admin.securityLockActive
     property string page: admin.ownerMode ? "dashboard" : "licenses"
     property bool showRaw: false
@@ -29,14 +31,14 @@ ApplicationWindow {
     // Owner and staff tools share this shell; the nav is the only split.
     readonly property var navItems: admin.ownerMode
         ? [
-            { key: "dashboard", label: "Dashboard", glyph: "#" },
-            { key: "licenses", label: "Licenses", glyph: "K" },
+            { key: "dashboard", label: "Dashboard", glyph: "D" },
+            { key: "licenses", label: "Licenses", glyph: "L" },
             { key: "staff", label: "Staff", glyph: "S" },
             { key: "audit", label: "Audit", glyph: "A" },
             { key: "config", label: "Config", glyph: "C" }
           ]
         : [
-            { key: "licenses", label: "Licenses", glyph: "K" },
+            { key: "licenses", label: "Licenses", glyph: "L" },
             { key: "audit", label: "My audit", glyph: "A" },
             { key: "account", label: "My access", glyph: "M" }
           ]
@@ -90,30 +92,22 @@ ApplicationWindow {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 9
 
-                Rectangle {
-                    width: 18
-                    height: 18
-                    radius: 4
+                AdminBrandMark {
+                    size: 20
                     anchors.verticalCenter: parent.verticalCenter
-                    gradient: Gradient {
-                        orientation: Gradient.Vertical
-                        GradientStop { position: 0.0; color: Theme.accent }
-                        GradientStop { position: 1.0; color: Qt.darker(Theme.accent, 1.3) }
-                    }
-                    Text {
-                        anchors.centerIn: parent
-                        text: "O"
-                        color: "#FFFFFF"
-                        font.pixelSize: 11
-                        font.weight: Font.Bold
-                    }
                 }
                 Text {
-                    text: admin.ownerMode ? "Orion Owner" : "Orion Staff"
+                    text: Theme.productName
                     color: Theme.textPrimary
                     font.pixelSize: 13
-                    font.weight: Font.DemiBold
+                    font.weight: Font.Bold
+                    font.letterSpacing: -0.2
                     anchors.verticalCenter: parent.verticalCenter
+                }
+                AdminPill {
+                    anchors.verticalCenter: parent.verticalCenter
+                    label: admin.ownerMode ? "Owner" : "Staff"
+                    tone: Theme.accent
                 }
                 AdminPill {
                     anchors.verticalCenter: parent.verticalCenter
@@ -217,6 +211,13 @@ ApplicationWindow {
                     spacing: 6
 
                     Text {
+                        text: "SIGNED IN AS"
+                        color: Theme.textFaint
+                        font.pixelSize: Theme.fontMicro
+                        font.weight: Font.Bold
+                        font.letterSpacing: 1.2
+                    }
+                    Text {
                         Layout.fillWidth: true
                         text: admin.staffName.length > 0 ? admin.staffName : (admin.ownerMode ? "Owner" : "Staff")
                         color: Theme.textPrimary
@@ -243,23 +244,41 @@ ApplicationWindow {
                             readonly property bool current: window.page === modelData.key
 
                             Layout.fillWidth: true
-                            Layout.preferredHeight: 36
+                            Layout.preferredHeight: 40
                             radius: Theme.radiusControl
                             color: current ? Theme.accentSoft : navMouse.containsMouse ? Theme.bgCardHover : "transparent"
                             border.color: current ? Theme.accentBorder : "transparent"
                             border.width: 1
+
+                            Rectangle {
+                                anchors.left: parent.left
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 3
+                                height: 18
+                                radius: 1.5
+                                color: Theme.accent
+                                visible: navRow.current
+                            }
 
                             RowLayout {
                                 anchors.fill: parent
                                 anchors.leftMargin: 10
                                 anchors.rightMargin: 10
                                 spacing: 10
-                                Text {
-                                    text: navRow.modelData.glyph
-                                    color: navRow.current ? Theme.accentBorder : Theme.textFaint
-                                    font.family: Theme.fontMono
-                                    font.pixelSize: Theme.fontBody
-                                    font.weight: Font.DemiBold
+                                Rectangle {
+                                    Layout.preferredWidth: 26
+                                    Layout.preferredHeight: 26
+                                    radius: 7
+                                    color: navRow.current ? Theme.accent : Theme.iconTileBg
+                                    border.color: navRow.current ? Theme.accentBorder : Theme.borderSoft
+                                    border.width: 1
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: navRow.modelData.glyph
+                                        color: navRow.current ? Theme.textOnAccent : Theme.textMuted
+                                        font.pixelSize: Theme.fontCaption
+                                        font.weight: Font.Bold
+                                    }
                                 }
                                 Text {
                                     Layout.fillWidth: true

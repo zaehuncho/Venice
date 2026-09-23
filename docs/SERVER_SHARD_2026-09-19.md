@@ -115,7 +115,7 @@ revoke operation; the update manifest then points customers at the replacement b
 | 5. Identity/machine | BLOCKED | Requires the signed outer activation broker + DPAPI record before a clean install can launch. |
 | 6. Per-build caps | CODED | Public release rows reject customer binding fields; rate limit is per license/machine. |
 | 7. Tests | CODED | Backend handler/denial/audit tests and Lethe contract tests are listed below. |
-| 8. Packer integration | BLOCKED-SAFE | `pack_lethe_release.py --server-shard` refuses before copying until the signed activation broker exists; the installer now defaults to `release\orion-package-packed`. |
+| 8. Packer integration | CODED (fail-closed VERIFY) | `pack_lethe_release.py --server-shard` now ASSEMBLES the three-exe chain (packed payload + bootstrap-as-OrionNative.exe + unpacked broker), signs the customer manifest, and the gate VERIFIES every shard essential is present AND manifest-covered — failing closed on any gap (2026-09-20 hardening). The Ed25519-signed manifest is the broker's package-INTEGRITY record (owner is cert-free) but NOT a sufficient sole bootstrap trust anchor — an OS-enforced verifier outside the broker is an OPEN release blocker (red team 2026-09-20). Real end-to-end pack (built bootstrap/packed app on a pinned clean Lethe + the VeniceSigning key) remains the owner's rig step. Installer defaults to `release\orion-package-packed` and points launch/shortcuts/`orion://` at the broker. |
 | 9. Acceptance | RIG REQUIRED | `scripts/accept_server_shard.ps1` records (a)-(f); (a)-(e) must pass live before ship. |
 
 ## Tests and evidence

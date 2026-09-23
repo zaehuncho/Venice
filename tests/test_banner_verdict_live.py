@@ -644,6 +644,32 @@ def test_a_fresh_panel_after_a_release_is_attributed(library, matcher):
     assert live.verdicts_forwarded == 1 and live.verdicts_unattributed == 0
 
 
+def test_overlapping_release_window_refuses_ambiguous_banner_and_keeps_next_shot(
+        library, matcher, caplog):
+    """A delayed first panel must not grade the newer shot in the overlap window."""
+    sink = []
+    live = make_reader(matcher, sink, require_release=True)
+    court = build_strip(library, [])
+    first = _two_cell(library, "LATE", "red")
+    second = _two_cell(library, "EXCELLENT", "green")
+    t0 = 1_789_511_846_400.0
+    live.note_release(1, t0)
+    live.note_release(2, t0 + 1700.0)
+    with caplog.at_level(logging.INFO):
+        t = feed(live, first, t=t0 + 2400.0, seq=101)
+        for _ in range(5):
+            live.process(court, 102, 0, t)
+            t += 100.0
+        feed(live, second, t=t, seq=103)
+    events = _events(sink)
+    assert [(e["timing"], e["release_seq"]) for e in events] == [
+        ("EXCELLENT", 2)]
+    assert live.verdicts_ambiguous == 1
+    assert live.verdicts_forwarded == 1
+    assert any("BANNER VERDICT AMBIGUOUS:" in r.getMessage() for r in caplog.records)
+    assert live._releases[0]["used"] is False
+
+
 def test_one_release_can_only_mint_one_verdict(library, matcher):
     """A second panel behind the SAME release is never a second tally entry."""
     sink = []

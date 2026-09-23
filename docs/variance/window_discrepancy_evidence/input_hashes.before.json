@@ -1,0 +1,42 @@
+[
+  {
+    "path": "docs/variance/PREREGISTRATION_OFFSET_SWEEP.md",
+    "sha256": "B0B1034B64603A875A1107300CB3C3A34423F4EDA6DE8E49D161F53C40601339",
+    "length": 25161
+  },
+  {
+    "path": "docs/variance/ONLINE_GRADING_CLOCK_2026-09-22.md",
+    "sha256": "B5DC8AE05FB5F8E035AB0F42AFADE48385DE8C1B4AAFA03F21B8527FA975CC55",
+    "length": 7385
+  },
+  {
+    "path": "native_orion/src/AutomationEngine.cpp",
+    "sha256": "4EAA115E4427CC6FF2FE2FE12C5C77C5AF6B05B22050EA6AB1E8EA0FF5EB4FE8",
+    "length": 1412553
+  },
+  {
+    "path": "native_orion/src/AutomationEngine.h",
+    "sha256": "A828980529AF1DB9347E651F82BBB66B53C4012CF494BA398DBF2CB87CA4B19D",
+    "length": 479647
+  },
+  {
+    "path": "logs/orion_native.log",
+    "sha256": "C56956943701329E2974D129279DCB6053A9D6DAAB50D2866BBF120D9F6010E0",
+    "length": 8214142
+  },
+  {
+    "path": "logs/orion_native.log.1",
+    "sha256": "BEA62C5EB199642086C69EC8D4B7AEA162AB2C9A9D2D5182866F959E015373D3",
+    "length": 17079080
+  },
+  {
+    "path": "tools/timing/net_join.py",
+    "sha256": "982FA44C434FF3F4A8E81525B48BF18FD2052973B9861CD47705D7C2AD552730",
+    "length": 12021
+  },
+  {
+    "path": "tools/timing/net_probe.py",
+    "sha256": "9B2716D8EB52A3C1626EEBE69DB03821DB783FA10F97DE14D9F50FEC7A283929",
+    "length": 9686
+  }
+]

@@ -30,6 +30,12 @@ def _activate(lf, key, machine="OWNER-PC"):
         body={"license_key": key, "machine_id": machine, **make_nonce_ts()})
 
 
+def _activate_session_only(lf, key, machine="OWNER-PC"):
+    return invoke(lf, "POST", "/api/license/redeem",
+        body={"license_key": key, "machine_id": machine,
+              "session_only": True, **make_nonce_ts()})
+
+
 def test_pair_issue_requires_trusted_oauth_relay_and_live_trial(lf, monkeypatch):
     status, body, _ = _issue(lf, authorized=False)
     assert status == 403 and body["error"] == "forbidden"
@@ -80,6 +86,43 @@ def test_pair_code_exchanges_once_for_canonical_key_and_bound_heartbeat(lf, monk
     _, fresh, _ = _issue(lf)
     wrong_pc_status, wrong_pc, _ = _activate(lf, fresh["pair_code"], "ATTACKER-PC")
     assert wrong_pc_status == 403 and wrong_pc["error"] == "device_mismatch"
+
+
+# [SERVER-SHARD blocker #5, Codex finding #1] The unpacked activation broker
+# redeems with session_only:true and MUST receive a usable session but NO license
+# material. The default in-app redeem is unchanged and still returns the canonical
+# key + profile.
+def test_session_only_redeem_returns_session_without_license_material(lf, monkeypatch):
+    trial = _claim_trial(lf, monkeypatch)
+    _, issued, _ = _issue(lf)
+    code = issued["pair_code"]
+
+    status, activated, _ = _activate_session_only(lf, code)
+    assert status == 200 and activated["ok"] is True
+    # Session essentials the broker writes to DPAPI are present...
+    assert activated.get("token")
+    assert activated.get("tid")
+    # ...but NO license material or customer PII is returned to the broker.
+    assert "canonical_license_key" not in activated
+    assert "license_key_suffix" not in activated
+    assert "profile" not in activated
+
+    # The bind is real server-side: the machine is now bound to the license.
+    item = lf.licenses_table().get_item(
+        Key={"license_key": trial["license_key"]}).get("Item", {})
+    assert item.get("machine_id") == "OWNER-PC"
+
+
+def test_default_redeem_still_returns_canonical_key_and_profile(lf, monkeypatch):
+    trial = _claim_trial(lf, monkeypatch)
+    _, issued, _ = _issue(lf)
+    code = issued["pair_code"]
+
+    status, activated, _ = _activate(lf, code)   # no session_only flag
+    assert status == 200 and activated["ok"] is True
+    assert activated["canonical_license_key"] == trial["license_key"]
+    assert "license_key_suffix" in activated
+    assert "profile" in activated
 
 
 def test_expired_pair_code_and_expired_trial_fail_closed(lf, monkeypatch):

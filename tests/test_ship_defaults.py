@@ -431,13 +431,13 @@ def test_the_rest_of_the_native_ship_list_is_where_the_launch_line_left_it(ship_
         encoding="utf-8", errors="replace")
     expected = {
         "sprintReleaseOnSquare": "false",          # refuted live 09-16 23:04; code kept
-        "squarePressR2HoldMs": "50.0",             # its replacement
+        "squarePressR2HoldMs": "0.0",              # 09-21 owner pass-through default; 50 ms is opt-in A/B only
         "bannerLeadTrim": "true",
         "bannerTrimTempoBuckets": "true",
         "leadAutoSeed": "true",
         "aimMarginMs": "69.0",                     # owner's slider 269 - fixed 200
         "leadFactoryPlaceholderMs": "269.0",
-        "leadOffsetLeftFadeMs": "8.0",
+        "leadOffsetLeftFadeMs": "-6.0",            # [ORION_LEFT_FADE_LATER 2026-09-22]
         "leadOffsetRightFadeMs": "8.0",
         "meterBackstopGraceMs": "100.0",
         "meterBackstopGraceFadeMs": "220.0",

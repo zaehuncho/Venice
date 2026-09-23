@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "C:\\Users\\aaron\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+    "-B",
+    "tools/timing/test_sweep_analysis.py"
+  ],
+  "cwd": "C:\\Users\\aaron\\Desktop\\NexusVision",
+  "stdin": "none",
+  "exit_status": 0,
+  "literal_output_file": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\MODIFIED_TESTS.txt"
+}

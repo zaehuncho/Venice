@@ -6,6 +6,7 @@
     "replaces_note": "#downloads is empty — nothing to replace. This is the first post.",
     "post_as": "Triton",
     "method": "POST /channels/1549499799861067876/messages",
+    "signing_status": "2026-09-23: installer/Output/VeniceSetup-1.0.0.exe is NOT Authenticode-signed (Get-AuthenticodeSignature = NotSigned). Field 1 now tells buyers about SmartScreen and the SHA-256 check. If an EV/OV-signed installer ships instead, replace the SmartScreen sentence with the publisher name. OWNER DECISION: blocked_by below still forbids posting an unsigned build.",
     "blocked_by": "Launch blocker B5: no signed installer is published yet. Replace INSTALLER_URL and INSTALLER_SHA256 with the real values, and delete this note, before posting. Do not post a link to an unsigned build."
   },
   "message": {
@@ -17,7 +18,7 @@
         "fields": [
           {
             "name": "1 • Installer",
-            "value": "[Download Venice Setup](INSTALLER_URL)\nSHA-256: `INSTALLER_SHA256`\nWindows will show the publisher on the signed installer — if it does not, stop and open a ticket.",
+            "value": "[Download Venice Setup](INSTALLER_URL)\nSHA-256: `INSTALLER_SHA256`\n**Windows SmartScreen:** the installer isn't code-signed yet, so Windows may say \"Windows protected your PC\". Click **More info**, then **Run anyway**. Setup asks for administrator rights because it installs a controller driver.\n**Check your download:** in PowerShell run `Get-FileHash $HOME\\Downloads\\VeniceSetup-*.exe` and make sure the hash matches the SHA-256 above. If it doesn't match, don't run it — open a ticket.",
             "inline": false
           },
           {

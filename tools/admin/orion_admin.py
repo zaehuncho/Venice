@@ -56,7 +56,7 @@ CONFIG_PATH = Path.home() / ".orion" / "admin_config.json"
 REASON_MAX_CHARS = 200
 
 # Mirrors backend/lambda_function.py (owner rule 2026-09-15). `month` is the only
-# plan sold — a free 3-day trial, then a recurring monthly subscription — and a
+# plan sold - a free 7-day trial, then a recurring monthly subscription - and a
 # HWID reset past the 3 free ones costs one day off that subscription.
 SELLABLE_PLAN = "month"
 RESET_FREE_DEFAULT = 3
@@ -999,8 +999,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reveal", action="store_true", help="Show the full key (off by default).")
 
     p = lic_sub.add_parser("create", help="Create licenses (keys shown once).")
-    # Owner rule 2026-09-15: `month` is the only plan sold (free 3-day trial, then
-    # $25/month recurring). `lifetime`/`week`/`day` are still ACCEPTED so staff can
+    # Owner rule 2026-09-15: `month` is the only plan sold (free 7-day trial, then
+    # $19.99/month recurring). `lifetime`/`week`/`day` are still ACCEPTED so staff can
     # mint a comp and so keys already sold keep resolving — they are not sold.
     p.add_argument("--plan", default=SELLABLE_PLAN,
                    help=f"Plan tier. Default {SELLABLE_PLAN!r} — the only plan sold. "

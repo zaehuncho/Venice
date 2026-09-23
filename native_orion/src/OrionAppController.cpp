@@ -1,4 +1,5 @@
 #include "OrionAppController.h"
+#include "ActivityLogClipboard.h"
 #include "ReleasePathPolicy.h"
 #include "LeadCalibrationPolicy.h"
 #include "OrionPaths.h"
@@ -50,6 +51,7 @@
 #include <QtGui/QWindow>
 #include <QtNetwork/QHostAddress>
 #include <QtNetwork/QTcpSocket>
+#include <QtNetwork/QNetworkInformation>   // [CL2-P8-002 2026-09-23] network-return heartbeat
 
 #include <algorithm>
 #include <array>
@@ -2264,7 +2266,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 authTokenExpires_ = 0;
                 licenseHeartbeatTimer_.stop();
                 licenseState_ = QStringLiteral("Locked");
-                authMessage_ = QStringLiteral("Discord connection did not return a valid license. Connect again.");
+                authMessage_ = QStringLiteral("Discord sign-in did not return a valid code. Get a fresh one-time code from zaeorion.com/connect and try again.");
                 updateSecurityStatus();
                 emit authChanged();
                 emit statusChanged();
@@ -2276,7 +2278,11 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             authenticated_ = true;
             currentPage_ = QStringLiteral("remotePlay");
             licenseState_ = result.plan.isEmpty() ? QStringLiteral("Verified") : result.plan;
-            authMessage_ = result.message.isEmpty() ? QStringLiteral("License verified. Opening Venice.") : result.message;
+            // Always the curated line: the server's success text is not customer copy and
+            // must not render unclassified in AuthGate (Astra, bug sweep). Keep it in the log.
+            if (!result.message.isEmpty())
+                appendLog(QStringLiteral("License server message: %1").arg(result.message));
+            authMessage_ = QStringLiteral("Verified. Opening Venice.");
             appendLog(QStringLiteral("License verified for %1").arg(result.user.isEmpty() ? QStringLiteral("current device") : result.user));
             // Profile page data rides the activation verdict (and every heartbeat
             // after it). Absent on the current live Lambda -> no-op.
@@ -2308,7 +2314,8 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 appendLog(entitlementState_);
             }
             emit navigationChanged();
-            licenseHeartbeatTimer_.start();
+            // [CL2-P8-002 2026-09-23] Fresh session: clean retry ladder, normal cadence.
+            applyHeartbeatAction(heartbeatCoordinator_.onSessionStarted());
             // Pre-warm the capture-card preview the instant auth succeeds, so the sidecar +
             // Elgato open (~2-4s) overlaps the remaining gate screens and the Live Capture
             // card is already live when RemotePlayPage mounts — instead of a black panel for
@@ -2336,6 +2343,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // License authority/cache mutation is a synchronous checkpoint. This
         // also invalidates any periodic result that began before the mutation.
         updateSecurityStatus();
+        refreshLeaseNotice();   // [CL2-P8-002 2026-09-23]
         emit authChanged();
         emit statusChanged();
     });
@@ -2362,10 +2370,24 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             if (!leaseKey.isEmpty()
                 && !LeaseGate::verifyLeaseSignature(leaseKey, authLicenseKey_, security_.machineId(),
                                                     result.leaseExpiresAtEpochS, result.leaseSig)) {
-                appendLog(QStringLiteral("License heartbeat: lease signature INVALID — lease not refreshed."));
+                appendLog(QStringLiteral("Lease heartbeat: lease signature INVALID — lease not refreshed."));
+                // [CL2-P8-002 2026-09-23] Treated as a failed refresh: retry on the
+                // backoff ladder. The lease is NOT touched and still fails closed.
+                applyHeartbeatAction(heartbeatCoordinator_.onResult(HeartbeatOutcome::Failure));
+                refreshLeaseNotice();
                 return;   // stale lease will fail closed via max-staleness
             }
             leaseGate_.recordHeartbeatOk(result.leaseExpiresAtEpochS);
+            // [CL2-P8-002 2026-09-23] Recovered: back to the normal cadence and clear
+            // the "Reconnecting" notice now instead of on the next notice tick.
+            // Engineering log only (not the customer Activity ring).
+            if (heartbeatCoordinator_.consecutiveFailures() > 0) {
+                appendLog(heartbeatRecoveredLogLine(heartbeatCoordinator_.consecutiveFailures(),
+                                                    leaseGate_.stateText()));
+            }
+            applyHeartbeatAction(heartbeatCoordinator_.onResult(
+                HeartbeatOutcome::Ok, leaseGate_.fireAllowed()));
+            refreshLeaseNotice();
             return;
         }
         // Fail-soft: only an EXPLICIT server kill code disables a running session.
@@ -2379,9 +2401,25 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // prose or an unknown string is never a kill.
         const bool kill = isLicenseKillCode(e);
         if (!kill) {
+            // [CL2-P8-002 2026-09-23] Transport failure (e empty) or a non-kill code
+            // (rate_limited, server error): retry at 15 s / 30 s / 60 s, then the
+            // normal 5-min cadence, instead of waiting a full 5 min. rate_limited
+            // jumps straight to the 60 s rung. Retries only REQUEST a refresh; the
+            // lease is untouched and still fails closed on expiry/max-staleness.
+            // [round 2] If an event queued a re-run behind this request, the
+            // coordinator sends it now instead (the stale failure is not counted).
+            const HeartbeatAction next = heartbeatCoordinator_.onResult(
+                e == QLatin1String("rate_limited") ? HeartbeatOutcome::RateLimited
+                                                   : HeartbeatOutcome::Failure);
+            // Engineering log only: a Wi-Fi blip must not spam the customer feed.
+            appendLog(heartbeatRetryLogLine(e, next.sendNow ? 0 : heartbeatCoordinator_.nextDelayMs(),
+                                            leaseGate_.stateText()));
+            applyHeartbeatAction(next);
+            refreshLeaseNotice();
             return;
         }
         appendLog(QStringLiteral("License heartbeat: session disabled (%1)").arg(e));
+        applyHeartbeatAction(heartbeatCoordinator_.onResult(HeartbeatOutcome::Kill));   // [CL2-P8-002] stops the timer
         licenseHeartbeatTimer_.stop();
         disconnectRemotePlay(true);   // stop the bot/capture immediately
         authenticated_ = false;
@@ -2394,16 +2432,45 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         // copy; the other codes show the server's `message` prose as before.
         authMessage_ = licenseErrorUserText(
             result, QStringLiteral("Venice has been disabled. Check the Discord for updates."));
+        // [CL2-P8-006/008 2026-09-23] authMessage_ may now be mapped customer copy;
+        // keep the raw server code in the engineering log for support (the
+        // "session disabled" line above is the customer event).
+        appendLog(QStringLiteral("Lease heartbeat: server code %1 shown to the customer as: %2").arg(e, authMessage_));
+        refreshLeaseNotice();   // [CL2-P8-002 2026-09-23] signed out -> no lease notice
         emit authChanged();
         emit navigationChanged();
         emit statusChanged();
     });
-    licenseHeartbeatTimer_.setInterval(5 * 60 * 1000);   // 5-min server re-check
+    licenseHeartbeatTimer_.setInterval(LicenseHeartbeatBackoff::kNormalIntervalMs);   // 5-min server re-check
     connect(&licenseHeartbeatTimer_, &QTimer::timeout, this, [this]() {
         if (authenticated_ && !authLicenseKey_.isEmpty()) {
             licenseClient_.validate(authLicenseKey_, security_.machineId());
         }
     });
+    // [CL2-P8-002 2026-09-23] Event-driven recovery + visible lease state.
+    //  * Network return: QNetworkInformation (Windows Network List Manager
+    //    backend, shipped in networkinformation/) -> Online triggers an
+    //    immediate heartbeat. Missing backend = logged, no-op (the retry ladder
+    //    and the resume hook in nativeEventFilter still recover).
+    //  * leaseNoticeTimer_ re-evaluates the lease every 5 s because staleness /
+    //    expiry is time-driven: nothing emits when the lease quietly lapses.
+    heartbeatMonotonic_.start();
+    if (QNetworkInformation::loadBackendByFeatures(QNetworkInformation::Feature::Reachability)) {
+        if (auto* netInfo = QNetworkInformation::instance()) {
+            connect(netInfo, &QNetworkInformation::reachabilityChanged, this,
+                    [this](QNetworkInformation::Reachability reachability) {
+                if (reachability == QNetworkInformation::Reachability::Online) {
+                    requestImmediateLicenseHeartbeat(QStringLiteral("network back online"));
+                }
+            });
+        }
+    } else {
+        appendLog(QStringLiteral("Lease heartbeat: network-reachability backend unavailable; "
+                                 "recovery relies on the retry ladder and resume events."));
+    }
+    leaseNoticeTimer_.setInterval(5'000);
+    connect(&leaseNoticeTimer_, &QTimer::timeout, this, [this]() { refreshLeaseNotice(); });
+    leaseNoticeTimer_.start();
     // MOTD `until` expiry: re-evaluate the stored notice when its deadline passes so
     // the banner hides between heartbeats instead of lingering up to 5 minutes.
     motdExpiryTimer_.setSingleShot(true);
@@ -2536,10 +2603,15 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     updateRecheckTimer_.start();
 
     connect(&remotePlay_, &RemotePlaySession::stateChanged, this, [this](RemotePlayState state, const QString& status) {
-        hookIdleNeutralSinceMs_ = -1;
+        hookDigitalRestSinceMs_ = -1;
+        hookReleaseRepairDueMs_ = -1;
+        hookReleaseRepairHavePreviousOutput_ = false;
         const QString prevRemoteState = remoteState_;   // [ORION_USER_LOG] dedupe user lines
         remoteState_ = remotePlayTeardownActive_ ? QStringLiteral("Disconnecting") : stateText(state);
-        remoteStatus_ = remotePlayTeardownActive_ ? QStringLiteral("Disconnecting…") : status;
+        // [COPY-FIX 2026-09-23 NEW-A5] The Live page, the input-dead overlay and the
+        // Activity feed show customer copy; the raw engine status is logged below.
+        const QString customerStatus = ui_notifications::customerRemoteStatus(status);
+        remoteStatus_ = remotePlayTeardownActive_ ? QStringLiteral("Disconnecting…") : customerStatus;
         remoteRunning_ = state == RemotePlayState::Running || state == RemotePlayState::Connecting;
         // The pre-Connect capture preview only exists while Disconnected. Once the real session
         // takes the panel over (Connecting/Running) drop the preview flag — this is also what makes
@@ -2624,7 +2696,11 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             shotState_ = holdStateText(shot_.state);
             observeBotOwnership(shot_);
         }
-        appendLog(QStringLiteral("Remote Play: %1 - %2").arg(remoteState_, status));
+        appendLog(QStringLiteral("Remote Play: %1 - %2").arg(remoteState_, customerStatus));
+        if (customerStatus != status) {
+            // Engineering log only (ui_notifications rule 0 hides "engine detail:").
+            appendLog(QStringLiteral("Remote Play engine detail: %1").arg(status));
+        }
         // [ORION_USER_LOG] (5b) plain-language connection lines, on state CHANGES only.
         if (userLog_.enabled() && remoteState_ != prevRemoteState) {
             if (state == RemotePlayState::Running) {
@@ -2632,7 +2708,7 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             } else if (state == RemotePlayState::Connecting) {
                 userLog_.append(QStringLiteral("Connecting to your console..."));
             } else if (state == RemotePlayState::Error) {
-                userLog_.append(QStringLiteral("Connection problem: %1").arg(status));
+                userLog_.append(QStringLiteral("Connection problem: %1").arg(customerStatus));
             } else {
                 userLog_.append(QStringLiteral("Disconnected from the console."));
             }
@@ -2669,6 +2745,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         preciseFireRecoveryNeutralFrames_ = 0;
         automation_.setArmed(false);
         automation_.reset();
+        // [2026-09-22 RED TEAM CL-007] This was the only reset() site that did not neutralise owned
+        // output; a bot-held Square could survive the recovery with no release and no drain.
+        neutralizeOwnedInput();
         shot_ = automation_.context();
         shotState_ = holdStateText(shot_.state);
         observeBotOwnership(shot_);
@@ -3452,6 +3531,12 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     // feedback banner -> the rolling 10-shot tally the owner tunes against, plus one plain
     // Activity line. Presentation only: it never reaches the engine, the telemetry snapshot
     // or any timing path.
+    // [ORION_ONSET_FF 2026-09-21] A court change drops the onset feedforward's reference.
+    connect(&remotePlay_, &RemotePlaySession::courtChanged, this,
+            [this](const QString& courtIp) {
+                Q_UNUSED(courtIp);   // never log the court address
+                automation_.noteContextChanged(QStringLiteral("court_changed"));
+            });
     connect(&remotePlay_, &RemotePlaySession::bannerVerdict, this,
             &OrionAppController::observeBannerVerdict);
     // [ORION_RELEASE_ORACLE_TRIM 2026-09-15] The banner-free input to the same trim.
@@ -3758,7 +3843,13 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
 
     connect(&remotePlay_, &RemotePlaySession::setupMessage, this, [this](const QString& message) {
         backendMessage_ = message;
-        appendLog(message);
+        // [CL2-P3-005 2026-09-23] Plain-language capture notices are customer events: also
+        // write them to the optional orion_user.log sink (appendCustomerEvent calls appendLog).
+        if (message.startsWith(QLatin1String("Capture: "))) {
+            appendCustomerEvent(message);
+        } else {
+            appendLog(message);
+        }
         emit statusChanged();
     });
 
@@ -3898,15 +3989,17 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 // whole session died shot by shot with nothing naming the cause. Say the cause
                 // and the fix. The conflict test runs against the CURRENT pair, so a genuine
                 // transient miss on a schedulable pair keeps the raw reason below.
+                // [COPY-FIX 2026-09-23 CW-9/EA-27/NEW-A7] On the Shot Lead card's own 1-100
+                // scale, no "schedule"/"deadline" jargon; the ms values stay in the raw
+                // "Shot automation aborted:" engineering line above.
                 appendCustomerEvent(QStringLiteral(
-                    "Shot not taken — Shot Lead %1 ms is more than Tip Timing %2 ms can "
-                    "schedule (the release deadline is already past when the shot starts). "
-                    "Lower Shot Lead to %3 ms or less, or raise/reset Tip Timing.")
-                                        .arg(actuationLeadMs(), 0, 'f', 0)
-                                        .arg(tipTimingMs(), 0, 'f', 0)
-                                        .arg(shotLeadMaxUsableMs(), 0, 'f', 0));
+                    "Shot not taken — Shot Lead %1 is too high for your jumpshot, so Venice "
+                    "can't release in time. Lower it to %2 or less (or press Reset on Tip Timing).")
+                                        .arg(ui_notifications::shotLeadSliderValue(actuationLeadMs()))
+                                        .arg(ui_notifications::shotLeadSliderValue(shotLeadMaxUsableMs())));
             } else {
-                appendCustomerEvent(QStringLiteral("Shot not taken (%1).").arg(reason));
+                // [COPY-FIX 2026-09-23 NEW-A7] Never print the raw reason enum to customers.
+                appendCustomerEvent(ui_notifications::customerShotNotTakenText(reason));
             }
         }
     });
@@ -4829,6 +4922,10 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 appendLog(QStringLiteral("SAFE MODE: sidecar exited again after %1 restarts — "
                                          "not restarting (crash loop). Manual reset required.")
                               .arg(safeModeSidecarRestarts_));
+                // [COPY-FIX 2026-09-23 NEW-A6] The line above is engineering-only now
+                // (ui_notifications rule 0 hides "sidecar"); the customer gets the action.
+                appendLog(QStringLiteral("Safe mode: video detection keeps stopping. Click SAFE MODE "
+                                         "at the top, then Exit safe mode, or restart Venice."));
             }
             return;
         }
@@ -4864,7 +4961,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             });
             return;
         }
-        tripWatchdog(QStringLiteral("Detection sidecar exited mid-stream"));
+        // [COPY-FIX 2026-09-23] The reason is shown in the SAFE MODE dialog and the
+        // "Watchdog trip:" Activity line, so it is customer copy.
+        tripWatchdog(QStringLiteral("Video detection stopped mid-stream"));
         if (!safeModeActive_) {
             appendLog(QStringLiteral("Watchdog: restarting detection sidecar."));
             restartSidecarWithWindowContainment();
@@ -4976,6 +5075,91 @@ void OrionAppController::dismissMotd()
     motdDismissed_ = true;
     appendLog(QStringLiteral("MOTD dismissed for this session."));
     emit motdChanged();
+}
+
+// ── [CL2-P8-002 2026-09-23] Licence heartbeat recovery ───────────────────────
+// None of these touch leaseGate_: they only REQUEST a /api/license/check. The
+// lease is refreshed exclusively by a verified ok answer in validationFinished,
+// so fail-closed behaviour is exactly as before.
+// [round 2] Executes a coordinator decision. Kill/stop is always honoured; a
+// (re)start or send only while signed in and not exiting.
+void OrionAppController::applyHeartbeatAction(const HeartbeatAction& action)
+{
+    if (action.stopTimer) {
+        licenseHeartbeatTimer_.stop();
+    }
+    if (applicationShutdownActive(applicationShutdownPhase_) || !authenticated_
+        || authLicenseKey_.isEmpty()) {
+        return;   // signed out / killed / exiting: never re-arm the heartbeat
+    }
+    if (action.restartTimerMs >= 0) {
+        licenseHeartbeatTimer_.start(action.restartTimerMs);
+    }
+    if (action.sendNow) {
+        licenseClient_.validate(authLicenseKey_, security_.machineId());
+    }
+}
+
+void OrionAppController::requestImmediateLicenseHeartbeat(const QString& reason)
+{
+    if (applicationShutdownActive(applicationShutdownPhase_) || !authenticated_
+        || authLicenseKey_.isEmpty()) {
+        return;
+    }
+    const qint64 nowMs = heartbeatMonotonic_.isValid() ? heartbeatMonotonic_.elapsed() : 0;
+    const bool inFlight = licenseClient_.validationInFlight();
+    const bool wasPending = heartbeatCoordinator_.rerunPending();
+    // Debounced inside (Windows fires several resume/online events per wake). A
+    // wake / network return restarts the short retry ladder; if a request is in
+    // flight the coordinator remembers ONE re-run for when it completes
+    // (LicenseClient::validate would otherwise silently no-op).
+    const HeartbeatAction action = heartbeatCoordinator_.onImmediateRequest(nowMs, inFlight);
+    const bool queued = !wasPending && heartbeatCoordinator_.rerunPending();
+    if (!action.sendNow && !queued) {
+        return;   // debounced
+    }
+    appendLog(heartbeatImmediateLogLine(reason, queued, leaseGate_.stateText()));   // engineering log only
+    applyHeartbeatAction(action);
+}
+
+void OrionAppController::refreshLeaseNotice()
+{
+    bool signedInForLease = authenticated_;
+#ifndef ORION_PRODUCTION_BUILD
+    // The dev-only Local Dev session bypasses the lease (AutomationAccessPolicy);
+    // do not show a lease notice for it.
+    if (licenseState_ == QLatin1String("Local Dev")) {
+        signedInForLease = false;
+    }
+#endif
+    const LeaseNoticeKind kind = leaseNoticeKind(leaseGate_.enabled(), signedInForLease,
+                                                 leaseGate_.fireAllowed(),
+                                                 heartbeatCoordinator_.clockOffAtReceipt());
+    if (kind == leaseNoticeKind_) {
+        return;
+    }
+    const LeaseNoticeKind previous = leaseNoticeKind_;
+    leaseNoticeKind_ = kind;
+    leaseNotice_ = leaseNoticeText(kind);
+    if (kind == LeaseNoticeKind::None) {
+        if (authenticated_) {   // a sign-out also clears the notice; that is not a restore
+            appendLog(leaseRestoredLogLine());   // customer Activity ring: one line per episode
+        }
+    } else {
+        // Customer Activity ring (licence allow-list): the plain banner copy, once
+        // per episode. The lease state goes to the engineering retry lines.
+        appendLog(leaseNotice_);
+    }
+    emit leaseNoticeChanged();
+    emit statusChanged();
+    // The lease just lapsed while only the normal 5-min tick is pending (e.g. a
+    // missed resume event): ask once now. Skipped while the retry ladder is
+    // already running so a failure never doubles up. Debounced; a no-op while a
+    // request is in flight.
+    if (previous == LeaseNoticeKind::None && kind == LeaseNoticeKind::Reconnecting
+        && heartbeatCoordinator_.consecutiveFailures() == 0) {
+        requestImmediateLicenseHeartbeat(QStringLiteral("lease lapsed"));
+    }
 }
 
 void OrionAppController::applyServerMotd(const LicenseMotd& motd)
@@ -5097,6 +5281,7 @@ void OrionAppController::prepareForApplicationExit()
     updateRecheckTimer_.stop();
     watchdogTimer_.stop();
     licenseHeartbeatTimer_.stop();
+    leaseNoticeTimer_.stop();   // [CL2-P8-002 2026-09-23]
     logFlushTimer_.stop();
 
     automation_.setArmed(false);
@@ -5134,6 +5319,20 @@ void OrionAppController::setFrameProvider(RemoteFrameProvider* provider)
 bool OrionAppController::nativeEventFilter(const QByteArray& eventType, void* message, qintptr* result)
 {
 #ifdef Q_OS_WIN
+    // [CL2-P8-002 2026-09-23] Resume from sleep/hibernate: the fire lease has
+    // usually lapsed while suspended, so re-check the licence now instead of on
+    // the next 5-min tick. Queued (never re-enter from inside a window proc) and
+    // debounced in requestImmediateLicenseHeartbeat (Windows sends both resume
+    // codes, to every top-level window). Never consumed: falls through below.
+    if (eventType == "windows_generic_MSG" && message) {
+        const auto* powerMsg = static_cast<const MSG*>(message);
+        if (powerMsg->message == WM_POWERBROADCAST
+            && (powerMsg->wParam == PBT_APMRESUMEAUTOMATIC || powerMsg->wParam == PBT_APMRESUMESUSPEND)) {
+            QMetaObject::invokeMethod(this, [this]() {
+                requestImmediateLicenseHeartbeat(QStringLiteral("resumed from sleep"));
+            }, Qt::QueuedConnection);
+        }
+    }
     // Steam Input / Windows GameInput can translate a desktop-visible XUSB pad's
     // A/D-pad/trigger input into keyboard or mouse navigation for the foreground
     // app. During a live PS5 session those events belong to the console, never to
@@ -5379,7 +5578,7 @@ void OrionAppController::authenticate(const QString& key)
 #endif
 
     authBusy_ = true;
-    authMessage_ = QStringLiteral("Checking license...");
+    authMessage_ = QStringLiteral("Checking your code…");
     licenseState_ = QStringLiteral("Checking");
     emit authChanged();
     emit statusChanged();
@@ -5670,7 +5869,10 @@ void OrionAppController::startUpdate()
     // rather than refusing -- combined with the no-lockout guard above, the worst case is
     // "update did not apply, app keeps working" instead of "app is gone".
     bool launched = false;
-    const bool installDirWritable = QFileInfo(installDir).isWritable();
+    // The verified helper and backup are siblings of the install, not children
+    // of it. A writable install with an unwritable parent still needs elevation.
+    const bool installDirWritable = QFileInfo(installDir).isWritable()
+        && QFileInfo(QFileInfo(installDir).dir().absolutePath()).isWritable();
 #ifdef Q_OS_WIN
     if (!installDirWritable) {
         appendLog(QStringLiteral(
@@ -6148,6 +6350,9 @@ void OrionAppController::releaseFailedRemoteInputRoute()
     shotIntentEdgeTracker_.reset();
     previousControllerUiState_ = ControllerState{};
     squareUpAuditTracker_.reset();
+    hookDigitalRestSinceMs_ = -1;
+    hookReleaseRepairDueMs_ = -1;
+    hookReleaseRepairHavePreviousOutput_ = false;
     inputRouteAwaitingRecovery_ = false;
     preciseFireDeliveryFault_ = false;
     preciseFireRecoveryNeutralFrames_ = 0;
@@ -6854,7 +7059,17 @@ void OrionAppController::switchProfile(const QString& name)
         const QString color = p.value(QStringLiteral("meter_color")).toString();
         const QString bandwidth = p.value(QStringLiteral("bandwidth_mode")).toString();
         if (!style.isEmpty()) {
-            data.meterStyle = style;
+            // [ORION_PILL_REMOVED 2026-09-21] A profile is a third ingress for meter_style
+            // beside settings.json load and setMeterStyle (Astra found this bypass). Apply
+            // the same acceptance rule: anything not on the list -- including a stored
+            // "Pill" -- becomes Arrow2 instead of reaching applyPillYoloRoute.
+            const QString normalized = normalizedMeterStyle(style);
+            const bool accepted = normalized == style.trimmed().left(48);
+            data.meterStyle = normalized;
+            if (!accepted) {
+                appendLog(QStringLiteral("Profile '%1': meter style '%2' is not available; using Arrow2.")
+                              .arg(trimmed, style.trimmed().left(48)));
+            }
         }
         if (!color.isEmpty()) {
             data.meterColor = color;
@@ -6867,6 +7082,9 @@ void OrionAppController::switchProfile(const QString& name)
     // Load the incoming profile's learning namespace and push it into the engine —
     // its per-type clocks/offsets warm-start exactly where that build left off.
     config_.reloadLearning();
+    if (!config_.learningLoadNote().isEmpty()) {
+        appendLog(QStringLiteral("Learning data: %1").arg(config_.learningLoadNote()));
+    }
     syncBackendConfig();
     appendLog(QStringLiteral("Profile -> '%1' (learning namespace %2).")
                   .arg(trimmed, QFileInfo(config_.learningPath()).fileName()));
@@ -7400,6 +7618,9 @@ void OrionAppController::connectRemotePlay()
     shotIntentEdgeTracker_.reset();
     previousControllerUiState_ = ControllerState{};
     squareUpAuditTracker_.reset();
+    hookDigitalRestSinceMs_ = -1;
+    hookReleaseRepairDueMs_ = -1;
+    hookReleaseRepairHavePreviousOutput_ = false;
     hookDownHeartbeats_ = 0;
     hookRecoveryAttempts_ = 0;
     hookFullRestartEscalated_ = false;
@@ -7640,35 +7861,39 @@ void OrionAppController::refreshInputDeliveryState()
     QString detail;
     if (severity == InputDeadSeverity::Notice) {
         // Connecting: deliberately-neutral routes, verdict pending. Honest, calm.
-        headline = QStringLiteral("CONNECTING — BUTTONS NOT REACHING THE CONSOLE YET");
+        // [COPY-FIX 2026-09-23 CW-13/EA-21] Sentence case, plain words.
+        headline = QStringLiteral("Connecting — buttons aren't reaching your PS5 yet");
+        // remoteStatus_ is already customer copy (ui_notifications::customerRemoteStatus).
         detail = remoteStatus_;
     } else if (severity == InputDeadSeverity::Critical) {
-        headline = QStringLiteral("CONTROLLER INPUT IS NOT REACHING THE CONSOLE");
+        headline = QStringLiteral("Controller input isn't reaching your PS5");
         if (sessionState == RemotePlayState::Running) {
             // Running with the direct pipe down: the heartbeat watchdog owns this recovery
             // (input-only repair, then one contained sidecar restart).
+            // [COPY-FIX 2026-09-23 EA-22] The cause is the Remote Play link, not the USB pad.
             detail = QStringLiteral(
-                "The direct input link dropped — recovering it now. Presses are not landing "
-                "in the game until it reconnects.");
+                "Connection to the PS5 dropped — reconnecting now. Presses won't reach the "
+                "game until it's back.");
         } else if (!inputSessionIntentActive_) {
             // Press latch outside a session: the player pressed a shot button into the
             // passive preview — they believe they are connected.
+            // [COPY-FIX 2026-09-23 EA-23] The button is "Connect" (RemotePlayPage.qml).
             detail = QStringLiteral(
-                "This is the HDMI preview only — no session is connected. Press Enable "
-                "Bot + Controller to connect.");
+                "This is the HDMI preview only — Venice isn't connected yet. Press Connect.");
         } else if (inputRetryPendingAttempt_ > 0) {
             detail = QStringLiteral("Reconnecting automatically — attempt %1 of %2.")
                          .arg(inputRetryPendingAttempt_)
                          .arg(InputSessionRetryPlanner::kMaxAttempts);
         } else if (inputRetryPlanner_.identityBlocked()) {
-            detail = QStringLiteral("Reconnect blocked: %1").arg(remoteStatus_);
+            // [COPY-FIX 2026-09-23 NEW-A18] remoteStatus_ is customer copy; the raw engine
+            // status is already in the log ("Remote Play engine detail:").
+            detail = remoteStatus_;
         } else if (inputRetryGaveUp_) {
+            // [COPY-FIX 2026-09-23 NEW-A5] No raw "(%1)" suffix; the detail is in the log.
             detail = QStringLiteral(
-                "Automatic reconnect did not restore the session — press Connect. (%1)")
-                         .arg(remoteStatus_);
+                "Venice couldn't reconnect your controller (code RP-07). Press Connect.");
         } else {
-            detail = QStringLiteral("Press Connect to restore the session. (%1)")
-                         .arg(remoteStatus_);
+            detail = QStringLiteral("Press Connect to restore the session.");
         }
     }
 
@@ -7856,6 +8081,9 @@ void OrionAppController::disconnectRemotePlay(bool synchronous)
     shotIntentEdgeTracker_.reset();
     previousControllerUiState_ = ControllerState{};
     squareUpAuditTracker_.reset();
+    hookDigitalRestSinceMs_ = -1;
+    hookReleaseRepairDueMs_ = -1;
+    hookReleaseRepairHavePreviousOutput_ = false;
     hookDownHeartbeats_ = 0;
     hookRecoveryAttempts_ = 0;
     hookFullRestartEscalated_ = false;
@@ -8768,8 +8996,9 @@ void OrionAppController::refreshCaptureDevices()
         poll->deleteLater();
         captureRefreshInFlight_ = false;
         const auto& devices = result->inventory.friendlyNames;
-        if (captureDeviceList_ != devices) {
+        if (captureDeviceList_ != devices || captureDeviceIds_ != result->inventory.stableIds) {
             captureDeviceList_ = devices;
+            captureDeviceIds_ = result->inventory.stableIds;
             emit captureDevicesChanged();
         }
         appendLog(QStringLiteral("Capture devices: %1")
@@ -8902,6 +9131,30 @@ void OrionAppController::setXboxRemotePlayWindowTitle(const QString& value)
     data.xboxRemotePlayWindowTitle = value.trimmed().left(512);
     if (data.xboxRemotePlayWindowTitle != config_.data().xboxRemotePlayWindowTitle)
         saveConfigSilently(data);
+}
+
+void OrionAppController::setXboxUntestedAcknowledged(bool value)
+{
+    auto data = config_.data();
+    if (data.xboxUntestedAcknowledged == value) {
+        emit settingsChanged();
+        return;
+    }
+    // Withdrawal policy (Astra, release review): the acknowledgement cannot be
+    // withdrawn while an Xbox session is Connecting/Running -- same rule as the
+    // console route itself (setRemotePlayConsole). Disconnect first; the gate
+    // then refuses the next start. Granting it mid-session is harmless.
+    if (!value && isXboxRemotePlay(data)
+            && (remotePlay_.state() == RemotePlayState::Running
+                || remotePlay_.state() == RemotePlayState::Connecting)) {
+        appendLog(QStringLiteral("Disconnect before withdrawing the Xbox untested-in-beta acknowledgement."));
+        emit settingsChanged();
+        return;
+    }
+    data.xboxUntestedAcknowledged = value;
+    saveConfigSilently(data);
+    appendLog(value ? QStringLiteral("Xbox: untested-in-beta notice acknowledged.")
+                    : QStringLiteral("Xbox: untested-in-beta acknowledgement withdrawn."));
 }
 
 QStringList OrionAppController::xboxRemotePlayWindows() const
@@ -9075,17 +9328,19 @@ QString OrionAppController::leadCalibrationHint() const
         return QString();
     }
     if (leadCal_.locked) {
+        // [COPY-FIX 2026-09-23 CW-6/EA-30] Speak the Shot Lead card's 1..100 scale, not ms.
         return QStringLiteral(
-            "Locked at %1 ms after %2 shots. Saved — you should not need to touch this again "
-            "unless you change capture hardware.").arg(qRound(leadCal_.leadMs)).arg(leadCal_.shots);
+            "Locked at Shot Lead %1 after %2 shots. Saved — you should not need to touch this "
+            "again unless you change capture hardware.")
+            .arg(ui_notifications::shotLeadSliderValue(leadCal_.leadMs)).arg(leadCal_.shots);
     }
     if (leadCal_.shots == 0) {
         return QStringLiteral(
             "Take a shot, then tap what the game's TIMING banner said. Skip any shot where you "
             "did not see the banner.");
     }
-    return QStringLiteral("Shot %1 — lead %2 ms, adjusting by %3 ms. Keep going until it locks.")
-        .arg(leadCal_.shots).arg(qRound(leadCal_.leadMs)).arg(leadCal_.stepMs, 0, 'f', 1);
+    return QStringLiteral("Shot %1 — Shot Lead %2 so far. Keep going until it locks.")
+        .arg(leadCal_.shots).arg(ui_notifications::shotLeadSliderValue(leadCal_.leadMs));
 }
 
 void OrionAppController::beginLeadCalibration()
@@ -9096,10 +9351,12 @@ void OrionAppController::beginLeadCalibration()
     // silently discarded. That exact trap already cost this project a session of sweeps through a
     // dead slider; refusing loudly is the only honest behaviour.
     if (automation_.config().leadOverrideFromEnv) {
+        // Engineering line (rule 0 hides ORION_ names) + one customer line.
         appendLog(QStringLiteral(
             "Lead calibration refused: an environment override owns the lead "
             "(ORION_LEAD_FLOOR_MS / ORION_LEAD_BIAS_MS). Clear it and relaunch, or the calibrated "
             "value would be silently ignored."));
+        appendLog(QStringLiteral("Calibration isn't available right now — restart Venice."));
         return;
     }
     // Start from the user's existing lead if they have one, else 300 ms. 300 is not this rig's
@@ -9107,9 +9364,21 @@ void OrionAppController::beginLeadCalibration()
     // this product targets (Remote Play through a capture card, where the card alone is ~160 ms).
     // Starting mid-range means the bisection brackets from either side in roughly equal steps; a
     // start at an extreme wastes shots walking in one direction before it can reverse.
+    // [ORION_LEAD_CALIBRATION 2026-09-21] ...and refuse when no shot can be taken: the spec's
+    // "no capture -> no calibration". A flow that cannot fire is a flow that cannot be graded.
+    if (!remoteRunning_) {
+        appendLog(QStringLiteral(
+            "Lead calibration needs a running session: start Remote Play (or the capture card) "
+            "and take open shots in shoot-around."));
+        return;
+    }
+    if (leadCalActive_) {
+        return;   // already running; the screen shows its state
+    }
     constexpr double kCalibrationStartMs = 300.0;
     leadCal_ = LeadCalibrationPolicy::begin(
         actuationLeadMs() > 0.0 ? actuationLeadMs() : kCalibrationStartMs);
+    leadCalStartLeadMs_ = actuationLeadMs();
     leadCalActive_ = true;
     appendLog(QStringLiteral("Lead calibration started at %1 ms.").arg(qRound(leadCal_.leadMs)));
     emit leadCalibrationChanged();
@@ -9121,7 +9390,22 @@ void OrionAppController::cancelLeadCalibration()
         return;
     }
     leadCalActive_ = false;
-    appendLog(QStringLiteral("Lead calibration cancelled; the lead is unchanged."));
+    // Every accepted step was persisted as it happened, so "cancel" after the lock is simply
+    // "done", and before it the lead sits wherever the last graded shot left it.
+    if (leadCal_.locked) {
+        appendLog(QStringLiteral("Lead calibration finished: %1 ms saved after %2 shots.")
+                      .arg(qRound(leadCal_.leadMs)).arg(leadCal_.shots));
+    } else if (leadCal_.shots > 0) {
+        // [2026-09-22 GM-006 / CX-007] Cancel means cancel: every graded step persisted as it
+        // happened, so restore the lead the customer walked in with.
+        const double restoreMs = leadCalStartLeadMs_ > 0.0 ? leadCalStartLeadMs_ : actuationLeadMs();
+        setActuationLeadMs(restoreMs);
+        appendLog(QStringLiteral(
+            "Lead calibration cancelled after %1 shots; the lead is back at %2 ms.")
+                      .arg(leadCal_.shots).arg(qRound(restoreMs)));
+    } else {
+        appendLog(QStringLiteral("Lead calibration cancelled; the lead is unchanged."));
+    }
     emit leadCalibrationChanged();
 }
 
@@ -9945,16 +10229,13 @@ void OrionAppController::setMeterStyle(const QString& value)
 {
     auto data = config_.data();
     const auto cleaned = value.trimmed().left(48);
-    const QString lower = cleaned.toLower();
-    if (lower != QLatin1String("arrow")
-        && lower != QLatin1String("arrow2")
-        && lower != QLatin1String("dial")
-        && lower != QLatin1String("pill")
-        && lower != QLatin1String("straight")
-        && lower != QLatin1String("sword")) {
+    // [ORION_PILL_REMOVED 2026-09-21 owner] One shared rule (normalizedMeterStyle):
+    // a value the rule would rewrite is not an accepted pick, so nothing in the UI
+    // or a settings round trip can select a withdrawn or unknown style.
+    if (cleaned.isEmpty() || normalizedMeterStyle(cleaned) != cleaned) {
         return;
     }
-    if (cleaned.isEmpty() || data.meterStyle == cleaned) {
+    if (data.meterStyle == cleaned) {
         return;
     }
     data.meterStyle = cleaned;
@@ -10296,6 +10577,19 @@ void OrionAppController::markStreamSetupComplete()
     if (data.streamSetupComplete) {
         return;
     }
+    // [2026-09-21 beta] The contract half of the Setup gate: never record setup as
+    // complete without a usable video route, whatever the UI showed (Astra, bug sweep).
+    if (isXboxRemotePlay(data)) {
+        if (!data.xboxUntestedAcknowledged || data.xboxRemotePlayWindowTitle.trimmed().isEmpty()) {
+            appendLog(QStringLiteral("Setup: acknowledge the Xbox notice and select the Remote Play window before continuing."));
+            emit settingsChanged();
+            return;
+        }
+    } else if (isCaptureCardSource(data) && !captureCardSelected()) {
+        appendLog(QStringLiteral("Setup: select a capture device with a stable identity, or switch the video source to PS5 Remote Play."));
+        emit settingsChanged();
+        return;
+    }
     data.streamSetupComplete = true;
     saveConfigSilently(data);
 }
@@ -10366,25 +10660,27 @@ void OrionAppController::copyActivityLog()
     // finishes the tiny queued write; with a healthy disk that is
     // microseconds, and a wedged disk surfaces via the fallback below anyway.
     flushPendingLogs();
-    appLogSink_.drain();
     // Prefer the on-disk engineer stream over the UI ring: the ring keeps
     // only the last kActivityRingMaxLines (1000) human events, which can
     // still be too little to show both the setup and the failure being
     // reported, and it excludes the periodic machine telemetry.
     // readLogTailForSharing() bounds the tail (256 KiB / 1500 lines, line-
     // aligned) and runs the same sharing redaction pass.
-    const QString tail = ui_notifications::readLogTailForSharing(
-        orionDataDir(rootDir_) + QStringLiteral("/logs/orion_native.log"));
-    if (!tail.isEmpty()) {
-        clipboard->setText(tail);
+    const ActivityLogClipboardCopyResult copy = copyActivityLogToClipboard(
+        clipboard, appLogSink_,
+        orionDataDir(rootDir_) + QStringLiteral("/logs/orion_native.log"), logs_);
+    if (copy.diskIncomplete) {
+        appendLog(QStringLiteral("Partial activity log copied from the session ring; disk logging is incomplete."));
+        return;
+    }
+    if (!copy.diskTail.isEmpty()) {
         appendLog(QStringLiteral("Activity log copied to clipboard "
                                  "(%1 lines from the disk log tail).")
-                      .arg(tail.count(QLatin1Char('\n')) + 1));
+                      .arg(copy.diskTail.count(QLatin1Char('\n')) + 1));
         return;
     }
     // Disk log absent/locked/empty (fresh install, exotic redirection): fall
     // back to the in-memory ring so the button never silently does nothing.
-    clipboard->setText(ui_notifications::serializeActivityLogForSharing(logs_));
     appendLog(QStringLiteral("Activity log copied to clipboard "
                              "(%1 lines from the session ring; disk log unavailable).")
                   .arg(logs_.size()));
@@ -10451,6 +10747,21 @@ void OrionAppController::setVideoSource(const QString& value)
     if (data.videoSource == norm) {
         return;
     }
+    const RemotePlayState state = remotePlay_.state();
+    if (!videoSourceChangeAllowed(state == RemotePlayState::Connecting,
+                                  state == RemotePlayState::Running,
+                                  remotePlayTeardownActive_ || remotePlay_.stopping()
+                                      || remoteState_ == QLatin1String("Disconnecting"))) {
+        appendLog(QStringLiteral("Video source change refused while Remote Play is active; disconnect first."));
+        emit settingsChanged(); // restore the selector after a rejected UI edit
+        return;
+    }
+    // A preview is logically Disconnected but still owns a live card and emits
+    // frames. Retire it before committing another source and its timing lead.
+    if (capturePreviewActive_ || remotePlay_.sidecarPid() != 0) {
+        remotePlay_.stop(QStringLiteral("video_source_change"));
+        clearRemotePreviewFrame();
+    }
     // [ORION_LEAD_BY_SOURCE 2026-09-14] The route IS most of the lead (capture exposure+encode
     // vs network+decoder), so the Shot Lead travels with it: stash the live pair under the route
     // being left, restore the route being entered. A route that was never configured restores
@@ -10474,13 +10785,38 @@ void OrionAppController::setVideoSource(const QString& value)
 
 void OrionAppController::setCaptureCardIndex(int value)
 {
-    value = std::clamp(value, 0, 16);
-    auto data = config_.data();
-    if (data.captureCardIndex == value) {
+    const RemotePlayState state = remotePlay_.state();
+    if (!videoSourceChangeAllowed(state == RemotePlayState::Connecting,
+                                   state == RemotePlayState::Running,
+                                   remotePlayTeardownActive_ || remotePlay_.stopping()
+                                       || remoteState_ == QLatin1String("Disconnecting"))) {
+        appendLog(QStringLiteral("Capture device change refused while Remote Play is active; disconnect first."));
+        emit settingsChanged();
         return;
     }
+    value = std::clamp(value, 0, 16);
+    if (value >= captureDeviceIds_.size() || captureDeviceIds_[value].isEmpty()) {
+        appendLog(QStringLiteral("Capture device selection needs a fresh stable device identity; refresh the device list."));
+        emit captureDevicesChanged();
+        return;
+    }
+    auto data = config_.data();
+    const QString chosenId = captureDeviceIds_[value];
+    if (data.captureCardIndex == value && data.captureCardDeviceId == chosenId) {
+        return;
+    }
+    // A disconnected warm preview still owns the previous card. Retire it and
+    // invalidate its last image before making the new selection visible. Do not
+    // reopen here: the old handle has an asynchronous release beat, and the next
+    // explicit Preview or Connect will launch with this new stable identity.
+    if (capturePreviewActive_ || remotePlay_.sidecarPid() != 0) {
+        remotePlay_.stop(QStringLiteral("capture_device_change"));
+        clearRemotePreviewFrame();
+    }
     data.captureCardIndex = value;
-    saveConfigSilently(data);
+    data.captureCardDeviceId = chosenId;
+    if (saveConfigSilently(data))
+        emit captureDevicesChanged();
 }
 
 void OrionAppController::setCaptureCardFps(int value)
@@ -10498,7 +10834,7 @@ void OrionAppController::setCaptureCardFps(int value)
         return;
     }
     appendLog(QStringLiteral(
-                  "Capture card refresh rate set to %1 fps (applies on the next sidecar launch)")
+                  "Capture card refresh rate set to %1 fps (applies the next time you connect)")
                   .arg(snapped));
     if (snapped > 60) {
         // [ORION_CAPTURE_FPS_60_ONLY 2026-09-14 owner] The UI cannot reach this any more — it is
@@ -11398,7 +11734,10 @@ void OrionAppController::observeMeterBlindness(quint64 physicalShotEpoch,
     if (genuineRawDetection) {
         meterBlindEpochSawMeter_ = true;
         meterBlindStreak_ = 0;
-        meterBlindWarning_ = false;
+        // [CL2-P9-001 r2 2026-09-23, Codex] While the engine gate is latched the customer must keep
+        // seeing why the bot is not timing shots: one raw blip (possibly a false lock) clears the
+        // STREAK but not the warning. The warning clears with the gate, after 2 owned shots.
+        meterBlindWarning_ = detectionUnavailable_;
         if (was != meterBlindWarning_) {
             emit meterBlindChanged();
         }
@@ -11423,7 +11762,21 @@ void OrionAppController::observeMeterBlindness(quint64 physicalShotEpoch,
         meterBlindEpochSawMeter_ = false;
     }
 
-    meterBlindWarning_ = meterBlindStreak_ >= kMeterBlindStreakTrip_;
+    const bool blindTripped = meterBlindStreak_ >= kMeterBlindStreakTrip_;
+    // [CL2-P9-001 2026-09-23] Latch the engine gate on the trip; only owned shots clear it
+    // (observeBotOwnership).
+    if (blindTripped && !detectionUnavailable_) {
+        detectionUnavailable_ = true;
+        detectionRecoveryOwnedShots_ = 0;
+        detectionRecoveryLastEpoch_ = physicalShotEpoch;
+        automation_.setDetectionUnavailable(true);
+        appendLog(QStringLiteral("DETECTION UNAVAILABLE: %1 armed shots with no meter - blind timer "
+                                 "shots are OFF until %2 owned shots prove detection is back.")
+                      .arg(meterBlindStreak_)
+                      .arg(kDetectionRecoveryOwnedShots_));
+    }
+    // [CL2-P9-001 r2] The customer warning follows the GATE, not just the streak.
+    meterBlindWarning_ = blindTripped || detectionUnavailable_;
     if (was != meterBlindWarning_) {
         // [2026-09-14 owner] The prefix was "NO METER:", which is now the name of a whole timing
         // MODE and the engine's own blind-release log tag — one grep, two unrelated meanings.
@@ -11441,6 +11794,25 @@ void OrionAppController::observeBotOwnership(const ShotContext& context)
     const bool takeoverState = context.state == HoldState::Armed
         || context.state == HoldState::Holding
         || context.state == HoldState::GreenWindow;
+    // [CL2-P9-001 2026-09-23] Count distinct OWNED meter shots while detection is latched off; two
+    // of them prove the meter is readable again.
+    if (detectionUnavailable_ && !context.inputTimedShot
+        && (context.state == HoldState::Holding || context.state == HoldState::GreenWindow)
+        && context.physicalShotEpoch != 0
+        && context.physicalShotEpoch != detectionRecoveryLastEpoch_) {
+        detectionRecoveryLastEpoch_ = context.physicalShotEpoch;
+        if (++detectionRecoveryOwnedShots_ >= kDetectionRecoveryOwnedShots_) {
+            detectionUnavailable_ = false;
+            automation_.setDetectionUnavailable(false);
+            appendLog(QStringLiteral("DETECTION RESTORED: %1 owned shots - blind backstop re-enabled.")
+                          .arg(detectionRecoveryOwnedShots_));
+            if (meterBlindWarning_ && meterBlindStreak_ < kMeterBlindStreakTrip_) {
+                meterBlindWarning_ = false;
+                appendLog(QStringLiteral("Meter detection recovered."));
+                emit meterBlindChanged();
+            }
+        }
+    }
     bool changed = false;
 
     if (context.armToken == 0) {
@@ -12133,6 +12505,16 @@ void OrionAppController::registerRawInputController()
 
 void OrionAppController::pollPhysicalController()
 {
+    {
+        // [CL2-P4-001 / CL2-P5-001] Track the worst gap between input ticks (reported and reset by
+        // the input hook heartbeat as `Input tick health`).
+        const auto tickNow = std::chrono::steady_clock::now();
+        if (inputTickLastAt_.time_since_epoch().count() != 0) {
+            const double gapMs = std::chrono::duration<double, std::milli>(tickNow - inputTickLastAt_).count();
+            inputTickGapMaxMs_ = std::max(inputTickGapMaxMs_, gapMs);
+        }
+        inputTickLastAt_ = tickNow;
+    }
 #ifdef Q_OS_WIN
     registerRawInputController();
     if (rawInputWorker_) {
@@ -12404,7 +12786,9 @@ void OrionAppController::pollPhysicalController()
         if (!selected.active) {
             if (squareOutputWatchdogEnabled_)
                 squareOutputWatchdog_.observePhysical(false, false);
-            hookIdleNeutralSinceMs_ = -1;
+            hookDigitalRestSinceMs_ = -1;
+            hookReleaseRepairDueMs_ = -1;
+            hookReleaseRepairHavePreviousOutput_ = false;
             previousControllerUiState_ = ControllerState{};
             squareUpAuditTracker_.reset();
             physicalPadLive_ = false;
@@ -12618,6 +13002,7 @@ void OrionAppController::pollPhysicalController()
         // disagree about what an RS pull-down is called.
         const QString intentSource = QString::fromLatin1(shotIntentSourceLabel(intent));
         quint64 physicalShotEpoch = 0;
+        double physicalPressWallMsEpoch = 0.0;
         if (intent.any()) {
             if (intent.stickUp || intent.stickDown) {
                 // Edge-only shot gestures (Go-To RS up/down) hold no button, so
@@ -12630,6 +13015,9 @@ void OrionAppController::pollPhysicalController()
                 ++physicalShotEpochCounter_; // zero is the invalid wire sentinel
             }
             physicalShotEpoch = physicalShotEpochCounter_;
+            // Observe the edge before logging/IPC work. This stamp is diagnostics
+            // only; engine monotonic clocks and release authority remain unchanged.
+            physicalPressWallMsEpoch = double(QDateTime::currentMSecsSinceEpoch());
             // This assignment must precede AutomationEngine::process() below. A detector
             // completion from the prior shot may arrive at any point in this GUI tick.
             // intent.square certifies a debounced physical Square DOWN edge (three clean
@@ -12743,7 +13131,7 @@ void OrionAppController::pollPhysicalController()
             remotePlay_.armMeterGate(
                 intentSource, physicalShotEpoch,
                 automation_.classifyPhysicalShotType(physicalState, intent.square),
-                automation_.rhythmReleaseConfigured());
+                automation_.rhythmReleaseConfigured(), physicalPressWallMsEpoch);
         } else if (physicalShotEpoch != 0) {
             // NAME THE REFUSAL. This failure was previously diagnosable only by
             // the ABSENCE of a "shot_gate_arm send" line next to a "Physical
@@ -13279,7 +13667,7 @@ void OrionAppController::pollPhysicalController()
         // disconnected and submitted identities (or neither).
         const bool virtualControllerConnectedAtSubmit = controller_.isConnected();
         const qint64 idleInputNowMs = static_cast<qint64>(automation_.engineNowMs());
-        const bool hookIdleNeutral = virtualControllerConnectedAtSubmit
+        const bool hookDigitalRest = virtualControllerConnectedAtSubmit
             && remotePlay_.state() == RemotePlayState::Running
             && orionInput_.enabled() && orionInput_.connected()
             && shot_.state == HoldState::Idle
@@ -13288,13 +13676,13 @@ void OrionAppController::pollPhysicalController()
             && !tempoMovementCommitRequired && !forceVirtualNeutral_
             && automation_.scheduledFireDeadlineMs() < 0.0
             && lastArmedFireToken_.load(std::memory_order_acquire) == 0
-            && PreciseFirePolicy::controllerStateFullyNeutral(physicalState)
-            && PreciseFirePolicy::controllerStateFullyNeutral(output);
-        if (!hookIdleNeutral) {
-            hookIdleNeutralSinceMs_ = -1;
-        } else if (hookIdleNeutralSinceMs_ < 0
-                   || idleInputNowMs < hookIdleNeutralSinceMs_) {
-            hookIdleNeutralSinceMs_ = idleInputNowMs;
+            && PreciseFirePolicy::controllerDigitalControlsAtRest(physicalState)
+            && PreciseFirePolicy::controllerDigitalControlsAtRest(output);
+        if (!hookDigitalRest) {
+            hookDigitalRestSinceMs_ = -1;
+        } else if (hookDigitalRestSinceMs_ < 0
+                   || idleInputNowMs < hookDigitalRestSinceMs_) {
+            hookDigitalRestSinceMs_ = idleInputNowMs;
         }
         if (squareUpDeliveryAudit && !virtualControllerConnectedAtSubmit) {
             appendLog(QStringLiteral(
@@ -13340,6 +13728,7 @@ void OrionAppController::pollPhysicalController()
             bool precisionRouteRejected = false;
             bool preciseReleaseAlreadyDelivered = false;
             bool routeBoundRelease = false;
+            bool outputDigitalReleaseEdge = false;
             {
                 // Sub-tick scheduler, step 3: serialize against the fire thread. If it
                 // already wrote the RELEASED state for this shot and the engine hasn't
@@ -13376,6 +13765,11 @@ void OrionAppController::pollPhysicalController()
                     if (squareOutputWatchdog_.suppressSquare())
                         output.buttons &= ~XINPUT_GAMEPAD_X;
                 }
+                outputDigitalReleaseEdge = hookReleaseRepairHavePreviousOutput_
+                    && PreciseFirePolicy::controllerDigitalReleaseEdge(
+                        hookReleaseRepairPreviousOutput_, output);
+                hookReleaseRepairPreviousOutput_ = output;
+                hookReleaseRepairHavePreviousOutput_ = true;
 
                 // The native input pipe is the authoritative PS5 route when connected. ViGEm is
                 // used only after a failure known to precede pipe acceptance; an ambiguous pending
@@ -13565,6 +13959,56 @@ void OrionAppController::pollPhysicalController()
                     && !(routeBoundRelease && !preciseReleaseAlreadyDelivered)) {
                     submitOk = preciseReleaseAlreadyDelivered
                         || hookOwnsInput || virtualSubmitOk;
+                }
+                if (outputDigitalReleaseEdge) {
+                    const OrionInputPacket confirmed = orionInput_.lastSent();
+                    if (directInputRouteCurrentlyOwned(
+                            orionInput_.connected(), orionInput_.haveSent(),
+                            orionInput_.haveSent() && confirmed.own != 0)) {
+                        hookReleaseRepairDueMs_ = idleInputNowMs + kHookReleaseRepairDelayMs_;
+                    }
+                }
+            }
+
+            // [ORION_INPUT_RELEASE_REPAIR 2026-09-21] LocalUdpAccepted is deliberately not a
+            // console acknowledgement. Re-check the established client-to-OrionStream route
+            // shortly after a release instead of waiting for the old all-axis-neutral 1 Hz
+            // probe. The sender's separate redundant-history path protects console button-ups;
+            // an equal-state MustDeliver does not itself replay button history. Re-presses are safe:
+            // reassertLastState() always duplicates the CURRENT confirmed state, never a cached
+            // release payload. Pending precision work postpones the repair rather than racing it.
+            if (hookReleaseRepairDueMs_ >= 0
+                && idleInputNowMs >= hookReleaseRepairDueMs_
+                && pendingSubmitSeq_ < 0
+                && automation_.scheduledFireDeadlineMs() < 0.0
+                && lastArmedFireToken_.load(std::memory_order_acquire) == 0
+                && directInputWriteAllowed(
+                    remotePlay_.state(), remotePlay_.inputRecoveryPending())) {
+                InputRouteWriteResult repairResult = InputRouteWriteResult::Failed;
+                bool repairAttempted = false;
+                {
+                    QMutexLocker submitLock(&submitMutex_);
+                    if (!fireThread_ || !fireThread_->firedUnconsumed()) {
+                        repairAttempted = true;
+                        repairResult = orionInput_.reassertLastState();
+                    }
+                }
+                if (repairAttempted
+                    && repairResult == InputRouteWriteResult::LocalUdpAccepted) {
+                    hookReleaseRepairDueMs_ = -1;
+                } else if (repairAttempted
+                           && repairResult == InputRouteWriteResult::Unchanged) {
+                    // The route no longer owns a confirmed packet; there is no direct state to
+                    // repair. A later owned seed starts a new release-tracking generation.
+                    hookReleaseRepairDueMs_ = -1;
+                } else if (repairAttempted
+                           && (repairResult == InputRouteWriteResult::WrittenUnconfirmed
+                               || repairResult == InputRouteWriteResult::Failed)) {
+                    hookReleaseRepairDueMs_ = -1;
+                    appendLog(QStringLiteral(
+                        "Input release-repair duplicate FAILED (result=%1): direct pipe closed; "
+                        "ordinary recovery must re-seed the current controller state.")
+                                  .arg(static_cast<int>(repairResult)));
                 }
             }
 
@@ -13839,6 +14283,14 @@ void OrionAppController::pollPhysicalController()
                                   .arg(hookTiming.writeSampleValid ? 1 : 0)
                                   .arg(hookTiming.ackAttempted ? 1 : 0)
                                   .arg(hookTiming.ackSampleValid ? 1 : 0));
+                    // [CL2-P4-001] Separate line: the heartbeat above is parser-pinned.
+                    appendLog(QStringLiteral("Input tick health: gap_max_ms=%1 owned_keepalives=%2 abandons=%3 "
+                                             "split_trigger_releases=%4")
+                                  .arg(inputTickGapMaxMs_, 0, 'f', 1)
+                                  .arg(orionInput_.ownedKeepalives())
+                                  .arg(orionInput_.abandonsSent())
+                                  .arg(orionInput_.splitTriggerReleases()));
+                    inputTickGapMaxMs_ = 0.0;
                     // The direct-input pipe and capture transport have independent lifecycles.
                     // Try the smallest repair three times (Chiaki input child only), then wait one
                     // final grace and allow ONE contained full-sidecar restart. The escalation
@@ -13929,7 +14381,7 @@ void OrionAppController::pollPhysicalController()
                     // recovery machinery can re-seed before a later press. Engine Idle
                     // alone is NOT physical idle: it includes initial Square debounce,
                     // pass-through holds and movement preparation. Require both the
-                    // physical report and generated output to remain fully neutral for
+                    // physical report and generated output digital controls to remain at rest for
                     // 250 ms, with no shot/recovery work pending. This avoids adding a
                     // second synchronous ACK on a press or its immediate release tick.
                     // A press arriving during the bounded ACK may still wait for it;
@@ -13941,8 +14393,8 @@ void OrionAppController::pollPhysicalController()
                     if (idleReassertEnabled && hookConnected
                         && directInputWriteAllowed(
                             remotePlay_.state(), remotePlay_.inputRecoveryPending())
-                        && hookIdleNeutral && hookIdleNeutralSinceMs_ >= 0
-                        && idleInputNowMs - hookIdleNeutralSinceMs_ >= 250
+                        && hookDigitalRest && hookDigitalRestSinceMs_ >= 0
+                        && idleInputNowMs - hookDigitalRestSinceMs_ >= 250
                         && !activeRouteDelivery.pipeAccepted) {
                         const InputRouteWriteResult reassertResult =
                             orionInput_.reassertLastState();

@@ -1,0 +1,192 @@
+[
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\PREREGISTRATION_OFFSET_SWEEP.md",
+    "bytes": 40388,
+    "sha256": "b9ab53db2f6e9c79289a275fd70ae36649f8402203df1f55b970e26ab7f6985e"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\WINDOW_DISCREPANCY.md",
+    "bytes": 22403,
+    "sha256": "3ca9996f7a2b5033f1537d61813856fd27fa30d1069974755f746bead6669474"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\tools\\timing\\sweep_analysis.py",
+    "bytes": 60736,
+    "sha256": "f0ad84b5d43f22514bb19b410a30e58b524bdb7a7da832a21a9510b5bafe4a49"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\tools\\timing\\test_sweep_analysis.py",
+    "bytes": 13366,
+    "sha256": "7a6d8fa5f4701cbad371762030aad028f2b94cc91e6e1696a5d0588c77690dfd"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\baseline_copy\\docs\\variance\\PREREGISTRATION_OFFSET_SWEEP.md",
+    "bytes": 25161,
+    "sha256": "b0b1034b64603a875a1107300cb3c3a34423f4eda6de8e49d161f53c40601339"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\DIFF_FILE.patch",
+    "bytes": 117985,
+    "sha256": "5d1b1b6761a1fdd536d622632375a8081c42821bfe31fc3207d5355c9399c5dc"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run\\RUN.txt",
+    "bytes": 533,
+    "sha256": "a4a1dd9779acc508680bcd5c50d48a91a94d045bcfccbf7a787979b52fc54cf5"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run\\shots.csv",
+    "bytes": 848653,
+    "sha256": "ac7f68d710a52e926ff4c5dd50031859042f8fb1fd82a4e84b1e45b27d5d7dac"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run\\summary.json",
+    "bytes": 89712,
+    "sha256": "9101064b1b27a070a5f7610894019ee049c6d0d9387233e965e85c51e795b8cc"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run_final\\RUN.txt",
+    "bytes": 559,
+    "sha256": "704f34ceb1e834134f205e8cfd25a89647f020a747422645ecaceed08f086858"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run_final\\shots.csv",
+    "bytes": 866511,
+    "sha256": "b6ad518d8bcec7e36f3a2b83a7d89cc10d0051afc303b0cd29a1ff1b8cd97861"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run_final\\summary.json",
+    "bytes": 90160,
+    "sha256": "a865f765678002403f03a78fca56da643bef884bbf7f58c5361c5bc0f472a9c2"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run_initial\\RUN.txt",
+    "bytes": 506,
+    "sha256": "74a5327be6b40a6e34aef36494fdec58c1ed55cf6cd6de7bc279a6b8c2d8231b"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run_initial\\shots.csv",
+    "bytes": 817782,
+    "sha256": "e060120e2b7cc07dc5f4bfbe2dd37e820152f4ec0fb84d45e4251e635aded847"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\dry_run_initial\\summary.json",
+    "bytes": 87333,
+    "sha256": "602b5ac17feb50e97f143c20cdddc25cd3238c8a0b58b0de60469150f60d8463"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\FINAL_INPUT_CHECK.json",
+    "bytes": 391,
+    "sha256": "22ac68b20b1fd0ab1a3abe139436a2d746ca2e539a2c061a54fefc36f574916a"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\independent_check.json",
+    "bytes": 817,
+    "sha256": "70d47f92c53c2a3fed0962f600ed912e3d017c5fda4d4068ac8e245aa9442161"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\input_hashes.before.json",
+    "bytes": 1325,
+    "sha256": "8fa15493f4601ae5f009df7ed49dc5868032a15c77b9c8d6b29543d0fba94315"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\manifest.json",
+    "bytes": 786,
+    "sha256": "2db5edf8fa2b1432fd0a40d8272375366358f5c85b5d87d6c948b0dbdf1c3626"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\MODIFIED_TESTS.command.json",
+    "bytes": 384,
+    "sha256": "23f9767e635e8c8484c69ca485a9ac5a8f4c9f917012f7b209939cdfc64018b6"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\MODIFIED_TESTS.txt",
+    "bytes": 2542,
+    "sha256": "9602d643fa59f3a6d80a6f2db9dba8e8eeb02b4296e10584192854c187a2b67c"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\PREREGISTRATION_OFFSET_SWEEP.before.md",
+    "bytes": 25161,
+    "sha256": "b0b1034b64603a875a1107300cb3c3a34423f4eda6de8e49d161f53c40601339"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_copy\\docs\\variance\\PREREGISTRATION_OFFSET_SWEEP.md",
+    "bytes": 40388,
+    "sha256": "b9ab53db2f6e9c79289a275fd70ae36649f8402203df1f55b970e26ab7f6985e"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_copy\\docs\\variance\\WINDOW_DISCREPANCY.md",
+    "bytes": 22050,
+    "sha256": "d33bb23ac4bea874367ae59eb84387e9bdcb41be7707ba0542841d2ea6f915b6"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_copy\\tools\\timing\\sweep_analysis.py",
+    "bytes": 60736,
+    "sha256": "f0ad84b5d43f22514bb19b410a30e58b524bdb7a7da832a21a9510b5bafe4a49"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_copy\\tools\\timing\\test_sweep_analysis.py",
+    "bytes": 13366,
+    "sha256": "7a6d8fa5f4701cbad371762030aad028f2b94cc91e6e1696a5d0588c77690dfd"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_final\\docs\\variance\\PREREGISTRATION_OFFSET_SWEEP.md",
+    "bytes": 40388,
+    "sha256": "b9ab53db2f6e9c79289a275fd70ae36649f8402203df1f55b970e26ab7f6985e"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_final\\docs\\variance\\WINDOW_DISCREPANCY.md",
+    "bytes": 22403,
+    "sha256": "3ca9996f7a2b5033f1537d61813856fd27fa30d1069974755f746bead6669474"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_final\\tools\\timing\\sweep_analysis.py",
+    "bytes": 60736,
+    "sha256": "f0ad84b5d43f22514bb19b410a30e58b524bdb7a7da832a21a9510b5bafe4a49"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\replay_final\\tools\\timing\\test_sweep_analysis.py",
+    "bytes": 13366,
+    "sha256": "7a6d8fa5f4701cbad371762030aad028f2b94cc91e6e1696a5d0588c77690dfd"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\ROLLBACK.sh",
+    "bytes": 365,
+    "sha256": "b03c19148bfc617767a709c73a214d67872a0845a51c258fc75004ca6de4a153"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\rollback_copy\\docs\\variance\\PREREGISTRATION_OFFSET_SWEEP.md",
+    "bytes": 25161,
+    "sha256": "b0b1034b64603a875a1107300cb3c3a34423f4eda6de8e49d161f53c40601339"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\rollback_final\\docs\\variance\\PREREGISTRATION_OFFSET_SWEEP.md",
+    "bytes": 25161,
+    "sha256": "b0b1034b64603a875a1107300cb3c3a34423f4eda6de8e49d161f53c40601339"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\run_synthetic_validation.py",
+    "bytes": 980,
+    "sha256": "7987ec9c68b35c8c72c39ded2b20b6172fd8aa2e3c95abf71afa2889fbba2397"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\synthetic_validation.json",
+    "bytes": 24100,
+    "sha256": "0a5398979d55aee0cfce9f5609f8e0fd9510b0b3def7826ec9ce71a24ed02067"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\synthetic_validation.txt",
+    "bytes": 124,
+    "sha256": "9eec5957f8d4d4d7607f731f302a62906ed2fe781b0eeae1ddbac290dedcc71f"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\transaction_check.py",
+    "bytes": 4165,
+    "sha256": "d2b02e69177df21e21153c52943712b6f71a204a673ea49c6155ced3b3167b52"
+  },
+  {
+    "path": "C:\\Users\\aaron\\Desktop\\NexusVision\\docs\\variance\\window_discrepancy_evidence\\VERIFICATION.txt",
+    "bytes": 11066,
+    "sha256": "698ef149d58e8079511336f48b8081746d995bfe20b68c172217b56dadd2f9c7"
+  }
+]

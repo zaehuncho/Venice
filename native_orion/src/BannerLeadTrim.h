@@ -499,7 +499,8 @@ public:
         out.sameDirection = static_cast<int>(
             std::count(window.begin(), window.end(), out.code));
 
-        const double before = trim_.value(out.key, 0.0);
+        const double before = trim_.value(out.key,
+            trimMsForType(shotType, out.tempo, out.range));
         out.beforeMs = before;
         out.afterMs = before;
         if (out.code == QLatin1Char('O')) {
@@ -757,7 +758,8 @@ public:
         oracleDirection_.insert(out.key, direction);
         out.direction = direction;
 
-        const double before = trim_.value(out.key, 0.0);
+        const double before = trim_.value(out.key,
+            trimMsForType(shotType, out.tempo, out.range));
         out.beforeMs = before;
         out.afterMs = before;
 

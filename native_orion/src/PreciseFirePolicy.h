@@ -196,6 +196,35 @@ struct PreciseFirePolicy final {
             && state.l2 == 0 && state.r2 == 0 && !state.touchpad;
     }
 
+    // A stick can remain in motion for minutes after a face-button/trigger release. Requiring
+    // stick-neutral before re-proving the direct-input route hides a wedged connection for
+    // that whole run. "At rest" for the release-repair
+    // path therefore means only controls with held/not-held semantics; analog stick coordinates
+    // continue to pass through untouched.
+    [[nodiscard]] static constexpr bool controllerDigitalControlsAtRest(
+        const ControllerState& state) noexcept
+    {
+        return state.buttons == 0 && state.dpad == 8
+            && state.l2 == 0 && state.r2 == 0 && !state.touchpad;
+    }
+
+    // Detect a transition that can strand a digital control downstream. Trigger movement within
+    // the analog range is not a release; only the zero boundary schedules the redundant proof.
+    [[nodiscard]] static constexpr bool controllerDigitalReleaseEdge(
+        const ControllerState& previous, const ControllerState& current) noexcept
+    {
+        // A diagonal-to-cardinal transition releases one direction even though the
+        // hat never passed through neutral. Treat the hat as four digital directions.
+        constexpr unsigned directions[] = {1, 3, 2, 6, 4, 12, 8, 9, 0};
+        const unsigned before = directions[previous.dpad >= 0 && previous.dpad < 8 ? previous.dpad : 8];
+        const unsigned after = directions[current.dpad >= 0 && current.dpad < 8 ? current.dpad : 8];
+        return (previous.buttons & ~current.buttons) != 0
+            || (before & ~after) != 0
+            || (previous.l2 != 0 && current.l2 == 0)
+            || (previous.r2 != 0 && current.r2 == 0)
+            || (previous.touchpad && !current.touchpad);
+    }
+
     [[nodiscard]] static constexpr bool latencyRouteAttestationEligible(
         bool sessionRunning, bool controllerConnected, bool automationArmed,
         bool routeFaultFree, const ControllerState& physical,

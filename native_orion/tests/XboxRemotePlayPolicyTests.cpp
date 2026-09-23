@@ -102,14 +102,82 @@ private slots:
             QVERIFY(obj["close_client_on_disconnect"].toBool());
         }
     }
-    void xboxRequiresExplicitWindowBeforeStarting()
+    // [2026-09-21 beta] Xbox is UNTESTED: RemotePlaySession::start() refuses an Xbox launch
+    // until the persisted acknowledgement (xbox_untested_ack) is true. The gate sits BEFORE
+    // the window check, so these tests read statusText() to prove WHICH check fired.
+    static QString startAndStatus(AppConfigData data)
     {
-        AppConfigData data;
-        data.remotePlayConsole = QStringLiteral("Xbox");
         RemotePlaySession session;
         session.applyConfig(data);
         session.start();
-        QCOMPARE(session.state(), RemotePlayState::Error);
+        return session.state() == RemotePlayState::Error ? session.statusText() : QString();
+    }
+    void xboxWithoutAcknowledgementIsRefusedEvenWithAValidWindow()
+    {
+        AppConfigData data;
+        data.remotePlayConsole = QStringLiteral("Xbox");
+        data.xboxRemotePlayWindowTitle = QStringLiteral("Xbox - Remote Play");
+        data.xboxUntestedAcknowledged = false;
+        const QString status = startAndStatus(data);
+        QVERIFY2(status.contains(QStringLiteral("untested"), Qt::CaseInsensitive),
+                 qPrintable(QStringLiteral("expected the untested-in-beta refusal, got: ") + status));
+        QVERIFY(!status.contains(QStringLiteral("Select the Xbox Remote Play window")));
+    }
+    void xboxRequiresExplicitWindowBeforeStarting()
+    {
+        // With the acknowledgement given, the NEXT gate is the window: this keeps the
+        // original meaning of the test now that the ack check runs first.
+        AppConfigData data;
+        data.remotePlayConsole = QStringLiteral("Xbox");
+        data.xboxUntestedAcknowledged = true;
+        const QString status = startAndStatus(data);
+        QVERIFY2(status.contains(QStringLiteral("Select the Xbox Remote Play window")),
+                 qPrintable(QStringLiteral("expected the window refusal, got: ") + status));
+        QVERIFY(!status.contains(QStringLiteral("untested"), Qt::CaseInsensitive));
+    }
+    void xboxWithAcknowledgementAndWindowPassesTheGate()
+    {
+        // Whatever the external-client path does next in a headless test, the beta gate
+        // itself must not be the reason a launch stops.
+        AppConfigData data;
+        data.remotePlayConsole = QStringLiteral("Xbox");
+        data.xboxRemotePlayWindowTitle = QStringLiteral("Xbox - Remote Play");
+        data.xboxUntestedAcknowledged = true;
+        const QString status = startAndStatus(data);
+        QVERIFY(!status.contains(QStringLiteral("untested"), Qt::CaseInsensitive));
+        QVERIFY(!status.contains(QStringLiteral("Select the Xbox Remote Play window")));
+    }
+    void ps5NeverConsultsTheXboxAcknowledgement()
+    {
+        AppConfigData data;
+        data.remotePlayConsole = QStringLiteral("PS5");
+        data.remotePlayConsoleIp = QStringLiteral("192.0.2.10");
+        data.xboxUntestedAcknowledged = false;
+        const QString status = startAndStatus(data);
+        QVERIFY(!status.contains(QStringLiteral("untested"), Qt::CaseInsensitive));
+    }
+    void xboxAcknowledgementRoundTripsAndDefaultsToFalse()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        {
+            // Absent key (an install that predates the gate) -> false: the gate fails closed.
+            AppConfig cfg(dir.path());
+            AppConfigData data;
+            QVERIFY(cfg.save(data));
+            AppConfig loaded(dir.path());
+            QVERIFY(loaded.load());
+            QVERIFY(!loaded.data().xboxUntestedAcknowledged);
+        }
+        {
+            AppConfig cfg(dir.path());
+            AppConfigData data;
+            data.xboxUntestedAcknowledged = true;
+            QVERIFY(cfg.save(data));
+            AppConfig loaded(dir.path());
+            QVERIFY(loaded.load());
+            QVERIFY(loaded.data().xboxUntestedAcknowledged);
+        }
     }
 };
 QTEST_GUILESS_MAIN(XboxRemotePlayPolicyTests)

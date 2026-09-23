@@ -556,7 +556,7 @@ FAQ_TOPICS = {
             "• **Is there a free trial?** Yes — `/claim_trial` in the server. Full features, no card. "
             "One per Discord account and per PC. Then open https://zaeorion.com/connect to sign in; "
             "your public Discord ID is not an activation code.\n"
-            "• **What does it cost?** A free 7-day trial, then one **$25/month** recurring membership.\n"
+            "• **What does it cost?** A free 7-day trial, then one **$19.99/month** recurring membership.\n"
             "• **Can I use it on two PCs at once?** No — single-user, one machine. Use `/hwid_reset` to move it.\n"
             "• **When does my license expire?** Run `/status` — it checks your linked Discord account privately.\n"
             "• **What does Venice actually do to my game?** Nothing. It watches your screen and times a controller input — "
@@ -663,14 +663,14 @@ async def on_ready():
     print(f"{client.user} is online")
 
 
-@tree.command(name="purchase", description="Buy Venice securely — $25 per month", guild=GUILD)
+@tree.command(name="purchase", description="Buy Venice securely — $19.99 per month", guild=GUILD)
 async def purchase(interaction: discord.Interaction):
     e = discord.Embed(
-        title="🛒 Venice — $25 / month",
+        title="🛒 Venice — $19.99 / month",
         description=(
             "One recurring monthly plan at **zaeorion.com**, paid by card through Stripe's secure checkout. "
             "Cancel anytime.\n\n"
-            "Connect the **same Discord account** you use in this server on the website; your membership is tied to its Discord ID. After payment, Triton "
+            "Connect the **same Discord account** you use in this server on the website; your membership is tied to its Discord ID. After payment, the Venice bot "
             "DMs a subscription confirmation and connection link, then grants Customer access. Your Discord ID alone cannot unlock the launcher.\n\n"
             "Questions or delivery problems? Open a ticket in **#create-ticket**."
         ),

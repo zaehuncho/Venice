@@ -932,3 +932,18 @@ def test_create_archive_hash_and_determinism(tmp_path):
     # reproducible: same package bytes -> same artifact hash (comparable across rebuilds)
     _, digest2 = pkg.create_archive(package, "1.2.3", out_dir=tmp_path / "out2")
     assert digest2 == digest
+
+
+def test_copy_runtime_prunes_unused_quick_styles_after_stripping_qml_source(monkeypatch, tmp_path):
+    """[2026-09-21] copy_runtime is the ONLY staging path, so the Qt style prune must hang off
+    it (after the app's own QML source is stripped, before the manifest is written) or the
+    2,200 dead style files come straight back in the next package."""
+    _root, _build = _configure_minimal_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(pkg, "copy_compiled_sidecar", lambda _package, _dist=None: True)
+    calls: list[str] = []
+    monkeypatch.setattr(pkg, "strip_app_qml_source", lambda _package: calls.append("strip"))
+    monkeypatch.setattr(pkg, "prune_unused_quick_styles",
+                        lambda package, **kw: calls.append(f"prune:{package.name}") or {"styles": 0, "files": 0})
+    package = tmp_path / "package"
+    pkg.copy_runtime(tmp_path / "sidecar.dist", package_dir=package)
+    assert calls == ["strip", "prune:package"]

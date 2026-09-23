@@ -29,7 +29,7 @@ def test_session_fence_rejects_previous_session_reused_ids():
     result = audit([record()], logs)
     assert result["counts"]["joined_releases"] == 1
     assert result["distributions"]["scheduler_error_ms_rounded"]["mean"] == .2
-    assert result["shots"][0]["measurements"]["command_minus_deadline_ms"] == .25
+    assert result["shots"][0]["measurements"]["command_minus_base_deadline_ms"] == .25
 
 
 def test_unknown_or_conflicting_identity_never_guesses_join():
@@ -104,7 +104,7 @@ def test_past_target_and_ruler_resets_join_before_a_release_sequence_exists():
     assert row["ruler_resets"] == 2
     assert row["measurements"]["late_decision_ms"] == 44.461
     assert not row["ambiguous_stages"]
-    assert "command_minus_deadline_ms" not in row["measurements"]
+    assert "command_minus_base_deadline_ms" not in row["measurements"]
 
 
 def test_reported_green_open_late_requires_release_identity_not_text_alone():

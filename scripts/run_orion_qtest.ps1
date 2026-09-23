@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')][string]$TestName,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')][string]$Configuration = 'Release',
     [Parameter(Mandatory = $true)][string]$LogDirectory,
+    [string]$SourceRoot = '',
     [ValidateRange(1, 120)][int]$TimeoutSeconds = 120
 )
 
@@ -10,6 +11,11 @@ param(
 # or translate a nonzero child exit into success. CTest's outer timeout must leave
 # time for this wrapper to terminate only its own test child and flush evidence.
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'orion_qtest_unit.ps1')
+$SourceRoot = if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    Join-Path $PSScriptRoot '..'
+} else { $SourceRoot }
+$SourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $root = if ([string]::IsNullOrWhiteSpace($env:ORION_QTEST_LOG_ROOT)) {
     $LogDirectory
 } else {
@@ -22,6 +28,7 @@ $qtestLog = Join-Path $runDirectory 'qtest.txt'
 $stdoutLog = Join-Path $runDirectory 'stdout.txt'
 $stderrLog = Join-Path $runDirectory 'stderr.txt'
 $resultLog = Join-Path $runDirectory 'result.json'
+$unitLog = Join-Path $runDirectory 'unit.json'
 foreach ($path in @($qtestLog, $stdoutLog, $stderrLog)) {
     [IO.File]::WriteAllText($path, '')
 }
@@ -43,8 +50,14 @@ $result = [ordered]@{
     qtest_log = $qtestLog
     stdout_log = $stdoutLog
     stderr_log = $stderrLog
+    unit_manifest = $unitLog
+    unit_before_sha256 = $null
+    unit_after_sha256 = $null
+    unit_coherent = $false
 }
+$unit = [ordered]@{ schema_version = 1; before = $null; after = $null; coherent = $false; error = $null }
 $result | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $resultLog -Encoding UTF8
+$unit | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $unitLog -Encoding UTF8
 Write-Output "[orion-qtest] $TestName ($Configuration) evidence: $runDirectory"
 $process = $null
 try {
@@ -53,6 +66,10 @@ try {
         throw 'QtTest target must be an existing executable file.'
     }
     $result.executable = $exe
+    $unit.before = Get-OrionQtestUnitSnapshot -TestExecutable $exe `
+        -Configuration $Configuration -SourceRoot $SourceRoot
+    $result.unit_before_sha256 = $unit.before.identity_sha256
+    $unit | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $unitLog -Encoding UTF8
     # Start-Process joins ArgumentList strings, so explicitly quote the complete
     # QtTest output argument (paths containing spaces remain ONE argument).
     $process = Start-Process -FilePath $exe -ArgumentList @('-o', ('"' + $qtestLog + ',txt"')) `
@@ -102,6 +119,26 @@ try {
     if ($process) { $process.Dispose() }
     $result.finished_utc = [DateTime]::UtcNow.ToString('o')
     try {
+        if ($unit.before) {
+            try {
+                $unit.after = Get-OrionQtestUnitSnapshot -TestExecutable $result.executable `
+                    -Configuration $Configuration -SourceRoot $SourceRoot
+                $result.unit_after_sha256 = $unit.after.identity_sha256
+                $unit.coherent = ($unit.before.identity_sha256 -eq $unit.after.identity_sha256)
+                $result.unit_coherent = $unit.coherent
+                if (-not $unit.coherent) {
+                    $result.status = 'unit_changed'
+                    $result.exit_code = 125
+                    $result.error = 'Native executable, DLL, build metadata, or source snapshot changed during the test.'
+                }
+            } catch {
+                $unit.error = $_.Exception.Message
+                $result.status = 'unit_snapshot_error'
+                $result.exit_code = 125
+                $result.error = "Native unit after-snapshot failed: $($unit.error)"
+            }
+        }
+        $unit | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $unitLog -Encoding UTF8
         $result | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $resultLog -Encoding UTF8
         if ($result.exit_code -ne 0) {
             foreach ($path in @($qtestLog, $stdoutLog, $stderrLog)) {

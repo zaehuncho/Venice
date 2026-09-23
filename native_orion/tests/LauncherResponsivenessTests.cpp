@@ -52,6 +52,25 @@ class LauncherResponsivenessTests : public QObject {
         return p;
     }
 private slots:
+    void parentRecordsForcedTerminationBeforeChildExit() {
+        QObject owner;
+        QPointer<QProcess> child = fixture("--fixture-hang");
+        QVector<AsyncProcessRetirer::TerminationTrace> trace;
+        QPointer<AsyncProcessRetirer> retire = new AsyncProcessRetirer(
+            child, &owner, {}, {}, {},
+            [&](const AsyncProcessRetirer::TerminationTrace& event) { trace.push_back(event); });
+        retire->start(100);
+        QTRY_VERIFY_WITH_TIMEOUT(retire.isNull(), 3000);
+        QCOMPARE(trace.size(), 3);
+        QCOMPARE(trace[0].kind, AsyncProcessRetirer::TerminationTrace::GracefulRequested);
+        QCOMPARE(trace[1].kind, AsyncProcessRetirer::TerminationTrace::ForcedRequested);
+        QCOMPARE(trace[2].kind, AsyncProcessRetirer::TerminationTrace::ObservedExit);
+        QVERIFY(trace[0].pid > 0);
+        QCOMPARE(trace[0].pid, trace[1].pid);
+        QCOMPARE(trace[1].pid, trace[2].pid);
+        QVERIFY(trace[2].forced);
+    }
+
     void gracefulStopKeepsEventLoopAlive() {
         int beats = 0, completions = 0, cleanups = 0, claims = 0;
         bool forced = true;

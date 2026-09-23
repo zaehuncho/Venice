@@ -184,6 +184,7 @@ class TestMonthlyRenewal:
     def test_stripe_checkout_dms_account_connection_once_without_private_key(self, lf, monkeypatch):
         sent = []
         monkeypatch.setattr(lf, "_discord_dm", lambda target, embed: sent.append((target, embed)))
+        monkeypatch.setattr(lf, "_discord_add_role", lambda target, role: True)
         body = {"order_id": "stripe:checkout:cs_fixture", "discord_user_id": "632",
                 "plan": "month", "notify": True, "subscription_id": "sub_fixture"}
         s, b, _ = invoke(lf, "POST", "/api/bot/provision", headers=WORKER_H, body=body)
@@ -201,6 +202,7 @@ class TestMonthlyRenewal:
 
     def test_stripe_paid_key_requires_discord_oauth_pairing(self, lf, monkeypatch):
         monkeypatch.setattr(lf, "_discord_dm", lambda target, embed: None)
+        monkeypatch.setattr(lf, "_discord_add_role", lambda target, role: True)
         discord_id = "632456789012345678"
         s, b, _ = self._provision(lf, "stripe:checkout:cs_oauth", discord_id=discord_id,
                                   notify=True, subscription_id="sub_oauthfixture")
@@ -242,6 +244,7 @@ class TestMonthlyRenewal:
 
     def test_stripe_dm_failure_retries_delivery_without_reminting(self, lf, monkeypatch):
         attempted = []
+        monkeypatch.setattr(lf, "_discord_add_role", lambda target, role: True)
         def dm(target, embed):
             attempted.append(target)
             if len(attempted) == 1:
@@ -270,6 +273,7 @@ class TestMonthlyRenewal:
 
     def test_stripe_renewal_requires_oauth_on_existing_paid_row(self, lf, monkeypatch):
         monkeypatch.setattr(lf, "_discord_dm", lambda target, embed: None)
+        monkeypatch.setattr(lf, "_discord_add_role", lambda target, role: True)
         key = "ORION-PAID-OAUTH-RENEW"
         put_license(lf, key, plan="month", extra={
             "discord_user_id": "634456789012345678", "source": "gumroad",

@@ -40,6 +40,8 @@ STAGES = {
     "TIP RESERVATION:": "reservation",
     "TIP SAMPLER RULER RESET:": "ruler_reset",
     "TIP PHASE RATE STRETCH:": "rate_stretch",
+    "Release onsetff:": "onset_ff",
+    "Release devoffset:": "dev_offset",
 }
 
 
@@ -152,6 +154,9 @@ def audit(records, lines):
         row = rows.get(epoch)
         if row is None or not row["press_ms"] <= event["wall_ms"] <= row["closed_ms"]:
             continue
+        if (stage == "onset_ff" and fields.get("physical_epoch") is not None
+                and identity(fields.get("physical_epoch")) != epoch):
+            continue
         key = (epoch, stage, event["wall_ms"], tuple(sorted(fields.items())))
         if key in seen:
             continue
@@ -177,17 +182,25 @@ def audit(records, lines):
             ("dispatch", "pipe_ack_wait_us", "pipe_ack_wait_us"),
             ("unowned", "hold_ms", "unowned_hold_ms"),
             ("late_decision", "lateness_ms", "late_decision_ms"),
+            ("onset_ff", "applied_ms", "reported_onset_ff_ms"),
+            ("dev_offset", "applied_ms", "reported_dev_offset_ms"),
         ):
             fields = single.get(stage, {})
             if dest in ("pipe_write_us", "pipe_ack_wait_us") and fields.get(source + "_valid") != "1":
                 continue
             value = number(fields.get(source))
-            if value is not None and (source == "deltaMs" or value >= 0):
+            if value is not None and (source in ("deltaMs", "applied_ms") or value >= 0):
                 metrics[dest] = value
         command = number(single.get("dispatch", {}).get("command_issued_ms"))
         deadline = number(single.get("schedule", {}).get("aligned_ms"))
         if command is not None and deadline is not None:
-            metrics["command_minus_deadline_ms"] = command - deadline
+            # aligned_ms is the vision/base deadline, BEFORE scheduleFire's
+            # applied onset/dev offsets. Its difference is not scheduler jitter.
+            # The release's reported deltaMs already uses the actual deadline.
+            metrics["command_minus_base_deadline_ms"] = command - deadline
+        age = single.get("decision", {}).get("age", "")
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?ms", age):
+            metrics["reported_frame_age_at_release_ms"] = number(age[:-2])
         # WHEN the engine first held a usable answer -- not the meter's onset, and not the
         # late-fire decision that may follow it. Two valid reservations sharing the earliest
         # instant are conflicting evidence, not a tie to break.
@@ -239,7 +252,7 @@ def audit(records, lines):
         row["prediction_revisions"] = len(by_stage.get("reservation", []))
     ordered = sorted(rows.values(), key=lambda r: r["press_ms"])
     names = sorted({name for row in ordered for name in row["measurements"]})
-    return dict(schema="shot_pipeline_audit/1", session=records[0]["session"],
+    return dict(schema="shot_pipeline_audit/2", session=records[0]["session"],
                 counts=dict(records=len(ordered), outcomes=dict(Counter(r["outcome"] for r in ordered)),
                             disarm_reasons=dict(Counter(r["abort_reason"] for r in ordered if r["outcome"] == "disarmed")),
                             release_banners=dict(Counter(r["banner"] or "unknown" for r in ordered if r["outcome"] == "released")),
@@ -258,7 +271,9 @@ def audit(records, lines):
                 unavailable=["true signed/absolute game release error in milliseconds", "console receipt time",
                              "open-shot denominator", "causal variance decomposition", "ground-truth false-lock rate"],
                 interpretation=["Local route wait includes write and ACK wait; do not add their variances.",
-                                "Command-minus-deadline measures local scheduling, not gameplay accuracy.",
+                                "Command-minus-base-deadline includes intentional onset/dev offsets, NOT scheduler jitter.",
+                                "scheduler_error_ms_rounded is the engine's actual-deadline error at 0.01ms precision.",
+                                "Missing offset evidence is UNKNOWN; offset-stage variances are not additive.",
                                 "Oracle gap is a pixel/progress proxy, not milliseconds or a make/miss label.",
                                 "Excellent streaks count released records; intervening taps are not outcomes.",
                                 "Reported-green open lates are an engine/game DISAGREEMENT census: the "

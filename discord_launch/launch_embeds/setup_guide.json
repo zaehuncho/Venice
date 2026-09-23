@@ -31,11 +31,6 @@
             "inline": false
           },
           {
-            "name": "4 • No Meter (optional)",
-            "value": "Turn No Meter mode on only once the capture is stable; it follows the shot animation rather than the meter.",
-            "inline": false
-          },
-          {
             "name": "🎥 Capture card not detected",
             "value": "Close every other app using the card (OBS, browser tabs, the card's own viewer) — cards allow **one** at a time. Use a **USB 3.0+** port and check HDMI goes console → card **IN**. **Turn HDCP off** on the PS5: Settings → System → HDMI. That is the most common cause of a black or missing feed. Then check the driver in Device Manager, and try 1080p output.",
             "inline": false
@@ -47,7 +42,7 @@
           },
           {
             "name": "🟩 No greens / the overlay isn't reading",
-            "value": "Check the Live Capture panel actually shows gameplay — if it is black, fix that first. **Hold** the shot input and let Venice release it; releasing manually fights the tool. The controller must be plugged into the **PC**. Shot meter **on** in 2K's settings. Give it 10–15 practice shots to calibrate before judging it.",
+            "value": "Check the Live Capture panel actually shows gameplay — if it is black, fix that first. **Hold** the shot input and let Venice release it; releasing manually fights the tool. The controller must be plugged into the **PC**. Shot meter **on**, style **Arrow2** (White), in 2K's settings. Give it 10–15 practice shots to calibrate before judging it.",
             "inline": false
           },
           {

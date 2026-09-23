@@ -716,8 +716,29 @@ class PlayerAnchor:
             tol_x += grow
             tol_y += grow
         conf = self._confidence(ps, tx, track_n, stale_s)
-        return Anchor(ix, iy, sc, conf, ps, tx, track_n, now,
-                      dx * s, dy * s, tol_x, tol_y, box_h, W, H)
+        anchor = Anchor(ix, iy, sc, conf, ps, tx, track_n, now,
+                        dx * s, dy * s, tol_x, tol_y, box_h, W, H)
+        # A fade can put the meter on the other side of the nameplate. The pooled
+        # last-40 dx median is a position hint, not proof that the original search
+        # region is empty: five standstills seeded dx=+26.5, then the real left-fade
+        # meter at dx=-97 was refused 31 times (20260920_030834, epoch 8).
+        # Preserve BOTH existing horizontal hypotheses for an armed fade. Do not
+        # erase learned history, widen either hypothesis's tolerance, relax the
+        # vertical band, or bypass the locator's shape/rise/identity checks.
+        state = ARM.state()
+        kind = str(state[2]).replace("_", " ").strip().lower()
+        if state[0] > 0 and state[3] and kind in ("left fade", "right fade"):
+            prior_cx = float(ix) - _fenv("ORION_ANCHOR_DX", -30.0) * s
+            # A narrow/custom operator prior can make the intervals disjoint.
+            # Do not turn the gap between them into a new allowed meter region.
+            if (np.isfinite(prior_cx)
+                    and prior_cx + tol_x >= anchor.cx_lo
+                    and prior_cx - tol_x <= anchor.cx_hi):
+                anchor.cx_lo = min(anchor.cx_lo, prior_cx - tol_x)
+                anchor.cx_hi = max(anchor.cx_hi, prior_cx + tol_x)
+                anchor.x0 = int(max(0, np.floor(anchor.cx_lo - 18)))
+                anchor.x1 = int(min(W, np.ceil(anchor.cx_hi + 18)))
+        return anchor
 
     def _confidence(self, ps, tx, track_n, stale_s):
         """0..1. IDENTITY is what earns the right to refuse (see the module docstring):

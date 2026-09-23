@@ -793,14 +793,14 @@ private slots:
         QVERIFY2(caption != nullptr,
                  "the Shot Lead card must carry the auto-trim caption");
         QCOMPARE(caption->property("text").toString(),
-                 QStringLiteral("Auto-trim from game feedback: +6 ms"));
+                 QStringLiteral("Auto-adjusting from game feedback: +2"));
         QVERIFY(caption->property("visible").toBool());
 
         // A negative trim reads as a MINUS SIGN, not a hyphen: the card is the only place the
         // owner sees the loop's direction and it has to be unambiguous next to the number.
         stub.insert(QStringLiteral("bannerLeadTrimMs"), -4.0);
         QTRY_COMPARE(caption->property("text").toString(),
-                     QStringLiteral("Auto-trim from game feedback: \u2212" "4 ms"));
+                     QStringLiteral("Auto-adjusting from game feedback: \u2212" "2"));
 
         // Nothing earned, nothing said.
         stub.insert(QStringLiteral("bannerLeadTrimMs"), 0.0);
@@ -852,7 +852,7 @@ private slots:
         QVERIFY2(caption != nullptr,
                  "the Shot Lead card must carry the auto-seed caption");
         QCOMPARE(caption->property("text").toString(),
-                 QStringLiteral("Auto: calibrating… using 269 ms until your latency is "
+                 QStringLiteral("Auto: calibrating… using 48 until your setup is "
                                 "measured"));
         QVERIFY(caption->property("visible").toBool());
 
@@ -862,7 +862,7 @@ private slots:
         stub.insert(QStringLiteral("leadAutoSeedMeasuredMs"), 208.3);
         stub.insert(QStringLiteral("leadAutoSeedMs"), 277.3);
         QTRY_COMPARE(caption->property("text").toString(),
-                     QStringLiteral("Auto: measured latency 208 ms + 69 ms margin = 277 ms"));
+                     QStringLiteral("Auto: set to 51 from your measured setup"));
         QVERIFY(caption->property("visible").toBool());
 
         // The owner sets their own value: the seed goes inert and the caption disappears. From
@@ -880,9 +880,93 @@ private slots:
         // Every objectName the card shipped with is still mounted.
         for (const char* name : {"shotLeadValue", "shotLeadStatePill", "shotLeadResetAction",
                                  "shotLeadSlider", "shotLeadDirectionHint",
-                                 "shotLeadMaxUsableTick", "shotLeadConflictBanner",
-                                 "shotLeadDisagreementBanner"}) {
+                                 "shotLeadMaxUsableTick", "shotLeadConflictBanner"}) {
             QVERIFY2(page->findChild<QObject*>(QLatin1String(name)) != nullptr, name);
+        }
+        // [2026-09-23 owner] The advisory "disagrees with this rig's measurement" banner is gone.
+        QVERIFY(page->findChild<QObject*>(QStringLiteral("shotLeadDisagreementBanner")) == nullptr);
+    }
+
+    // [2026-09-23 owner screenshot] The direction hint was a fixed-width line, so it set the
+    // card's minimum width; the layout then laid everything out wider than the side panel and the
+    // disagreement banner and hint ran off the right edge. At a narrow panel width every line must
+    // stay inside the card.
+    void shotLeadCardFitsANarrowPanel()
+    {
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        QmlOrionSmokeStub stub;
+        // Show the longest banner the card still has (the Tip Timing conflict): user value above
+        // the highest value Tip Timing can schedule.
+        stub.insert(QStringLiteral("actuationLeadMs"), 272.0);
+        stub.insert(QStringLiteral("actuationLeadUserSet"), true);
+        stub.insert(QStringLiteral("shotLeadMaxUsableMs"), 250.0);
+        stub.insert(QStringLiteral("shotLeadConflictMisses"), 3);
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+
+        QQmlComponent component(
+            &engine, QUrl::fromLocalFile(
+                         qmlRoot + QStringLiteral("/components/ShotLeadCard.qml")));
+        if (component.isLoading()) {
+            QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        }
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) {
+            errorLines.append(error.toString());
+        }
+        std::unique_ptr<QObject> obj(component.create());
+        QVERIFY2(obj != nullptr, qPrintable(errorLines.join(QLatin1Char('\n'))));
+        auto* card = qobject_cast<QQuickItem*>(obj.get());
+        QVERIFY(card != nullptr);
+        constexpr qreal kPanelWidth = 300.0;
+        card->setWidth(kPanelWidth);
+        card->setHeight(600.0);
+
+        auto* banner = card->findChild<QQuickItem*>(QStringLiteral("shotLeadConflictBanner"));
+        QVERIFY(banner != nullptr);
+        QTRY_VERIFY(banner->isVisible());
+        for (const char* name : {"shotLeadConflictBanner", "shotLeadDirectionHint",
+                                 "shotLeadSlider", "shotLeadCalibrationPanel"}) {
+            auto* item = card->findChild<QQuickItem*>(QLatin1String(name));
+            QVERIFY2(item != nullptr, name);
+            QTRY_VERIFY2(item->mapToItem(card, QPointF(item->width(), 0)).x() <= kPanelWidth + 0.5,
+                         name);
+        }
+    }
+
+    // [2026-09-23 owner] Tempo is a simple toggle + "Release with" dropdown, sized to its content;
+    // with Tempo on, every row stays inside a narrow side panel.
+    void tempoCardFitsANarrowPanel()
+    {
+        const QString qmlRoot = QStringLiteral(ORION_QML_SOURCE_DIR);
+        registerSmokeQmlTypes(qmlRoot);
+        QQmlEngine engine;
+        engine.addImportPath(qmlRoot);
+        QmlOrionSmokeStub stub;
+        stub.insert(QStringLiteral("tempoEnabled"), true);
+        stub.insert(QStringLiteral("tempoInputPath"), QStringLiteral("Stick"));
+        engine.rootContext()->setContextProperty(QStringLiteral("orion"), &stub);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(
+            qmlRoot + QStringLiteral("/components/RhythmCard.qml")));
+        if (component.isLoading()) QTRY_VERIFY_WITH_TIMEOUT(!component.isLoading(), 3000);
+        QStringList errorLines;
+        for (const QQmlError& error : component.errors()) errorLines.append(error.toString());
+        std::unique_ptr<QObject> obj(component.create());
+        QVERIFY2(obj != nullptr, qPrintable(errorLines.join(QChar::LineFeed)));
+        auto* card = qobject_cast<QQuickItem*>(obj.get());
+        QVERIFY(card != nullptr);
+        constexpr qreal kPanelWidth = 300.0;
+        card->setWidth(kPanelWidth);
+        card->setHeight(400.0);
+        for (const char* name : {"tempoToggle", "releasePathSelector", "tempoHint"}) {
+            auto* item = card->findChild<QQuickItem*>(QLatin1String(name));
+            QVERIFY2(item != nullptr, name);
+            QTRY_VERIFY2(item->isVisible(), name);
+            QTRY_VERIFY2(item->mapToItem(card, QPointF(item->width(), 0)).x() <= kPanelWidth + 0.5,
+                         name);
         }
     }
 

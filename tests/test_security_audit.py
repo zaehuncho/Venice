@@ -41,6 +41,9 @@ def _write_security_policy(package_dir: Path) -> None:
     policy = {
         "schema": "orion.security_policy.v1",
         "require_release_manifest": True,
+        "lock_automation_on_integrity_failure": True,
+        "lock_automation_on_debugger": True,
+        "lock_automation_on_analysis_tool": True,
         "allow_local_dev_bypass": False,
     }
     (package_dir / "security_policy.json").write_text(json.dumps(policy), encoding="utf-8")
@@ -375,3 +378,88 @@ def test_security_policy_must_fail_closed(tmp_path):
 
     assert "RELEASE_MANIFEST_NOT_REQUIRED" in codes
     assert "LOCAL_DEV_BYPASS_ALLOWED" in codes
+
+
+def test_package_audit_refuses_qt_quick_style_content_outside_the_allowlist(tmp_path):
+    """[ORION_QT_STYLE_PRUNE 2026-09-21] The audit reads release_filter_policy.QT_QUICK_STYLE_ROOTS
+    independently of the packager: a style directory, a style DLL, a `+Style` selector folder or
+    QtQuick/NativeStyle the pinned app cannot select is a HIGH finding."""
+    package = tmp_path / "package"
+    (package / "qml" / "QtQuick" / "Controls" / "Basic").mkdir(parents=True)
+    (package / "qml" / "QtQuick" / "Controls" / "Fusion").mkdir()
+    (package / "qml" / "QtQuick" / "NativeStyle").mkdir()
+    (package / "qml" / "QtQuick" / "Dialogs" / "quickimpl" / "qml" / "+Universal").mkdir(parents=True)
+    (package / "Qt6QuickControls2Imagine.dll").write_bytes(b"dll")
+    (package / "Qt6QuickControls2Basic.dll").write_bytes(b"dll")
+
+    findings = security_audit.audit_package_structure(package)
+    hits = sorted(f.path for f in findings if f.code == "PACKAGE_QT_STYLE_UNPRUNED")
+    assert [h.rsplit("/package/", 1)[-1] for h in hits] == [
+        "Qt6QuickControls2Imagine.dll",
+        "qml/QtQuick/Controls/Fusion",
+        "qml/QtQuick/Dialogs/quickimpl/qml/+Universal",
+        "qml/QtQuick/NativeStyle",
+    ]
+    assert all(f.severity == "HIGH" for f in findings if f.code == "PACKAGE_QT_STYLE_UNPRUNED")
+
+
+def _complete_qt_root(app_root: Path, styles) -> None:
+    controls = app_root / "qml" / "QtQuick" / "Controls"
+    controls.mkdir(parents=True, exist_ok=True)
+    (controls / "qmldir").write_text("module", encoding="utf-8")
+    (controls / "qtquickcontrols2plugin.dll").write_bytes(b"p")
+    (controls / "impl").mkdir(exist_ok=True)
+    (controls / "impl" / "qmldir").write_text("module", encoding="utf-8")
+    (controls / "impl" / "qtquickcontrols2implplugin.dll").write_bytes(b"p")
+    (app_root / "Qt6QuickControls2.dll").write_bytes(b"d")
+    (app_root / "Qt6QuickControls2Impl.dll").write_bytes(b"d")
+    for style in styles:
+        (controls / style).mkdir(exist_ok=True)
+        (controls / style / "qmldir").write_text("module", encoding="utf-8")
+        (controls / style / f"qtquickcontrols2{style.lower()}styleplugin.dll").write_bytes(b"p")
+        (app_root / f"Qt6QuickControls2{style}StyleImpl.dll").write_bytes(b"d")
+
+
+def _qt_codes(package: Path) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for f in security_audit.audit_package_structure(package):
+        if f.code.startswith("PACKAGE_QT_"):
+            out.setdefault(f.code, []).append(f.path.rsplit("/package/", 1)[-1])
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def test_package_audit_requires_the_qt_tree_and_a_complete_pinned_style_for_each_shipped_app(tmp_path):
+    """[ORION_QT_STYLE_PRUNE 2026-09-21 Codex r2] The audit reads the completeness half of the
+    policy too: a shipped app (its exe present) with no Controls tree, or with a pinned style
+    missing one of its files, is a HIGH finding -- independently of the packager's own refusal.
+    A fixture without the exes is untouched."""
+    package = tmp_path / "package"
+    stream = package / "chiaki-ng-orion" / "chiaki-ng-Win"
+    stream.mkdir(parents=True)
+    # (0) complete: no Qt findings
+    (package / "OrionNative.exe").write_bytes(b"exe")
+    (stream / "OrionStream.exe").write_bytes(b"exe")
+    _complete_qt_root(package, ("Basic",))
+    _complete_qt_root(stream, ("Basic", "Material"))
+    assert _qt_codes(package) == {}
+    # (1) launcher tree gone
+    import shutil
+    shutil.rmtree(package / "qml")
+    assert _qt_codes(package) == {"PACKAGE_QT_ROOT_MISSING": ["qml/QtQuick/Controls"]}
+    _complete_qt_root(package, ("Basic",))
+    # (2) stream tree gone
+    shutil.rmtree(stream / "qml")
+    assert _qt_codes(package) == {
+        "PACKAGE_QT_ROOT_MISSING": ["chiaki-ng-orion/chiaki-ng-Win/qml/QtQuick/Controls"]}
+    _complete_qt_root(stream, ("Basic", "Material"))
+    # (3) the launcher's Basic plugin gone; the stream's Material StyleImpl gone
+    (package / "qml" / "QtQuick" / "Controls" / "Basic" / "qtquickcontrols2basicstyleplugin.dll").unlink()
+    (stream / "Qt6QuickControls2MaterialStyleImpl.dll").unlink()
+    assert _qt_codes(package) == {"PACKAGE_QT_STYLE_INCOMPLETE": [
+        "chiaki-ng-orion/chiaki-ng-Win/Qt6QuickControls2MaterialStyleImpl.dll",
+        "qml/QtQuick/Controls/Basic/qtquickcontrols2basicstyleplugin.dll",
+    ]}
+    # (4) no shipped exe -> a fixture, untouched
+    (package / "OrionNative.exe").unlink()
+    (stream / "OrionStream.exe").unlink()
+    assert _qt_codes(package) == {}

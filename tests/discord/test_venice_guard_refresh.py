@@ -87,11 +87,16 @@ def test_status_prefers_discord_id_and_fail_closed_legacy_lookup():
     module = ast.parse(source)
     status = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef)
                   and node.name == "status")
-    assert [argument.arg for argument in status.args.args] == ["interaction", "key"]
+    # [2026-09-21] Keyless since the 09-15 "no licence keys, Discord-linked access" rule: the
+    # invoking Discord account IS the identity, /status takes no key, and the old legacy-key
+    # fallback through the STAFF route is gone. Fail-closed now means: identity comes from the
+    # interaction only, the self-only bot route is the only lookup, and a customer command
+    # never reaches a staff-token route. (This contract had drifted and was failing at HEAD.)
+    assert [argument.arg for argument in status.args.args] == ["interaction"]
     body = ast.get_source_segment(source, status)
     assert "lambda_post(ROUTE_STATUS" in body
     assert '"discord_id": uid, "actor_discord_id": uid' in body
     assert "if st == 404" in body
-    assert "str(license_row.get(\"discord_user_id\") or \"\") != str(uid)" in body
-    assert "staff_post(ROUTE_STAFF_LIC" in body
-    assert "No matching membership belongs to your Discord account" in body
+    assert "staff_post(" not in body
+    assert "license_row" not in body
+    assert "No membership is linked to your Discord account yet" in body

@@ -173,6 +173,23 @@ def _drop_count(*kinds: str) -> int:
     return total
 
 
+def _iter_stdin_commands(lines, note_drop=_note_drop):
+    """Yield object-shaped JSONL commands; one malformed line never ends the reader."""
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception as exc:
+            note_drop("stdin_bad_json", exc)
+            continue
+        if not isinstance(msg, dict):
+            note_drop("stdin_bad_schema", TypeError("command must be object"))
+            continue
+        yield msg
+
+
 def _release_window_diagnostic_wire(record) -> dict | None:
     """Serialize only a real, immutable native release-window diagnostic.
 
@@ -829,6 +846,32 @@ def _tip_registration_wire(raw) -> dict:
 _DETECTOR_HEALTH_INTERVAL_S = 2.0
 
 
+def _capture_notice_wire(orch, state: dict) -> dict | None:
+    """{"event":"log","level":"warn","msg":"Capture: ...","capture_notice":code} once per new
+    orchestrator capture notice, else None.
+
+    [CL2-P3-005 2026-09-23] The orchestrator publishes ``_capture_notice = (seq, code, text)``;
+    this relays each seq exactly once over the existing ``log`` event, which every shipped
+    native build already forwards. The ``capture_notice`` field lets a rebuilt native route it
+    to the customer Activity feed without the "Sidecar:" prefix.
+    """
+    raw = getattr(orch, "_capture_notice", None)
+    if not isinstance(raw, tuple) or len(raw) < 3:
+        return None
+    try:
+        seq = int(raw[0] or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if seq <= int(state.get("seq", 0) or 0):
+        return None
+    state["seq"] = seq
+    text = str(raw[2] or "")[:400]
+    if not text:
+        return None
+    return {"event": "log", "level": "warn", "msg": text,
+            "capture_notice": str(raw[1] or "")[:32]}
+
+
 def _detector_health_wire(orch) -> dict | None:
     """{"event":"detector_health", ...} for the native Meter Detection card, or None while the
     orchestrator has no reader with a health snapshot (pre-warm, retired chain, legacy reader).
@@ -882,6 +925,7 @@ def _read_processed_frame_snapshot(orch) -> dict:
             "epoch_ms": float(getattr(snapshot, "epoch_ms", 0.0) or 0.0),
             "measurement_epoch_ms": float(
                 getattr(snapshot, "measurement_epoch_ms", 0.0) or 0.0),
+            "detector_done_epoch_ms": float(getattr(snapshot, "detector_done_epoch_ms", 0.0) or 0.0),
             "pts": int(getattr(snapshot, "pts", 0) or 0),
             "frame_wh": (int(frame_wh[0]), int(frame_wh[1])),
             "integrity_healthy": bool(getattr(snapshot, "integrity_healthy", False)),
@@ -2564,6 +2608,7 @@ def main() -> int:
             _stall_ms = 250.0
         # Next monotonic instant the detector-health line is due (0 = emit on the first pass).
         _health_next = 0.0
+        _notice_state = {"seq": 0}   # [CL2-P3-005 2026-09-23] last relayed capture notice
         while not stop_evt.is_set():
             try:
                 # One immutable reference pairs seq, source identity, all timestamps,
@@ -2653,6 +2698,8 @@ def main() -> int:
                     # epoch<->steady once and runs all timing fusion on CAPTURE time, so IPC/
                     # processing jitter no longer smears the fill timeline.
                     "capture_ts_ms": float(_processed["epoch_ms"]),
+                    "detector_done_ts_ms": float(_processed.get("detector_done_epoch_ms", 0.0)),
+                    "processed_seq": int(_processed["seq"]),
                     "measurement_capture_ts_ms": _measurement_epoch_ms,
                     # Reader stage for the last processed frame (track / track_green / acquire /
                     # coast / no_meter): lets the engine tell a fresh read from a coasted sample
@@ -2661,16 +2708,26 @@ def main() -> int:
                     # Phase-1: feed health passthrough — false when the capture card's content-stall
                     # detector has exhausted reopen attempts (feed_frozen). The native engine uses
                     # this to suppress blind fires on a dead feed. True when the feed is live.
+                    # [CL2-P3-002/004 2026-09-23] ...and the capture feed must have QUALIFIED
+                    # by measurement (steady rate, bounded gaps; capture-card mode only), so a
+                    # badly degraded or 30 fps feed gets no fire authority. Absent on other
+                    # sources/older orchestrators -> True (unchanged).
                     "feed_healthy": (
                         bool(_processed["integrity_healthy"])
                         and not bool(_processed["backend_frozen"])
+                        and bool(getattr(orch, "_capture_feed_qualified", True))
                     ),
                     # Dark/invalid detector content disarms the bot through feed_healthy, but is
                     # not itself proof that the backend or process needs to be restarted.
                     "backend_frozen": bool(
                         getattr(orch, "_last_feed_frozen", _processed["backend_frozen"])
                     ),
-                    "frame_reject_reason": str(_processed["reject_reason"]),
+                    "frame_reject_reason": (
+                        str(_processed["reject_reason"])
+                        or ("" if bool(getattr(orch, "_capture_feed_qualified", True))
+                            else "capture_feed_unqualified:"  # [CL2-P3-004 2026-09-23]
+                            + str(getattr(orch, "_capture_feed_reason", "") or "unmeasured"))
+                    ),
                     "frame_reject_counts": dict(_processed["reject_counts"]),
                     "cv_frames_skipped": int(getattr(orch, "_cv_frames_skipped", 0) or 0),
                     "frame_revision": _payload_revision,
@@ -2930,6 +2987,14 @@ def main() -> int:
             # ~2 s (see _DETECTOR_HEALTH_INTERVAL_S). Deliberately outside the payload
             # try-block above: a health failure can never cost the engine a meter sample,
             # and a payload failure never silences the card.
+            # [CL2-P3-005 2026-09-23] Relay each new plain-language capture notice exactly once
+            # as a "Capture: ..." log line; native shows it in the customer Activity feed.
+            try:
+                _notice = _capture_notice_wire(orch, _notice_state)
+                if _notice is not None:
+                    _emit(_notice)
+            except Exception as exc:
+                _note_drop("telemetry_capture_notice", exc)
             if time.monotonic() >= _health_next:
                 _health_next = time.monotonic() + _DETECTOR_HEALTH_INTERVAL_S
                 try:
@@ -3031,18 +3096,7 @@ def main() -> int:
     _deferred_cmd_thread.start()
 
     def _stdin_loop():
-        for raw in sys.stdin:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except Exception as exc:
-                # A dropped command line = a launcher instruction (start_stream / shutdown /
-                # release_marker) silently never executed. Counted so a corrupted stdin channel
-                # is visible; stays non-fatal so one bad line can't kill the command loop.
-                _note_drop("stdin_bad_json", exc)
-                continue
+        for msg in _iter_stdin_commands(sys.stdin):
             cmd = str(msg.get("cmd", ""))
             if cmd == "shutdown":
                 _EXIT_REASON["reason"] = "shutdown-cmd"
@@ -3202,10 +3256,15 @@ def main() -> int:
                 fn = getattr(orch, "arm_shot_gate", None)
                 if callable(fn):
                     try:
-                        fn(source, shot_epoch, shot_type, rhythm)
+                        fn(source, shot_epoch, shot_type, rhythm,
+                           press_ms=msg.get("press_ms", 0.0))
                     except TypeError:
-                        # Older in-tree orchestrator: epoch-only arm, no type channel.
-                        fn(source, shot_epoch)
+                        # Additive diagnostic field: old orchestrators still receive
+                        # their original arm/type notification, without a guessed clock.
+                        try:
+                            fn(source, shot_epoch, shot_type, rhythm)
+                        except TypeError:
+                            fn(source, shot_epoch)
                 else:
                     # Older in-tree orchestrators expose only the internal helper.
                     legacy = getattr(orch, "_arm_shot_gate", None)

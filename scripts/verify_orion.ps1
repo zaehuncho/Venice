@@ -25,7 +25,15 @@ if ([string]::IsNullOrWhiteSpace($Python) -or -not (Test-Path -LiteralPath $Pyth
     $candidates = @()
     if (-not [string]::IsNullOrWhiteSpace($Python)) {
         $c = Get-Command $Python -ErrorAction SilentlyContinue
-        if ($c) { $candidates += $c.Source }
+        if ($c) {
+            $candidates += $c.Source
+        } else {
+            # [2026-09-21 verification provenance] An EXPLICIT -Python that is neither an
+            # existing path nor a resolvable command name must not silently degrade to
+            # whatever interpreter happens to be around: the gate's evidence would then
+            # name an interpreter nobody asked for (Astra, release review).
+            throw "-Python '$Python' does not exist and is not a command on PATH. Pass a real interpreter path, or omit -Python to auto-resolve."
+        }
     }
     $candidates += (Join-Path $Root ".venv\Scripts\python.exe")
     $onPath = Get-Command python -ErrorAction SilentlyContinue
@@ -267,6 +275,9 @@ Invoke-OrionStep "[orion] Python sidecar tests" {
         tests\test_decoder_payload_assembly.py `
         tests\test_meter_detector_yolo_geometry.py `
         tests\test_meter_locator_cv.py `
+        tests\test_fade_candidate_budget.py `
+        tests\test_meter_hsv_hotpath.py `
+        tests\test_player_anchor.py tests\test_player_anchor_acquire.py `
         tests\test_meter_locator_crop_context.py `
         tests\test_meter_detector_async_priority.py `
         tests\test_meter_detector_async_lifecycle.py `
@@ -274,9 +285,14 @@ Invoke-OrionStep "[orion] Python sidecar tests" {
         tests\test_meter_update_idempotence.py `
         tests\test_async_diagnostic_csv.py `
         tests\test_framedump_census_reliability.py `
+        tests\test_green_cap_association.py `
+        tests\test_lossless_frame_archive.py `
+        tests\test_pipeline_clock_trace.py `
+        tests\test_shot_pipeline_audit.py tests\test_timing_tail_audit.py `
         tests\test_shot_record_framedump_completion.py `
         tests\test_shot_records.py `
         tests\test_shot_records_wiring.py `
+        tests\test_shot_record_clocks.py `
         tests\test_detcsv_frame_identity.py `
         tests\test_detcsv_authority.py `
         tests\test_detector_frame_wakeup.py `
@@ -335,7 +351,13 @@ Invoke-OrionStep "[orion] Python sidecar tests" {
         tests\test_gui_cadence_contract.py `
         tests\test_latency_calibration_ui_contract.py `
         tests\test_passive_court_flow_contract.py `
-        tests\test_roi_relock.py tests\test_stability_tracking.py -q
+        tests\test_roi_relock.py tests\test_stability_tracking.py `
+        tests\discord -q
+    # [2026-09-21] tests\discord was outside this allowlist entirely, so the customer-
+    # facing bot copy (the /purchase embed and its price) had NO release-gate coverage:
+    # a price change passed Strict with the bot test still pinning the old price. The
+    # whole directory is gated now; its one stale contract (test_venice_guard_refresh:
+    # the keyless status() handler) was reconciled the same day rather than xfail-ed.
 }
 
 Invoke-OrionStep "[orion] Custom Remote Play runtime" {
@@ -350,7 +372,7 @@ Invoke-OrionStep "[orion] Custom Remote Play runtime" {
 
 Invoke-OrionStep "[orion] Native build" {
     Assert-OrionCMakeOwnership -BuildDirectory "native_orion\build"
-    cmake --build native_orion\build --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionXboxPolicyTests OrionLauncherResponseTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionShmNotificationTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests
+    cmake --build native_orion\build --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionXboxPolicyTests OrionLauncherResponseTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionLicenseHeartbeatPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionRouteTransitionTests OrionShmNotificationTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests OrionActivateContractTests OrionBrokerInstallTrustTests OrionBrokerSelfTrustGateTests OrionBrokerSessionStoreTests OrionBrokerSpkiPinTests OrionMachineIdParityTests
 }
 
 Invoke-OrionStep "[orion] Native tests" {
@@ -383,7 +405,7 @@ if ($StrictSecurity) {
     }
     Invoke-OrionStep "[orion] Production native build" {
         Assert-OrionCMakeOwnership -BuildDirectory $ProdBuild
-        cmake --build $ProdBuild --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionXboxPolicyTests OrionLauncherResponseTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionShmNotificationTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests
+        cmake --build $ProdBuild --config Release --target OrionNative OrionOwner OrionStaff VeniceNet OrionVeniceNetTests OrionVeniceNetIpcClientTests VeniceNetSvc OrionVeniceNetServiceTests OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionXboxPolicyTests OrionLauncherResponseTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionLicenseHeartbeatPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionRouteTransitionTests OrionShmNotificationTests OrionPreciseWaitTests OrionUpdater OrionUpdaterTests OrionActivateContractTests OrionBrokerInstallTrustTests OrionBrokerSelfTrustGateTests OrionBrokerSessionStoreTests OrionBrokerSpkiPinTests OrionMachineIdParityTests
     }
     Invoke-OrionStep "[orion] Production dev-hook marker audit" {
         $ProdNative = Join-Path $Root "$ProdBuild\Release\OrionNative.exe"

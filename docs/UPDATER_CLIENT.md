@@ -10,7 +10,7 @@ artifact host, and signing) is built separately — see `docs/SERVER_HANDOFF.md`
 | Piece | Role |
 |-------|------|
 | `OrionNative.exe` | Main launcher. Checks `/api/update` at startup **before AuthGate** (blocking gate, fail-soft), auto-proceeds into the updater after a countdown, and keeps the Patch pill live for later checks. |
-| `OrionUpdater.exe` | Standalone helper shipped next to `OrionNative.exe`. Waits for the launcher to exit, re-fetches + re-verifies the manifest, downloads, verifies, backs up, replaces, rolls back on failure, relaunches. |
+| `OrionUpdater.exe` | Installed first stage verifies the signed old runtime, stages its own EXE and complete declared DLL/Qt-plugin closure in a sibling directory, starts that copy, then exits. The staged second stage waits for install owners, verifies the signed update and both release inventories, applies/rolls back, and relaunches. |
 | `UpdateManifest` (SecurityCore) | Parse + signature + hash + version-policy logic. Unit-tested. |
 | `UpdaterArchive` (UpdaterCore) | Path-traversal-safe zip extraction + backup/restore. Unit-tested. |
 
@@ -119,8 +119,71 @@ secret) is **`orion-ed25519-v1`** =
 (hex `38943613b64014294e08ce12e3fe50ccb7908e310c4998cf8863336e22d9756b`). It is
 embedded in `OrionUpdater.exe` at build time via the CMake defines
 `ORION_UPDATE_ED25519_PUBKEY` / `ORION_UPDATE_ED25519_PUBKEY_ID`. Additional /
-rotated keys can also be supplied (resolved by `public_key_id`) via
-`--pubkeys-file`, the `ORION_UPDATE_PUBKEYS` env var, or an `update_pubkeys.json`
+rotated keys can also be supplied **in development builds only** (resolved by
+`public_key_id`) via `--pubkeys-file`, the `ORION_UPDATE_PUBKEYS` env var, or an
+`update_pubkeys.json`. **Production builds (`ORION_PRODUCTION_BUILD`) trust only the
+embedded key**: every external source is ignored and named in the updater log, and
+`--manifest-file` is refused. Rationale (2026-09-21): an unprivileged local process
+can set a user environment variable or drop a file next to the install; letting
+either become the trust root of an elevated updater would be a signed-update bypass
+and a privilege escalation. Key rotation in production ships the new embedded key
+through a signed update (embed both ids during the transition).
+## Install location (2026-09-21)
+
+The installer fixes the install directory under Program Files (`installer/orion.iss`), and the
+updater refuses any install root that is a reparse point (symlink, junction, mount point, cloud
+placeholder) or, in production, any directory other than its own. Cloud-backed or redirected trees
+(OneDrive, Dev Drive junctions, roaming redirects) are therefore unsupported as an install location
+by construction: an update there fails closed with "reparse point" in `orion_updater.log`. A
+network (UNC) install root is refused outright ("not supported") in every build profile.
+
+## Relaunch and build attestation (2026-09-21)
+
+- `--relaunch` is **ignored in production**: the updater relaunches `OrionNative.exe` from its
+  own directory and nothing else (an override attempt is written to `orion_updater.log`).
+  Development accepts a bare `*.exe` name only; the resolved path must be a regular file
+  directly under the install root with no reparse point on the way, or no relaunch happens.
+- `OrionUpdater.exe --build-profile <new file under %TEMP%>` writes the build attestation:
+  `profile`, `version`, `embedded_key_ids`, and `embedded_keys` (id + SHA-256 of the 32 raw
+  public-key bytes). `tools/package_orion_release.py` refuses a production package unless the
+  profile is `production`, `--manifest-file` is disabled, every embedded key is listed in its
+  `APPROVED_UPDATE_KEYS` with the matching fingerprint, and the staged `OrionUpdater.exe`
+  is byte-identical to the binary that attested.
+
+## Key rotation and compromise (2026-09-21)
+
+**Planned rotation** (no compromise):
+1. Generate the new Ed25519 pair server-side; store the private half in SSM next to the
+   current one. Never on a workstation.
+2. Build a release with BOTH public keys embedded:
+   `-DORION_UPDATE_ED25519_PUBKEY2_ID=orion-ed25519-v2 -DORION_UPDATE_ED25519_PUBKEY2=<base64>`.
+   Sign that release's manifest with the CURRENT key (every installed client trusts it).
+3. Once the fleet is on that release (`minimum_supported_version` can force it), switch
+   the server signer to the new key id.
+4. The following release embeds only the new key (primary) and the old pair is retired.
+   `OrionUpdater.exe --build-profile out.json` lists `embedded_key_ids` for any binary.
+
+**Signing key on disk (2026-09-21)**: the private key may stay encrypted (PKCS8
+"ENCRYPTED PRIVATE KEY" or a legacy passphrase PEM). `tools/package_orion_release.py` reads the
+passphrase from `ORION_UPDATE_SIGNING_KEY_PASSPHRASE` or, when that is unset and the run is
+interactive, from a hidden prompt; it is never accepted on the command line, never logged, and
+the key is decrypted in memory only. The key file itself is named by `--signing-key` or
+`ORION_UPDATE_SIGNING_KEY_PEM` (a path; `scripts/verify_orion.ps1 -StrictSecurity` uses the
+env form) and must live outside the package tree.
+
+**Compromised signing key**: the compromised key alone is not enough to push an update —
+the launcher fetches the manifest from the pinned HTTPS endpoint only, so an attacker also
+needs the endpoint (or its DNS + a valid certificate). Procedure, in order:
+1. Rotate the server signer to a new key immediately and publish a **mandatory** update,
+   signed with the OLD key (still trusted by installed clients), whose binary embeds ONLY
+   the new key. Set `minimum_supported_version` past the compromised builds.
+2. Revoke/disable the compromised key material in SSM; audit manifest publishes.
+3. Until the fleet has moved, the endpoint is the control: the global kill switch and
+   `minimum_supported_version` stop compromised-era clients from running.
+4. Clients that missed the window (offline for the whole transition) reinstall from the
+   signed installer; that is the recovery root.
+
+Rotated keys were previously accepted from
 next to the executable: `{ "keys": { "<id>": "<hex or base64 32-byte key>" } }`.
 
 Verification uses the bundled OpenSSL `libcrypto` loaded at runtime; if it (or the
@@ -140,20 +203,32 @@ filter. All endpoints are HTTPS.
 
 ## Update flow (OrionUpdater.exe)
 
-1. Launcher starts `OrionUpdater.exe` with `--manifest-url https://api.zaeorion.com/api/update`,
+1. Launcher starts the installed `OrionUpdater.exe` with `--manifest-url https://api.zaeorion.com/api/update`,
    `--install-dir <dir>`, `--launcher-pid <pid>`, `--current-version <ver>`,
    `--relaunch OrionNative.exe`, then exits.
-2. Updater waits (≤30 s) for the launcher PID to close.
-3. Downloads the manifest (**HTTPS enforced**).
-4. Verifies: HTTPS source · `signature_alg == ed25519` · `public_key_id` resolves
+2. The installed first stage verifies every file against the exact-root signed
+   `release_manifest.json`, copies its EXE, all manifested root DLLs, and the
+   required Qt-plugin families into a verified sibling `.orion_updater_stage-*`
+   directory, starts the copied helper, then exits. Production rejects a
+   foreign `--install-dir`; the second stage accepts only that sibling layout
+   and re-verifies the copied closure against the signed old manifest.
+3. The staged helper waits (≤30 s each) for the launcher and bootstrap PIDs,
+   then for every observable install-local process/service or mapped DLL owner.
+   Timeout/refused inspection aborts before backup or destination mutation.
+4. Downloads the manifest (**HTTPS enforced**).
+5. Verifies: HTTPS source · `signature_alg == ed25519` · `public_key_id` resolves
    to a trusted public key · Ed25519 manifest signature · then, after download,
    the artifact SHA-256 · version is newer (downgrade only if `allow_rollback`).
-5. Extracts to a temp staging dir, **validating every zip entry stays inside the
-   install dir** (rejects `..` traversal, absolute/drive/UNC paths, symlinks).
-6. Backs up the current install.
-7. Replaces files from the staging dir.
-8. On any apply failure (or a missing relaunch target) restores the backup.
-9. Relaunches `OrionNative.exe`.
+6. Extracts to a temp staging dir, rejecting traversal, absolute/drive/UNC
+   paths and links. Both old and new exact-root release manifests must verify
+   before the install changes.
+7. Rechecks ownership, backs up the current install, overlays the new runtime,
+   and removes only files named in the verified old manifest but absent from
+   the verified new one. Unrelated user data stays in place.
+8. Checks the installed new manifest and relaunch target. On any apply, prune,
+   integrity or relaunch-target failure it restores the exact old backup.
+9. Relaunches `OrionNative.exe`. A bounded installed-helper cleanup removes
+   the sibling stage after the staged process exits.
 
 Nothing downloaded is executed until every verification gate in step 4–5 passes.
 A log is written to `<install-dir>/orion_updater.log` (no secrets).
@@ -171,7 +246,10 @@ manifest. `OrionUpdater.exe` itself is part of the shipped package.
 `OrionUpdater.exe` options: `--manifest-url` / `--manifest-file` (local, for
 testing) · `--install-dir` · `--launcher-pid` · `--relaunch` · `--current-version`
 · `--pubkeys-file` (trusted Ed25519 public keys JSON) · `--dry-run` (verify +
-extract, no replace) · `--no-relaunch`.
+extract, no replace) · `--no-relaunch`. The local `--artifact-file`,
+`--stage-runtime`, `--exit-on-complete` and fault-injection fixture flags are
+development-only; production refuses them. `--staged-helper`, `--bootstrap-pid`
+and `--cleanup-stage` are internal handoff flags, with root/layout checks.
 
 ## Tests
 
@@ -186,3 +264,8 @@ fails; wrong public key fails; missing `public_key_id` fails; unsupported
 artifact SHA-256 verify/mismatch, update/downgrade/min-version policy,
 path-traversal rejection (interior `..` and absolute paths that `QZipReader`
 passes through), symlink rejection, clean extraction, and backup/replace/rollback.
+`tests/test_updater_e2e_disposable.py` runs a signed offline update and an
+injected-failure rollback on copied install trees. It changes updater/Core/Qt
+DLL hashes, retires a manifested file, preserves user data, checks the PID
+barrier, and confirms the external helper stage is cleaned. It never starts
+`OrionNative.exe` or calls the update service.

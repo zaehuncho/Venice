@@ -2,6 +2,7 @@
 #include "PacketBridgeAuthority.h"
 #include "RemotePlayExecutablePolicy.h"
 #include "SidecarReaderProfile.h"
+#include "SidecarWatchdog.h"
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
@@ -10,6 +11,8 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QTemporaryDir>
+#include <QtCore/QTimer>
+#include <limits>
 #include <QtTest/QTest>
 
 using namespace orion;
@@ -50,6 +53,79 @@ class RemotePlayExecutablePolicyTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    void captureCardSelectionDefaultsUnselectedAndRoundTrips()
+    {
+        AppConfigData data;
+        QVERIFY(data.captureCardDeviceId.isEmpty());
+#ifndef ORION_PRODUCTION_BUILD
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        AppConfig writer(temp.path());
+        data.captureCardIndex = 1;
+        data.captureCardDeviceId = QStringLiteral("dshow-moniker-sha256-v1:")
+            + QString(64, QLatin1Char('2'));
+        QString error;
+        QVERIFY2(writer.save(data, &error), qPrintable(error));
+        AppConfig reader(temp.path());
+        QVERIFY(reader.load());
+        QCOMPARE(reader.data().captureCardIndex, 1);
+        QCOMPARE(reader.data().captureCardDeviceId, data.captureCardDeviceId);
+#endif
+    }
+
+    void sourceSwitchRefusesActiveAndTeardownEventLoop()
+    {
+        bool producerCapture = true;
+        int appliedLead = 8;
+        const auto trySwitch = [&](bool connecting, bool running, bool disconnecting) {
+            if (videoSourceChangeAllowed(connecting, running, disconnecting)) {
+                producerCapture = false;
+                appliedLead = 29;
+            }
+        };
+        for (const auto state : {1, 2, 3}) {
+            bool fired = false;
+            QTimer::singleShot(1, this, [&] {
+                trySwitch(state == 1, state == 2, state == 3);
+                fired = true;
+            });
+            QTRY_VERIFY_WITH_TIMEOUT(fired, 1000);
+            QVERIFY(producerCapture);
+            QCOMPARE(appliedLead, 8);
+        }
+        trySwitch(false, false, false);
+        QVERIFY(!producerCapture);
+        QCOMPARE(appliedLead, 29);
+    }
+
+    void warmPreviewPromotionRequiresExactLaunchIdentityEventLoop()
+    {
+        AppConfigData warm;
+        warm.videoSource = QStringLiteral("capture_card");
+        warm.captureCardIndex = 0;
+        warm.captureCardDeviceId = QStringLiteral("A");
+        warm.captureCardFps = 60;
+        AppConfigData requested = warm;
+        bool promoted = false;
+        bool fired = false;
+        QTimer::singleShot(1, this, [&] {
+            requested.captureCardIndex = 1;
+            requested.captureCardDeviceId = QStringLiteral("B");
+            promoted = shouldReuseWarmSidecarForConnect(true, true, true,
+                captureSidecarLaunchIdentity(warm), captureSidecarLaunchIdentity(requested));
+            fired = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(fired, 1000);
+        QVERIFY(!promoted);
+        requested = warm;
+        requested.captureCardFps = 30;
+        QVERIFY(!shouldReuseWarmSidecarForConnect(true, true, true,
+            captureSidecarLaunchIdentity(warm), captureSidecarLaunchIdentity(requested)));
+        requested = warm;
+        QVERIFY(shouldReuseWarmSidecarForConnect(true, true, true,
+            captureSidecarLaunchIdentity(warm), captureSidecarLaunchIdentity(requested)));
+    }
+
     void networkShipsOnAndLegacyCaptureOptOutIsRetired()
     {
 #ifdef ORION_PRODUCTION_BUILD
@@ -514,7 +590,9 @@ private slots:
             QJsonDocument(killed).toJson(QJsonDocument::Compact)));
         AppConfig killedConfig(killedRoot);
         QVERIFY(killedConfig.load());
-        QCOMPARE(killedConfig.data().meterStyle, QStringLiteral("Pill"));
+        // [ORION_PILL_REMOVED, re-withdrawn 2026-09-23] A persisted "Pill" is MIGRATED to Arrow2 on
+        // load; the kill-switch key still round-trips untouched.
+        QCOMPARE(killedConfig.data().meterStyle, QStringLiteral("Arrow2"));
         QVERIFY(!killedConfig.data().pillYoloRoute);
         // A save must not quietly re-enable it. (Snapshot first: save() writes through
         // data_, so handing it a reference to data_ would be self-aliasing.)
@@ -545,14 +623,74 @@ private slots:
         QVERIFY(legacyConfig.load());
         QVERIFY(legacyConfig.data().pillYoloRoute);
 
-        // ...and the launch route reads exactly those two loaded fields.
+        // [ORION_PILL_REMOVED, re-withdrawn 2026-09-23] A persisted "Pill" loads as Arrow2, so the
+        // Pill -> yolo route is unreachable from a settings file (env untouched, no style key).
+        QCOMPARE(legacyConfig.data().meterStyle, QStringLiteral("Arrow2"));
         QProcessEnvironment env;
         seedProposerEnv(env, legacyConfig.data().meterProposer);
         const MeterStyleRouteResult route = applyPillYoloRoute(
             env, legacyConfig.data().meterStyle, legacyConfig.data().pillYoloRoute);
-        QVERIFY(route.routed);
-        QCOMPARE(env.value(QString::fromLatin1(kMeterProposerEnvKey)), QStringLiteral("yolo"));
-        QCOMPARE(env.value(QString::fromLatin1(kMeterStyleEnvKey)), QStringLiteral("pill"));
+        QVERIFY(!route.routed);
+        QVERIFY(route.log.isEmpty());
+        QCOMPARE(env.value(QString::fromLatin1(kMeterProposerEnvKey)), QStringLiteral("cv"));
+        QVERIFY(!env.contains(QString::fromLatin1(kMeterStyleEnvKey)));
+    }
+
+    // [ORION_LEFT_FADE_LATER 2026-09-22] The old +8 left-fade default is migrated to -6 exactly once:
+    // a pre-revision file holding +8 adopts -6; any other value is a deliberate choice and is kept;
+    // after a save (rev 2) even a deliberate +8 survives.
+    void leftFadeOffsetMigratesOldDefaultOnce()
+    {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const auto loadWith = [&](const QString& name, const QJsonObject& obj) {
+            const QString root = QDir(temp.path()).filePath(name);
+            if (!createExecutableFixture(QDir(root).filePath(QStringLiteral("settings.json")),
+                                         QJsonDocument(obj).toJson(QJsonDocument::Compact)))
+                return std::numeric_limits<double>::quiet_NaN();
+            AppConfig cfg(root);
+            if (!cfg.load())
+                return std::numeric_limits<double>::quiet_NaN();
+            return cfg.data().leadOffsetLeftFadeMs;
+        };
+        QCOMPARE(loadWith(QStringLiteral("old8"),
+                          QJsonObject{{QStringLiteral("lead_offset_left_fade_ms"), 8.0}}), -6.0);
+        QCOMPARE(loadWith(QStringLiteral("deliberate3"),
+                          QJsonObject{{QStringLiteral("lead_offset_left_fade_ms"), 3.0}}), 3.0);
+        QCOMPARE(loadWith(QStringLiteral("rev2_8"),
+                          QJsonObject{{QStringLiteral("lead_offset_left_fade_ms"), 8.0},
+                                      {QStringLiteral("lead_offset_left_fade_rev"), 2}}), 8.0);
+        QCOMPARE(loadWith(QStringLiteral("absent"),
+                          QJsonObject{{QStringLiteral("meter_style"), QStringLiteral("Arrow2")}}), -6.0);
+    }
+
+    // [ORION_PILL_BETA 2026-09-22] The generic save API is the fourth ingress (Astra):
+    // normalizedMeterStyle() runs on save as well as load. Pill is accepted again; an unknown
+    // style still persists as the default.
+    void savePersistsPillBetaAndDefaultsUnknownStyles()
+    {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        AppConfig cfg(temp.path());
+        AppConfigData data;
+        data.meterStyle = QStringLiteral("Pill");
+        QVERIFY(cfg.save(data));
+        const QJsonObject persisted =
+            QJsonDocument::fromJson(
+                [&] {
+                    QFile file(QDir(temp.path()).filePath(QStringLiteral("settings.json")));
+                    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+                }())
+                .object();
+        QCOMPARE(persisted.value(QStringLiteral("meter_style")).toString(), QStringLiteral("Arrow2"));
+        AppConfig reloaded(temp.path());
+        QVERIFY(reloaded.load());
+        QCOMPARE(reloaded.data().meterStyle, QStringLiteral("Arrow2"));
+        // The rule itself: accepted spellings survive, everything else is the default.
+        QCOMPARE(normalizedMeterStyle(QStringLiteral("  Straight ")), QStringLiteral("Straight"));
+        QCOMPARE(normalizedMeterStyle(QStringLiteral("pill")), QStringLiteral("Arrow2"));
+        QCOMPARE(normalizedMeterStyle(QStringLiteral("Mystery")), QStringLiteral("Arrow2"));
+        QCOMPARE(normalizedMeterStyle(QString()), QStringLiteral("Arrow2"));
     }
 #endif
 
@@ -604,6 +742,6 @@ private slots:
 #endif
 };
 
-QTEST_APPLESS_MAIN(RemotePlayExecutablePolicyTests)
+QTEST_GUILESS_MAIN(RemotePlayExecutablePolicyTests)
 
 #include "RemotePlayExecutablePolicyTests.moc"

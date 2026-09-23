@@ -7,6 +7,8 @@
 #include <QtCore/QStringList>
 #include <QtCore/QtGlobal>
 
+#include <cmath>
+
 namespace orion::ui_notifications {
 
 // Broad statusChanged is the NOTIFY signal for a large portion of the QML
@@ -120,7 +122,9 @@ private:
 // enter the customer Activity ring.
 //
 // Precedence, in order:
-//   1. ALLOW-LIST  — an explicitly customer-meaningful template wins outright,
+//   0. INTERNAL-ONLY — lease / sidecar / ORION_ env lines never reach customers,
+//                    even when they also carry an allow-listed word.
+//   1. ALLOW-LIST — an explicitly customer-meaningful template wins outright,
 //                    even when it carries engineering-shaped detail.
 //   2. DENY-LIST   — the known telemetry templates.
 //   3. `Sidecar:`  — raw sidecar stdout is a machine stream; the human events it
@@ -132,6 +136,144 @@ private:
 //   5. DEFAULT KEEP — fail OPEN. A new human-facing event must never be silently
 //                    swallowed just because nobody added it to a list.
 // ---------------------------------------------------------------------------
+
+// Rule 0. [COPY-FIX 2026-09-23 NEW-A6] Internal-only lines. Checked BEFORE the
+// allow-list, because allow-listed words ("watchdog", "safe mode", "stream warm-up
+// hiccup", "controller") used to carry sidecar / lease / env-var text straight into
+// the customer feed. These lines still reach logs/orion_native.log byte-for-byte.
+// Markers are deliberately specific: a bare "lease" would also match "release".
+[[nodiscard]] inline bool isInternalOnlyLine(const QString& message)
+{
+    static const QStringList internal = {
+        QStringLiteral("lease-gated fire"),     // "Lease-gated fire ENABLED (ORION_LEASE_GATED_FIRE)…"
+        QStringLiteral("fire lease"),           // "Fire lease seeded by activation: …"
+        QStringLiteral("sidecar"),              // any process-level detection-engine detail
+        QStringLiteral("orion_"),               // developer env-var names
+        QStringLiteral("engine detail:"),       // raw Remote Play status behind a mapped one
+        // The raw abort enum line (its reason can contain the allow-listed word
+        // "controller"); the customer gets the plain "Shot not taken" line written
+        // next to it (customerShotNotTakenText).
+        QStringLiteral("shot automation aborted:"),
+    };
+    for (const QString& marker : internal) {
+        if (message.contains(marker, Qt::CaseInsensitive)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// [COPY-FIX 2026-09-23 NEW-A5 / EA-25] Customer copy for a raw RemotePlaySession
+// status. The Live Capture subtitle, the input-dead overlay and the Activity feed
+// show THIS; the raw text goes to the engineering log ("Remote Play engine detail:",
+// hidden by rule 0). Coded in the RP-01..RP-04 style RemotePlaySession already uses.
+// Anything not recognised and free of engine words passes through unchanged (plain
+// statuses like "Disconnected", "Waking the console from rest mode..." and the
+// existing RP-0x copy).
+[[nodiscard]] inline QString customerRemoteStatus(const QString& raw)
+{
+    const auto has = [&raw](const char* needle) {
+        return raw.contains(QLatin1String(needle), Qt::CaseInsensitive);
+    };
+    if (has("Production package is incomplete")) {
+        return QStringLiteral("Part of Venice is missing from this install (code RP-05). "
+                              "Reinstall Venice from the latest download.");
+    }
+    if (has("Failed to launch autogreen sidecar")
+        || has("sidecar script or Python runtime not found")
+        || has("Compiled sidecar")) {
+        return QStringLiteral("Venice's detection engine didn't start (code RP-06). "
+                              "Restart Venice; if it happens again, reinstall from the latest download.");
+    }
+    if (has("Autogreen sidecar CRASHED") || has("sidecar died")) {
+        return QStringLiteral("Venice's detection engine stopped (code RP-06). "
+                              "If the picture doesn't come back, disconnect and connect again.");
+    }
+    if (has("Stream start did not confirm") || has("input session was not proven ready")) {
+        return QStringLiteral("Venice couldn't link your controller to the PS5 (code RP-08). "
+                              "Disconnect and connect again.");
+    }
+    if (has("Chiaki input recovery") || has("Recovered input child")) {
+        return QStringLiteral("Venice couldn't reconnect your controller (code RP-07). Press Connect.");
+    }
+    if (has("Console IP is required")) {
+        return QStringLiteral("Enter your PS5's IP address in Setup, then press Connect.");
+    }
+    // Progress lines.
+    if (has("Starting Chiaki autogreen sidecar")) {
+        return QStringLiteral("Starting\u2026");
+    }
+    if (has("Starting Chiaki input") || has("starting Chiaki input")) {
+        return QStringLiteral("Connecting your controller\u2026");
+    }
+    if (has("Waiting for the detection sidecar")) {
+        return QStringLiteral("Starting video detection\u2026");
+    }
+    if (has("Restarting detection sidecar")) {
+        return QStringLiteral("Restarting video detection\u2026");
+    }
+    if (has("Recovering Chiaki input link") || has("Recovering console input session")
+        || has("Chiaki input child relaunched")) {
+        return QStringLiteral("Reconnecting your controller\u2026");
+    }
+    if (has("Autogreen running")) {
+        return QStringLiteral("Connected \u2014 meter detection active");
+    }
+    if (raw.trimmed().compare(QLatin1String("Autogreen stopped"), Qt::CaseInsensitive) == 0) {
+        return QStringLiteral("Stopped");
+    }
+    if (has("frame receiver boundary")) {
+        return QStringLiteral("PS5 connection test passed");
+    }
+    // Catch-all: any other engine wording never reaches the customer verbatim.
+    if (has("sidecar") || has("chiaki") || has("autogreen") || has("input child")
+        || has("ORION_")) {
+        return QStringLiteral("Venice hit an unexpected error (code RP-09). "
+                              "Disconnect and connect again; if it repeats, restart Venice.");
+    }
+    return raw;
+}
+
+// [COPY-FIX 2026-09-23 NEW-A7] Shot Lead ms -> the 1..100 number the Shot Lead card
+// shows. MUST mirror ShotLeadCard.qml valueFromMs (msLo 150, msHi 400).
+[[nodiscard]] inline int shotLeadSliderValue(double ms)
+{
+    constexpr double kLo = 150.0;
+    constexpr double kHi = 400.0;
+    const long v = std::lround((ms - kLo) * 99.0 / (kHi - kLo)) + 1;
+    return static_cast<int>(v < 1 ? 1 : (v > 100 ? 100 : v));
+}
+
+// [COPY-FIX 2026-09-23 NEW-A7] "Shot not taken (%1)." printed the raw AutomationEngine
+// abort enum. Customers get a plain category; the enum stays in the engineering line
+// "Shot automation aborted: <reason>" (tools/timing/live_batch_report.py parses it).
+[[nodiscard]] inline QString customerShotNotTakenText(const QString& reason)
+{
+    const auto has = [&reason](const char* needle) {
+        return reason.contains(QLatin1String(needle), Qt::CaseInsensitive);
+    };
+    if (has("cancel")) {
+        return QStringLiteral("Shot canceled.");
+    }
+    if (has("lead_unready")) {
+        return QStringLiteral("Shot not taken — Venice is still measuring your setup.");
+    }
+    if (has("deadline") || has("late") || has("timeout")) {
+        return QStringLiteral("Shot not taken — Venice couldn't release in time.");
+    }
+    if (has("controller") || has("route") || has("delivery") || has("input_timer")
+        || has("commit")) {
+        return QStringLiteral("Shot not taken — the controller link wasn't ready.");
+    }
+    if (has("meter") || has("detector") || has("ownership") || has("structure") || has("pose")
+        || has("candidate") || has("fill") || has("stale") || has("goto")) {
+        return QStringLiteral("Shot not taken — Venice lost track of the shot.");
+    }
+    if (has("disarmed") || has("authority")) {
+        return QStringLiteral("Shot not taken — automation was paused.");
+    }
+    return QStringLiteral("Shot not taken.");
+}
 
 // Rule 1. Customer-meaningful templates. Matched case-insensitively as
 // substrings of the simplified line, so a prefix here covers every argument
@@ -237,6 +379,10 @@ private:
         QStringLiteral("network bridge:"),
         QStringLiteral("packet bridge"),
         QStringLiteral("winmm raw"),
+        // [CL2-P8-002 round 2 2026-09-23] Heartbeat retry / re-check chatter
+        // (LicenseHeartbeatPolicy.h builders). The customer gets the banner and one
+        // transition line instead of a line per retry during a Wi-Fi blip.
+        QStringLiteral("lease heartbeat"),
     };
     for (const QString& marker : deny) {
         if (message.contains(marker, Qt::CaseInsensitive)) {
@@ -270,6 +416,9 @@ private:
     const QString line = message.trimmed();
     if (line.isEmpty()) {
         return false;
+    }
+    if (isInternalOnlyLine(line)) {
+        return false;                                  // 0
     }
     if (isCustomerActivityTemplate(line)) {
         return true;                                   // 1
@@ -452,6 +601,21 @@ inline constexpr qsizetype kActivityShareTailMaxLines = 1500;
         return {};
     }
     return serializeActivityLogForSharing(lines);
+}
+
+// A successful drain is not enough when admission dropped a prior batch. In
+// either case the ring is the newest shareable source; do not let a nonempty
+// older disk tail hide the error that prompted Copy Log.
+[[nodiscard]] inline QString activityLogCopyForSharing(
+    const QString& redactedDiskTail, const QStringList& ring,
+    bool drained, bool storageFault, quint64 droppedBatches)
+{
+    const QString redactedRing = serializeActivityLogForSharing(ring);
+    if (!drained || storageFault || droppedBatches != 0) {
+        return QStringLiteral("Disk log incomplete; recent session events follow.\n")
+            + redactedRing;
+    }
+    return redactedDiskTail.isEmpty() ? redactedRing : redactedDiskTail;
 }
 
 // Presence states that may legitimately alternate at capture cadence without a

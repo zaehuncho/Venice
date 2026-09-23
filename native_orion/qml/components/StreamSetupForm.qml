@@ -105,7 +105,12 @@ ColumnLayout {
         DashboardCombo {
             id: consoleCombo
             Layout.preferredWidth: 118
-            model: ["PS5", "Xbox"]
+            // [COPY-FIX 2026-09-23 CW-14/EA-33] Xbox is untested: customer builds list PS5
+            // only. Dev builds keep Xbox, and an install that already has Xbox selected keeps
+            // the entry so the combo never shows a value missing from its list (switching to
+            // PS5 then removes it).
+            model: (orion.debugUiEnabled === true || orion.remotePlayConsole === "Xbox")
+                   ? ["PS5", "Xbox"] : ["PS5"]
             enabled: form.routeIdle
             value: orion.remotePlayConsole
             onActivated: function(index) {
@@ -158,7 +163,7 @@ ColumnLayout {
 
     FieldHint {
         text: orion.remotePlayConsole === "Xbox"
-              ? "Xbox Remote Play · Beta. Start Remote Play in the Xbox Windows app, then select its window below."
+              ? "Xbox Remote Play — EXPERIMENTAL. No Xbox console has been measured yet, so shot timing on Xbox is untested and not supported. Start Remote Play in the Xbox Windows app, then select its window below."
               : "Discovery is usually enough. Enter a fixed console IP only when discovery is unavailable."
     }
 
@@ -170,17 +175,45 @@ ColumnLayout {
         Component.onCompleted: if (form.xboxMode) form.refreshXboxWindows()
         onVisibleChanged: if (visible) form.refreshXboxWindows()
         SectionLabel { text: "Xbox Remote Play" }
+        // [2026-09-21 beta] Untested-path acknowledgement. Persisted (orion.xboxUntestedAcknowledged);
+        // the session refuses to start on Xbox until it is on (RemotePlaySession::start).
+        RowLayout {
+            objectName: "xboxUntestedAckRow"
+            Layout.fillWidth: true
+            spacing: 10
+            Text {
+                Layout.fillWidth: true
+                text: "I understand Xbox support is experimental and untested: no console has been measured and shot timing is not supported on Xbox."
+                color: Theme.textPrimary
+                wrapMode: Text.WordWrap
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSmall
+            }
+            DashboardToggle {
+                objectName: "xboxUntestedAckToggle"
+                checked: orion.xboxUntestedAcknowledged
+                onToggled: orion.xboxUntestedAcknowledged = checked
+            }
+        }
         RowLayout {
             Layout.fillWidth: true
-            PrimaryButton { text: "Open Xbox app"; onClicked: orion.openXboxRemotePlay() }
-            PrimaryButton { text: "Refresh windows"; onClicked: form.refreshXboxWindows() }
+            PrimaryButton {
+                text: "Open Xbox app"
+                enabled: orion.xboxUntestedAcknowledged
+                onClicked: orion.openXboxRemotePlay()
+            }
+            PrimaryButton {
+                text: "Refresh windows"
+                enabled: orion.xboxUntestedAcknowledged
+                onClicked: form.refreshXboxWindows()
+            }
         }
         DashboardCombo {
             id: xboxWindowPicker
             objectName: "xboxWindowPicker"
             Layout.fillWidth: true
             Layout.preferredHeight: Theme.controlHeight
-            enabled: form.routeIdle && form.xboxWindows.length > 0
+            enabled: form.routeIdle && orion.xboxUntestedAcknowledged && form.xboxWindows.length > 0
             model: form.xboxWindows
             value: orion.xboxRemotePlayWindowTitle || "Select the Remote Play window"
             onActivated: function(index) {
@@ -191,10 +224,11 @@ ColumnLayout {
             }
         }
         FieldHint {
-            text: "WGC video → shared meter reader → virtual Xbox controller. Keep the stream window visible and at a fixed size. Disconnecting Venice leaves the Xbox app open."
+            // [COPY-FIX 2026-09-23 NEW-A9] Plain words, no pipeline jargon.
+            text: "Venice watches the Xbox app window and sends input through a virtual controller. Keep the window visible at a fixed size. Disconnecting Venice leaves the Xbox app open."
         }
         FieldHint {
-            text: "Verify the Xbox app receives only Venice's virtual controller, not a second physical pad. Configure HidHide separately if needed. Xbox has its own Shot Lead; PS5 calibration is preserved. Live Xbox timing still needs testing."
+            text: "Make sure the Xbox app sees only Venice's virtual controller, not your physical pad as well. Xbox has its own Shot Lead; PS5 calibration is preserved. Xbox timing is untested: no accuracy is claimed, and support cannot troubleshoot Xbox timing yet."
         }
     }
 
@@ -204,6 +238,8 @@ ColumnLayout {
     DashboardCombo {
         id: videoSourceCombo
         visible: !form.xboxMode
+        enabled: orion.remoteState !== "Running" && orion.remoteState !== "Connecting"
+                 && orion.remoteState !== "Disconnecting"
         Layout.fillWidth: true
         model: ["Remote Play stream", "Capture card (HDMI)"]
         value: orion.videoSource === "capture_card"
@@ -227,6 +263,11 @@ ColumnLayout {
         text: "Remote Play carries video and the controller with no capture card required."
     }
 
+    FieldHint {
+        visible: !form.xboxMode && !videoSourceCombo.enabled
+        text: "Disconnect before changing the video source or its Shot Lead."
+    }
+
     ColumnLayout {
         Layout.fillWidth: true
         visible: !form.xboxMode && orion.videoSource === "capture_card"
@@ -244,19 +285,19 @@ ColumnLayout {
                 id: ccPicker
                 Layout.fillWidth: true
                 Layout.preferredHeight: Theme.controlHeight
-                enabled: orion.captureDeviceList.length > 0
+                enabled: orion.captureDeviceList.length > 0 && videoSourceCombo.enabled
                 model: orion.captureDeviceList.length > 0
                        ? orion.captureDeviceList
                        : ["No capture device detected"]
-                currentIndex: orion.captureCardIndex >= 0
+                currentIndex: orion.captureCardSelected && orion.captureCardIndex >= 0
                               && orion.captureCardIndex < orion.captureDeviceList.length
-                              ? orion.captureCardIndex : 0
+                              ? orion.captureCardIndex : -1
                 onActivated: {
                     if (orion.captureDeviceList.length > 0)
                         orion.captureCardIndex = currentIndex
                 }
                 contentItem: Text {
-                    text: ccPicker.displayText
+                    text: ccPicker.currentIndex < 0 ? "Choose a capture device" : ccPicker.displayText
                     color: Theme.textPrimary
                     verticalAlignment: Text.AlignVCenter
                     leftPadding: 12
@@ -282,8 +323,10 @@ ColumnLayout {
             }
         }
 
+        // [CL2-P3-002 2026-09-23] Any card works if its feed measures steady; say what that
+        // takes, and where the reason appears when it does not.
         FieldHint {
-            text: "Use a clean HDMI feed, turn HDCP off, and close other capture apps before you connect."
+            text: "Pick your capture card (not a webcam). Set it to 1080p60 or 720p60 on a USB 3.0 port, turn HDCP off, and close other capture apps before you connect. If the feed is too slow or busy, the Activity feed says why."
         }
 
         // Capture refresh rate. The card is opened at this rate on the next

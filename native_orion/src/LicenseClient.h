@@ -125,7 +125,8 @@ ORION_SECURITY_API bool isLicenseKillCode(const QString& code);
 
 // Copy shown to the user for a failed activate / heartbeat verdict. Distinct text
 // for frozen, blacklisted and version_blocked (the latter names min_client_version
-// when the server sent it); every other code shows the server's `message` prose,
+// when the server sent it); [CL2-P8-006/008 2026-09-23] timestamp_expired and
+// device_mismatch get plain fix-it copy; every other code shows the server's `message` prose,
 // falling back to `fallback` when that is empty too.
 ORION_SECURITY_API QString licenseErrorUserText(const LicenseResult& result,
                                                const QString& fallback = QString());
@@ -151,6 +152,9 @@ public:
     // Read-only heartbeat (POST /api/license/check). Used to disable a running
     // session when the server revokes/expires the key or flips the killswitch.
     void validate(QString licenseKey, QString machineId);
+    // [CL2-P8-002 round 2 2026-09-23] validate() is a no-op while this is true; the
+    // controller queues one re-run instead of losing an event-driven heartbeat.
+    [[nodiscard]] bool validationInFlight() const noexcept { return validationInFlight_; }
     void checkVersion();
     // Fetch /api/update and report the parsed client-update manifest. Fail-soft:
     // a network/parse failure emits a manifest with ok == false and never throws.

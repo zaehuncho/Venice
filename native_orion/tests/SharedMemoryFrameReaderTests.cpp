@@ -4,6 +4,7 @@
 #include "ControllerRoutingPolicy.h"
 
 #include <QtCore/QDir>
+#include <QtCore/QDebug>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QFileInfo>
 #include <QtCore/QProcess>
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -373,10 +375,102 @@ private:
 
 } // namespace
 
+struct AbandonedReadAttempt final {
+    bool imageNull = true;
+    int frameNumber = 0;
+    QString error;
+    std::uint64_t generation = 0;
+    std::uint32_t win32WaitResult = 0xffffffffu;
+    qint64 readElapsedMs = 0;
+};
+
+struct AbandonedObservation final {
+    bool sawAbandoned = false;
+    int attempts = 0;
+    QString failure;
+    QStringList trace;
+};
+
+static AbandonedObservation observeAbandonedPublish(
+    const std::function<AbandonedReadAttempt()>& read, int maxAttempts, int maxElapsedMs)
+{
+    AbandonedObservation observed;
+    QElapsedTimer bounded;
+    bounded.start();
+    while (observed.attempts < maxAttempts && bounded.elapsed() < maxElapsedMs) {
+        const AbandonedReadAttempt attempt = read();
+        ++observed.attempts;
+        observed.trace << QStringLiteral(
+            "attempt=%1 win32_wait=%2 read_elapsed_ms=%3 image_null=%4 frame=%5 "
+            "generation=%6 error=%7")
+            .arg(observed.attempts).arg(attempt.win32WaitResult)
+            .arg(attempt.readElapsedMs).arg(attempt.imageNull)
+            .arg(attempt.frameNumber).arg(attempt.generation).arg(attempt.error);
+        if (!attempt.imageNull || attempt.frameNumber != 0 || attempt.generation != 0) {
+            observed.failure = QStringLiteral("partial frame/generation escaped before abandonment");
+            return observed;
+        }
+        if (attempt.error.contains(QStringLiteral("abandoned"), Qt::CaseInsensitive)) {
+            observed.sawAbandoned = true;
+            return observed;
+        }
+        if (!attempt.error.isEmpty()) {
+            observed.failure = QStringLiteral("unexpected SHM diagnostic before abandonment: %1")
+                                   .arg(attempt.error);
+            return observed;
+        }
+        // Only null/zero/empty ordinary contention may be retried. The reader's
+        // production 3 ms mutex bound is unchanged.
+        QThread::msleep(1);
+    }
+    observed.failure = QStringLiteral("abandonment not observed within %1 attempts/%2 ms")
+                           .arg(maxAttempts).arg(maxElapsedMs);
+    return observed;
+}
+
 class SharedMemoryFrameReaderTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    void abandonedObservationRetriesOnlyEmptyContentionAndIsBounded()
+    {
+#ifdef Q_OS_WIN
+        int index = 0;
+        const auto firstTimeout = observeAbandonedPublish([&]() {
+            ++index;
+            AbandonedReadAttempt attempt;
+            attempt.win32WaitResult = index == 1 ? WAIT_TIMEOUT : WAIT_ABANDONED;
+            attempt.readElapsedMs = index == 1 ? 3 : 0;
+            if (index == 2) attempt.error = QStringLiteral("SHM producer abandoned a partial publish");
+            return attempt;
+        }, 3, 100);
+        QVERIFY2(firstTimeout.sawAbandoned, qPrintable(firstTimeout.failure));
+        QCOMPARE(firstTimeout.attempts, 2);
+        QVERIFY(firstTimeout.trace.first().contains(QStringLiteral("win32_wait=258")));
+
+        const auto neverAbandoned = observeAbandonedPublish([]() {
+            AbandonedReadAttempt attempt;
+            attempt.win32WaitResult = WAIT_TIMEOUT;
+            attempt.readElapsedMs = 3;
+            return attempt;
+        }, 3, 100);
+        QVERIFY(!neverAbandoned.sawAbandoned);
+        QCOMPARE(neverAbandoned.attempts, 3);
+        QVERIFY(neverAbandoned.failure.contains(QStringLiteral("not observed")));
+
+        const auto partial = observeAbandonedPublish([]() {
+            AbandonedReadAttempt attempt;
+            attempt.imageNull = false;
+            attempt.frameNumber = 9;
+            return attempt;
+        }, 3, 100);
+        QVERIFY(!partial.sawAbandoned);
+        QCOMPARE(partial.attempts, 1);
+#else
+        QSKIP("Win32 mutex observation is Windows-only");
+#endif
+    }
+
     void pythonWriterInteroperatesAcrossProcesses()
     {
         const QDir repoRoot(QStringLiteral(ORION_REPO_ROOT));
@@ -635,12 +729,24 @@ private slots:
         abandonedProducer.kill();
         QVERIFY(abandonedProducer.waitForFinished(3000));
 
-        int partialFrameNumber = -1;
-        const QImage partial = reader.readFrame(partialFrameNumber);
-        QVERIFY(partial.isNull());
-        QCOMPARE(partialFrameNumber, 0);
-        QVERIFY2(reader.lastError().contains(QStringLiteral("abandoned"), Qt::CaseInsensitive),
-                 qPrintable(reader.lastError()));
+        const auto abandoned = observeAbandonedPublish([&]() {
+            int partialFrameNumber = -1;
+            QElapsedTimer readElapsed;
+            readElapsed.start();
+            const QImage partial = reader.readFrame(partialFrameNumber);
+            AbandonedReadAttempt attempt;
+            attempt.imageNull = partial.isNull();
+            attempt.frameNumber = partialFrameNumber;
+            attempt.error = reader.lastError();
+            attempt.generation = reader.lastReadGeneration();
+            attempt.win32WaitResult = reader.lastMutexWaitResult();
+            attempt.readElapsedMs = readElapsed.elapsed();
+            return attempt;
+        }, 64, 500);
+        qInfo().noquote() << "abandoned-publish observation:" << abandoned.trace.join(QStringLiteral(" | "));
+        QVERIFY2(abandoned.sawAbandoned,
+                 qPrintable(abandoned.failure + QStringLiteral("; ")
+                            + abandoned.trace.join(QStringLiteral(" | "))));
         QCOMPARE(reader.lastReadGeneration(), std::uint64_t{0});
 
         QProcess cleanProducer;
@@ -1386,6 +1492,8 @@ private slots:
         QCOMPARE(verdicts.at(3).at(9).toBool(), true);
         // The relayed log line is the verdict's only route into the native log, and
         // `coverage=-` alone was ambiguous there for exactly the same reason.
+        // [ORION_ONSET_FF 2026-09-21] `attributed` and `release_seq` (the shot-gate epoch)
+        // are APPENDED so an offline grader joins the verdict to its shot by key.
         QStringList lines;
         for (const QList<QVariant>& row : setup) {
             const QString line = row.at(0).toString();
@@ -1395,13 +1503,51 @@ private slots:
         }
         QCOMPARE(lines.count(), 4);
         QCOMPARE(lines.at(0), QStringLiteral(
-            "Sidecar: BANNER VERDICT: timing=LATE coverage=- has_cov=0 ncc=0.970"));
+            "Sidecar: BANNER VERDICT: timing=LATE coverage=- has_cov=0 ncc=0.970 "
+            "attributed=1 release_seq=4242"));
         QCOMPARE(lines.at(1), QStringLiteral(
-            "Sidecar: BANNER VERDICT: timing=LATE coverage=WIDE OPEN has_cov=1 ncc=0.970"));
+            "Sidecar: BANNER VERDICT: timing=LATE coverage=WIDE OPEN has_cov=1 ncc=0.970 "
+            "attributed=1 release_seq=4242"));
         const QString strict = QStringLiteral(
-            "Sidecar: BANNER VERDICT: timing=LATE coverage=- has_cov=1 ncc=0.970");
+            "Sidecar: BANNER VERDICT: timing=LATE coverage=- has_cov=1 ncc=0.970 "
+            "attributed=1 release_seq=4242");
         QCOMPARE(lines.at(2), strict);
         QCOMPARE(lines.at(3), strict);
+    }
+
+    // [ORION_ONSET_FF 2026-09-21 Codex r2] The RTT sampler's court is the engine's only view of
+    // an online-delay CONTEXT change. One `courtChanged` per new PUBLIC court, from the same
+    // telemetry snapshot the sync numbers are read from; the sampler's startup target (the local
+    // console/gateway) never counts, and the same court repeated never fires twice.
+    void courtChangedFiresOncePerNewPublicCourt()
+    {
+        RemotePlaySession session;
+        QSignalSpy courts(&session, &RemotePlaySession::courtChanged);
+        auto telemetry = [](const QString& ip, bool verified) {
+            return QJsonObject{
+                {QStringLiteral("event"), QStringLiteral("telemetry")},
+                {QStringLiteral("rtt"), QJsonObject{
+                    {QStringLiteral("court_ip"), ip},
+                    {QStringLiteral("filtered_ms"), 30.0},
+                    {QStringLiteral("jitter_ms"), 2.0},
+                    {QStringLiteral("ready"), true},
+                    {QStringLiteral("target_verified"), verified}}}};
+        };
+        // The sampler's startup target (local console/gateway) is never target_verified.
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, telemetry(QStringLiteral("192.168.137.1"), false));
+        QCOMPARE(courts.count(), 0);
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, telemetry(QString(), false));
+        QCOMPARE(courts.count(), 0);                       // no court yet
+        // A public court the sampler has not verified yet is not a context either.
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, telemetry(QStringLiteral("3.227.237.86"), false));
+        QCOMPARE(courts.count(), 0);
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, telemetry(QStringLiteral("3.227.237.86"), true));
+        QCOMPARE(courts.count(), 1);
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, telemetry(QStringLiteral("3.227.237.86"), true));
+        QCOMPARE(courts.count(), 1);                       // same court: once
+        RemotePlaySessionTestAccess::deliverSidecarMessage(session, telemetry(QStringLiteral("3.227.237.87"), true));
+        QCOMPARE(courts.count(), 2);
+        QCOMPARE(courts.at(1).at(0).toString(), QStringLiteral("3.227.237.87"));
     }
 };
 

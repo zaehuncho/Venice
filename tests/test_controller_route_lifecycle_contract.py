@@ -37,10 +37,20 @@ def test_direct_input_pipe_cache_is_reset_at_every_process_generation_boundary()
         "void OrionAppController::restartSidecarWithWindowContainment()",
         "void OrionAppController::setChiakiEmbedVisible",
     )
-    teardown = _function(
+    # [2026-09-21] The disconnect-side reset moved EARLIER than teardown: disconnectRemotePlay()
+    # calls unplugRemoteController(), which resets the pipe "immediately, before asynchronous
+    # process cleanup", so a generation boundary is crossed with the cache already cleared
+    # rather than after the async teardown finishes. This contract used to search
+    # finishRemotePlayTeardown() alone and was failing at HEAD; it now follows the reset.
+    unplug = _function(
         source,
-        "void OrionAppController::finishRemotePlayTeardown()",
-        "void OrionAppController::runLatencyProbes",
+        "void OrionAppController::unplugRemoteController()",
+        "void OrionAppController::finishRemotePlayTeardown",
+    )
+    disconnect = _function(
+        source,
+        "void OrionAppController::disconnectRemotePlay(",
+        "void OrionAppController::unplugRemoteController",
     )
     connect = _function(
         source,
@@ -50,7 +60,8 @@ def test_direct_input_pipe_cache_is_reset_at_every_process_generation_boundary()
 
     assert "orionInput_.resetConnection();" in failed_route
     assert "orionInput_.resetConnection();" in contained_restart
-    assert "orionInput_.resetConnection();" in teardown
+    assert "orionInput_.resetConnection();" in unplug
+    assert "unplugRemoteController();" in disconnect
     assert "orionInput_.resetConnection();" in connect
 
 
@@ -71,28 +82,44 @@ def test_input_client_reset_forces_a_fresh_seed_without_resetting_sequence() -> 
 
 def test_pipe_write_timeout_rechecks_exact_boundary_completion_after_cancel_drain() -> None:
     source = INPUT_CLIENT.read_text(encoding="utf-8")
+    operation = _function(
+        source,
+        "PipeIoOutcome runOwnedPipeIo(",
+        "CheckedElapsedMicros qpcElapsedUs(",
+    )
     send = _function(
         source,
-        "InputRouteWriteResult OrionInputClient::sendDetailed(",
+        "InputRouteWriteResult OrionInputClient::transmitLocked(",
+        "void OrionInputClient::sendAbandonLocked(",
+    )
+    abandon = _function(
+        source,
+        "void OrionInputClient::sendAbandonLocked(",
         "#else\nvoid OrionInputClient::closePipe()",
     )
 
-    timeout_branch = send.index("CancelIoEx(pipe_, &ov);")
-    drain = send.index(
-        "WaitForSingleObject(writeEvent_, INFINITE) == WAIT_OBJECT_0",
-        timeout_branch,
-    )
-    terminal_result = send.index(
-        "GetOverlappedResult(pipe_, &ov, &written, FALSE)",
-        drain,
-    )
-    failure_classification = send.index("if(!writeOk)", terminal_result)
+    # A timed-out caller cannot wait for cancellation while its stack buffer is
+    # still in use by the kernel. The operation owns all pending storage, and a
+    # separate reaper handles the incomplete branch. A completion that wins the
+    # timeout/cancel race is inspected without another blocking wait.
+    assert "std::make_unique<OwnedPipeIo>()" in operation
+    assert "DuplicateHandle(" in operation
+    deadline = operation.index("WaitForSingleObject(op->event, timeoutMs)")
+    cancel = operation.index("CancelIoEx(op->pipe, &op->overlapped)", deadline)
+    boundary = operation.index("WaitForSingleObject(op->event, 0)", cancel)
+    defer = operation.index("reapPendingPipeIo(std::move(op));", boundary)
+    terminal = operation.index("GetOverlappedResult(op->pipe, &op->overlapped, &outcome.bytes, FALSE)", defer)
+    assert deadline < cancel < boundary < defer < terminal
+    assert "GetOverlappedResult(op->pipe, &op->overlapped, &outcome.bytes, TRUE)" not in operation
+    assert "WaitForSingleObject(op->event, INFINITE)" not in operation
 
-    # The buffer remains alive until cancellation is drained. If the write won the
-    # timeout/cancel race, its exact terminal completion is authoritative; aborted,
-    # partial, and failed writes still flow to the ambiguous fail-closed result.
-    assert timeout_branch < drain < terminal_result < failure_classification
-    assert "&& written == sizeof(p);" in send[terminal_result:failure_classification]
+    write = send.index("runOwnedPipeIo(pipe_, false, &p, kWriteTimeoutMs)")
+    full_write = send.index("io.success && written == sizeof(p)", write)
+    failure = send.index("if(!writeOk)", full_write)
+    assert write < full_write < failure
+    assert "inputRouteWriteFailureResult(routeWasOwned, writeMayHaveBeenAccepted)" in send[failure:]
+    assert "runOwnedPipeIo(pipe_, false, &abandon, kWriteTimeoutMs)" in abandon
+    assert "if(io.success && io.bytes == sizeof(abandon))" in abandon
 
 
 def test_delayed_auto_reconnect_is_fenced_to_its_lifecycle_generation() -> None:

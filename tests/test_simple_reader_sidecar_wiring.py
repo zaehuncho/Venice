@@ -433,7 +433,7 @@ def test_sidecar_stdin_contract_for_the_three_shot_gate_commands():
         assert needle in src, needle
 
     arm = inspect.signature(rpo.RemotePlayOrchestrator.arm_shot_gate).parameters
-    assert list(arm) == ["self", "source", "shot_epoch", "shot_type", "rhythm"]
+    assert list(arm) == ["self", "source", "shot_epoch", "shot_type", "rhythm", "press_ms"]
     # every new argument is optional: an old sidecar calling the two-argument form still works
     assert arm["shot_type"].default == ""
     assert arm["rhythm"].default is False

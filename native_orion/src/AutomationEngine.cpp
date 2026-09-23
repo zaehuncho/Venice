@@ -1599,6 +1599,96 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
         }
     }
     config_.bannerTrimAbsentCoverageOpen = bannerTrimAbsentCoverageOpen;
+    // [ORION_ONSET_FF 2026-09-21 owner] The feedforward's limits, on the same clamp-on-every-route
+    // policy as the trim's: a numeric env value is CLAMPED into the band, a non-numeric one leaves
+    // the setting's own value in force, and the keying switch honours only an exact "0" or "1".
+    {
+        double gain = settings.onsetFeedforwardGain;
+        double clampMs = settings.onsetFeedforwardClampMs;
+        int window = settings.onsetFeedforwardWindow;
+        int minSamples = settings.onsetFeedforwardMinSamples;
+        bool oneSided = settings.onsetFeedforwardOneSided;
+        // [CL2-P6-006 / GM2-006 2026-09-23] The env overrides below (and the A/B arms) are
+        // development instruments: a customer build flies exactly the signed settings.
+#ifndef ORION_PRODUCTION_BUILD
+        bool ok = false;
+        const double envGain = qEnvironmentVariable("ORION_ONSET_FF_GAIN").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envGain)) {
+            gain = envGain;
+        }
+        ok = false;
+        const double envClamp =
+            qEnvironmentVariable("ORION_ONSET_FF_CLAMP_MS").trimmed().toDouble(&ok);
+        if (ok && std::isfinite(envClamp)) {
+            clampMs = envClamp;
+        }
+        ok = false;
+        const int envWindow = qEnvironmentVariable("ORION_ONSET_FF_WINDOW").trimmed().toInt(&ok);
+        if (ok) {
+            window = envWindow;
+        }
+        ok = false;
+        const int envMin = qEnvironmentVariable("ORION_ONSET_FF_MIN_SAMPLES").trimmed().toInt(&ok);
+        if (ok) {
+            minSamples = envMin;
+        }
+        if (qEnvironmentVariableIsSet("ORION_ONSET_FF_ONE_SIDED")) {
+            const QString envSided = qEnvironmentVariable("ORION_ONSET_FF_ONE_SIDED").trimmed();
+            if (envSided == QLatin1String("0")) {
+                oneSided = false;
+            } else if (envSided == QLatin1String("1")) {
+                oneSided = true;
+            }
+        }
+#endif
+        config_.onsetFeedforwardGain = std::clamp(gain, AppConfigData::kOnsetFeedforwardGainMin,
+                                                  AppConfigData::kOnsetFeedforwardGainMax);
+        config_.onsetFeedforwardClampMs = std::clamp(clampMs,
+                                                     AppConfigData::kOnsetFeedforwardClampMinMs,
+                                                     AppConfigData::kOnsetFeedforwardClampMaxMs);
+        config_.onsetFeedforwardWindow = std::clamp(window,
+                                                    AppConfigData::kOnsetFeedforwardWindowMin,
+                                                    AppConfigData::kOnsetFeedforwardWindowMax);
+        config_.onsetFeedforwardMinSamples =
+            std::clamp(minSamples, AppConfigData::kOnsetFeedforwardMinSamplesMin,
+                       AppConfigData::kOnsetFeedforwardMinSamplesMax);
+        config_.onsetFeedforwardOneSided = oneSided;
+#ifndef ORION_PRODUCTION_BUILD
+        onsetFfAbArms_ = orion::parseOnsetFeedforwardArms(
+            qEnvironmentVariable("ORION_ONSET_FF_AB"),
+            AppConfigData::kOnsetFeedforwardGainMax, AppConfigData::kOnsetFeedforwardClampMaxMs);
+#else
+        onsetFfAbArms_.clear();
+#endif
+        onsetFfAbKey_ = ~quint64{0};
+        onsetFfAbArm_ = -1;
+    }
+    // [ORION_LATE_CARRY 2026-09-22] "a,b,..." ms, each 0..15; anything malformed disarms the whole
+    // list loudly (a guessed arm would corrupt the A/B). Never parsed in a production build.
+    lateCarryAbArmsMs_.clear();
+#ifndef ORION_PRODUCTION_BUILD
+    if (qEnvironmentVariableIsSet("ORION_DEV_LATE_CARRY_AB")) {
+        const QString spec = qEnvironmentVariable("ORION_DEV_LATE_CARRY_AB").trimmed();
+        QVector<double> arms;
+        bool ok = !spec.isEmpty();
+        for (const QString& part : spec.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+            bool numOk = false;
+            const double v = part.trimmed().toDouble(&numOk);
+            if (!numOk || !std::isfinite(v) || v < 0.0 || v > kLateCarryMaxMs) {
+                ok = false;
+                break;
+            }
+            arms.append(v);
+        }
+        if (ok && arms.size() >= 2) {
+            lateCarryAbArmsMs_ = arms;
+        }
+        emit engineDiagnostic(QStringLiteral("LATE CARRY: ab spec=\"%1\" armed=%2 arms=%3")
+                                  .arg(spec.left(64))
+                                  .arg(lateCarryAbArmsMs_.isEmpty() ? 0 : 1)
+                                  .arg(lateCarryAbArmsMs_.size()));
+    }
+#endif
     // [ORION_BANNER_TRIM_BIAS 2026-09-19 owner] The integrator's window and vote margin, on the
     // same clamp-on-every-route policy the hold uses: file, setting and environment all land
     // inside the one band, and a non-numeric env value leaves the setting's own limit in force.
@@ -1632,7 +1722,7 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // The fixed per-shot-type addition to the Shot Lead, with the same clamp-on-every-route
     // policy every neighbouring timing knob uses: file, setting and environment all land inside
     // the one band, so no route can install an offset the setting could not have produced.
-    config_.leadOffsetLeftFadeMs = clampedLeadOffsetMs(settings.leadOffsetLeftFadeMs, 8.0);
+    config_.leadOffsetLeftFadeMs = clampedLeadOffsetMs(settings.leadOffsetLeftFadeMs, -6.0);
     config_.leadOffsetRightFadeMs = clampedLeadOffsetMs(settings.leadOffsetRightFadeMs, 8.0);
     config_.leadOffsetStandstillMs = clampedLeadOffsetMs(settings.leadOffsetStandstillMs, 0.0);
     config_.leadOffsetOtherMs = clampedLeadOffsetMs(settings.leadOffsetOtherMs, 0.0);
@@ -1945,10 +2035,12 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     // (0 = inert = the kill switch). The env knob IGNORES anything it cannot parse -- a typo must
     // not install a fabricated hold -- and CLAMPS anything it can, so the three routes can never
     // disagree about what a hold of "500" means.
+    // [R2_HOLD_DEFAULT_INERT 2026-09-21] Invalid input cannot create a button hold. The only
+    // non-zero path is an explicit, finite setting or the bounded diagnostic environment knob.
     config_.squarePressR2HoldMs = std::isfinite(settings.squarePressR2HoldMs)
         ? std::clamp(settings.squarePressR2HoldMs, AppConfigData::kSquarePressR2HoldMinMs,
                      AppConfigData::kSquarePressR2HoldMaxMs)
-        : 50.0;
+        : 0.0;
     if (qEnvironmentVariableIsSet("ORION_SQUARE_PRESS_R2_HOLD_MS")) {
         bool holdOk = false;
         const double envHold =
@@ -2534,6 +2626,10 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
         }
     }
     bool leadOverrideFromEnv = false;
+    // [SEC 2026-09-23 EA-31 side note] Lead floor / bias env overrides are development sweep
+    // instruments, gated exactly like the ORION_ONSET_FF_* overrides: a production (customer)
+    // build ignores them and flies the signed settings, so leadOverrideFromEnv stays false there.
+#ifndef ORION_PRODUCTION_BUILD
     if (qEnvironmentVariableIsSet("ORION_LEAD_FLOOR_MS")) {
         bool leadFloorOk = false;
         const double envFloor =
@@ -2555,6 +2651,7 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
             leadOverrideFromEnv = true;
         }
     }
+#endif
     // Recomputed every apply (never latched): the dev override is live only while the env var is.
     // Its whole job is to keep a live sweep byte-identical to today, so it OUT-RANKS the user
     // setting — see measuredLeadForActuationMs.
@@ -5009,6 +5106,24 @@ void AutomationEngine::reset()
     tipReservation_ = AutonomousTipReservation{};
     latencyCalibrationMode_ = false;
     latencyCalibrationAutomatic_ = false;
+    // [ORION_ONSET_FF 2026-09-21] A reset is a new context: the reference ring, the epoch fence
+    // and the per-token log fence all start cold with it.
+    onsetFeedforward_.reset();
+    onsetFfAbKey_ = ~quint64{0};   // a reset epoch 1 must draw a fresh arm
+    onsetFfAbArm_ = -1;
+    // [ORION_LATE_CARRY 2026-09-22] A new context carries nothing from the old one.
+    lateCarryPrevEpoch_ = 0;
+    lateCarryPrevBucket_.clear();
+    lateCarryPrevReleaseMs_ = -1.0;
+    lateCarryPrevVerdict_ = 0;
+    lateCarryShotKey_ = ~quint64{0};
+    lateCarryShotMs_ = 0.0;
+    lateCarryShotArm_ = -1;
+    lateCarryShotReason_.clear();
+    onsetFeedforwardLastEpoch_ = 0;
+    onsetFeedforwardLoggedToken_ = ~quint64{0};
+    onsetFeedforwardLoggedReason_.clear();
+    lastReleaseOnsetFfMs_ = 0.0;
     beginSidecarProcessGeneration();
     const double offset = shot_.networkOffsetMs;
     shot_ = ShotContext{};
@@ -5130,6 +5245,8 @@ void AutomationEngine::beginSidecarProcessGeneration()
 
     // A restart ends the old capture/label namespace. Neither a late landing
     // nor a restarted post-hoc counter can teach the prior process's shot.
+    pendingReleaseOracles_.clear();
+    bannerTrimReleases_.clear();
     cancelPostReleaseGrade(meterCapSeq_);
     endedShotAppearMs_ = -1.0;
     endedShotBucketKey_.clear();
@@ -6292,6 +6409,29 @@ bool AutomationEngine::recordPendingMeterOwnershipSample(
         && pendingMeterFirstSeenEpoch_ != physicalEpoch) {
         pendingMeterFirstSeenEpoch_ = physicalEpoch;
         pendingMeterFirstSeenMs_ = sampleNow;
+    }
+    if (pendingGesture && qEnvironmentVariableIntValue("ORION_OWNERSHIP_TRACE") == 1) {
+        if (ownershipTraceEpoch_ != physicalEpoch) {
+            ownershipTraceEpoch_ = physicalEpoch;
+            ownershipTraceSamples_ = 0;
+        }
+        if (ownershipTraceSamples_++ < 480) {
+            emit engineDiagnostic(QStringLiteral(
+                "OWNERSHIP INPUT: epoch=%1 frame=%2 capture_ms=%3 age_ms=%4 max_age_ms=%5"
+                " press_age_ms=%6 detected=%7 reason_ok=%8 stale=%9 ghost=%10 coast=%11"
+                " age_ok=%12 after_press=%13 confidence=%14 fill=%15 size_ok=%16"
+                " identity_ok=%17 timing_ok=%18 structure_ok=%19 genuine=%20 eligible=%21")
+                .arg(physicalEpoch).arg(result.frameNumber).arg(result.captureTsMs, 0, 'f', 3)
+                .arg(result.frameAgeMs, 0, 'f', 3).arg(config_.strictReleaseMaxSourceAgeMs, 0, 'f', 3)
+                .arg(pressAgeMs, 0, 'f', 3).arg(result.detected ? 1 : 0)
+                .arg(acceptedReason ? 1 : 0).arg(result.staleFrame ? 1 : 0)
+                .arg(result.ghostFrame ? 1 : 0).arg(coasted ? 1 : 0).arg(strictAge ? 1 : 0)
+                .arg(capturedAfterPress ? 1 : 0).arg(result.confidence, 0, 'f', 3)
+                .arg(proofFillPct, 0, 'f', 3).arg(result.width > 0 && result.height > 0 ? 1 : 0)
+                .arg(usableIdentity ? 1 : 0).arg(canonicalTimingIdentity ? 1 : 0)
+                .arg(currentGameplayEpochProof ? 1 : 0).arg(genuineCurrent ? 1 : 0)
+                .arg(genuineCurrent && (!strictOwnershipProof || currentGameplayEpochProof) ? 1 : 0));
+        }
     }
     if (!genuineCurrent
         || (strictOwnershipProof && !currentGameplayEpochProof)) {
@@ -9233,6 +9373,7 @@ bool AutomationEngine::consumeDueScheduledFire(ControllerState& output, double n
     // [ORION_DEV_FIRE_OFFSET] Carry the displacement this token actually fired with, so the
     // release-marker site can log it seq-paired for the offline sweep join.
     lastReleaseDevOffsetMs_ = schedFireAppliedDevOffsetMs_;
+    lastReleaseOnsetFfMs_ = schedFireAppliedOnsetFfMs_;    // [ORION_ONSET_FF]
     const double firedAt = confirmed ? schedFireActualMs_ : now;
     clearScheduledFire();
     if (triggerRelease(firedAt, confirmed)) {
@@ -9949,7 +10090,7 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
                 // [ORION_DEV_FIRE_OFFSET] Drift comparisons run against the UNDISPLACED armed
                 // deadline (identical when the hook is disarmed, offset 0).
                 const double armedBaseMs =
-                    schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
+                    schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_ - schedFireAppliedOnsetFfMs_;
                 if (std::abs(fireAtMs - armedBaseMs) <= 1e-6
                     && schedFireCode_ == QLatin1String("latency_calibration_validation")) {
                     shot_.releasePlan = QStringLiteral("Non-cap latency validation scheduled");
@@ -10702,7 +10843,7 @@ void AutomationEngine::processAutonomousLiveMeterHolding(ControllerState& output
         // the UNDISPLACED armed deadline (equal to schedFireDeadlineMs_ whenever the hook is
         // disarmed, offset 0): comparing against a displaced deadline would read the commanded
         // offset as per-tick drift and churn invalidate/re-arm every 4ms tick for the whole shot.
-        const double armedBaseMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
+        const double armedBaseMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_ - schedFireAppliedOnsetFfMs_;
         const bool deferEarlierCandidate = ownedHold
             && fireAtMs + 1e-6 < armedBaseMs
             && slowMeterDeferBinds(tipDecision, fireAtMs, effectiveLeadMs, now);
@@ -11452,7 +11593,7 @@ void AutomationEngine::processHolding(ControllerState& output, double now)
                     && (schedFireDeadlineMs_ - now) > config_.fusedCommitLockMs
                     // [ORION_DEV_FIRE_OFFSET] undisplaced comparison (offset 0 when disarmed)
                     && std::abs(tFire - (schedFireDeadlineMs_
-                                         - schedFireAppliedDevOffsetMs_))
+                                         - schedFireAppliedDevOffsetMs_ - schedFireAppliedOnsetFfMs_))
                         > config_.fusedRescheduleMinDeltaMs) {
                     invalidateUnconfirmedVisionSchedule("fused_b");
                 }
@@ -13097,12 +13238,29 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
     // on a latencyCalibrationProbe -- so the L1/L2 protocol is untouched by construction, and the
     // suppression is logged rather than silent so a returned log can account for every missing
     // marker.
-    if (shot_.holdBandKind.isEmpty()) {
+    // [ORION_ONSET_FF 2026-09-21] The same rule, one more instance: a feedforward-displaced
+    // release went where the displacement said, so its marker would teach the estimator the
+    // displacement. Dropped and logged, exactly as the band-clamped marker is; the shot-gate
+    // release (records, banner attribution) is a separate message and is untouched.
+    // [ORION_ONSET_FF 2026-09-21 Codex r2] Normalised HERE, before the marker and before the
+    // shot-gate release stamps the trim ring: only a SCHEDULED release carries the displacement
+    // (submitScheduledFire copied it a moment ago); an in-tick release carries 0, and must not
+    // inherit the previous scheduled shot's value through this member.
+    lastReleaseOnsetFfMs_ = shot_.firedByScheduler ? lastReleaseOnsetFfMs_ : 0.0;
+    const bool onsetFfDisplaced = lastReleaseOnsetFfMs_ != 0.0;
+    if (shot_.holdBandKind.isEmpty() && !onsetFfDisplaced) {
         emit releaseMarker(
             shot_.releaseSeq, releaseWallEpochMs, latencyCalibrationRelease,
             validationTargetMarker ? shot_.latencyValidationTargetPct : -1.0,
             validationToleranceMarkerPct,
             shot_.physicalShotEpoch, shot_.armToken);
+    } else if (onsetFfDisplaced && shot_.holdBandKind.isEmpty()) {
+        emit engineDiagnostic(QStringLiteral(
+            "ONSET FF: marker_suppressed_onset_ff seq=%1 applied_ms=%2 epoch=%3 shot_attempt=%4")
+                                  .arg(shot_.releaseSeq)
+                                  .arg(lastReleaseOnsetFfMs_, 0, 'f', 2)
+                                  .arg(shot_.physicalShotEpoch)
+                                  .arg(shot_.armToken));
     } else {
         emit engineDiagnostic(QStringLiteral(
             "HOLD BAND: marker_suppressed seq=%1 hold_band=%2 epoch=%3 shot_attempt=%4")
@@ -13136,6 +13294,23 @@ bool AutomationEngine::triggerRelease(double now, bool alreadySubmitted)
         // PHASE SAMPLE fence field ~1.2s later reports this shot's displacement, not a
         // predecessor's.
         lastReleaseDevOffsetMs_ = appliedMs;
+    }
+    // [ORION_ONSET_FF 2026-09-21] The same seq-paired join for the feedforward, emitted whenever
+    // the term is on (it ships on), 0 for an in-tick release exactly as applied_ms is above, and
+    // normalised the same way so the delayed PHASE SAMPLE field reports THIS shot's displacement.
+    if (config_.onsetFeedforwardGain > 0.0) {
+        const double ffMs = lastReleaseOnsetFfMs_;   // normalised above, before the marker
+        emit engineDiagnostic(QStringLiteral(
+            "Release onsetff: seq=%1 applied_ms=%2 scheduled=%3 shot_attempt=%4 "
+            "physical_epoch=%5")
+                                  .arg(shot_.releaseSeq)
+                                  .arg(ffMs, 0, 'f', 2)
+                                  .arg(shot_.firedByScheduler ? 1 : 0)
+                                  .arg(shot_.armToken)
+                                  .arg(shot_.physicalShotEpoch));
+        lastReleaseOnsetFfMs_ = ffMs;
+    } else {
+        lastReleaseOnsetFfMs_ = 0.0;
     }
     // Open the post-release meter capture: collect the bot's own settled meter for the next
     // ~1.2s and calibrate the per-type clock from where the release actually landed vs green.
@@ -13871,7 +14046,7 @@ bool AutomationEngine::frameBoundaryNoiseKeepsToken(
         return false;
     }
     const auto grid = shot_.framePhase.estimate();
-    const double armedMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
+    const double armedMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_ - schedFireAppliedOnsetFfMs_;
     const double armedOffsetMs = shot_.fireTargetFrameOffsetMs;
     if (!grid.locked || !grid.valid() || !std::isfinite(candidateMs)
         || !std::isfinite(armedMs) || !std::isfinite(frameOffsetMs)
@@ -14049,7 +14224,7 @@ bool AutomationEngine::armedPhaseTokenCarriesAnchorAuthority(double now) const n
         || schedFireArmedCommandEtaMs_ <= 0.0
         || !(untilArmedMs > 0.0)
         || untilArmedMs > schedFireArmedCommandEtaMs_
-            + std::max(0.0, schedFireAppliedDevOffsetMs_) + 1e-6) {
+            + std::max(0.0, schedFireAppliedDevOffsetMs_ + schedFireAppliedOnsetFfMs_) + 1e-6) {
         return false;
     }
     // A non-negative expiry proves the token went through the genuine-frame authority gate at
@@ -15118,10 +15293,131 @@ QString AutomationEngine::bannerLeadTrimSummary() const
                            : QStringLiteral("trims=%1").arg(parts.join(QLatin1Char(',')));
 }
 
+void AutomationEngine::noteContextChanged(const QString& reason)
+{
+    // [ORION_ONSET_FF 2026-09-21 Codex r2] A court change is a new online-delay context: the
+    // reference ring, the epoch fence and the per-token log fence start cold, exactly as on
+    // reset(). The carried displacement is NOT touched: it belongs to a release already made.
+    const int had = onsetFeedforward_.samples(QStringLiteral("Standstill"))
+        + onsetFeedforward_.samples(QStringLiteral("Left Fade"))
+        + onsetFeedforward_.samples(QStringLiteral("Right Fade"))
+        + onsetFeedforward_.samples(QStringLiteral("Other"));
+    onsetFeedforward_.reset();
+    onsetFeedforwardLastEpoch_ = 0;
+    onsetFeedforwardLoggedToken_ = ~quint64{0};
+    onsetFeedforwardLoggedReason_.clear();
+    emit engineDiagnostic(QStringLiteral("ONSET FF: context_reset reason=%1 dropped_onsets=%2")
+                              .arg(reason.left(32))
+                              .arg(had));
+}
+
+void AutomationEngine::noteOnsetFeedforwardRelease(quint64 physicalShotEpoch,
+                                                   const QString& shotType, double onsetMs)
+{
+    // [ORION_ONSET_FF 2026-09-21] One observation per physical epoch (the native's type_upgrade
+    // re-arm shares the epoch), and only a real onset: a blind NO METER release or a backstop
+    // carries -1 and must not pull the bucket's reference toward nothing.
+    if (physicalShotEpoch == 0 || physicalShotEpoch == onsetFeedforwardLastEpoch_) {
+        return;
+    }
+    // [ORION_LATE_CARRY 2026-09-22] Every release is "the previous shot" for the next one, onset or
+    // not; stamped before the onset guard below so a blind release still resets the carry.
+    if (physicalShotEpoch != lateCarryPrevEpoch_) {
+        lateCarryPrevEpoch_ = physicalShotEpoch;
+        lateCarryPrevBucket_ = orion::BannerLeadTrim::bucketFor(shotType);
+        lateCarryPrevReleaseMs_ = nowMs();
+        lateCarryPrevVerdict_ = 0;
+    }
+    if (!std::isfinite(onsetMs) || onsetMs < 0.0) {
+        return;
+    }
+    onsetFeedforwardLastEpoch_ = physicalShotEpoch;
+    onsetFeedforward_.observe(orion::BannerLeadTrim::bucketFor(shotType), onsetMs,
+                              config_.onsetFeedforwardWindow, nowMs(),
+                              orion::OnsetFeedforwardLimits{}.staleMs);
+}
+
+void AutomationEngine::noteLateCarryVerdict(quint64 physicalShotEpoch, const QString& timing)
+{
+    // Only the verdict of the MOST RECENT release counts: a panel for an older shot arriving late
+    // says nothing about the state the next shot fires into.
+    if (physicalShotEpoch == 0 || physicalShotEpoch != lateCarryPrevEpoch_) {
+        return;
+    }
+    const QString word = timing.trimmed().toUpper();
+    if (word.isEmpty()) {
+        return;
+    }
+    lateCarryPrevVerdict_ = word.startsWith(QLatin1String("LATE")) ? 1 : 2;
+}
+
+double AutomationEngine::lateCarryForShotMs(double now)
+{
+    if (lateCarryAbArmsMs_.isEmpty()) {
+        return 0.0;
+    }
+    const quint64 key = shot_.physicalShotEpoch > 0
+        ? static_cast<quint64>(shot_.physicalShotEpoch) : shot_.armToken;
+    // One treatment per physical shot. The one exception: a shot decided while the previous
+    // verdict was still in flight is re-decided if that verdict lands before the fire, so the race
+    // costs only the shots it must.
+    if (key == lateCarryShotKey_ && lateCarryShotReason_ != QLatin1String("verdict_pending")) {
+        return lateCarryShotMs_;
+    }
+    const QString bucket = orion::BannerLeadTrim::bucketFor(shot_.shotType);
+    const double sincePrevMs = lateCarryPrevReleaseMs_ >= 0.0 ? now - lateCarryPrevReleaseMs_ : -1.0;
+    QString reason;
+    if (lateCarryPrevEpoch_ == 0 || lateCarryPrevEpoch_ == key) {
+        reason = QStringLiteral("no_previous");
+    } else if (bucket != QLatin1String("Standstill") || lateCarryPrevBucket_ != bucket) {
+        reason = QStringLiteral("not_standstill_pair");
+    } else if (sincePrevMs < 0.0 || sincePrevMs > kLateCarryWindowMs) {
+        reason = QStringLiteral("stale");
+    } else if (lateCarryPrevVerdict_ == 0) {
+        reason = QStringLiteral("verdict_pending");
+    } else if (lateCarryPrevVerdict_ != 1) {
+        reason = QStringLiteral("prev_not_late");
+    } else {
+        reason = QStringLiteral("eligible");
+    }
+    const bool firstDecision = key != lateCarryShotKey_;
+    lateCarryShotKey_ = key;
+    lateCarryShotReason_ = reason;
+    lateCarryShotMs_ = 0.0;
+    if (reason == QLatin1String("eligible")) {
+        lateCarryShotArm_ = static_cast<int>(lateCarryRng_()
+                                             % static_cast<unsigned>(lateCarryAbArmsMs_.size()));
+        lateCarryShotMs_ = std::clamp(lateCarryAbArmsMs_[lateCarryShotArm_], 0.0, kLateCarryMaxMs);
+    } else {
+        lateCarryShotArm_ = -1;
+    }
+    // Every eligible shot is logged whatever its arm (arm 0 is the control), plus the pending race,
+    // so the offline join has the full denominator. Ineligible reasons are logged once per shot.
+    if (firstDecision || reason == QLatin1String("eligible")) {
+        emit engineDiagnostic(QStringLiteral(
+            "LATE CARRY: reason=%1 prev_epoch=%2 prev_verdict=%3 since_prev_ms=%4 arm=%5 "
+            "carry_ms=%6 shot_attempt=%7 physical_epoch=%8")
+                                  .arg(reason)
+                                  .arg(lateCarryPrevEpoch_)
+                                  .arg(lateCarryPrevVerdict_ == 1 ? QStringLiteral("LATE")
+                                       : lateCarryPrevVerdict_ == 2 ? QStringLiteral("other")
+                                                                    : QStringLiteral("unknown"))
+                                  .arg(sincePrevMs, 0, 'f', 0)
+                                  .arg(lateCarryShotArm_)
+                                  .arg(lateCarryShotMs_, 0, 'f', 1)
+                                  .arg(shot_.armToken)
+                                  .arg(shot_.physicalShotEpoch));
+    }
+    return lateCarryShotMs_;
+}
+
 void AutomationEngine::noteBannerTrimRelease(quint64 physicalShotEpoch, const QString& shotType,
                                             double onsetMs,
                                             orion::BannerLeadTrim::Range range)
 {
+    // [ORION_ONSET_FF 2026-09-21] The feedforward's ring rides the SAME release stamp, ahead of
+    // the trim's own kill switch: turning the banner trim off must not blind the feedforward.
+    noteOnsetFeedforwardRelease(physicalShotEpoch, shotType, onsetMs);
     if (!config_.bannerLeadTrim || physicalShotEpoch == 0) {
         return;
     }
@@ -15140,6 +15436,10 @@ void AutomationEngine::noteBannerTrimRelease(quint64 physicalShotEpoch, const QS
     entry.onsetMs = (std::isfinite(onsetMs) && onsetMs >= 0.0) ? onsetMs : -1.0;
     // [ORION_BANNER_TRIM_RANGE 2026-09-17] Stamped here for the same reason the onset is.
     entry.range = range;
+    // [ORION_ONSET_FF 2026-09-21] ...and the displacement this release fired with, normalised
+    // already (0 for an in-tick release) by the seq-paired `Release onsetff` line above this
+    // note in the release path.
+    entry.onsetFfMs = lastReleaseOnsetFfMs_;
     bannerTrimReleases_.append(entry);
     while (bannerTrimReleases_.size() > kBannerTrimReleaseRing) {
         bannerTrimReleases_.removeFirst();
@@ -15165,7 +15465,8 @@ bool AutomationEngine::peekBannerTrimRelease(quint64 physicalShotEpoch, QString&
 
 bool AutomationEngine::consumeBannerTrimRelease(quint64 physicalShotEpoch, QString& shotType,
                                                 double& onsetMs,
-                                                orion::BannerLeadTrim::Range* range)
+                                                orion::BannerLeadTrim::Range* range,
+                                                double* onsetFfMs)
 {
     for (int i = bannerTrimReleases_.size() - 1; i >= 0; --i) {
         if (bannerTrimReleases_.at(i).physicalShotEpoch == physicalShotEpoch) {
@@ -15173,6 +15474,9 @@ bool AutomationEngine::consumeBannerTrimRelease(quint64 physicalShotEpoch, QStri
             onsetMs = bannerTrimReleases_.at(i).onsetMs;
             if (range != nullptr) {
                 *range = bannerTrimReleases_.at(i).range;
+            }
+            if (onsetFfMs != nullptr) {
+                *onsetFfMs = bannerTrimReleases_.at(i).onsetFfMs;
             }
             // One move per release: a re-read panel, or a banner arriving behind an oracle that
             // already spent the epoch, must never move the trim twice.
@@ -15191,6 +15495,9 @@ void AutomationEngine::observeBannerVerdict(quint64 releaseSeq, const QString& t
 void AutomationEngine::observeBannerVerdict(quint64 releaseSeq, const QString& timing,
                                             const QString& coverage, bool hasCoverage)
 {
+    // [ORION_LATE_CARRY 2026-09-22] Ahead of the trim's kill switch, like the feedforward's ring:
+    // turning the banner trim off must not blind the carry.
+    noteLateCarryVerdict(releaseSeq, timing);
     if (!config_.bannerLeadTrim || timing.trimmed().isEmpty()) {
         return;
     }
@@ -15227,7 +15534,9 @@ void AutomationEngine::observeBannerVerdict(quint64 releaseSeq, const QString& t
     QString shotType;
     double onsetMs = -1.0;
     orion::BannerLeadTrim::Range shotRange = orion::BannerLeadTrim::Range::Unknown;
-    const bool matched = consumeBannerTrimRelease(releaseSeq, shotType, onsetMs, &shotRange);
+    double onsetFfMs = 0.0;
+    const bool matched = consumeBannerTrimRelease(releaseSeq, shotType, onsetMs, &shotRange,
+                                                  &onsetFfMs);
     if (!matched) {
         emit engineDiagnostic(QStringLiteral(
             "BANNER TRIM: ignored reason=no_matching_release release_seq=%1 verdict=%2")
@@ -15247,6 +15556,33 @@ void AutomationEngine::observeBannerVerdict(quint64 releaseSeq, const QString& t
     // verdict without the policy holding a copy of the config.
     limits.biasWindow = config_.bannerTrimBiasWindow;
     limits.biasVotes = config_.bannerTrimBiasVotes;
+    // [CL2-P6-003 2026-09-22] The dev fire-offset sweep/list displaces releases on purpose; a
+    // deliberately late shot once stepped the persisted trim EARLIER (09-22 22:05:56). While the
+    // hook is armed no verdict is evidence about the lead. Dev builds only: the hook cannot arm
+    // in production.
+    if (devFireOffsetArmed_) {
+        bannerLeadTrim_.observe(shotType, QStringLiteral("COVERAGE_EXCLUDED"),
+                                limits, onsetMs, shotRange);
+        emit engineDiagnostic(QStringLiteral(
+            "BANNER TRIM: ignored reason=dev_offset release_seq=%1 verdict=%2")
+                .arg(releaseSeq)
+                .arg(timing.trimmed().toUpper().left(32)));
+        return;
+    }
+    // [ORION_ONSET_FF 2026-09-21] A release the feedforward displaced went where the
+    // displacement said, not where the lead said, so its verdict is not evidence about the lead:
+    // refused exactly as a contested panel is (hysteresis broken, nothing stepped or decayed).
+    if (onsetFfMs != 0.0) {
+        bannerLeadTrim_.observe(shotType, QStringLiteral("COVERAGE_EXCLUDED"),
+                                limits, onsetMs, shotRange);
+        emit engineDiagnostic(QStringLiteral(
+            "BANNER TRIM: ignored reason=onset_ff_displaced release_seq=%1 verdict=%2 "
+            "applied_ms=%3")
+                .arg(releaseSeq)
+                .arg(timing.trimmed().toUpper().left(32))
+                .arg(onsetFfMs, 0, 'f', 2));
+        return;
+    }
     const QString coverageWord = coverage.simplified().toUpper();
     const bool coverageOpen = (coverageWord == QLatin1String("OPEN")
                                || coverageWord == QLatin1String("WIDE OPEN"));
@@ -15517,7 +15853,9 @@ void AutomationEngine::flushExpiredReleaseOracles(double atMs)
         QString shotType;
         double onsetMs = -1.0;
         orion::BannerLeadTrim::Range shotRange = orion::BannerLeadTrim::Range::Unknown;
-        if (!consumeBannerTrimRelease(parked.physicalShotEpoch, shotType, onsetMs, &shotRange)) {
+        double onsetFfMs = 0.0;
+        if (!consumeBannerTrimRelease(parked.physicalShotEpoch, shotType, onsetMs, &shotRange,
+                                      &onsetFfMs)) {
             emit engineDiagnostic(QStringLiteral(
                 "ORACLE: epoch=%1 gap_px=%2 proxy=%3 bucket=%4 used=0 reason=release_spent"
                 " tempo=%5 onset_ms=%6 range=%7")
@@ -15534,6 +15872,19 @@ void AutomationEngine::flushExpiredReleaseOracles(double atMs)
                              config_.bannerTrimRangeBuckets
                                  ? orion::BannerLeadTrim::rangeFor(parked.shotType, parked.range)
                                  : orion::BannerLeadTrim::Range::Unknown)));
+            continue;
+        }
+        // [ORION_ONSET_FF 2026-09-21] The oracle of a displaced release is refused for the same
+        // reason its banner is: the retraction gap rode the displaced release.
+        if (onsetFfMs != 0.0) {
+            emit engineDiagnostic(QStringLiteral(
+                "ORACLE: epoch=%1 gap_px=%2 proxy=%3 bucket=%4 used=0 reason=onset_ff_displaced"
+                " applied_ms=%5")
+                    .arg(parked.physicalShotEpoch)
+                    .arg(QString::number(parked.gapPx, 'f', 1),
+                         parked.green ? QStringLiteral("green") : QStringLiteral("miss"),
+                         orion::BannerLeadTrim::bucketFor(parked.shotType))
+                    .arg(onsetFfMs, 0, 'f', 2));
             continue;
         }
         orion::BannerLeadTrimLimits limits;
@@ -17262,6 +17613,126 @@ bool AutomationEngine::scheduleFire(double deadlineMs, double now, double horizo
             deadlineMs = displaced;
         }
     }
+    // [ORION_ONSET_FF 2026-09-21] The per-shot onset feedforward, at this SAME single choke point
+    // and under the same rules as the dev sweep offset above: only an AutonomousMeterVision
+    // deadline, never a calibration probe, never a guaranteed-past deadline, and the applied
+    // displacement retained so every undisplaced comparison can recover the base. The
+    // measurement and the rule are in OnsetFeedforward.h; the reference ring is fed at the
+    // release (noteOnsetFeedforwardRelease). A displaced release is a DISPLACEMENT for every
+    // learner, exactly as a dev-sweep or band-clamped one: its marker is dropped, the phase
+    // constant and landing-lead samples refuse it, and the banner trim refuses its verdict and
+    // its oracle (see lastReleaseOnsetFfMs_ at each of those five sites).
+    schedFireAppliedOnsetFfMs_ = 0.0;
+    if (authority == ScheduledFireAuthority::AutonomousMeterVision
+        && !shot_.latencyCalibrationProbe
+        && (config_.onsetFeedforwardGain > 0.0 || !onsetFfAbArms_.isEmpty())) {
+        orion::OnsetFeedforwardLimits limits;
+        limits.gain = config_.onsetFeedforwardGain;
+        limits.clampMs = config_.onsetFeedforwardClampMs;
+        limits.window = config_.onsetFeedforwardWindow;
+        limits.minSamples = config_.onsetFeedforwardMinSamples;
+        limits.oneSided = config_.onsetFeedforwardOneSided;
+        // [2026-09-22 VARIANCE HUNT] One arm per PHYSICAL shot (scheduleFire re-runs per payload and a
+        // shot may re-arm), drawn uniformly, logged on every ONSET FF line as ab_arm.
+        int abArm = -1;
+        if (!onsetFfAbArms_.isEmpty()) {
+            const quint64 abKey = shot_.physicalShotEpoch > 0
+                ? static_cast<quint64>(shot_.physicalShotEpoch) : shot_.armToken;
+            if (abKey != onsetFfAbKey_ || onsetFfAbArm_ < 0) {
+                onsetFfAbKey_ = abKey;
+                onsetFfAbArm_ = static_cast<int>(onsetFfAbRng_() % static_cast<unsigned>(onsetFfAbArms_.size()));
+            }
+            abArm = onsetFfAbArm_;
+            limits.gain = onsetFfAbArms_[abArm].gain;
+            limits.clampMs = onsetFfAbArms_[abArm].clampMs;
+            limits.oneSided = onsetFfAbArms_[abArm].oneSided;
+        }
+        const QString bucket = orion::BannerLeadTrim::bucketFor(shot_.shotType);
+        orion::OnsetFeedforward::Decision decision =
+            onsetFeedforward_.decide(bucket, liveShotOnsetMs(), limits, now);
+        // [ORION_ONSET_FF 2026-09-21] ONE bound for the two "fire earlier" corrections. The banner
+        // trim this shot already spends (up to +bannerTrimMaxMs earlier) and this displacement
+        // must not sum past the trim's own ceiling: a bucket the trim has already pulled 15 ms
+        // earlier gets no feedforward on top, one it pulled 9 ms earlier gets at most 6.
+        const double trimEarlierMs = std::max(0.0, appliedBannerLeadTrimMs());
+        // An A/B arm carries its own early bound: a gain-0.45 / clamp-40 arm capped at the 15 ms trim
+        // ceiling would silently become the arm it is being compared with.
+        const double earlyCeilingMs = abArm >= 0
+            ? std::max(config_.bannerTrimMaxMs, limits.clampMs) : config_.bannerTrimMaxMs;
+        const double boundMs = std::max(0.0, earlyCeilingMs - trimEarlierMs);
+        if (decision.applied && decision.offsetMs < -boundMs) {
+            decision.offsetMs = -boundMs;
+            if (std::abs(decision.offsetMs) < orion::OnsetFeedforward::kMinAppliedMs) {
+                decision.offsetMs = 0.0;
+                decision.applied = false;
+                decision.reason = QStringLiteral("trim_bound");
+            }
+        }
+        if (decision.applied) {
+            double displaced = deadlineMs + decision.offsetMs;
+            if (displaced <= now) {
+                displaced = now + 0.05;   // never arm a guaranteed-past deadline
+            }
+            const double appliedMs = displaced - deadlineMs;
+            // The trim cap and near-now clip run AFTER the pure feedforward policy.
+            // A final sub-floor movement still fences every learner, so it must be
+            // exactly zero rather than merely logged as a small displacement.
+            if (std::abs(appliedMs) >= orion::OnsetFeedforward::kMinAppliedMs) {
+                schedFireAppliedOnsetFfMs_ = appliedMs;
+                deadlineMs = displaced;
+            } else {
+                decision.applied = false;
+                decision.offsetMs = 0.0;
+                decision.reason = QStringLiteral("final_zero");
+            }
+        }
+        // One line per arm token (scheduleFire re-runs on every sidecar payload), plus one more
+        // whenever the decision changes inside the token: the meter can appear after the first
+        // arm, which turns no_onset into applied.
+        if (onsetFeedforwardLoggedToken_ != shot_.armToken
+            || onsetFeedforwardLoggedReason_ != decision.reason) {
+            onsetFeedforwardLoggedToken_ = shot_.armToken;
+            onsetFeedforwardLoggedReason_ = decision.reason;
+            emit engineDiagnostic(QStringLiteral(
+                "ONSET FF: reason=%1 bucket=%2 onset_ms=%3 ref_ms=%4 dev_ms=%5 offset_ms=%6 "
+                "applied_ms=%7 n=%8 gain=%9 clamp_ms=%10 net_offset_ms=%11 shot_attempt=%12 "
+                "physical_epoch=%13 trim_ms=%14 bound_ms=%15 ab_arm=%16 one_sided=%17")
+                                      .arg(decision.reason, bucket)
+                                      .arg(decision.onsetMs, 0, 'f', 0)
+                                      .arg(decision.referenceMs, 0, 'f', 0)
+                                      .arg(decision.deviationMs, 0, 'f', 1)
+                                      .arg(decision.offsetMs, 0, 'f', 2)
+                                      .arg(schedFireAppliedOnsetFfMs_, 0, 'f', 2)
+                                      .arg(decision.samples)
+                                      .arg(limits.gain, 0, 'f', 2)
+                                      .arg(limits.clampMs, 0, 'f', 1)
+                                      .arg(shot_.networkOffsetMs, 0, 'f', 1)
+                                      .arg(shot_.armToken)
+                                      .arg(shot_.physicalShotEpoch)
+                                      .arg(trimEarlierMs, 0, 'f', 1)
+                                      .arg(boundMs, 0, 'f', 1)
+                                      .arg(abArm)
+                                      .arg(limits.oneSided ? 1 : 0));
+        }
+    }
+    // [ORION_LATE_CARRY 2026-09-22] Same choke point, same rules as the feedforward, and folded
+    // into the SAME retained displacement (schedFireAppliedOnsetFfMs_, reset above on every call):
+    // a carried release is a displacement for every learner, so the five sites that fence a
+    // feedforward-displaced release fence this one with no new plumbing. It has its own ceiling
+    // (kLateCarryMaxMs) rather than the feedforward's trim bound, so a clipped arm can never
+    // silently turn into the other arm of its own A/B.
+    if (authority == ScheduledFireAuthority::AutonomousMeterVision
+        && !shot_.latencyCalibrationProbe) {
+        const double carryMs = lateCarryForShotMs(now);
+        if (carryMs > 0.0) {
+            double displaced = deadlineMs - carryMs;
+            if (displaced <= now) {
+                displaced = now + 0.05;   // never arm a guaranteed-past deadline
+            }
+            schedFireAppliedOnsetFfMs_ += displaced - deadlineMs;
+            deadlineMs = displaced;
+        }
+    }
     // [ORION_CAPTURE_PHASE_LOCK] Same single choke point. The fire phase is logged on every
     // scheduled fire so verdict-labelled batches can tune the target; the rounding itself is
     // opt-in. Symmetric nearest-phase (shift in (-P/2, +P/2], zero mean) so the aim is unchanged
@@ -17487,6 +17958,7 @@ void AutomationEngine::clearScheduledFire()
     schedFireArmedPhaseRateStretch_ = 1.0;
     schedFireArmedPhasePhysicalMs_ = -1.0;
     schedFireAppliedDevOffsetMs_ = 0.0;        // [ORION_DEV_FIRE_OFFSET]
+    schedFireAppliedOnsetFfMs_ = 0.0;         // [ORION_ONSET_FF]
     schedFireConfirmedToken_ = 0;
     schedFireFailedToken_ = 0;
     schedFireActualMs_ = -1.0;
@@ -17752,7 +18224,7 @@ void AutomationEngine::reevaluateScheduleOnFreshSample()
             && imminentHeldMs < std::max(1.0, config_.maxHoldMs)
             && phaseAnchorImminent(shot_.fillPct, tipDecision.samplerFit.slopePctPerMs);
         // [ORION_DEV_FIRE_OFFSET] undisplaced comparison (offset 0 when disarmed).
-        const double armedBaseMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_;
+        const double armedBaseMs = schedFireDeadlineMs_ - schedFireAppliedDevOffsetMs_ - schedFireAppliedOnsetFfMs_;
         // [ORION_SOURCE_STEAL_GUARD 2026-08-13] Quality gate, mirror of the tick site's. This
         // mirror is where tonight's steals actually happened (every TIP TOKEN KILL in the seq=93
         // class was site=subtick_reschedule), so parity here is the fix, not a nicety.
@@ -19118,7 +19590,7 @@ void AutomationEngine::notePhaseAnchorSample(double fillPct, double captureMs,
                             && schedFirePhysicalShotEpoch_ == shot_.physicalShotEpoch
                             && schedFireShotAttempt_ == shot_.armToken;
                         const double originalRunwayBoundMs = schedFireArmedCommandEtaMs_
-                            + std::max(0.0, schedFireAppliedDevOffsetMs_);
+                            + std::max(0.0, schedFireAppliedDevOffsetMs_ + schedFireAppliedOnsetFfMs_);
                         const bool boundedByOriginalArm = std::isfinite(originalRunwayBoundMs)
                             && originalRunwayBoundMs > 0.0
                             && refinedEtaMs <= originalRunwayBoundMs + 1e-6;
@@ -19446,7 +19918,7 @@ bool AutomationEngine::commitPhaseAnchorRefinement(
     // imminentTokenWindowMs(): its one-frame fence belongs to invalidate/re-arm paths.
     const double replaceWindowMs = phaseAnchorRetargetGuardMs();
     const double originalRunwayBoundMs = schedFireArmedCommandEtaMs_
-        + std::max(0.0, schedFireAppliedDevOffsetMs_);
+        + std::max(0.0, schedFireAppliedDevOffsetMs_ + schedFireAppliedOnsetFfMs_);
     const bool identityValid = stageTransitionValid
         && schedFireDeadlineMs_ >= 0.0
         && schedFireToken_ == scheduleToken
@@ -20387,7 +20859,8 @@ void AutomationEngine::latchPhaseRateStretch(double fillPct, double captureMs)
         // also clamp at now. Keep those existing policies, but do not recover a
         // model while either transformation can apply to its replacement.
         if (tickPhaseAuthoritative(now) || devFireOffsetArmed_
-            || schedFireAppliedDevOffsetMs_ != 0.0) {
+            || schedFireAppliedDevOffsetMs_ != 0.0
+            || schedFireAppliedOnsetFfMs_ != 0.0) {   // [ORION_ONSET_FF] same rule
             return;
         }
         double proposedDeadlineMs = -1.0;
@@ -20995,6 +21468,11 @@ QString AutomationEngine::meterBlindBackstopBlockReason(double now) const
 {
     if (!config_.meterBlindBackstop) {
         return QStringLiteral("off");
+    }
+    // [CL2-P9-001 2026-09-23] Detection is unavailable (e.g. a game patch changed the meter): never
+    // time a shot on a guess. The player's own release passes through.
+    if (detectionUnavailable_) {
+        return QStringLiteral("detection_unavailable");
     }
     // The backstop belongs to the strict live meter path. NO METER mode and pose timing have
     // their own release clocks and must never grow a second one.
@@ -22318,6 +22796,9 @@ void AutomationEngine::recordPhaseConstantSample()
     // commanded offset. While the sweep hook is armed NOTHING it produced may teach the aim:
     // the sample is still logged (the sweep analysis wants it) but never accepted.
     const bool devOffsetFenced = devFireOffsetArmed_;
+    // [ORION_ONSET_FF 2026-09-21] The same fence for the same reason: the stop rides the
+    // displaced release. Logged (the offline grader wants the landing), never accepted.
+    const bool onsetFfFenced = lastReleaseOnsetFfMs_ != 0.0;
     const bool subframeUnavailable = config_.stopDatingSubframe
         && stopSubframeRawMs < 0.0;
     // [ORION_TIP_PHASE_FIRST_SIGHT] A first-sight-dated landing is LOGGED but never LEARNED
@@ -22335,6 +22816,7 @@ void AutomationEngine::recordPhaseConstantSample()
         && observedMs >= config_.tipPhaseLearnMinMs
         && observedMs <= config_.tipPhaseLearnMaxMs
         && !devOffsetFenced
+        && !onsetFfFenced
         && !subframeUnavailable
         && !firstSightAnchored
         && !meterCapFadePhaseCatchup_; // a corrected capture clock must not train the shared constant
@@ -22374,6 +22856,12 @@ void AutomationEngine::recordPhaseConstantSample()
     if (devOffsetFenced) {
         extraFields += QStringLiteral("dev_offset_fence=1 dev_offset_ms=%1 ")
                            .arg(lastReleaseDevOffsetMs_, 0, 'f', 2);
+    }
+    // [ORION_ONSET_FF 2026-09-21] APPEND-ONLY, present only when the term displaced this fire,
+    // so every existing parser is unaffected and a graded batch can regress landing on it.
+    if (onsetFfFenced) {
+        extraFields += QStringLiteral("onset_ff_fence=1 onset_ff_ms=%1 ")
+                           .arg(lastReleaseOnsetFfMs_, 0, 'f', 2);
     }
     // [ORION_TIP_PHASE_FIRST_SIGHT] Present ONLY on a first-sight-dated landing, so every
     // existing line -- and every existing parser (tools/timing RE_PHASE and kin) -- is
@@ -22619,8 +23107,10 @@ void AutomationEngine::recordLandingLeadSample(double peakFillPct, double fillAt
     // same kind of known quantity, so it is excluded by exactly the same rule.
     // [ORION_VISION_HOLD_BAND 2026-09-15] And so is a band-clamped release, for the third time
     // and the third instance of the same rule: travel_pp rides the displaced release.
+    // [ORION_ONSET_FF 2026-09-21] ...and the fourth: travel_pp rides a feedforward-displaced
+    // release exactly as it rides a band-clamped one.
     if (devFireOffsetArmed_ || meterCapLateFireMs_ > 0.0
-        || !meterCapHoldBandKind_.isEmpty()) {
+        || !meterCapHoldBandKind_.isEmpty() || lastReleaseOnsetFfMs_ != 0.0) {
         return;
     }
     const double velocity = meterCapRiseVelocityPctPerMs_;

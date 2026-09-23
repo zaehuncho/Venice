@@ -385,7 +385,9 @@ test('launcher connection requires a signed Discord session and never trusts a c
   const calls = [];
   const pairCode = `PAIR-${'A'.repeat(32)}`;
   globalThis.fetch = async (input, init) => {
-    calls.push({ path: new URL(input).pathname, body: JSON.parse(init.body), headers: init.headers });
+    const path = new URL(input).pathname;
+    calls.push({ path, body: JSON.parse(init.body), headers: init.headers });
+    if (path === '/api/bot/pair-status') return Response.json({ ok: true, ready: true });
     return Response.json({ ok: true, pair_code: pairCode, expires: Math.floor(Date.now() / 1000) + 300 });
   };
   try {
@@ -397,6 +399,7 @@ test('launcher connection requires a signed Discord session and never trusts a c
     assert.equal(response.headers.get('cache-control'), 'private, no-store');
     assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
     assert.deepEqual(calls.map(({ path, body }) => ({ path, body })), [
+      { path: '/api/bot/pair-status', body: { discord_id: '123456789012345678' } },
       { path: '/api/bot/pair-issue', body: { discord_id: '123456789012345678' } },
     ]);
     assert.equal(calls[0].headers['X-Orion-Pair-Secret'], stripeEnv.PAIR_ISSUER_SECRET);
@@ -952,4 +955,254 @@ test('a renewal invoice whose status is not paid never provisions, whatever lega
     }
     assert.deepEqual(paths, []);
   } finally { globalThis.fetch = originalFetch; }
+});
+
+// ── [2026-09-22 RED TEAM GMC-001] paid-but-not-yet-provisioned race ──
+
+const ACTIVATING_TEXT = 'Payment received — activating your Venice subscription. This usually takes under a minute.';
+const ACTIVATING_FALLBACK = 'Still waiting? Open a ticket in Discord with your receipt email — you will not be charged twice.';
+const ENTITLEMENT_TEXT = 'Your Discord account needs an active trial or subscription. Claim the trial in Discord, then try again. Just paid? Activation can take up to a minute — refresh this page.';
+
+async function paidCheckoutCookie(discordId = MEMBER_ID) {
+  // Obtained exactly as a customer gets it: /checkout/complete after Stripe confirms the session.
+  const { calls, restore } = installFetch((path) => {
+    if (path === '/v1/checkout/sessions/cs_test_paid') {
+      return Response.json({ id: 'cs_test_paid', status: 'complete', metadata: { discord_user_id: discordId } });
+    }
+    throw Error(`unexpected path ${path}`);
+  });
+  try {
+    const response = await worker.fetch(new Request('https://zaeorion.com/checkout/complete?session_id=cs_test_paid',
+      { headers: { Cookie: await sessionCookieFor(discordId) } }), stripeEnv);
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get('location'), 'https://zaeorion.com/discord?purchase=complete');
+    assert.deepEqual(calls.map(({ path }) => path), ['/v1/checkout/sessions/cs_test_paid']);
+    const setCookie = response.headers.get('set-cookie') || '';
+    assert.match(setCookie, /^venice_paid=.*; HttpOnly; Secure; SameSite=Lax; Max-Age=1800$/u);
+    return setCookie.split(';', 1)[0];
+  } finally { restore(); }
+}
+
+async function connectWith(cookie, statusReply, path = '/connect', issueReply = () => {
+  throw Error('pair-issue must not run before ready');
+}) {
+  const { calls, restore } = installFetch((requestPath) => {
+    if (requestPath === '/api/bot/pair-status') return statusReply();
+    if (requestPath === '/api/bot/pair-issue') return issueReply();
+    throw Error(`unexpected path ${requestPath}`);
+  });
+  try {
+    const response = await worker.fetch(new Request(`https://zaeorion.com${path}`, { headers: { Cookie: cookie } }), stripeEnv);
+    return { response, html: await response.text(), calls };
+  } finally { restore(); }
+}
+
+const notProvisioned = () => Response.json({ ok: true, ready: false });
+
+test('GMC-001: paid but not yet provisioned shows the activating state with a bounded retry, never a code', async () => {
+  const paid = await paidCheckoutCookie();
+  const cookie = `${await sessionCookieFor()}; ${paid}`;
+  const first = await connectWith(cookie, notProvisioned);
+  assert.equal(first.response.status, 202);
+  assert.equal(first.response.headers.get('cache-control'), 'private, no-store');
+  assert.equal(first.calls.length, 1);
+  assert.equal(first.calls[0].path, '/api/bot/pair-status');
+  assert.ok(first.html.includes(ACTIVATING_TEXT));
+  assert.match(first.html, /<meta http-equiv="refresh" content="5;url=\/connect\?activating=1">/u);
+  assert.ok(!first.html.includes(ENTITLEMENT_TEXT));
+  assert.doesNotMatch(first.html, /orion:\/\/activate|PAIR-/u);
+
+  const later = await connectWith(cookie, notProvisioned, '/connect?activating=23');
+  assert.match(later.html, /url=\/connect\?activating=24/u);
+
+  // After 24 x 5 s the loop stops and the customer gets the ticket fallback.
+  for (const path of ['/connect?activating=24', '/connect?activating=999']) {
+    const done = await connectWith(cookie, notProvisioned, path);
+    assert.equal(done.response.status, 202);
+    assert.ok(done.html.includes(ACTIVATING_FALLBACK));
+    assert.doesNotMatch(done.html, /http-equiv="refresh"|orion:\/\/activate/u);
+  }
+});
+
+test('GMC-001: once provisioned the paid customer gets the code and the hint cookie is cleared', async () => {
+  const paid = await paidCheckoutCookie();
+  const pairCode = `PAIR-${'B'.repeat(32)}`;
+  const { response, html } = await connectWith(`${await sessionCookieFor()}; ${paid}`,
+    () => Response.json({ ok: true, ready: true }), '/connect?activating=3',
+    () => Response.json({ ok: true, pair_code: pairCode }));
+  assert.equal(response.status, 200);
+  assert.ok(html.includes(`orion://activate?key=${pairCode}`));
+  assert.ok(!html.includes(ACTIVATING_TEXT));
+  assert.match(response.headers.get('set-cookie') || '', /^venice_paid=; .*Max-Age=0$/u);
+});
+
+test('GMC-001: never-paid, forged, or another account\'s paid hint still gets the subscription message', async () => {
+  const session = await sessionCookieFor();
+  const neverPaid = await connectWith(session, notProvisioned, '/connect?activating=1');
+  assert.equal(neverPaid.response.status, 403);
+  assert.ok(neverPaid.html.includes(ENTITLEMENT_TEXT));
+  assert.ok(!neverPaid.html.includes(ACTIVATING_TEXT));
+
+  const otherPaid = await paidCheckoutCookie(OTHER_ID);
+  const forged = `venice_paid=${await signValue({ discordId: MEMBER_ID, paid: true,
+    exp: Math.floor(Date.now() / 1000) + 600 }, 'not-the-session-secret')}`;
+  for (const hint of [otherPaid, forged, 'venice_paid=garbage']) {
+    const result = await connectWith(`${session}; ${hint}`, notProvisioned);
+    assert.equal(result.response.status, 403);
+    assert.ok(result.html.includes(ENTITLEMENT_TEXT));
+    assert.ok(!result.html.includes(ACTIVATING_TEXT));
+  }
+  // The paid hint is never a session on its own.
+  const paid = await paidCheckoutCookie();
+  const alone = await worker.fetch(new Request('https://zaeorion.com/connect',
+    { headers: { Cookie: paid.replace('venice_paid=', 'venice_session=') } }), stripeEnv);
+  assert.equal(alone.status, 302);
+  assert.equal(new URL(alone.headers.get('location')).pathname, '/auth/discord');
+});
+
+test('GMC-001: an incomplete checkout sets no paid hint', async () => {
+  const { restore } = installFetch(() => Response.json({ id: 'cs_test_open', status: 'open',
+    metadata: { discord_user_id: MEMBER_ID } }));
+  try {
+    const response = await worker.fetch(new Request('https://zaeorion.com/checkout/complete?session_id=cs_test_open',
+      { headers: { Cookie: await sessionCookieFor() } }), stripeEnv);
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get('set-cookie'), null);
+  } finally { restore(); }
+});
+
+test('AUD-A5-001: sixty-second provisioning polls status without spending pair-issue quota', async () => {
+  const paid = await paidCheckoutCookie();
+  const cookie = `${await sessionCookieFor()}; ${paid}`;
+  let elapsedSeconds = 0;
+  let issueAttempts = 0;
+  let issued = 0;
+  let statusPolls = 0;
+  const pairCode = `PAIR-${'C'.repeat(32)}`;
+  const { calls, restore } = installFetch((path) => {
+    if (path === '/api/bot/pair-status') {
+      statusPolls += 1;
+      return Response.json({ ok: true, ready: elapsedSeconds >= 60 });
+    }
+    if (path === '/api/bot/pair-issue') {
+      issueAttempts += 1;
+      if (issueAttempts > 5) return Response.json({ error: 'rate_limited' }, { status: 429 });
+      if (elapsedSeconds < 60) return Response.json({ error: 'subscription_required' }, { status: 403 });
+      issued += 1;
+      return Response.json({ ok: true, pair_code: pairCode });
+    }
+    throw Error(`unexpected path ${path}`);
+  });
+  try {
+    for (let attempt = 0; attempt <= 12; attempt += 1) {
+      elapsedSeconds = attempt * 5;
+      const response = await worker.fetch(new Request(
+        `https://zaeorion.com/connect?activating=${attempt}`, { headers: { Cookie: cookie } }), stripeEnv);
+      const html = await response.text();
+      if (elapsedSeconds < 60) {
+        assert.equal(response.status, 202, `at ${elapsedSeconds} s`);
+        assert.match(html, /http-equiv="refresh"/u);
+      } else {
+        assert.equal(response.status, 200);
+        assert.match(html, /orion:\/\/activate/u);
+      }
+    }
+    assert.equal(issued, 1);
+    assert.equal(issueAttempts, 1);
+    assert.equal(statusPolls, 13);
+    assert.equal(calls.filter((call) => call.path === '/api/bot/pair-issue').length, 1);
+  } finally { restore(); }
+});
+
+test('AUD-A5-001: two tabs can poll ninety seconds without minting before readiness', async () => {
+  const paid = await paidCheckoutCookie();
+  const cookie = `${await sessionCookieFor()}; ${paid}`;
+  let elapsedSeconds = 0;
+  let issueCalls = 0;
+  const { calls, restore } = installFetch((path) => {
+    if (path === '/api/bot/pair-status') {
+      return Response.json({ ok: true, ready: elapsedSeconds >= 90 });
+    }
+    if (path === '/api/bot/pair-issue') {
+      issueCalls += 1;
+      return Response.json({ ok: true, pair_code: `PAIR-${'D'.repeat(32)}` });
+    }
+    throw Error(`unexpected path ${path}`);
+  });
+  try {
+    for (let attempt = 0; attempt < 18; attempt += 1) {
+      elapsedSeconds = attempt * 5;
+      for (let tab = 0; tab < 2; tab += 1) {
+        const response = await worker.fetch(new Request(
+          `https://zaeorion.com/connect?activating=${attempt}`, { headers: { Cookie: cookie } }), stripeEnv);
+        assert.equal(response.status, 202);
+      }
+    }
+    assert.equal(issueCalls, 0);
+    elapsedSeconds = 90;
+    const ready = await worker.fetch(new Request('https://zaeorion.com/connect?activating=18',
+      { headers: { Cookie: cookie } }), stripeEnv);
+    assert.equal(ready.status, 200);
+    assert.equal(issueCalls, 1);
+    assert.equal(calls.filter((call) => call.path === '/api/bot/pair-status').length, 37);
+  } finally { restore(); }
+});
+
+test('AUD-A5-001: status and issue quota 429 show an honest retry deadline, no code', async () => {
+  const paid = await paidCheckoutCookie();
+  const cookie = `${await sessionCookieFor()}; ${paid}`;
+  for (const caseName of ['status', 'issue']) {
+    const { calls, restore } = installFetch((path) => {
+      if (path === '/api/bot/pair-status') {
+        return caseName === 'status'
+          ? Response.json({ error: 'rate_limited', retry_after_s: 73 }, { status: 429 })
+          : Response.json({ ok: true, ready: true });
+      }
+      if (path === '/api/bot/pair-issue') {
+        return Response.json({ error: 'rate_limited', retry_after_s: 73 }, { status: 429 });
+      }
+      throw Error(`unexpected path ${path}`);
+    });
+    try {
+      const response = await worker.fetch(new Request('https://zaeorion.com/connect?activating=2',
+        { headers: { Cookie: cookie } }), stripeEnv);
+      const html = await response.text();
+      assert.equal(response.status, 202);
+      assert.match(html, /Try again in 73 seconds/u);
+      assert.doesNotMatch(html, /http-equiv="refresh"|orion:\/\/activate/u);
+      assert.equal(calls.filter((call) => call.path === '/api/bot/pair-issue').length,
+        caseName === 'status' ? 0 : 1);
+    } finally { restore(); }
+  }
+});
+
+// [COPY-FIX 2026-09-23 CW-4] After checkout the one-time code is the only primary action.
+test('CW-4: the account page after checkout offers only Get your one-time code', async () => {
+  const cookie = await sessionCookieFor();
+  const after = await worker.fetch(new Request('https://zaeorion.com/discord?purchase=complete',
+    { headers: { Cookie: cookie } }), stripeEnv);
+  assert.equal(after.status, 200);
+  const html = await after.text();
+  assert.match(html, /Checkout complete\./u);
+  assert.match(html, /<a class="button primary" href="\/connect">Get your one-time code<\/a>/u);
+  assert.equal((html.match(/class="button primary"/gu) || []).length, 1);
+  assert.doesNotMatch(html, /href="\/buy"|Subscribe · \$19\.99\/month|Starting the 7-day trial\?|account-trial/u);
+
+  // Without the purchase flag the page still sells: Subscribe primary, code secondary, trial block.
+  const before = await worker.fetch(new Request('https://zaeorion.com/discord',
+    { headers: { Cookie: cookie } }), stripeEnv);
+  const plain = await before.text();
+  assert.match(plain, /<a class="button primary" href="\/buy">Subscribe · \$19\.99\/month<\/a>/u);
+  assert.match(plain, /<a class="button secondary" href="\/connect">Get your one-time code<\/a>/u);
+  assert.match(plain, /Starting the 7-day trial\?/u);
+  assert.doesNotMatch(plain, /Checkout complete/u);
+});
+
+// [COPY-FIX 2026-09-23 CW-1] Paid in another browser (no paid cookie): the not-ready page
+// tells them activation can lag, instead of only "needs an active subscription".
+test('CW-1: no paid cookie + not yet provisioned tells a just-paid customer to refresh', async () => {
+  const { response, html } = await connectWith(await sessionCookieFor(), notProvisioned);
+  assert.equal(response.status, 403);
+  assert.ok(html.includes('Just paid? Activation can take up to a minute — refresh this page.'));
+  assert.doesNotMatch(html, /orion:\/\/activate|PAIR-|http-equiv="refresh"/u);
 });

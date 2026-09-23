@@ -72,6 +72,12 @@ struct ShotIntentEdges {
 // Canonical physical-end predicate for every shot-control recovery boundary.
 // A selected controller report is required: transport absence is not evidence
 // that Square was released or that the right stick returned to center.
+// Square up and the right stick centred. Triggers deliberately do NOT count here: this predicate
+// also ends physical transport recovery (a sprinting player holding R2 through a pad blip must
+// get the pad back) and gates Input-Timed readiness (a shot started off a sprint).
+// [CL2-P4-002 2026-09-22] The 09-22 CL-003 patch had widened THIS shared function; that forced
+// the whole pad neutral while R2 was held. The trigger requirement now lives only in
+// routeRecoveryShotInputsNeutral (ControllerRoutingPolicy.h), where it belongs.
 [[nodiscard]] inline bool shotInputControlsNeutral(
     const ControllerState& state,
     double stickUpThreshold,

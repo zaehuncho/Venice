@@ -60,6 +60,7 @@ native_orion/build/
 native_orion/build-regular-shot/
 native_orion/build_prod/
 native_orion/build_prod_codex/
+native_orion/build_prod_review/
 native_orion/backend/orion_sidecar_build_id.py
 native_orion/CMakeFiles/
 native_orion/CMakeCache.txt

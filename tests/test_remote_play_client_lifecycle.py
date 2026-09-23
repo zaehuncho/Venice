@@ -1,5 +1,19 @@
 import remote_play_client
+import pytest
 from decoder_pipe_identity import stable_executable_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_parent_exit_evidence(monkeypatch, tmp_path):
+    """Fake child PIDs must not write termination evidence to the real APPDATA."""
+    original = remote_play_client._chiaki_session_log_dir
+    monkeypatch.setattr(remote_play_client, "_chiaki_session_log_dir",
+                        lambda override="": original(override) if override else str(tmp_path))
+    # Launcher lifecycle fixtures use synthetic console addresses. A disabled
+    # wake flag does not suppress address-drift and failure-diagnostic probes.
+    monkeypatch.setattr(remote_play_client, "_console_host_lookup", lambda host: host)
+    monkeypatch.setattr(remote_play_client.RemotePlayClientManager,
+                        "_console_failure_evidence", lambda self: "")
 
 
 class _Process:

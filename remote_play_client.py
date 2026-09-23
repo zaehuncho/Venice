@@ -3,14 +3,18 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+
+from orion_exit_evidence import SessionExitEvidence
 
 from decoder_pipe_identity import (
     canonical_executable_path,
@@ -546,6 +550,7 @@ def _terminate_pids_in_process(pids: List[Tuple[int, str]],
 
         PROCESS_TERMINATE = 0x0001
         SYNCHRONIZE = 0x00100000
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         WAIT_OBJECT_0 = 0x00000000
 
         kernel32 = ctypes.windll.kernel32
@@ -555,6 +560,8 @@ def _terminate_pids_in_process(pids: List[Tuple[int, str]],
         kernel32.TerminateProcess.restype = wintypes.BOOL
         kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
     except Exception:
@@ -572,16 +579,31 @@ def _terminate_pids_in_process(pids: List[Tuple[int, str]],
             continue
         handle = 0
         try:
-            handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+            handle = kernel32.OpenProcess(
+                PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                False, pid)
             if not handle:
                 # Already gone (the common case) or access denied: the post-kill
                 # snapshot below is the authority, not this call.
                 failed.append(pid)
                 continue
-            if not kernel32.TerminateProcess(handle, 1):
+            trace = SessionExitEvidence(
+                _chiaki_session_log_dir() or os.path.join(tempfile.gettempdir(), "OrionSessionEvidence"),
+                pid=pid, creation_time_100ns=windows_process_creation_time_100ns(handle),
+                session_generation=0, pin_abnormal=False, persist_unbound=True)
+            trace.request("launcher", "stale_client_sweep", forced=True,
+                          requested_exit_code=1)
+            terminated = bool(kernel32.TerminateProcess(handle, 1))
+            trace.request_result(terminated)
+            if not terminated:
                 failed.append(pid)
                 continue
             if kernel32.WaitForSingleObject(handle, budget_ms) == WAIT_OBJECT_0:
+                observed_code = wintypes.DWORD()
+                exit_code = (int(observed_code.value)
+                             if kernel32.GetExitCodeProcess(handle, ctypes.byref(observed_code))
+                             else None)
+                trace.observe(exit_code)
                 killed.append(pid)
             else:
                 failed.append(pid)
@@ -1113,6 +1135,22 @@ class StandbyClient:
     # Set the first time the control pipe is observed: a child that WAS ready and
     # later died was a working standby build (crash/sweep), not an unsupported one.
     ready_seen: bool = False
+    spawn_generation: int = 0
+    creation_time_100ns: int = 0
+    exit_evidence: Optional[SessionExitEvidence] = None
+
+
+def _standby_exit_trace(client: StandbyClient) -> SessionExitEvidence:
+    trace = getattr(client, "exit_evidence", None)
+    if trace is None:
+        trace = SessionExitEvidence(
+            _chiaki_session_log_dir() or os.path.join(tempfile.gettempdir(), "OrionSessionEvidence"),
+            pid=int(getattr(client.process, "pid", 0) or 0),
+            creation_time_100ns=int(getattr(client, "creation_time_100ns", 0) or 0),
+            session_generation=int(getattr(client, "spawn_generation", 0) or 0),
+            pin_abnormal=False)
+        client.exit_evidence = trace
+    return trace
 
 
 class StandbyClientPool:
@@ -1210,17 +1248,26 @@ class StandbyClientPool:
     def _kill_locked(self, client: StandbyClient, reason: str) -> None:
         logger.info("Standby client discarded (%s): pid=%s",
                     reason, getattr(client.process, "pid", 0))
+        trace = _standby_exit_trace(client)
         try:
             if client.process.poll() is None:
+                trace.request("standby_pool", "discard", forced=True,
+                              requested_exit_code=1)
                 client.process.terminate()
+                trace.request_result(True)
                 try:
                     client.process.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
+                    trace.request("standby_pool", "discard_deadline", forced=True,
+                                  requested_exit_code=1)
                     client.process.kill()
+                    trace.request_result(True)
                     try:
                         client.process.wait(timeout=1.0)
                     except Exception:
                         pass
+            if client.process.poll() is not None:
+                trace.observe(getattr(client.process, "returncode", client.process.poll()))
         except Exception as exc:
             logger.debug("Standby discard cleanup failed: %s", exc)
 
@@ -1367,6 +1414,14 @@ class StandbyClientPool:
                 logger.warning("Standby client spawn failed: %s", exc)
                 return "spawn-failed"
 
+            creation_stamp = windows_process_creation_time_100ns(
+                getattr(process, "_handle", None))
+            standby_trace = SessionExitEvidence(
+                _chiaki_session_log_dir() or os.path.join(tempfile.gettempdir(), "OrionSessionEvidence"),
+                pid=int(getattr(process, "pid", 0) or 0),
+                creation_time_100ns=creation_stamp,
+                session_generation=self._spawn_counter,
+                pin_abnormal=False)
             self._client = StandbyClient(
                 process=process,
                 pipe_name=pipe_name,
@@ -1378,6 +1433,9 @@ class StandbyClientPool:
                 identity_sha256=expected_sha if identity_requested else "",
                 identity_size=expected_size if identity_requested else -1,
                 spawned_at=time.monotonic(),
+                spawn_generation=self._spawn_counter,
+                creation_time_100ns=creation_stamp,
+                exit_evidence=standby_trace,
             )
             if not self._atexit_registered:
                 self._atexit_registered = True
@@ -1470,19 +1528,28 @@ class StandbyClientPool:
             self._client = None
         if client is None:
             return
+        trace = _standby_exit_trace(client)
         try:
             if client.process.poll() is None:
-                _standby_pipe_transact(client.pipe_path, "quit", timeout_s=0.5)
+                trace.request("standby_pool", "shutdown_quit", forced=False,
+                              requested_exit_code=0)
+                reply = _standby_pipe_transact(client.pipe_path, "quit", timeout_s=0.5)
+                trace.request_result(bool(reply))
                 try:
                     client.process.wait(timeout=1.5)
                 except subprocess.TimeoutExpired:
                     pass
             if client.process.poll() is None:
+                trace.request("standby_pool", "shutdown_force", forced=True,
+                              requested_exit_code=1)
                 client.process.kill()
+                trace.request_result(True)
                 try:
                     client.process.wait(timeout=1.0)
                 except Exception:
                     pass
+            if client.process.poll() is not None:
+                trace.observe(getattr(client.process, "returncode", client.process.poll()))
             logger.info("Standby client shut down (pid=%s)",
                         getattr(client.process, "pid", 0))
         except Exception as exc:
@@ -1514,6 +1581,7 @@ class RemotePlayClientManager:
         self._owned_launch_generation = 0
         self._owned_launch_path = ""
         self._owned_creation_time_100ns = 0
+        self._exit_evidence: Optional[SessionExitEvidence] = None
         self._status = RemotePlayClientStatus()
         self._session_log_dir = _chiaki_session_log_dir(self._config.session_log_dir)
         self._session_log_baseline: Dict[str, int] = {}
@@ -1540,6 +1608,7 @@ class RemotePlayClientManager:
             return {}
         try:
             if process.poll() is not None:
+                self._observe_owned_exit(process)
                 return {}
             pid = int(getattr(process, "pid", 0) or 0)
         except Exception:
@@ -1564,7 +1633,10 @@ class RemotePlayClientManager:
         all later promotes then became no-ops while the bot had no console route.
         """
         if self._process is not None:
-            return self._process.poll() is None
+            if self._process.poll() is None:
+                return True
+            self._observe_owned_exit(self._process)
+            return False
         hwnd = int(getattr(self._status, "hwnd", 0) or 0)
         if not hwnd or os.name != "nt":
             return False
@@ -1573,6 +1645,44 @@ class RemotePlayClientManager:
             return bool(ctypes.windll.user32.IsWindow(hwnd))
         except Exception:
             return False
+
+    def _owned_exit_trace(self, process) -> SessionExitEvidence:
+        """Bind one ledger to the retained process handle and launch generation."""
+        pid = int(getattr(process, "pid", 0) or 0)
+        trace = self._exit_evidence
+        if (trace is None or trace.pid != pid
+                or trace.session_generation != self._owned_launch_generation):
+            root = os.path.dirname(os.path.abspath(__file__))
+            context = {
+                "native.log": os.path.join(root, "logs", "orion_native.log"),
+                "sidecar_fault.log": os.path.join(root, "logs", "sidecar_fault.log"),
+                "sidecar_crash.log": os.path.join(root, "logs", "sidecar_crash.log"),
+            }
+            trace = SessionExitEvidence(
+                self._session_log_dir or os.path.join(tempfile.gettempdir(), "OrionSessionEvidence"), pid=pid,
+                creation_time_100ns=self._owned_creation_time_100ns,
+                session_generation=self._owned_launch_generation,
+                session_log_path=self._status.session_log_path,
+                context_paths=context)
+            self._exit_evidence = trace
+        elif self._status.session_log_path:
+            trace.session_log_path = Path(self._status.session_log_path)
+        return trace
+
+    def _observe_owned_exit(self, process) -> str:
+        trace = self._owned_exit_trace(process)
+        if not trace.session_log_path:
+            try:
+                _state, path = self._session_tracker.poll()
+                if path:
+                    trace.session_log_path = Path(path)
+            except Exception:
+                pass
+        try:
+            exit_code = process.poll()
+        except Exception:
+            exit_code = getattr(process, "returncode", None)
+        return trace.observe(exit_code)
 
     def is_session_ready(self) -> bool:
         """Current console-session authority, independent of local pipe/process liveness."""
@@ -1637,6 +1747,9 @@ class RemotePlayClientManager:
         # deadline, where our carefully-built error text is never surfaced.
         if self._stop_requested.is_set():
             return self._cancelled_status()
+        if self._process is not None and self._process.poll() is not None:
+            # Pin abnormal evidence before a retry child can prune Chiaki logs.
+            self._observe_owned_exit(self._process)
         self._prep_started = time.time()
         # [ORION_CONNECT_LATENCY 2026-08-29] Per-stage wall-clock instrumentation.
         # The 5.3s warm promote was diagnosed from a single fallback-timer log line
@@ -1927,20 +2040,26 @@ class RemotePlayClientManager:
         if proc is None:
             self._failed_start_reaped = True
             return True
+        trace = self._owned_exit_trace(proc)
         try:
             if proc.poll() is not None:
+                self._observe_owned_exit(proc)
                 self._failed_start_reaped = True
                 return True
         except Exception:
             return False
 
+        trace.request("launcher", "failed_start_reap", forced=True, requested_exit_code=1)
         try:
             proc.terminate()
+            trace.request_result(True)
         except Exception as exc:
+            trace.request_result(False)
             logger.debug("Failed-start Chiaki terminate() failed: %s", exc)
 
         try:
             proc.wait(timeout=0.75)
+            self._observe_owned_exit(proc)
             self._failed_start_reaped = True
             return True
         except subprocess.TimeoutExpired:
@@ -1951,7 +2070,9 @@ class RemotePlayClientManager:
         pid = int(getattr(proc, "pid", 0) or 0)
         if os.name == "nt" and pid > 0:
             try:
-                subprocess.run(
+                trace.request("launcher", "failed_start_taskkill", forced=True,
+                              requested_exit_code=1)
+                result = subprocess.run(
                     ["taskkill.exe", "/PID", str(pid), "/F", "/T"],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -1960,16 +2081,23 @@ class RemotePlayClientManager:
                     check=False,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
+                trace.request_result(result.returncode == 0)
             except Exception as exc:
+                trace.request_result(False)
                 logger.debug("Failed-start Chiaki taskkill failed: %s", exc)
         else:
+            trace.request("launcher", "failed_start_kill", forced=True,
+                          requested_exit_code=1)
             try:
                 proc.kill()
+                trace.request_result(True)
             except Exception as exc:
+                trace.request_result(False)
                 logger.debug("Failed-start Chiaki kill() failed: %s", exc)
 
         try:
             proc.wait(timeout=0.5)
+            self._observe_owned_exit(proc)
             self._failed_start_reaped = True
             return True
         except Exception:
@@ -2057,9 +2185,17 @@ class RemotePlayClientManager:
         # exactly the legacy terminate + taskkill + terminate_chiaki_processes().
         hwnd = int(getattr(self._status, "hwnd", 0) or 0)
         if proc is not None:
-            if proc.poll() is None and self._post_wm_close(hwnd):
+            trace = self._owned_exit_trace(proc)
+            posted_close = False
+            if proc.poll() is None and hwnd:
+                trace.request("launcher", "window_close", forced=False,
+                              requested_exit_code=0)
+                posted_close = self._post_wm_close(hwnd)
+                trace.request_result(posted_close)
+            if proc.poll() is None and posted_close:
                 try:
                     proc.wait(timeout=self._GRACEFUL_CLOSE_S)
+                    self._observe_owned_exit(proc)
                     logger.info("Chiaki exited gracefully after WM_CLOSE "
                                 "(chiaki_session_stop ran; console sees a clean disconnect)")
                 except subprocess.TimeoutExpired:
@@ -2068,26 +2204,38 @@ class RemotePlayClientManager:
                 except Exception as exc:
                     logger.debug("Chiaki graceful-close wait failed: %s", exc)
             if proc.poll() is None:
+                trace.request("launcher", "stop_force_after_graceful_budget", forced=True,
+                              requested_exit_code=1)
                 try:
                     proc.terminate()
+                    trace.request_result(True)
                 except Exception as exc:
+                    trace.request_result(False)
                     logger.debug("Chiaki terminate() failed: %s", exc)
-                try:
-                    if os.name == "nt":
-                        subprocess.Popen(
-                            ["taskkill.exe", "/PID", str(int(getattr(proc, "pid", 0) or 0)), "/F", "/T"],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                    else:
-                        proc.kill()
-                except Exception:
+                if proc.poll() is None:
+                    trace.request("launcher", "stop_force_fallback", forced=True,
+                                  requested_exit_code=1)
                     try:
-                        proc.kill()
+                        if os.name == "nt":
+                            subprocess.Popen(
+                                ["taskkill.exe", "/PID", str(int(getattr(proc, "pid", 0) or 0)), "/F", "/T"],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            )
+                        else:
+                            proc.kill()
+                        trace.request_result(True)
                     except Exception as exc:
+                        trace.request_result(False)
                         logger.debug("Chiaki kill() failed: %s", exc)
+                try:
+                    proc.wait(timeout=0.25)
+                except (subprocess.TimeoutExpired, AttributeError):
+                    pass
+            if proc.poll() is not None:
+                self._observe_owned_exit(proc)
         elif hwnd:
             # We adopted a window we did not launch (mode="existing"), so there is no process
             # handle to wait on — but the same graceful path applies: ask the window to close
@@ -2369,17 +2517,26 @@ class RemotePlayClientManager:
         (which runs next) remains the backstop."""
         logger.info("Claimed standby discarded (%s): pid=%s",
                     reason, getattr(client.process, "pid", 0))
+        trace = _standby_exit_trace(client)
         try:
             if client.process.poll() is None:
+                trace.request("launcher", "claimed_standby_discard", forced=True,
+                              requested_exit_code=1)
                 client.process.terminate()
+                trace.request_result(True)
                 try:
                     client.process.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
+                    trace.request("launcher", "claimed_standby_deadline", forced=True,
+                                  requested_exit_code=1)
                     client.process.kill()
+                    trace.request_result(True)
                     try:
                         client.process.wait(timeout=1.0)
                     except Exception:
                         pass
+            if client.process.poll() is not None:
+                trace.observe(getattr(client.process, "returncode", client.process.poll()))
         except Exception as exc:
             logger.debug("Claimed-standby cleanup failed: %s", exc)
 
@@ -2636,6 +2793,16 @@ class RemotePlayClientManager:
                         env=launch_env,
                         startupinfo=startupinfo,
                     )
+                    # Bind identity while the owned Popen handle is still under
+                    # the process lock. A concurrent stop can now ledger a kill
+                    # even if path canonicalization fails immediately afterward.
+                    self._launch_generation_counter += 1
+                    self._owned_launch_generation = self._launch_generation_counter
+                    self._owned_creation_time_100ns = windows_process_creation_time_100ns(
+                        getattr(self._process, "_handle", None))
+                    self._owned_launch_path = ""
+                    self._status.session_log_path = ""
+                    self._exit_evidence = None
 
             expected_sha = str(
                 self._config.chiaki_identity_sha256 or "").strip().lower()
@@ -2678,18 +2845,23 @@ class RemotePlayClientManager:
                 # never become the trusted decoder producer.  Keep the process for
                 # normal bounded cleanup while returning a launch failure.
                 try:
-                    self._process.terminate()
+                    proc = self._process
+                    if proc is not None:
+                        trace = self._owned_exit_trace(proc)
+                        trace.request("launcher", "executable_identity_unavailable", forced=True,
+                                      requested_exit_code=1)
+                        try:
+                            proc.terminate()
+                            trace.request_result(True)
+                        except Exception:
+                            trace.request_result(False)
                 except Exception:
                     pass
                 self._process = None
                 return RemotePlayClientStatus(
                     ok=False, mode=mode, path=path,
                     message=f"Failed to start {mode}: executable identity unavailable")
-            self._launch_generation_counter += 1
-            self._owned_launch_generation = self._launch_generation_counter
             self._owned_launch_path = launched_path
-            self._owned_creation_time_100ns = windows_process_creation_time_100ns(
-                getattr(self._process, "_handle", None))
             if self._owned_creation_time_100ns <= 0:
                 # The video/input child remains usable.  The pipe identity gate
                 # sees the explicit missing creation stamp and permanently keeps

@@ -26,6 +26,10 @@ DT = 1.0 / FPS
 
 def _press_orchestrator(tmp_path, monkeypatch, **env):
     """A framedump-only orchestrator in press-window mode, with a REAL writer thread."""
+    # Positive writer/window assertions must not depend on workstation free space.
+    # Dedicated disk-guard tests retain the production low-space policy.
+    monkeypatch.setattr(rpo.shutil, "disk_usage", lambda _path:
+                        SimpleNamespace(total=100 * _GIB, used=_GIB, free=99 * _GIB))
     monkeypatch.setenv("ORION_FRAMEDUMP_PRESS_WINDOW", "1")
     monkeypatch.setenv("ORION_FRAMEDUMP_DIR", str(tmp_path))
     for k, v in env.items():
@@ -86,18 +90,18 @@ def _frame(i):
     return f
 
 
-def _pace(orch, budget_s=DT):
-    """Give the writer the same head start a real 60 fps feed would.
+def _pace(deadline_s):
+    """Emit active-window frames on the synthetic 60 fps wall clock.
 
-    The synthetic producer below runs 30 s of frames in well under a second, which a
-    bounded queue cannot absorb -- and that has nothing to do with the window logic under
-    test.  Real capture hands the writer one frame every 16.7 ms, so wait at most one
-    frame period for a slot.  If the writer still has no room after a whole frame period
-    it genuinely cannot keep up at 60 fps and the drop that follows is a REAL failure.
+    Waiting only when the queue was full let the producer compress 30 simulated
+    seconds into under a real second. A single Windows scheduler pause could then
+    overflow the queue even though a real 60 fps producer would still be waiting
+    for its next frame. We keep the zero-drop assertion, but give the writer the
+    actual inter-frame interval rather than an opportunistic queue-full timeout.
     """
-    end = time.perf_counter() + budget_s
-    while orch._framedump_q.full() and time.perf_counter() < end:
-        time.sleep(0.0002)
+    remaining = deadline_s - time.perf_counter()
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def _idle_gap(orch, budget_s=2.0):
@@ -158,11 +162,16 @@ def test_thirty_seconds_ten_windows_no_drops_inside_no_frames_outside(tmp_path, 
         n_frames = int(30.0 * FPS)
         pi = 0
         opened = closed = False
+        wall_anchor = time.perf_counter()
         for i in range(n_frames):
             now = t0 + i * DT
             rel_t = now - t0
             if float(orch._framedump_press_until or 0.0) <= now:
                 _idle_gap(orch)
+                # Quiet synthetic time is compressed. Start a fresh real-time
+                # clock when the next press window opens; do not catch up in a
+                # burst after the writer drains between windows.
+                wall_anchor = time.perf_counter() - i * DT
             if pi < len(presses) and rel_t >= presses[pi] and not opened:
                 orch.framedump_press_open(1000 + pi, mono_now=now)
                 opened = True
@@ -172,7 +181,7 @@ def test_thirty_seconds_ten_windows_no_drops_inside_no_frames_outside(tmp_path, 
             if closed and rel_t >= releases[pi] + post_s:
                 pi += 1
                 opened = closed = False
-            _pace(orch)
+            _pace(wall_anchor + i * DT)
             orch._dump_frame(_frame(i), _result(), now=now)
             # ground truth: is this frame inside SOME [press-pre, release+post]?
             for p, r in zip(presses, releases):

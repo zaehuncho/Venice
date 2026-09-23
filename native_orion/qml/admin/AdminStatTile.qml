@@ -10,28 +10,42 @@ Rectangle {
     property color tone: Theme.textPrimary
 
     Layout.fillWidth: true
-    Layout.preferredHeight: 84
+    Layout.preferredHeight: 88
     radius: Theme.radiusControl
-    color: Theme.bgInset
     border.color: Theme.borderSoft
     border.width: 1
+    gradient: Gradient {
+        orientation: Gradient.Vertical
+        GradientStop { position: 0.0; color: Theme.bgCardTop }
+        GradientStop { position: 1.0; color: Theme.bgInset }
+    }
 
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 12
         spacing: 2
-        Text {
-            text: root.label.toUpperCase()
-            color: Theme.textFaint
-            font.pixelSize: Theme.fontMicro
-            font.weight: Font.DemiBold
-            font.letterSpacing: 0.6
+        RowLayout {
+            spacing: 6
+            Rectangle {
+                Layout.preferredWidth: 6
+                Layout.preferredHeight: 6
+                radius: 3
+                color: Qt.colorEqual(root.tone, Theme.textPrimary) ? Theme.accent : root.tone
+            }
+            Text {
+                text: root.label.toUpperCase()
+                color: Theme.textFaint
+                font.pixelSize: Theme.fontMicro
+                font.weight: Font.Bold
+                font.letterSpacing: 0.8
+            }
         }
         Text {
             text: root.value
             color: root.tone
-            font.pixelSize: 24
-            font.weight: Font.DemiBold
+            font.pixelSize: 26
+            font.weight: Font.Bold
+            font.letterSpacing: -0.5
             elide: Text.ElideRight
             Layout.fillWidth: true
         }

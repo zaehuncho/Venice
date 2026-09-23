@@ -211,8 +211,12 @@ struct EngineArmDecision {
     double stickUpThreshold,
     double stickDownThreshold) noexcept
 {
-    return shotInputControlsNeutral(
-        state, stickUpThreshold, stickDownThreshold);
+    // [2026-09-22 RED TEAM CL-003 / CL2-P4-002] Triggers count HERE only: a route recovery that
+    // re-seeds while R2 is held was one half of "R2 clamps down" (the other half is wire
+    // redundancy in the client/fork). Transport recovery and Input-Timed readiness use the
+    // narrower shotInputControlsNeutral and are unaffected.
+    return shotInputControlsNeutral(state, stickUpThreshold, stickDownThreshold)
+        && state.l2 == 0 && state.r2 == 0;
 }
 
 // A failed session promotion is a terminal input-authority boundary even when

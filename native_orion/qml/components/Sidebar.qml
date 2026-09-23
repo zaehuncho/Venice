@@ -488,7 +488,64 @@ Rectangle {
                 contentItem: ColumnLayout {
                     spacing: 8
 
-                    // ---- header: state chip + plan, days left as the headline ----
+                    // ---- identity block [2026-09-21 owner: "profile card displaying the
+                    // user's discord name and days left, build version etc"] ----
+                    // The Discord NAME is the headline (it was a small key/value row),
+                    // with an initial tile beside it; the ID sits under the name in mono.
+                    // The state chip + plan and the days-left line follow as the status
+                    // row. Every objectName and binding the contract tests pin is kept.
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        Rectangle {
+                            id: identityTile
+                            readonly property string displayName: String(orion.profileDiscordName || "").trim()
+                            Layout.preferredWidth: 40
+                            Layout.preferredHeight: 40
+                            radius: 12
+                            color: identityTile.displayName.length > 0 ? Theme.accentSoft : Theme.bgField
+                            border.color: identityTile.displayName.length > 0 ? Theme.accentBorder : Theme.borderSoft
+                            border.width: 1
+                            Behavior on color { ColorAnimation { duration: Theme.motionBase } }
+                            Text {
+                                anchors.centerIn: parent
+                                text: identityTile.displayName.length > 0
+                                      ? identityTile.displayName.charAt(0).toUpperCase() : "V"
+                                color: identityTile.displayName.length > 0 ? Theme.accentBorder : Theme.textFaint
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.fontHeading
+                                font.weight: Font.DemiBold
+                            }
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Text {
+                                objectName: "licenseFlyoutDiscordName"
+                                Layout.fillWidth: true
+                                text: identityTile.displayName.length > 0
+                                      ? identityTile.displayName : "Discord not linked"
+                                color: identityTile.displayName.length > 0 ? Theme.textPrimary : Theme.textMuted
+                                font.family: Theme.fontUi
+                                font.pixelSize: Theme.fontTitle
+                                font.weight: Font.DemiBold
+                                elide: Text.ElideRight
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: String(orion.profileDiscordId || "").length > 0
+                                text: String(orion.profileDiscordId || "")
+                                color: Theme.textFaint
+                                font.family: Theme.fontMono
+                                font.pixelSize: Theme.fontMicro
+                                elide: Text.ElideLeft
+                            }
+                        }
+                    }
+
+                    // ---- status row: state chip + plan, days left as the headline ----
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 8
@@ -528,8 +585,6 @@ Rectangle {
                             }
                         }
 
-                        Item { Layout.fillWidth: true }
-
                         Text {
                             visible: root.licensePlanLabel.length > 0
                                      && root.licensePlanLabel !== root.licenseChipText
@@ -542,17 +597,19 @@ Rectangle {
                             Layout.maximumWidth: 96
                             Layout.alignment: Qt.AlignVCenter
                         }
-                    }
 
-                    Text {
-                        text: root.licenseDaysText
-                        color: root.licenseExpiringSoon ? Theme.warning : Theme.textPrimary
-                        font.family: Theme.fontUi
-                        font.pixelSize: Theme.fontTitle
-                        font.weight: Font.DemiBold
-                        elide: Text.ElideRight
-                        Layout.fillWidth: true
-                        Behavior on color { ColorAnimation { duration: Theme.motionBase } }
+                        Item { Layout.fillWidth: true }
+
+                        Text {
+                            text: root.licenseDaysText
+                            color: root.licenseExpiringSoon ? Theme.warning : Theme.textPrimary
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.fontTitle
+                            font.weight: Font.DemiBold
+                            elide: Text.ElideRight
+                            Layout.alignment: Qt.AlignVCenter
+                            Behavior on color { ColorAnimation { duration: Theme.motionBase } }
+                        }
                     }
 
                     // The controller's own phrasing of the expiry (an exact date
@@ -581,8 +638,13 @@ Rectangle {
                         Layout.fillWidth: true
                         spacing: 6
 
+                        // [COPY-FIX 2026-09-23 NEW-A3] Sign-in is keyless: the customer
+                        // unlocks with a one-time code and never needs this stored internal
+                        // key, and a Copy button next to it only invites sharing. Dev
+                        // builds keep the row for support/debugging.
                         DetailRow {
-                            visible: String(orion.licenseKeyMasked || "").length > 0
+                            visible: orion.debugUiEnabled === true
+                                     && String(orion.licenseKeyMasked || "").length > 0
                             label: "Key"
                             value: String(orion.licenseKeyMasked || "")
                             mono: true
@@ -603,11 +665,7 @@ Rectangle {
                             copyObjectName: "licenseFlyoutCopyDiscordId"
                             onCopyRequested: orion.copyProfileDiscordId()
                         }
-                        DetailRow {
-                            visible: String(orion.profileDiscordName || "").length > 0
-                            label: "Name"
-                            value: String(orion.profileDiscordName || "")
-                        }
+                        // (The Discord NAME row moved to the identity headline above.)
                         DetailRow {
                             objectName: "licenseFlyoutResetsRow"
                             label: "PC resets"
@@ -658,7 +716,7 @@ Rectangle {
                         // it in a second pass (the popup width is fixed, so this
                         // cannot loop).
                         Layout.preferredHeight: contentHeight
-                        text: "Each licence key includes "
+                        text: "Your account includes "
                               + (orion.profileKnown === true ? root.licenseFreeTotal : 3)
                               + " free PC resets. After that, buy a reset credit or trade "
                               + "days off your subscription. Run the reset from the Venice Discord."

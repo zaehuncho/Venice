@@ -9,7 +9,7 @@
   "message": {
     "embeds": [
       {
-        "title": "Venice — $25 / month",
+        "title": "Venice — $19.99 / month",
         "color": 2450411,
         "description": "Checkout runs on **zaeorion.com** with Stripe. Sign in with the **same Discord account** you use in this server, and stay in the server — your subscription is linked to that account.",
         "fields": [
@@ -20,7 +20,7 @@
           },
           {
             "name": "After checkout",
-            "value": "You get **no licence key**. Triton grants Customer access and DMs your confirmation, then you unlock the app with a one-time code from [zaeorion.com/connect](https://zaeorion.com/connect) — one PC at a time, 3 free resets with `/hwid_reset`.",
+            "value": "You get **no licence key**. The Venice bot grants Customer access and DMs your confirmation, then you unlock the app with a one-time code from [zaeorion.com/connect](https://zaeorion.com/connect) — one PC at a time, 3 free resets with `/hwid_reset`.",
             "inline": false
           },
           {

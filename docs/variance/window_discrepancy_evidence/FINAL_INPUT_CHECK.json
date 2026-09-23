@@ -1,0 +1,12 @@
+{
+  "protected_inputs": {
+    "docs/variance/ONLINE_GRADING_CLOCK_2026-09-22.md": true,
+    "native_orion/src/AutomationEngine.cpp": true,
+    "native_orion/src/AutomationEngine.h": true,
+    "logs/orion_native.log": true,
+    "logs/orion_native.log.1": true,
+    "tools/timing/net_join.py": true,
+    "tools/timing/net_probe.py": true
+  },
+  "dry_run_input_files_unchanged": 61
+}

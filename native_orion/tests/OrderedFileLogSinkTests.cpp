@@ -1,6 +1,7 @@
 #include "OrderedFileLogSink.h"
 
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QTemporaryDir>
 #include <QtTest/QTest>
@@ -44,6 +45,7 @@ private slots:
     void preservesBatchAndLineOrderWithinByteBound();
     void rotatesBeforeFirstPendingBatch();
     void stopDrainsAndRejectsLaterWrites();
+    void failingStorageNeverBlocksProducerOrShutdown();
 };
 
 void OrderedFileLogSinkTests::preservesBatchAndLineOrderWithinByteBound()
@@ -125,6 +127,43 @@ void OrderedFileLogSinkTests::stopDrainsAndRejectsLaterWrites()
     QCOMPARE(stats.acceptedLines, quint64(200));
     QCOMPARE(stats.writtenLines, quint64(200));
     QVERIFY(stats.workerStopped);
+}
+
+// [M-02 / CX-015 2026-09-22] A log path that can never be opened (here: a directory sits where
+// the file should be) must not block the producer - the GUI/input thread - or hang shutdown.
+void OrderedFileLogSinkTests::failingStorageNeverBlocksProducerOrShutdown()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("logs/orion_native.log"));
+    QVERIFY(QDir().mkpath(path));   // the "file" is a directory: every open fails
+
+    OrderedFileLogSink::Options options;
+    options.maxOutstandingBytes = 64;
+    options.retryDelayMs = 5;
+    options.admissionWaitMs = 250;
+    options.shutdownGiveUpMs = 100;
+    OrderedFileLogSink sink(path, options);
+
+    QElapsedTimer timer;
+    timer.start();
+    for (int i = 0; i < 200; ++i) {
+        QVERIFY(sink.enqueue({QStringLiteral("diagnostic line %1 with some padding").arg(i)}));
+    }
+    // At most one bounded healthy-storage wait before the fault is flagged; after that, drops
+    // are immediate.
+    QVERIFY2(timer.elapsed() < 2000, qPrintable(QString::number(timer.elapsed())));
+    const OrderedFileLogSink::Stats faulted = sink.stats();
+    QVERIFY(faulted.storageFault);
+    QVERIFY(faulted.storageFaultEpisodes >= 1);
+    QVERIFY(faulted.droppedBatches > 0);
+    QVERIFY(faulted.outstandingBytes <= options.maxOutstandingBytes);
+
+    timer.restart();
+    sink.stopAndDrain();
+    QVERIFY2(timer.elapsed() < 1500, qPrintable(QString::number(timer.elapsed())));
+    QVERIFY(sink.stats().workerStopped);
+    QVERIFY(!sink.enqueue({QStringLiteral("after stop")}));
 }
 
 QTEST_APPLESS_MAIN(OrderedFileLogSinkTests)

@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Venice — Jump-shot timing for NBA 2K27 on PS5</title>
-  <meta name="description" content="Venice is a Windows app that reads the NBA 2K27 shot meter over a capture card or PS5 Remote Play and times the release. Free 7-day trial, then $25/month.">
+  <meta name="description" content="Venice is a Windows app that reads the NBA 2K27 shot meter over a capture card or PS5 Remote Play and times the release. Free 7-day trial, then $19.99/month.">
   <meta name="theme-color" content="#06080c">
   <meta name="color-scheme" content="dark">
   <link rel="canonical" href="https://zaeorion.com/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Venice">
   <meta property="og:title" content="Venice — Jump-shot timing for NBA 2K27 on PS5">
-  <meta property="og:description" content="A Windows app that reads the NBA 2K27 shot meter over a capture card or PS5 Remote Play and times the release. Free 7-day trial, then $25/month.">
+  <meta property="og:description" content="A Windows app that reads the NBA 2K27 shot meter over a capture card or PS5 Remote Play and times the release. Free 7-day trial, then $19.99/month.">
   <meta property="og:image" content="https://zaeorion.com/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -61,7 +61,7 @@
   --error: #ffc2c2;
   --radius: 12px;
   --shell: min(1040px, 100% - 40px);
-  --header-h: 60px;
+  --header-h: 68px;
   --font: "Geist", "Geist Fallback", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
 }
@@ -75,10 +75,18 @@ body {
   -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
   overflow-x: hidden; overflow-x: clip;
 }
-/* One soft light at the top of the page. */
+/* Two soft lights over the page: one at the top, one high to the right. They breathe (motion only). */
 body::before {
+  content: ""; position: fixed; inset: -8%; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(1000px 460px at 50% -120px, rgba(38, 112, 255, .22), transparent 70%),
+    radial-gradient(720px 600px at 84% 2%, rgba(90, 179, 251, .11), transparent 72%);
+}
+/* Fine matte grain over everything, so the flat dark areas read as a surface, not a void. */
+body::after {
   content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
-  background: radial-gradient(900px 420px at 50% -170px, rgba(38, 112, 255, .13), transparent 70%);
+  opacity: .05; mix-blend-mode: soft-light;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
 }
 h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
 p, dl, dd { margin: 0; }
@@ -118,8 +126,8 @@ code {
   font-size: 15px; font-weight: 600; line-height: 1.1; text-align: center; white-space: nowrap; cursor: pointer;
   transition: background-color .18s, border-color .18s, color .18s;
 }
-.button.primary { color: #fff; background: var(--btn); border-color: var(--btn); }
-.button.primary:hover { background: var(--btn-hover); border-color: var(--btn-hover); }
+.button.primary { color: #fff; background: linear-gradient(135deg, #2064e0, #2f86f9 58%, #57aefb); border-color: rgba(120, 180, 255, .5); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18); }
+.button.primary:hover { background: linear-gradient(135deg, #2a6ef0, #3a90ff 58%, #64b6ff); border-color: rgba(150, 200, 255, .62); }
 .button.ghost, .button.secondary { color: var(--text); background: rgba(255, 255, 255, .045); border-color: var(--line-2); }
 .button.ghost:hover, .button.secondary:hover { background: rgba(255, 255, 255, .085); border-color: rgba(255, 255, 255, .26); }
 .button.small { --h: 36px; padding: 0 14px; font-size: 14px; border-radius: 9px; }
@@ -129,6 +137,13 @@ code {
 .top { border-bottom: 1px solid var(--line); }
 .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: var(--header-h); }
 .brand { display: inline-flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 650; letter-spacing: .2em; line-height: 1; }
+/* BETA tag: sits beside the brand word and on the plan card. Small, calm, unmistakable. */
+.beta-tag {
+  display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 6px; margin-left: 2px;
+  color: var(--blue-3); background: rgba(111, 180, 255, .12); border: 1px solid rgba(111, 180, 255, .32);
+  font-size: 10.5px; font-weight: 700; letter-spacing: .14em; line-height: 1.3;
+}
+.gate-head .beta-tag { font-size: 11px; padding: 3px 8px; }
 .brand-logo { width: 24px; height: 24px; }
 .brand-mark { display: grid; place-items: center; width: 26px; height: 26px; flex: none; }
 .brand-mark img, .brand-mark svg { width: 100%; height: 100%; object-fit: contain; }
@@ -161,22 +176,41 @@ code {
 
 /* ---------- Hero: name and gate side by side ---------- */
 .hero {
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 420px); gap: 48px; align-items: center;
-  padding: clamp(48px, 8vw, 96px) 0 clamp(40px, 6vw, 72px);
+  display: grid; justify-items: center; text-align: center; gap: clamp(36px, 5vw, 60px);
+  padding: clamp(64px, 10vw, 132px) 0 clamp(52px, 7vw, 96px);
 }
-.hero h1 { font-size: clamp(2.75rem, 2rem + 3vw, 4rem); letter-spacing: -.035em; line-height: 1; }
-.lede { margin-top: 14px; font-size: clamp(1.2rem, 1.05rem + .6vw, 1.5rem); font-weight: 500; letter-spacing: -.015em; line-height: 1.3; }
-.sub { margin-top: 14px; max-width: 44ch; color: var(--text-2); font-size: 16.5px; line-height: 1.6; }
+.intro { max-width: 680px; }
+.hero h1 { font-size: clamp(3rem, 2.1rem + 3.6vw, 4.75rem); letter-spacing: -.035em; line-height: 1; text-shadow: 0 0 70px rgba(47, 134, 249, .22); }
+.lede { margin-top: 18px; font-size: clamp(1.3rem, 1.08rem + .8vw, 1.7rem); font-weight: 500; letter-spacing: -.018em; line-height: 1.25; }
+.beta-line { margin: 14px auto 0; max-width: 52ch; color: var(--text-3); font-size: 14px; line-height: 1.6; }
+.beta-line strong { color: var(--text-2); font-weight: 600; }
+.sub { margin: 16px auto 0; max-width: 46ch; color: var(--text-2); font-size: 17px; line-height: 1.65; }
 
 /* ---------- Purchase gate ---------- */
-.gate { padding: 22px; border: 1px solid rgba(111, 180, 255, .3); border-radius: var(--radius); background: var(--panel); }
-.gate-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-.gate-head h2 { font-size: 17px; letter-spacing: -.015em; }
+.gate { width: min(480px, 100%); margin-inline: auto; text-align: left; padding: clamp(24px, 3.4vw, 34px); border: 1px solid rgba(111, 180, 255, .28); border-radius: var(--radius); background: linear-gradient(180deg, rgba(111, 180, 255, .06), rgba(111, 180, 255, 0) 46%), var(--panel); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), 0 32px 72px -34px rgba(31, 110, 255, .58); }
+/* The V, inside the plan card. */
+.plan-mark {
+  display: grid; place-items: center; width: 60px; height: 60px; margin-bottom: 20px; border-radius: 14px;
+  background: radial-gradient(120% 100% at 50% 0%, rgba(90, 179, 251, .2), transparent 60%), rgba(10, 16, 26, .92);
+  border: 1px solid rgba(120, 180, 255, .3);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .12), 0 12px 26px -12px rgba(47, 134, 249, .7);
+}
+.plan-mark svg { width: 32px; height: 32px; filter: drop-shadow(0 3px 8px rgba(47, 134, 249, .55)); }
+.gate-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 10px; flex-wrap: wrap; }
+.gate-head .badges { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.gate-head h2 { font-size: 20px; letter-spacing: -.02em; }
 .badge {
   display: inline-flex; align-items: center; padding: 3px 9px; border-radius: 999px; white-space: nowrap;
   color: var(--blue-3); background: rgba(61, 134, 255, .14); border: 1px solid rgba(111, 180, 255, .3); font-size: 12.5px; font-weight: 600;
 }
-.gate-note { margin-top: 8px; padding-bottom: 18px; border-bottom: 1px solid var(--line); color: var(--text-2); font-size: 14px; }
+.gate-note { margin-top: 8px; color: var(--text-2); font-size: 14px; }
+/* [2026-09-21 owner: "improve the get venice card"] Three facts under the price, so the card says
+   what the money buys without a marketing claim anywhere near it. The divider moved off .gate-note
+   and onto this list, so the head/price/what-you-get read as one block above the actions. */
+.gate-points { margin-top: 14px; padding-bottom: 18px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; list-style: none; }
+.gate-points li { position: relative; padding-left: 21px; color: var(--text-2); font-size: 13.5px; line-height: 1.5; }
+.gate-points li::before { content: ""; position: absolute; left: 4px; top: .58em; width: 6px; height: 6px; border-radius: 50%; background: #4f9dfb; box-shadow: 0 0 9px rgba(79, 157, 251, .8); }
+.gate-points strong { color: var(--text); font-weight: 600; }
 /* Every state is in the markup and only visibility is switched, inside one grid cell, so the gate
    is exactly the same height in all four states and resolving it shifts nothing (CLS 0). */
 .states { display: grid; margin-top: 18px; }
@@ -202,25 +236,29 @@ code {
 .fine a:hover { color: var(--text); }
 
 /* ---------- Steps and details ---------- */
-.block { padding: clamp(36px, 5vw, 56px) 0; border-top: 1px solid var(--line); }
-.block h2 { font-size: 13px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--text-3); }
-.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px 32px; margin-top: 22px; list-style: none; }
+.block { padding: clamp(48px, 6.5vw, 84px) 0; border-top: 1px solid var(--line); }
+.block h2 { display: inline-flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--text-3); }
+.block h2::before { content: ""; width: 18px; height: 2px; border-radius: 2px; background: linear-gradient(90deg, #2f86f9, #5ab3fb); }
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px 36px; margin-top: 30px; list-style: none; }
 .steps li { display: flex; gap: 14px; align-items: flex-start; }
 .steps span {
   display: grid; place-items: center; flex: none; width: 28px; height: 28px; border-radius: 8px;
-  color: var(--blue-3); background: rgba(61, 134, 255, .14); border: 1px solid rgba(111, 180, 255, .28);
+  color: #eaf3ff; background: linear-gradient(140deg, rgba(31, 94, 219, .95), rgba(90, 179, 251, .82)); border: 1px solid rgba(140, 195, 255, .45);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22), 0 6px 16px -8px rgba(47, 134, 249, .8);
   font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600;
 }
-.steps p { padding-top: 3px; color: var(--text-2); font-size: 15px; line-height: 1.5; }
+.steps p { padding-top: 4px; color: var(--text-2); font-size: 15px; line-height: 1.55; }
 .steps strong { color: var(--text); font-weight: 600; }
 .steps a { color: var(--blue-3); text-decoration: underline; text-decoration-color: rgba(159, 208, 255, .4); text-underline-offset: 3px; }
-.facts { margin-top: 10px; }
-.facts > div { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 4px 24px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.facts { margin-top: 14px; padding: 4px 18px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(255, 255, 255, .018); }
+.facts > div { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 4px 24px; padding: 16px 0; border-bottom: 1px solid var(--line); transition: background-color .18s; }
+.facts > div:last-child { border-bottom: 0; }
+.facts > div:hover { background: rgba(255, 255, 255, .022); }
 .facts dt { color: var(--text); font-size: 15px; font-weight: 600; }
 .facts dd { color: var(--text-2); font-size: 15px; line-height: 1.55; }
 
 /* ---------- Footer ---------- */
-.foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 24px; padding: 22px 0 36px; }
+.foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 24px; padding: 30px 0 48px; }
 .foot nav { display: flex; flex-wrap: wrap; gap: 4px 18px; }
 .foot a { color: var(--text-2); font-size: 14px; border-radius: 6px; transition: color .18s; }
 .foot a:hover { color: var(--text); }
@@ -289,6 +327,26 @@ main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
 .notfound .button { margin-top: 24px; }
 
 /* ---------- Motion ---------- */
+/* All motion below is opt-in: under reduced motion the page runs zero animations, and without JS
+   nothing is ever hidden — the reveal only layers motion on top of an already-visible page. */
+@media (prefers-reduced-motion: no-preference) {
+  /* The ambient light breathes — drifting and brightening over ~18s, then easing back. */
+  body::before { animation: breathe 18s ease-in-out infinite alternate; }
+
+  /* Hero, gate and each section settle in the first time they reach the viewport. */
+  .reveal-ready [data-reveal] { opacity: 0; transform: translateY(16px); transition: opacity .7s ease, transform .7s cubic-bezier(.22, .61, .36, 1); }
+  .reveal-ready [data-reveal].is-in { opacity: 1; transform: none; }
+  .reveal-ready .gate[data-reveal] { transition-delay: .08s; }
+
+  /* Buttons and the account chip lift a hair on hover. */
+  .button { transition: background-color .18s, border-color .18s, color .18s, transform .18s, box-shadow .18s; }
+  .button.primary:hover { transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), 0 12px 28px rgba(28, 103, 221, .42); }
+  .button.ghost:hover, .button.secondary:hover, .acct-link:hover { transform: translateY(-1px); }
+}
+@keyframes breathe {
+  from { opacity: .68; transform: translate3d(-2%, -1.4%, 0) scale(1); }
+  to   { opacity: 1;   transform: translate3d(2%, 1.4%, 0) scale(1.08); }
+}
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after { transition-duration: .01ms !important; }
@@ -297,8 +355,7 @@ main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 900px) {
-  .hero { grid-template-columns: 1fr; gap: 36px; padding-top: clamp(40px, 7vw, 56px); }
-  .gate { max-width: 560px; }
+  .hero { gap: 34px; padding-top: clamp(44px, 8vw, 72px); }
   .steps { grid-template-columns: 1fr; gap: 18px; }
 }
 @media (max-width: 640px) {
@@ -335,6 +392,7 @@ main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
       <a class="brand" href="/" aria-label="Venice home">
         <svg class="brand-logo" width="24" height="24" aria-hidden="true"><use href="#v-mark"/></svg>
         <span class="brand-word">VENICE</span>
+        <span class="beta-tag" aria-label="Beta">BETA</span>
       </a>
       <div class="acct" data-account data-state="out">
         <div class="acct-out-state">
@@ -362,18 +420,26 @@ main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
 
   <main id="main">
     <section class="shell hero" id="top" aria-labelledby="title">
-      <div class="intro">
+      <div class="intro" data-reveal>
         <h1 id="title">Venice</h1>
         <p class="lede">Jump-shot timing for NBA 2K27 on PS5.</p>
         <p class="sub">A Windows app that reads the shot meter over Remote Play or capture card and times the release.</p>
+        <p class="beta-line"><strong>Venice is in beta.</strong> PS5 with a capture card is the supported setup; Remote Play-only and Xbox are experimental. You see your own results in the app.</p>
       </div>
 
-      <div class="gate" id="pricing" data-plan>
+      <div class="gate" id="pricing" data-plan data-reveal>
+        <span class="plan-mark"><svg viewBox="0 0 256 256" aria-hidden="true"><use href="#v-mark"/></svg></span>
         <div class="gate-head">
-          <h2>Get Venice — $25/month</h2>
-          <span class="badge">Free 7-day trial</span>
+          <h2>Get Venice — $19.99/month</h2>
+          <span class="badges"><span class="beta-tag">BETA</span><span class="badge">Free 7-day trial</span></span>
         </div>
         <p class="gate-note">Billed monthly after the trial. No activation fee. Cancel anytime.</p>
+
+        <ul class="gate-points">
+          <li><strong>Times your release</strong> from the game's own shot meter, shot by shot.</li>
+          <li><strong>PS5 over a capture card</strong> is the supported setup — Remote Play-only and Xbox are experimental in beta.</li>
+          <li><strong>One plan, Discord-linked.</strong> Your membership follows your Discord account; cancel it yourself any time.</li>
+        </ul>
 
         <div class="states" data-plan-actions data-state="out">
           <div class="state state-out">
@@ -392,7 +458,7 @@ main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
           <div class="state state-in">
             <p class="lead">Start the free trial, or subscribe now.</p>
             <button class="button primary" type="button" data-trial-claim><span data-trial-label>Start free 7-day trial</span></button>
-            <a class="button ghost" href="/buy" data-checkout>Subscribe — $25/month</a>
+            <a class="button ghost" href="/buy" data-checkout>Subscribe — $19.99/month</a>
             <p class="hint"><span data-trial-note hidden>Opens the Venice Discord — run <code>/claim_trial</code> there. </span><span data-membership-note hidden>We couldn’t confirm your membership — <a href="https://discord.gg/yTuekgdgEN" target="_blank" rel="noopener" data-join-link>join the server</a> first if you haven’t. </span>Signed in as <strong data-account-name>your Discord account</strong>.</p>
           </div>
 
@@ -414,24 +480,24 @@ main.shell > .section code { white-space: normal; overflow-wrap: anywhere; }
 
     <!-- OWNER: add real clips/vouches here (a short gameplay clip or real Discord vouches, shared with permission). Never invented reviews, user counts, ratings or results. -->
 
-    <section class="shell block" id="how-it-works" aria-labelledby="how-title">
+    <section class="shell block" id="how-it-works" aria-labelledby="how-title" data-reveal>
       <h2 id="how-title">How it works</h2>
       <ol class="steps">
         <li><span aria-hidden="true">1</span><p><strong>Sign in with Discord</strong> and join the Venice server.</p></li>
-        <li><span aria-hidden="true">2</span><p><strong>Start the free trial</strong>, or subscribe for $25 a month.</p></li>
+        <li><span aria-hidden="true">2</span><p><strong>Start the free trial</strong>, or subscribe for $19.99 a month.</p></li>
         <li><span aria-hidden="true">3</span><p><strong>Unlock Venice on your PC</strong> with a one-time code from <a href="/connect">zaeorion.com/connect</a>.</p></li>
       </ol>
     </section>
 
-    <section class="shell block" id="details" aria-labelledby="details-title">
+    <section class="shell block" id="details" aria-labelledby="details-title" data-reveal>
       <h2 id="details-title">Details</h2>
       <dl class="facts">
         <div><dt>Runs on</dt><dd>Windows PC. NBA 2K27 on PS5 only — there is no Xbox version.</dd></div>
         <div><dt>Video</dt><dd>PS5 Remote Play or capture card (60 Hz).</dd></div>
-        <div><dt>Meter styles</dt><dd>Arrow2, and Pill (beta).</dd></div>
+        <div><dt>Meter styles</dt><dd>Arrow2.</dd></div>
         <div><dt>Discord-linked access</dt><dd>No licence key. A one-time code from <a href="/connect">zaeorion.com/connect</a> unlocks Venice on one PC — it works once and expires in 5 minutes. 3 free PC resets.</dd></div>
         <div><dt>Free trial</dt><dd>7 days, no card. One per Discord account and one per PC. Also available with <code>/claim_trial</code> in the server.</dd></div>
-        <div><dt>Billing</dt><dd>$25 a month, no activation fee. Cancel anytime in the <a href="https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00" target="_blank" rel="noopener">billing portal</a>; access runs to the end of the paid period.</dd></div>
+        <div><dt>Billing</dt><dd>$19.99 a month, no activation fee. Cancel anytime in the <a href="https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00" target="_blank" rel="noopener">billing portal</a>; access runs to the end of the paid period.</dd></div>
       </dl>
     </section>
   </main>

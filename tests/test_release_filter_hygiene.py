@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 
 from tools.release_filter_policy import (
+    FORBIDDEN_PATH_COMPONENTS,
     is_crown_jewel_python,
     is_forbidden_file_name,
     is_unapproved_model_path,
@@ -32,6 +33,26 @@ def test_packet_delay_lab_artifacts_are_never_release_files():
 
     assert is_forbidden_file_name("delay_test.py")
     assert is_forbidden_file_name("ADAPTIVE_DELAY_PLAN.md")
+
+
+def test_withdrawn_pill_style_profile_never_ships_in_any_case():
+    """[ORION_PILL_REMOVED 2026-09-21, re-withdrawn 2026-09-23] Pill (beta) is withdrawn; its
+    style profile is denylisted in every casing (the matcher lowercases the name first)."""
+
+    assert is_forbidden_file_name("pill.json")
+    assert is_forbidden_file_name("Pill.json")
+    assert is_forbidden_file_name("PILL.JSON")
+    # The other style profiles are still customer runtime inputs.
+    assert not is_forbidden_file_name("Arrow2.json")
+
+
+def test_forbidden_path_components_are_all_lowercase():
+    """is_forbidden_file_name() compares name.lower() against this set, so any entry with
+    an uppercase letter is dead on arrival and the artifact it names ships. Guard the
+    whole class, not just the one entry that bit."""
+
+    not_lower = sorted(c for c in FORBIDDEN_PATH_COMPONENTS if c != c.lower())
+    assert not not_lower, f"uppercase denylist entries never match: {not_lower}"
 
 
 def test_only_source_bound_production_detector_model_is_release_approved():

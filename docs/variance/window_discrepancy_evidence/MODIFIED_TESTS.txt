@@ -1,0 +1,27 @@
+test_ambiguous_epoch_is_quarantined (__main__.SweepTests.test_ambiguous_epoch_is_quarantined) ... ok
+test_area_and_competing_curves (__main__.SweepTests.test_area_and_competing_curves) ... ok
+test_broad_and_narrow_MLE_recovery (__main__.SweepTests.test_broad_and_narrow_MLE_recovery) ... ok
+test_cohort_uses_first_presses_not_graded_survivors (__main__.SweepTests.test_cohort_uses_first_presses_not_graded_survivors) ... ok
+test_curve_not_release_velocity (__main__.SweepTests.test_curve_not_release_velocity) ... ok
+test_distinct_arm_token_draws_preserve_first_and_final (__main__.SweepTests.test_distinct_arm_token_draws_preserve_first_and_final) ... ok
+test_exact_physical_key_native_seq_and_late_landing (__main__.SweepTests.test_exact_physical_key_native_seq_and_late_landing) ... ok
+test_ff_missing_banner_is_policy_failure_not_early (__main__.SweepTests.test_ff_missing_banner_is_policy_failure_not_early) ... ok
+test_fidelity_one_vs_029 (__main__.SweepTests.test_fidelity_one_vs_029) ... ok
+test_fidelity_uses_ungraded_releases_and_flags_multidraw (__main__.SweepTests.test_fidelity_uses_ungraded_releases_and_flags_multidraw) ... ok
+test_impossible_release_clock_blocks_inference (__main__.SweepTests.test_impossible_release_clock_blocks_inference) ... ok
+test_in_tick_must_be_zero_and_arm_conflicts_fail (__main__.SweepTests.test_in_tick_must_be_zero_and_arm_conflicts_fail) ... ok
+test_missing_assignments_are_not_zero (__main__.SweepTests.test_missing_assignments_are_not_zero) ... ok
+test_newcombe_and_exact_permutation (__main__.SweepTests.test_newcombe_and_exact_permutation) ... ok
+test_no_primary_without_protocol_and_width_no_audit (__main__.SweepTests.test_no_primary_without_protocol_and_width_no_audit) ... ok
+test_output_refuses_overwrite (__main__.SweepTests.test_output_refuses_overwrite) ... ok
+test_primary_estimator_smoke (__main__.SweepTests.test_primary_estimator_smoke) ... ok
+test_profiles_contain_fit (__main__.SweepTests.test_profiles_contain_fit) ... ok
+test_record_dedup_and_invalid_identity (__main__.SweepTests.test_record_dedup_and_invalid_identity) ... ok
+test_release_value_not_last_refinement (__main__.SweepTests.test_release_value_not_last_refinement) ... ok
+test_resets_and_forwarded_duplicate (__main__.SweepTests.test_resets_and_forwarded_duplicate) ... ok
+test_scale_nonidentification_demonstrated (__main__.SweepTests.test_scale_nonidentification_demonstrated) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 2.349s
+
+OK

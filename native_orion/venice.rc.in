@@ -14,6 +14,15 @@
 // while the Description column and the Processes tab both read "Venice". That is
 // intended, not an oversight.
 //
+// [2026-09-21 owner: "rename everything to Venice?"] ONE template, THREE executables:
+// OrionNative (Venice), OrionUpdater (Venice Updater) and VeniceNetSvc (Venice network
+// service) each configure it with their own description / original filename, so every
+// process a customer can see in Task Manager, a firewall prompt or Explorer says Venice.
+// The filenames and every internal identifier (env vars, log prefixes, pipe names,
+// manifest schemas, Lambda/Worker names) stay Orion: they are the engineering codename,
+// wired across the updater, the audit, the backend and the tooling, and renaming them
+// buys the customer nothing they can see.
+//
 // IDI_ICON1 is declared FIRST because Windows uses the lowest-numbered icon
 // resource as the application icon in Explorer, the taskbar, and Alt-Tab. Before
 // this file existed the exe carried NO embedded icon at all — the window icon was
@@ -43,11 +52,11 @@ BEGIN
         BLOCK "040904b0"  // U.S. English, Unicode
         BEGIN
             VALUE "CompanyName",      "Venice"
-            VALUE "FileDescription",  "Venice"
+            VALUE "FileDescription",  "@VENICE_FILE_DESCRIPTION@"
             VALUE "FileVersion",      "@PROJECT_VERSION@.0"
-            VALUE "InternalName",     "Venice"
+            VALUE "InternalName",     "@VENICE_INTERNAL_NAME@"
             VALUE "LegalCopyright",   "Copyright (C) Venice"
-            VALUE "OriginalFilename", "OrionNative.exe"
+            VALUE "OriginalFilename", "@VENICE_ORIGINAL_FILENAME@"
             VALUE "ProductName",      "Venice"
             VALUE "ProductVersion",   "@PROJECT_VERSION@.0"
         END

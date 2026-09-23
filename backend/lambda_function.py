@@ -110,7 +110,7 @@ DISCORD_TRIAL_ROLE_SSM = "/orion/discord_trial_role_id"
 DISCORD_CUSTOMER_ROLE_SSM = "/orion/discord_customer_role_id"
 BRAND_EMBED_COLOR      = 0x2563EB
 # Stripe customer portal (public by design): where a paying customer manages or
-# cancels the $25/month plan. Linked from the paid provisioning DMs.
+# cancels the $19.99/month plan. Linked from the paid provisioning DMs.
 BILLING_PORTAL_URL     = "https://billing.stripe.com/p/login/5kQ7sL0Ec4Ya5MfcFsgQE00"
 # Website Worker only (zaeorion.com). The Discord interactions Worker and the bot
 # host carry /orion/bot_service_secret, the webhook Lambdas /orion/webhook_bot_secret.
@@ -350,7 +350,9 @@ def rate_limit_ok(scope, subject, limit=RATELIMIT_MAX,
                   window=RATELIMIT_WINDOW_S, fail_open=True):
     """Return True if under the cap for (scope, subject) in the current window.
     Fail-open on infra error so a missing table/permission never fully blackholes
-    the money path, but a working table enforces the cap."""
+    the money path, but a working table enforces the cap. ``fail_open=None``
+    preserves an unavailable result for callers that must not mint or fabricate
+    a truthful quota deadline when the limiter table itself is down."""
     if not subject:
         subject = "anon"
     bucket = int(now_ts() // window)
@@ -365,8 +367,11 @@ def rate_limit_ok(scope, subject, limit=RATELIMIT_MAX,
         hits = int(r.get("Attributes", {}).get("hits", 1))
         return hits <= limit
     except Exception as e:
-        posture = "fail-open" if fail_open else "fail-closed"
+        posture = "unavailable" if fail_open is None else (
+            "fail-open" if fail_open else "fail-closed")
         print(f"[RATELIMIT] {posture} ({scope}): {e}")
+        if fail_open is None:
+            return None
         return bool(fail_open)
 
 def _client_ip(event):
@@ -406,10 +411,16 @@ SYSTEM_ACTOR = {"type": "system", "id": "lambda", "role": "system"}
 def make_actor(actor_type, actor_id="", role="", ip=""):
     return {"type": actor_type, "id": str(actor_id or ""), "role": role or actor_type, "ip": ip}
 
+class AuditUnavailable(Exception):
+    """Raised only by audit(..., required=True): the audit table refused the row."""
+
 def audit(actor, action, target=None, target_type=None, reason="",
-          result="ok", details=None, ip="", flat=None):
-    """The one audit writer. Never raises — an audit failure must not fail the
-    operation, but it IS printed so CloudWatch keeps a copy."""
+          result="ok", details=None, ip="", flat=None, required=False):
+    """The one audit writer. By default never raises — an audit failure must not
+    fail the operation, but it IS printed so CloudWatch keeps a copy.
+    [2026-09-22 RED TEAM CX-014] With required=True (used BEFORE every destructive
+    mutation) a failed write raises AuditUnavailable so the mutation is refused:
+    a revoke, kill or config change without a durable row is a release blocker."""
     actor = actor or SYSTEM_ACTOR
     ts = now_ts()
     aid = gen_ulid(ts * 1000)
@@ -442,7 +453,24 @@ def audit(actor, action, target=None, target_type=None, reason="",
         audit_table().put_item(Item=item)
     except Exception as e:
         print(f"[WARNING] AUDIT write failed action={action}: {e}")
+        if required:
+            raise AuditUnavailable(str(e))
     return aid
+
+
+def audit_attempt_or_refuse(actor, action, target, target_type, reason, ip="", details=None):
+    """Durable '<action>.attempt' row BEFORE a destructive mutation (actor, target,
+    reason, ip). The '<action>' row with result=ok follows the mutation as before;
+    if that later write fails, this row is the recoverable record. Returns an error
+    response (to be returned by the handler) if the row cannot be written."""
+    try:
+        audit(actor, action, target=target, target_type=target_type, reason=reason,
+              result="attempt", details=details, ip=ip, required=True)
+    except AuditUnavailable as e:
+        print(f"[ERROR] destructive mutation refused, audit unavailable action={action}: {e}")
+        return err("audit_unavailable", 503,
+                   message="The audit log is unavailable; destructive actions are refused until it recovers.")
+    return None
 
 def audit_log(event_type, license_key=None, extra=None):
     """Legacy shim: unauthenticated/system-originated events. Keeps the old
@@ -456,13 +484,26 @@ def audit_log(event_type, license_key=None, extra=None):
                  details=extra or None, ip=ip, flat=flat)
 
 # ── kill switch config ────────────────────────────────────────────────────────
+# [2026-09-22 RED TEAM CX-013] A config-table read failure used to return (False, "") - the
+# owner's emergency kill silently OFF for the duration of a DynamoDB blip. Now: the last value this
+# container read is remembered; on a read failure we return that, and if there is no last value we
+# FAIL CLOSED ("kill_state_unavailable"). A known-enabled kill can never become disabled by an
+# outage, and new/renewed authority is denied while the state is genuinely unknown.
+_LAST_GLOBAL_KILL = None   # (enabled, reason) from the most recent successful read
+
 def get_global_kill():
+    global _LAST_GLOBAL_KILL
     try:
         r = config_table().get_item(Key={"config_key": "global_kill"})
         item = r.get("Item", {})
-        return item.get("enabled", False), item.get("reason", "")
-    except Exception:
-        return False, ""
+        state = (bool(item.get("enabled", False)), item.get("reason", ""))
+        _LAST_GLOBAL_KILL = state
+        return state
+    except Exception as e:
+        print(f"[ERROR] global_kill read failed: {e}")
+        if _LAST_GLOBAL_KILL is not None:
+            return _LAST_GLOBAL_KILL
+        return True, "kill_state_unavailable"
 
 # ── /api/version ─────────────────────────────────────────────────────────────
 def handle_version(event):
@@ -551,6 +592,12 @@ def handle_activate(event):
 
     license_key = (body.get("license_key") or "").strip().upper()
     machine_id  = (body.get("machine_id")  or "").strip()
+    # [SERVER-SHARD blocker #5, Codex finding #1] Broker/session-only mode. When the
+    # unpacked activation broker sets this, the response withholds ALL license
+    # material (canonical_license_key, license_key_suffix) and the customer PII
+    # profile — the broker only needs the session token/token_id. The DEFAULT
+    # in-app response (flag absent/false) is byte-unchanged.
+    session_only = bool(body.get("session_only"))
 
     if not license_key or not machine_id:
         return err("license_key and machine_id required")
@@ -605,7 +652,11 @@ def handle_activate(event):
     # verified account's current entitlement, then run every normal check/bind.
     paired = license_key.startswith("PAIR-")
     if paired:
-        paired_item = consume_pair_code(license_key)
+        try:
+            paired_item = consume_pair_code(license_key)
+        except EntitlementLookupUnavailable:
+            return err("entitlement_unavailable", 503,
+                       message="Account access could not be checked just now. Retry shortly.")
         if not paired_item:
             return err("pair_invalid", 403,
                        message="This sign-in link expired or was used. Connect Discord again.")
@@ -616,6 +667,8 @@ def handle_activate(event):
         r = licenses_table().get_item(Key={"license_key": license_key})
     except Exception as e:
         print(f"[ERROR] DynamoDB GetItem failed: {e}")
+        if paired:
+            restore_pair_code_after_lookup_outage(body.get("license_key", ""))
         return err("internal_error", 500)
 
     item = r.get("Item")
@@ -687,6 +740,11 @@ def handle_activate(event):
     # manually minted or copied key must not unlock the launcher by itself.
     entitled, entitlement_reason, lookup_mode = discord_access_entitlement(item)
     if not entitled:
+        if lookup_mode == "unavailable":
+            if paired:
+                restore_pair_code_after_lookup_outage(body.get("license_key", ""))
+            return err("entitlement_unavailable", 503,
+                       message="Account access could not be checked just now. Retry shortly.")
         audit_log("activate_subscription_required", license_key,
                   {"reason": entitlement_reason, "lookup_mode": lookup_mode})
         return err("subscription_required", 403,
@@ -802,19 +860,23 @@ def handle_activate(event):
         "token":            token,
         "tid":              token_id,
         "expires":          expires,
-        "license_key_suffix": license_key[-4:],
     }
-    if paired:
-        # The desktop client stores this private key for signed heartbeats;
-        # never send it to a public channel or to the website.
-        resp["canonical_license_key"] = license_key
-    # Customer profile block (launcher Profile page). `item` is the pre-bind read,
-    # so stamp the bind we just wrote rather than reporting the previous session.
-    resp["profile"] = license_profile(item)
-    resp["profile"]["activated_at"] = activated_at
-    motd = get_motd()
-    if motd:
-        resp["motd"] = motd
+    if not session_only:
+        # DEFAULT (in-app) response: unchanged fields, in the original order.
+        resp["license_key_suffix"] = license_key[-4:]
+        if paired:
+            # The desktop client stores this private key for signed heartbeats;
+            # never send it to a public channel or to the website.
+            resp["canonical_license_key"] = license_key
+        # Customer profile block (launcher Profile page). `item` is the pre-bind
+        # read, so stamp the bind we just wrote rather than the previous session.
+        resp["profile"] = license_profile(item)
+        resp["profile"]["activated_at"] = activated_at
+        motd = get_motd()
+        if motd:
+            resp["motd"] = motd
+    # session_only (broker): return ONLY {ok, token, tid, expires} — no license
+    # material, no PII. The broker writes {token, token_id, machine_id} to DPAPI.
     return ok(resp)
 
 
@@ -1758,6 +1820,11 @@ def handle_validate(event):
         return err("expired", 403, message="This licence has expired.")
     entitled, entitlement_reason, lookup_mode = discord_access_entitlement(item, now=now)
     if not entitled:
+        if lookup_mode == "unavailable":
+            audit_log("check_entitlement_unavailable", license_key,
+                      {"reason": entitlement_reason})
+            return err("entitlement_unavailable", 503,
+                       message="Account access could not be checked just now. Retry shortly.")
         audit_log("check_subscription_required", license_key,
                   {"reason": entitlement_reason, "lookup_mode": lookup_mode})
         return err("subscription_required", 403,
@@ -1814,6 +1881,8 @@ def _find_license_by_discord(discord_id):
     falls back to a full scan when it does not — the caller surfaces lookup_mode so
     the owner can see the index is still missing."""
     rows, mode = find_licenses_by_discord(discord_id)
+    if mode == "unavailable":
+        return None, mode
     return _newest_active(rows), mode
 
 # ── HIGH-3: order_id spend-once markers (atomic claim, mint-once per order) ─────
@@ -1972,6 +2041,8 @@ def handle_bot_status(event):
     if aerr:
         return aerr
     item, lookup_mode = _find_license_by_discord(discord_id)
+    if lookup_mode == "unavailable":
+        return err("entitlement_unavailable", 503)
     if not item:
         return ok({"ok": True, "has_license": False, "lookup_mode": lookup_mode})
     now = now_ts()
@@ -2026,6 +2097,8 @@ def handle_bot_hwid_reset(event):
         return aerr
 
     item, lookup_mode = _find_license_by_discord(discord_id)
+    if lookup_mode == "unavailable":
+        return err("entitlement_unavailable", 503)
     if not item:
         return ok({"ok": False, "error": "no_license", "lookup_mode": lookup_mode,
                    "message": "No active license is linked to your account."})
@@ -2398,33 +2471,79 @@ def handle_bot_guild_member(event):
 
 def active_license_for_discord(discord_id):
     """Resolve an account's live entitlement without trusting a submitted ID."""
-    rows, _ = find_licenses_by_discord(discord_id)
-    eligible = [row for row in rows
-                if row.get("status") == "active"
-                and str(row.get("discord_user_id") or "") == discord_id
-                and not str(row.get("license_key") or "").startswith(("PAIR#", "TRIAL#", "TRIALMACHINE#"))
-                and discord_access_entitlement(row)[0]]
+    rows, mode = find_licenses_by_discord(discord_id)
+    if mode == "unavailable":
+        raise EntitlementLookupUnavailable()
+    eligible = []
+    for row in rows:
+        if (row.get("status") != "active"
+                or str(row.get("discord_user_id") or "") != discord_id
+                or str(row.get("license_key") or "").startswith(("PAIR#", "TRIAL#", "TRIALMACHINE#"))):
+            continue
+        entitled, _, entitlement_mode = discord_access_entitlement(row)
+        if entitlement_mode == "unavailable":
+            raise EntitlementLookupUnavailable()
+        if entitled:
+            eligible.append(row)
     eligible.sort(key=lambda row: (
         str(row.get("plan") or "").lower() != "trial",
         int(row.get("created_at") or 0)), reverse=True)
     return eligible[0] if eligible else None
 
-def handle_bot_pair_issue(event):
-    """A trusted website Worker relays its verified Discord OAuth identity here."""
+
+class EntitlementLookupUnavailable(Exception):
+    """Purchase evidence could not be read; it is not an entitlement denial."""
+
+
+def _pair_request_discord_id(event):
     if not require_pair_issuer(event):
-        return err("forbidden", 403)
+        return None, err("forbidden", 403)
     try:
         body = json.loads(event.get("body") or "{}")
     except Exception:
-        return err("invalid_json", 400)
+        return None, err("invalid_json", 400)
     discord_id = str(body.get("discord_id") or "").strip()
     if not (16 <= len(discord_id) <= 22 and discord_id.isascii() and discord_id.isdigit()):
-        return err("invalid_discord_id", 400)
-    if not rate_limit_ok("pair_issue", discord_id, limit=5, window=600):
-        return err("rate_limited", 429)
+        return None, err("invalid_discord_id", 400)
+    return discord_id, None
+
+
+def handle_bot_pair_status(event):
+    """Authenticated, non-minting provisioning check with a separate poll budget."""
+    discord_id, error = _pair_request_discord_id(event)
+    if error:
+        return error
+    limited = rate_limit_ok("pair_status", discord_id, limit=120, window=600,
+                            fail_open=None)
+    if limited is None:
+        return err("rate_limit_unavailable", 503)
+    if not limited:
+        return err("rate_limited", 429, retry_after_s=600 - now_ts() % 600)
     if is_blacklisted(discord_id=discord_id):
         return err("blacklisted", 403)
-    item = active_license_for_discord(discord_id)
+    try:
+        item = active_license_for_discord(discord_id)
+    except EntitlementLookupUnavailable:
+        return err("entitlement_unavailable", 503)
+    return ok({"ok": True, "ready": bool(item)})
+
+def handle_bot_pair_issue(event):
+    """A trusted website Worker relays its verified Discord OAuth identity here."""
+    discord_id, error = _pair_request_discord_id(event)
+    if error:
+        return error
+    limited = rate_limit_ok("pair_issue", discord_id, limit=5, window=600,
+                            fail_open=None)
+    if limited is None:
+        return err("rate_limit_unavailable", 503)
+    if not limited:
+        return err("rate_limited", 429, retry_after_s=600 - now_ts() % 600)
+    if is_blacklisted(discord_id=discord_id):
+        return err("blacklisted", 403)
+    try:
+        item = active_license_for_discord(discord_id)
+    except EntitlementLookupUnavailable:
+        return err("entitlement_unavailable", 503)
     if not item:
         return err("subscription_required", 403,
                    message="Claim a trial or subscribe on this Discord account first.")
@@ -2454,6 +2573,22 @@ def consume_pair_code(code):
         return None
     marker = "PAIR#" + hashlib.sha256(code.encode("ascii")).hexdigest()
     now = now_ts()
+    # Resolve entitlement BEFORE the one-use transition. An unavailable purchase
+    # lookup must not burn the customer's valid code, and the normal activation
+    # path checks entitlement again after this transition.
+    try:
+        pending = licenses_table().get_item(Key={"license_key": marker}).get("Item", {})
+    except Exception as exc:
+        print(f"[ERROR] pair lookup failed: {type(exc).__name__}")
+        raise EntitlementLookupUnavailable() from exc
+    if pending.get("status") != "pair_pending" or int(pending.get("expires") or 0) <= now:
+        return None
+    discord_id = str(pending.get("pair_discord_id") or "")
+    if not discord_id:
+        return None
+    item = active_license_for_discord(discord_id)
+    if not item:
+        return None
     try:
         response = licenses_table().update_item(
             Key={"license_key": marker},
@@ -2468,13 +2603,28 @@ def consume_pair_code(code):
     except Exception as e:
         print(f"[ERROR] pair redeem failed: {type(e).__name__}")
         return None
-    discord_id = str(response.get("Attributes", {}).get("pair_discord_id") or "")
-    if not discord_id:
-        return None
-    item = active_license_for_discord(discord_id)
-    if item:
-        audit_log("pair_code_consumed", item["license_key"], {"discord_id": discord_id})
+    audit_log("pair_code_consumed", item["license_key"], {"discord_id": discord_id})
     return item
+
+
+def restore_pair_code_after_lookup_outage(code):
+    """A retriable backend failure after consume must not spend the sign-in code."""
+    code = str(code or "").strip().upper()
+    if not (code.startswith("PAIR-") and len(code) == 37):
+        return False
+    marker = "PAIR#" + hashlib.sha256(code.encode("ascii")).hexdigest()
+    try:
+        licenses_table().update_item(
+            Key={"license_key": marker},
+            UpdateExpression="SET #s = :pending REMOVE consumed_at",
+            ConditionExpression="#s = :consumed",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":pending": "pair_pending",
+                                       ":consumed": "pair_consumed"})
+        return True
+    except Exception as exc:
+        print(f"[WARN] pair code restore failed: {type(exc).__name__}")
+        return False
 
 def handle_bot_deliver(event):
     """§4 BREAKING: /deliver is a STAFF mint path, so the Discord front-end must
@@ -2577,7 +2727,7 @@ def _notify_stripe_provision(discord_id, key, order_id, *, renewed=False):
         "footer": {"text": "Venice • Need help? Open a ticket"},
     } if renewed else {
         "title": "✅ Venice subscription active",
-        "description": "Your $25/month membership is active and linked to this Discord account. Sign in with Discord on the PC where you use Venice; your public Discord ID is not a password or activation code.",
+        "description": "Your $19.99/month membership is active and linked to this Discord account. Sign in with Discord on the PC where you use Venice; your public Discord ID is not a password or activation code.",
         "fields": [
             {"name": "Connect Venice", "value": "https://zaeorion.com/connect", "inline": False},
             {"name": "Check membership", "value": "Run `/status` privately in the Venice server.", "inline": False},
@@ -2597,6 +2747,40 @@ def _notify_stripe_provision(discord_id, key, order_id, *, renewed=False):
     except Exception as exc:
         print(f"[WARN] Stripe provision DM pending order={order_id}: {type(exc).__name__}")
         return False
+
+
+def _reconcile_order_role(discord_id, key, order_id):
+    """Persist the role obligation separately from the order mint and DM.
+
+    Discord role PUT is idempotent. If Discord succeeds but the marker write fails,
+    replaying the webhook repeats only that PUT; it never mints or renews again.
+    """
+    if not discord_id:
+        return False
+    license_item = licenses_table().get_item(Key={"license_key": key}).get("Item", {})
+    if str(license_item.get("discord_user_id") or "") != str(discord_id):
+        return False
+    marker_key = "ORDER#" + order_id
+    marker = licenses_table().get_item(Key={"license_key": marker_key}).get("Item", {})
+    if marker.get("minted_license_key") != key:
+        return False
+    if marker.get("role_granted_at"):
+        return True
+    granted = _discord_add_role(discord_id, DISCORD_CUSTOMER_ROLE_SSM)
+    try:
+        values = {":t": now_ts(), ":s": "delivered" if granted else "pending"}
+        update = "SET role_last_attempt_at = :t, role_delivery_status = :s"
+        if granted:
+            update += ", role_granted_at = :t"
+        licenses_table().update_item(
+            Key={"license_key": marker_key}, UpdateExpression=update,
+            ExpressionAttributeValues=values)
+    except Exception as exc:
+        print(f"[WARN] role delivery state write failed order={order_id}: {type(exc).__name__}")
+        return False
+    if not granted:
+        audit_log("stripe_role_delivery_pending", key, {"order_id": order_id})
+    return granted
 
 
 def handle_bot_provision(event):
@@ -2626,9 +2810,19 @@ def handle_bot_provision(event):
                         or (order_id.startswith("stripe:invoice:in_") and body.get("renew") is True))):
             return err("invalid_stripe_provision", 400)
     if notify and (not order_id.startswith("stripe:") or not discord_id
-                   or not subscription_id.startswith("sub_")
-                   or not subscription_id[4:].isalnum()):
+                 or not subscription_id.startswith("sub_")
+                 or not subscription_id[4:].isalnum()):
         return err("invalid_notification_target", 400)
+
+    renew_requested = (str(body.get("renew", "")).strip().lower()
+                       in ("1", "true", "yes") and bool(discord_id))
+    renew_rows, renew_mode = [], "none"
+    if renew_requested:
+        # Do not spend the order marker before a lookup that can fail. Otherwise
+        # an outage turns the paid renewal into a permanently pending order.
+        renew_rows, renew_mode = find_licenses_by_discord(discord_id)
+        if renew_mode == "unavailable":
+            return err("entitlement_unavailable", 503)
 
     # ── HIGH-3: scope the mint to a verified-UNSPENT order_id. One backend license
     # per paid order EVER — an attacker replaying a webhook (or a leaked webhook
@@ -2642,11 +2836,18 @@ def handle_bot_provision(event):
             if not dup:
                 return err("order_pending", 503)
             marker = licenses_table().get_item(Key={"license_key": "ORDER#" + order_id}).get("Item", {})
-            if not _notify_stripe_provision(discord_id, dup, order_id,
-                                            renewed=bool(marker.get("renewed"))):
+            role_granted = _reconcile_order_role(discord_id, dup, order_id)
+            notified = _notify_stripe_provision(discord_id, dup, order_id,
+                                                renewed=bool(marker.get("renewed")))
+            if not notified:
                 return err("dm_pending", 503)
+            if not role_granted:
+                return err("role_pending", 503)
             return ok({"ok": True, "license_key_suffix": dup[-4:],
-                       "duplicate_order": True, "notified": True}, 200)
+                       "duplicate_order": True, "notified": True,
+                       "role_granted": True}, 200)
+        if dup and discord_id:
+            _reconcile_order_role(discord_id, dup, order_id)
         return ok({"ok": True, "license_key": dup, "plan": plan,
                    "duplicate_order": True}, 200)
 
@@ -2658,8 +2859,8 @@ def handle_bot_provision(event):
     # so a renewal ping extends the key they already have instead. Guards: never
     # resurrect a revoked key, never touch `status` (a frozen key stays frozen for
     # the owner to release), and a key with no expiry has nothing to extend.
-    if str(body.get("renew", "")).strip().lower() in ("1", "true", "yes") and discord_id:
-        rows, renew_mode = find_licenses_by_discord(discord_id)
+    if renew_requested:
+        rows = renew_rows
         # A later trial or staff comp on the same Discord account is not the
         # paid subscription being renewed. Never convert that key into paid
         # access or extend it in place.
@@ -2703,10 +2904,14 @@ def handle_bot_provision(event):
                            "lookup_mode": renew_mode})
                 print(f"[INFO] AUDIT bot_provision_renew key ...{ckey[-4:]} plan={plan} "
                       f"days={days} order={order_id}")
-                role_granted = _discord_add_role(discord_id, DISCORD_CUSTOMER_ROLE_SSM)
+                role_granted = _reconcile_order_role(discord_id, ckey, order_id)
                 if notify:
-                    if not _notify_stripe_provision(discord_id, ckey, order_id, renewed=True):
+                    notified = _notify_stripe_provision(discord_id, ckey, order_id,
+                                                        renewed=True)
+                    if not notified:
                         return err("dm_pending", 503)
+                    if not role_granted:
+                        return err("role_pending", 503)
                     return ok({"ok": True, "license_key_suffix": ckey[-4:], "plan": plan,
                                "expiry": new_expiry, "renewed": True,
                                "role_granted": role_granted, "notified": True}, 200)
@@ -2733,10 +2938,13 @@ def handle_bot_provision(event):
     _bind_order_license(order_id, key)
     audit_log("bot_provision", key, {"plan": plan, "days": days, "discord_id": discord_id, "order_id": order_id})
     print(f"[INFO] AUDIT bot_provision key ...{key[-4:]} plan={plan} days={days} order={order_id}")
-    role_granted = _discord_add_role(discord_id, DISCORD_CUSTOMER_ROLE_SSM) if discord_id else False
+    role_granted = _reconcile_order_role(discord_id, key, order_id) if discord_id else False
     if notify:
-        if not _notify_stripe_provision(discord_id, key, order_id):
+        notified = _notify_stripe_provision(discord_id, key, order_id)
+        if not notified:
             return err("dm_pending", 503)
+        if not role_granted:
+            return err("role_pending", 503)
         return ok({"ok": True, "license_key_suffix": key[-4:], "plan": plan,
                    "expiry": expiry, "role_granted": role_granted, "notified": True}, 201)
     return ok({"ok": True, "license_key": key, "plan": plan, "expiry": expiry,
@@ -2960,6 +3168,8 @@ def handle_shard_retrieve(event):
                    message="Your Venice access is not active. Subscribe at zaeorion.com or open a ticket.")
     entitled, entitlement_reason, lookup_mode = discord_access_entitlement(lic)
     if not entitled:
+        if lookup_mode == "unavailable":
+            return err("entitlement_unavailable", 503)
         audit_log("shard_subscription_required", license_key,
                   {"build_id": build_id[:16], "reason": entitlement_reason,
                    "lookup_mode": lookup_mode})
@@ -3543,26 +3753,43 @@ def is_blacklisted(machine_id=None, discord_id=None):
 def find_licenses_by_discord(discord_id):
     """(rows, lookup_mode). lookup_mode is "gsi" when the index served the read and
     "scan" when it is absent — surfaced in the response so the owner knows the GSI
-    still has to be created."""
+    still has to be created. A partial page is never an authoritative empty lookup."""
     did = str(discord_id or "").strip()
     if not did:
         return [], "none"
+    table = licenses_table()
+
+    def all_pages(method, kwargs, max_pages):
+        rows, start = [], None
+        for _ in range(max_pages):
+            request = dict(kwargs)
+            if start:
+                request["ExclusiveStartKey"] = start
+            page = getattr(table, method)(**request)
+            rows.extend(page.get("Items", []))
+            start = page.get("LastEvaluatedKey")
+            if not start:
+                return rows
+        raise RuntimeError("Discord licence lookup page limit reached")
+
     try:
-        r = licenses_table().query(
-            IndexName=LICENSE_DISCORD_GSI,
-            KeyConditionExpression="discord_user_id = :d",
-            ExpressionAttributeValues={":d": did})
-        return r.get("Items", []), "gsi"
+        rows = all_pages("query", {
+            "IndexName": LICENSE_DISCORD_GSI,
+            "KeyConditionExpression": "discord_user_id = :d",
+            "ExpressionAttributeValues": {":d": did}}, 64)
+        return rows, "gsi"
     except Exception:
         pass
     try:
-        rows = licenses_table().scan(
-            FilterExpression="discord_user_id = :d",
-            ExpressionAttributeValues={":d": did}).get("Items", [])
+        # The fallback is bounded; a large table needs its GSI. An incomplete
+        # scan reports unavailable instead of falsely denying a paying account.
+        rows = all_pages("scan", {
+            "FilterExpression": "discord_user_id = :d",
+            "ExpressionAttributeValues": {":d": did}}, 32)
         return rows, "scan"
     except Exception as e:
         print(f"[LOOKUP] discord scan failed: {e}")
-        return [], "scan"
+        return [], "unavailable"
 
 
 def discord_access_entitlement(item, now=None):
@@ -3595,6 +3822,8 @@ def discord_access_entitlement(item, now=None):
         return allowed, ("trial_active" if allowed else "trial_inactive"), "self"
 
     rows, lookup_mode = find_licenses_by_discord(discord_id)
+    if lookup_mode == "unavailable":
+        return False, "lookup_unavailable", lookup_mode
     for candidate in rows:
         if str(candidate.get("source") or "").strip().lower() != "gumroad":
             continue
@@ -3660,6 +3889,8 @@ def resolve_license(body):
         val = body.get(field)
         if val:
             rows, mode = finder(val)
+            if mode == "unavailable":
+                return None, mode, "entitlement_unavailable"
             item = _newest_active(rows) or (rows[0] if rows else None)
             return (item, mode, None) if item else (None, mode, "invalid_key")
     return None, "none", "missing_license_key"
@@ -3929,6 +4160,8 @@ def handle_license_action(event, actor, staff=None, surface="admin"):
                    message="Supply key, discord_user_id, email or machine_id.")
     if lerr == "internal_error":
         return err("internal_error", 500)
+    if lerr == "entitlement_unavailable":
+        return err("entitlement_unavailable", 503)
     if lerr or not item:
         return err("invalid_key", 404, message="No license matched.", lookup_mode=lookup_mode)
     key = item["license_key"]
@@ -3946,6 +4179,10 @@ def handle_license_action(event, actor, staff=None, surface="admin"):
     # Mutations from here on: reason mandatory.
     if not reason:
         return err("reason_required", 400, message="Every mutation needs a reason.")
+    # [CX-014] durable attempt row BEFORE the mutation; refuse if it cannot be written.
+    refused = audit_attempt_or_refuse(actor, f"license.{action}.attempt", key[-4:], "license", reason, ip=ip)
+    if refused:
+        return refused
 
     if action in ("revoke", "unrevoke"):
         e = require_capability(actor, f"license.{action}")
@@ -4620,11 +4857,18 @@ def handle_admin_config(event):
         if key == "global_kill":
             enabled = bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
             kreason = (value.get("reason") if isinstance(value, dict) else "") or reason
+            refused = audit_attempt_or_refuse(actor, "config.set.attempt", key, "config", reason, ip=ip,
+                                              details={"enabled": enabled})
+            if refused:
+                return refused
             config_table().put_item(Item={"config_key": "global_kill",
                                           "enabled": enabled, "reason": kreason if enabled else "",
                                           "set_at": now_ts()})
             applied[key] = {"enabled": enabled, "reason": kreason if enabled else ""}
         else:
+            refused = audit_attempt_or_refuse(actor, "config.set.attempt", key, "config", reason, ip=ip)
+            if refused:
+                return refused
             config_set(key, value)
             applied[key] = value
         audit(actor, "config.set", target=key, target_type="config", reason=reason,
@@ -4774,20 +5018,24 @@ def handle_bot_reset_credit(event):
     reason = str(body.get("reason") or "gumroad hwid-reset purchase")[:REASON_MAX]
     order_id = str(body.get("order_id", "") or "").strip()
     actor = make_actor("webhook", consumer, "webhook", _client_ip(event))
-    if order_id:
-        dup = _claim_order("RESETCREDIT-" + order_id, "reset_credit")
-        if dup is not None:
-            return ok({"ok": True, "duplicate_order": True})
     item, mode = None, "key"
     if key_in:
         item = licenses_table().get_item(Key={"license_key": key_in}).get("Item")
     elif discord_id:
         rows, mode = find_licenses_by_discord(discord_id)
+        if mode == "unavailable":
+            return err("entitlement_unavailable", 503)
         item = _newest_active(rows)
     if not item:
         audit(actor, "license.grant_reset_credit", result="invalid_key",
               target_type="license", reason=reason)
         return err("invalid_key", 404, message="No active license for that customer.")
+    # Resolve the target before spending the order. A secondary lookup outage
+    # must not leave a paid reset-credit order permanently claimed but ungranted.
+    if order_id:
+        dup = _claim_order("RESETCREDIT-" + order_id, "reset_credit")
+        if dup is not None:
+            return ok({"ok": True, "duplicate_order": True})
     key = item["license_key"]
     credits = int(item.get("hwid_paid_credits", 0) or 0) + 1
     licenses_table().update_item(
@@ -4826,6 +5074,8 @@ def handle_bot_chargeback(event):
         item = licenses_table().get_item(Key={"license_key": key_in}).get("Item")
     elif discord_id:
         rows, mode = find_licenses_by_discord(discord_id)
+        if mode == "unavailable":
+            return err("entitlement_unavailable", 503)
         paid_rows = [row for row in rows
                      if str(row.get("source") or "").lower() == "gumroad"
                      and str(row.get("order_id") or "").strip()
@@ -4846,8 +5096,14 @@ def handle_bot_chargeback(event):
         ExpressionAttributeValues={":s": "revoked", ":r": True,
                                    ":k": f"{kind}: {reason}", ":t": now_ts()})
     if discord_id:
-        rows, _ = find_licenses_by_discord(discord_id)
-        other_paid = any(
+        rows, lookup_mode = find_licenses_by_discord(discord_id)
+        if lookup_mode == "unavailable":
+            # The revocation already succeeded, but missing evidence about
+            # another purchase must not remove the shared Customer role.
+            audit_log("chargeback_role_reconcile_pending", key,
+                      {"discord_id": discord_id})
+            rows = None
+        other_paid = rows is None or any(
             row.get("license_key") != key
             and str(row.get("source") or "").lower() == "gumroad"
             and row.get("status") == "active" and not row.get("revoked", False)
@@ -4934,6 +5190,8 @@ def lambda_handler(event, context):
         return handle_bot_trial(event)
     elif path == "/api/bot/pair-issue" and method == "POST":
         return handle_bot_pair_issue(event)
+    elif path == "/api/bot/pair-status" and method == "POST":
+        return handle_bot_pair_status(event)
     elif path == "/api/bot/guild-join" and method == "POST":
         return handle_bot_guild_join(event)
     elif path == "/api/bot/guild-member" and method == "POST":

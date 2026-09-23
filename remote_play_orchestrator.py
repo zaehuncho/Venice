@@ -1,6 +1,7 @@
 import collections
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -425,6 +426,7 @@ class _ProcessedFrameSnapshot:
     # remains the raw source-publication identity and must not be substituted for
     # this value in sampler/registration math.
     measurement_epoch_ms: float = 0.0
+    detector_done_epoch_ms: float = 0.0  # diagnostics only; never timing authority
     pts: int = 0
     frame_wh: tuple = (0, 0)
     integrity_healthy: bool = False
@@ -789,6 +791,7 @@ def _latency_route_scope(config) -> str:
                 or any(ch not in '0123456789abcdef' for ch in value[len(id_prefix):])
                 for value in stable_ids):
             return _scope_reject('device_moniker_ids_malformed')
+        selected_id = str(os.environ.get('ORION_CAPTURE_SELECTED_ID', '') or '').strip().lower()
         try:
             from capture_card_backend import _classify_name
             classes = [_classify_name(name) if name else 'unknown' for name in names]
@@ -809,10 +812,19 @@ def _latency_route_scope(config) -> str:
         # (test_latency_cache_capture_scope_rejects_identically_named_card_swap proves exactly
         # this with no census involved). What the configured device IS remains load-bearing;
         # what else exists on the machine does not.
-        if classes[index] != 'card':
+        # [AUD-A4-001] A generic configured row needs a matching explicit picker ID;
+        # a card-named row may use the independent named-card fallback. The moniker
+        # SHA (device-id= below) carries the timing namespace; the name class is only a
+        # heuristic. Requiring 'card' benched every card outside the hint list ("USB Video",
+        # "Razer Ripsaw", "ShadowCast"...) for every session with no reason given. Only a
+        # webcam-named pick is refused here; whether the feed may drive the bot is decided by
+        # measuring it (capture_card_backend.qualify_capture_feed -> feed_healthy).
+        if classes[index] == 'webcam':
             return _scope_reject(
                 'configured_index_not_a_capture_card (%r -> %s)'
                 % (names[index][:48], classes[index]))
+        if selected_id != stable_ids[index] and classes[index] != 'card':
+            return _scope_reject('capture_device_not_explicitly_selected')
         stable_name = ' '.join(names[index].casefold().split())
         parts.extend([
             str(index),
@@ -887,6 +899,11 @@ _DETCSV_HEADER = ('t_ms,detected,fill_pct,confidence,x,y,w,h,rejection_reason,'
                   'frame_integrity_generation,'
                   'sample_shot_epoch,gameplay_structure_verified,gameplay_structure_epoch,'
                   'raw_fed,reader_stage,processed_seq,source_epoch_ms,source_identity,backend_frozen')
+_FRAMEDUMP_CONTEXT_COLUMNS = (
+    'epoch', 'processed_seq', 'sample_shot_epoch', 'frame_no', 'source_pts',
+    'source_epoch_ms', 'source_identity', 'frame_integrity_generation',
+    'frame_w', 'frame_h', 'green_start_pct', 'green_end_pct', 'green_width_pct',
+    'green_confidence', 'structure_verified', 'structure_epoch', 'raw_fed', 'filename', 'container_frame')
 # wall_ms is written %.3f, NOT %.0f: the capture stamp is nanosecond-sourced end to end
 # (backend capture_epoch_ns -> _frame_measurement_epoch_ms -> here), and the old integer-ms
 # truncation at THIS line was the reason every offline frame-interval census read a median of
@@ -1157,6 +1174,19 @@ class RemotePlayOrchestrator:
             and os.environ.get('ORION_REQUIRE_FRAME_PIPE', '').strip().lower()
             in ('1', 'true', 'yes', 'on'))
         self._cc_last_retry = 0.0          # capture-loop background re-attempt throttle
+        # [CL2-P3-002/004 2026-09-23] Measured capture qualification. In capture-card mode the
+        # feed starts UNQUALIFIED (fail closed) and earns fire authority only after
+        # _update_capture_feed_qualification has seen consecutive passing windows; the sidecar
+        # ANDs this into feed_healthy, which the native engine already honours. Other sources
+        # are not measured here and stay qualified (byte-identical behaviour).
+        self._capture_feed_qualified = not self._cc_mode
+        self._capture_feed_pass_run = 0
+        self._capture_feed_fail_run = 0
+        self._capture_feed_reason = '' if not self._cc_mode else 'not_yet_measured'
+        # [CL2-P3-005 2026-09-23] Latest plain-language capture notice for the sidecar to relay:
+        # (seq, code, text). seq increments per notice so the relay emits each exactly once.
+        self._capture_notice = (0, '', '')
+        self._capture_notice_last = {}
         self._last_error_msg = ''
         self._last_frame = None
         self._last_frame_ts = 0.0
@@ -2145,7 +2175,8 @@ class RemotePlayOrchestrator:
             return False
 
     @_with_shot_gate_lock
-    def arm_shot_gate(self, source: str = "hw", shot_epoch=0, shot_type="", rhythm=False):
+    def arm_shot_gate(self, source: str = "hw", shot_epoch=0, shot_type="", rhythm=False,
+                      press_ms=0.0):
         """Public, input-only wake-up used by the native first-edge command.
 
         It grants detector acquisition/coast state only. Release authority remains
@@ -2159,6 +2190,17 @@ class RemotePlayOrchestrator:
         re-types a Standstill into a fade; that lands here as a duplicate epoch (notify=0, the
         reader's shot identity and its early trajectory are kept) and updates only the type.
         """
+        receipt_wall_ms = time.time() * 1000.0
+        receipt_mono_ms = time.perf_counter() * 1000.0
+        # Only the recorder consumes this stamp. Reader arm, range acquisition,
+        # capture windows, and native fire authority keep their existing clocks.
+        try:
+            native_press_ms = float(press_ms)
+            arm_age_ms = receipt_wall_ms - native_press_ms
+            stamp_ok = (math.isfinite(native_press_ms) and native_press_ms > 0.0
+                        and 0.0 <= arm_age_ms <= 30000.0)
+        except (TypeError, ValueError, OverflowError):
+            native_press_ms, arm_age_ms, stamp_ok = 0.0, 0.0, False
         incoming_epoch = _parse_pose_arm_token(shot_epoch)
         current_epoch = _parse_pose_arm_token(getattr(self, '_shot_gate_epoch', 0))
         if 0 < incoming_epoch < current_epoch:
@@ -2178,11 +2220,33 @@ class RemotePlayOrchestrator:
         rec = getattr(self, '_shot_records', None)
         if rec is not None and effective_epoch > 0:
             try:
-                rec.note_press(effective_epoch, ts_ms=time.time() * 1000.0,
-                               mono_ms=time.perf_counter() * 1000.0, source=source,
-                               shot_type=shot_type, rhythm=rhythm)
+                rec.note_press(effective_epoch,
+                               ts_ms=native_press_ms if stamp_ok else None,
+                               mono_ms=receipt_mono_ms - arm_age_ms if stamp_ok else None,
+                               source=source, shot_type=shot_type, rhythm=rhythm,
+                               clock_source='native_edge' if stamp_ok else 'arm_receipt',
+                               received_ts_ms=receipt_wall_ms)
             except Exception as exc:
                 logger.debug('shot record note_press failed: %s', exc)
+            # [ORION_ONSET_FF 2026-09-21] Stamp the court RTT the sampler holds RIGHT NOW on the
+            # same record, so the onset the reader measures for this press can be regressed on
+            # the network state it flew under. O(1): one snapshot, no I/O. Never blocks the press.
+            _rtt = getattr(self, '_rtt_engine', None)
+            if _rtt is not None:
+                try:
+                    _snap = _rtt.get_snapshot()
+                    _half = float(getattr(_snap, 'rtt_half_ms', 0.0) or 0.0)
+                    _jit = getattr(_snap, 'jitter_ms', None)
+                    if _jit is None:
+                        _jit = getattr(_snap, 'jitter_margin_ms', 0.0)
+                    _ready = bool(getattr(_snap, 'ready', False)) and \
+                        bool(getattr(_snap, 'target_verified', False))
+                    rec.note_network(effective_epoch,
+                                     court_rtt_ms=round(2.0 * _half, 1),
+                                     court_jitter_ms=round(float(_jit or 0.0), 1),
+                                     court_ready=1 if _ready else 0)
+                except Exception as exc:
+                    logger.debug('shot record note_network failed: %s', exc)
         # [ORION_SHOT_RANGE 2026-09-17] The range window is press-anchored exactly as the
         # record is, so it opens on the same edge and on the same clock.  A duplicate epoch
         # (the native's type_upgrade re-arm) is refused inside note_press: the press did not
@@ -2213,11 +2277,13 @@ class RemotePlayOrchestrator:
         try:
             logger.warning(
                 "SHOT-GATE ARM RECEIPT: src=%s epoch=%d effective_epoch=%d notify=%d "
-                "frame_seq=%d shot_type=%s rhythm=%d typed=%d",
+                "frame_seq=%d shot_type=%s rhythm=%d typed=%d press_ms=%.1f "
+                "arm_delivery_ms=%.2f press_clock=%s",
                 str(source)[:24], incoming_epoch, effective_epoch,
                 int(notified_reader), self._frame_seq,
                 (str(shot_type).strip().replace(" ", "_")[:24] or "unclassified"),
-                int(bool(rhythm)), int(typed))
+                int(bool(rhythm)), int(typed), native_press_ms if stamp_ok else -1.0,
+                arm_age_ms if stamp_ok else -1.0, 'native_edge' if stamp_ok else 'unknown')
         except Exception:
             pass
         return True
@@ -2379,13 +2445,13 @@ class RemotePlayOrchestrator:
                 logger.debug('shot record banner tee failed: %s', exc)
         emit_stdout_jsonl(line)
 
-    def _shot_record_frame_hook(self, frame, result, now):
+    def _shot_record_frame_hook(self, frame, result, now, frame_seq=None, sample_wall_ms=None):
         """Detect-thread half of the shot record.  READS ONLY FIELDS THIS FRAME ALREADY HAS.
 
         Two things, both bounded:
-          * the FALLBACK meter onset -- the first frame of this press the reader called
-            detected.  Two attribute reads and a comparison (~0.5 us); the PICKUP record
-            still wins when it exists.
+          * the first epoch-matched reader detection. Locator PICKUP remains separate
+            proposal evidence and never overwrites this observation. This does not
+            claim the native engine has accepted ownership of the sample.
           * the OPT-IN nameplate "3"-cell brightness sample at 10 Hz
             (ORION_SHOT_RECORD_ICON=1), taken at the plate position player_anchor already
             found on this frame.  0.026 ms per sample, measured; off by default.
@@ -2397,14 +2463,20 @@ class RemotePlayOrchestrator:
         if epoch <= 0:
             return
         detected = bool(getattr(result, 'detected', False)) if result is not None else False
-        if detected and not getattr(self, '_shot_record_onset_done', False):
-            self._shot_record_onset_done = True
+        sample_epoch = _parse_pose_arm_token(getattr(result, 'gameplay_sample_epoch', 0))
+        if (detected and sample_epoch == epoch
+                and getattr(self, '_shot_record_onset_done_epoch', 0) != epoch):
             try:
                 press_ms = self._shot_record_press_mono_ms(epoch)
                 if press_ms is not None:
-                    rec.note_onset(epoch, now * 1000.0 - press_ms,
-                                   fill=getattr(result, 'fill_pct', None),
-                                   source='detect_loop')
+                    accepted = rec.note_onset(
+                        epoch, now * 1000.0 - press_ms,
+                        fill=getattr(result, 'fill_pct', None), source='detect_loop',
+                        frame_seq=frame_seq, sample_wall_ms=sample_wall_ms,
+                        structure_verified=(bool(getattr(result, 'gameplay_structure_verified', False))
+                            and _parse_pose_arm_token(getattr(result, 'gameplay_structure_epoch', 0)) == epoch))
+                    if accepted:
+                        self._shot_record_onset_done_epoch = epoch
             except Exception:
                 pass
         if getattr(self, '_shot_record_icon', False)                 and now >= float(getattr(self, '_shot_record_icon_next', 0.0) or 0.0):
@@ -3828,10 +3900,33 @@ class RemotePlayOrchestrator:
                     # and sidecar telemetry.  A DirectShow inventory identity
                     # never authorises an MSMF fallback or auto-resolved index.
                     self._guard_capture_latency_route(backend=backend)
+                    # [CL2-P3-002/004 2026-09-23] A (re)opened device earns fire authority
+                    # from its own measured feed, never from the previous handle's verdict.
+                    self._capture_feed_qualified = False
+                    self._capture_feed_pass_run = 0
+                    self._capture_feed_fail_run = 0
+                    self._capture_feed_reason = 'not_yet_measured'
+                    # [CL2-P3-001 2026-09-23] Say so when the device that opened is not the
+                    # customer's card (no card-name identity, and not the configured index).
+                    try:
+                        _basis = str(backend.route_identity_basis() or '')
+                        _resolved = int(backend.active_route()[1])
+                    except Exception:
+                        _basis, _resolved = '', configured_idx
+                    if _basis == 'uncertain' and _resolved != configured_idx:
+                        self._post_capture_notice(
+                            'not_card', device=self._capture_device_name(_resolved))
                     self._frame_backend = backend
                     self._frame_backend_mode = 'capture_card'
                     logger.info('Frame source: HDMI capture card (requested %dfps)', _fps)
                     return True
+                # [CL2-P3-005 2026-09-23] Tell the customer WHY the card did not come up.
+                try:
+                    _code, _dev, _detail = backend.last_start_failure()
+                except Exception:
+                    _code, _dev, _detail = '', '', ''
+                if _code:
+                    self._post_capture_notice(_code, device=_dev, detail=_detail)
             except Exception as exc:
                 logger.warning('Capture-card backend error (%s)', exc)
             # EXCLUSIVE: the card is the only valid video source in capture-card mode. Do NOT fall back to
@@ -4798,6 +4893,7 @@ class RemotePlayOrchestrator:
                 measurement_epoch_ms=float(getattr(
                     prior, 'measurement_epoch_ms',
                     getattr(self, '_last_processed_measurement_epoch_ms', 0.0)) or 0.0),
+                detector_done_epoch_ms=float(getattr(prior, 'detector_done_epoch_ms', 0.0) or 0.0),
                 pts=int(getattr(prior, 'pts', getattr(self, '_last_processed_pts', 0)) or 0),
                 frame_wh=tuple(getattr(
                     prior, 'frame_wh', getattr(self, '_last_processed_frame_wh', (0, 0)))),
@@ -4887,6 +4983,7 @@ class RemotePlayOrchestrator:
                 frame_ts=self._last_processed_frame_ts,
                 epoch_ms=self._last_processed_epoch_ms,
                 measurement_epoch_ms=self._last_processed_measurement_epoch_ms,
+                detector_done_epoch_ms=time.time() * 1000.0,
                 pts=self._last_processed_pts,
                 frame_wh=tuple(self._last_processed_frame_wh),
                 integrity_healthy=bool(self._capture_integrity_healthy),
@@ -5846,6 +5943,9 @@ class RemotePlayOrchestrator:
                     self._capture_count = 0
                     self._unique_count = 0
                     self._last_fps_time = now
+                    # [CL2-P3-002/004 2026-09-23] once-per-second measured qualification of
+                    # the capture feed (grants/revokes fire authority via feed_healthy).
+                    self._update_capture_feed_qualification(now)
                 # Capture-health diagnostic: surface the tier mix + video-core liveness so
                 # a live/gameplay run self-explains roi_not_found dropouts. Logged every
                 # ~5s, or immediately on SUSPECT/recovery transitions (black core,
@@ -6034,8 +6134,10 @@ class RemotePlayOrchestrator:
             max_bytes = max(1, int(os.environ.get('ORION_DETCSV_MAX_BYTES', str(64 * 1024 * 1024))))
             max_parts = max(1, int(os.environ.get('ORION_DETCSV_MAX_PARTS', '16')))
             flush_s = max(0.0, min(5.0, float(os.environ.get('ORION_DETCSV_FLUSH_MS', '2000')) / 1000.0))
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                'logs', 'diagnostics', 'detframes.csv')
+            # Opt-in measurement batches can keep both pixels and dense telemetry
+            # on the data drive. Default location remains backward compatible.
+            path = os.environ.get('ORION_DETCSV_PATH', '').strip() or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'logs', 'diagnostics', 'detframes.csv')
             self._detcsv_t0 = time.perf_counter()
             self._detcsv = AsyncDiagnosticCsv(path, _DETCSV_HEADER, keep=keep,
                                              capacity=256, report=logger.warning,
@@ -6152,10 +6254,10 @@ class RemotePlayOrchestrator:
         self._framedump_crop_w = int(_f('ORION_FRAMEDUMP_CROP_W', 400.0, 64.0, 1920.0))
         self._framedump_crop_h = int(_f('ORION_FRAMEDUMP_CROP_H', 500.0, 64.0, 1080.0))
         fmt = str(os.environ.get('ORION_FRAMEDUMP_FORMAT', '') or '').strip().lower()
-        if fmt not in ('jpg', 'jpeg', 'png'):
+        if fmt not in ('jpg', 'jpeg', 'png', 'bmp', 'huffyuv'):
             # Legacy dumps stay PNG byte-for-byte; only the new mode changes its default.
             fmt = 'jpg' if self._framedump_press_window else 'png'
-        self._framedump_format = 'jpg' if fmt in ('jpg', 'jpeg') else 'png'
+        self._framedump_format = 'jpg' if fmt in ('jpg', 'jpeg') else fmt
         self._framedump_jpeg_quality = int(_f('ORION_FRAMEDUMP_JPEG_QUALITY', 90.0, 40.0, 100.0))
         # Pre-roll ring: pre_ms of 60 fps frames + 2 slack, capped.
         depth = int(self._framedump_press_pre_ms / (1000.0 / 60.0)) + 2
@@ -6178,6 +6280,13 @@ class RemotePlayOrchestrator:
                 1, min(_qd_cap, int(os.environ.get('ORION_FRAMEDUMP_QUEUE_DEPTH', _qd_default))))
         except ValueError:
             self._framedump_queue_depth = int(_qd_default)
+        self._framedump_archive = None
+        self._framedump_buffer_bytes = 0
+        self._framedump_buffer_limit = int(_f(
+            'ORION_FRAMEDUMP_BUFFER_MB', 256.0, 16.0, 512.0) * 1024 * 1024)
+        self._framedump_archive_guard_ms = _f(
+            'ORION_FRAMEDUMP_RELEASE_GUARD_MS', 150.0, 0.0, 500.0)
+        self._framedump_archive_protected_until = 0.0
         self._framedump_press_epoch = 0
         self._framedump_press_until = 0.0       # perf_counter deadline; 0 = no open window
         self._framedump_press_hard_until = 0.0
@@ -6204,6 +6313,7 @@ class RemotePlayOrchestrator:
                 self._framedump_press_epoch = ep
                 self._framedump_press_hard_until = now + self._framedump_press_max_ms / 1000.0
                 self._framedump_press_until = self._framedump_press_hard_until
+                self._framedump_archive_protected_until = self._framedump_press_hard_until
                 stats = self._framedump_press_stats = {
                     'epoch': ep, 'first_idx': -1, 'last_idx': -1, 'frames': 0,
                     'dropped': 0, 'skipped': 0, 'preroll': 0, 'preroll_ondisk': 0,
@@ -6252,6 +6362,9 @@ class RemotePlayOrchestrator:
                 self._framedump_press_until = min(
                     self._framedump_press_until, self._framedump_press_hard_until,
                     now + self._framedump_press_post_ms / 1000.0)
+                self._framedump_archive_protected_until = min(
+                    self._framedump_archive_protected_until,
+                    now + self._framedump_archive_guard_ms / 1000.0)
             return True
         except Exception:
             return False
@@ -6340,8 +6453,12 @@ class RemotePlayOrchestrator:
             # Legacy diagnostic tests may seed sentinel objects in the queue.
             self._framedump_dropped = int(getattr(self, '_framedump_dropped', 0)) + 1
             return
+        self._framedump_release_buffer(item)
         stats = info.get('_framedump_stats')
         if stats is None:
+            if info.get('_framedump_accounted', False):
+                return
+            info['_framedump_accounted'] = True
             if not info.get('_framedump_raw_saved', False):
                 self._framedump_dropped = int(getattr(self, '_framedump_dropped', 0)) + 1
             return
@@ -6389,7 +6506,11 @@ class RemotePlayOrchestrator:
                 return False
             # As in legacy mode, saturation must be tested BEFORE an optional
             # capture-isolation copy. Never copy a full frame just to discard it.
-            if self._framedump_count >= self._framedump_max or q.full():
+            frame_bytes = int(getattr(frame, 'nbytes', 0) or 0)
+            buffered = int(getattr(self, '_framedump_buffer_bytes', 0))
+            limit = int(getattr(self, '_framedump_buffer_limit', 256 * 1024 * 1024))
+            if (self._framedump_count >= self._framedump_max or q.full()
+                    or buffered + frame_bytes > limit):
                 stats['dropped'] += 1
                 self._framedump_dropped += 1
                 self._framedump_press_dropped += 1
@@ -6399,6 +6520,7 @@ class RemotePlayOrchestrator:
             info['epoch'] = int(stats.get('epoch', 0))
             info['preroll'] = 1 if preroll else 0
             info['_framedump_stats'] = stats
+            info['_framedump_buffer_bytes'] = frame_bytes
             if getattr(self, '_framedump_press_copy', False) and frame is not None:
                 frame = frame.copy()
             # The writer takes this same SHORT metadata lock after I/O. It must
@@ -6410,6 +6532,7 @@ class RemotePlayOrchestrator:
                 self._framedump_press_dropped += 1
                 stats['dropped'] += 1
                 return False
+            self._framedump_buffer_bytes = buffered + frame_bytes
             self._framedump_count = idx + 1
             self._framedump_press_frames += 1
             stats['frames'] += 1
@@ -6508,7 +6631,7 @@ class RemotePlayOrchestrator:
             return False
         writer = getattr(self, '_framedump_writer', None)
         if writer is not None and writer.is_alive():
-            return True
+            return bool(getattr(self, '_framedump_enabled', False))
         # Generation 0 is the constructor's first arm; anything after that is a capture restart and
         # is worth a line, because "the dump came back" is exactly what was missing before.
         restarting = int(getattr(self, '_framedump_generation', 0)) > 0
@@ -6714,6 +6837,10 @@ class RemotePlayOrchestrator:
         if str(getattr(self, '_framedump_format', 'png')) == 'jpg':
             return '.jpg', [cv2.IMWRITE_JPEG_QUALITY,
                             int(getattr(self, '_framedump_jpeg_quality', 90))]
+        if getattr(self, '_framedump_format', '') == 'bmp':
+            # Opt-in lossless measurement: trade bounded disk space for no JPEG
+            # artifacts and no PNG compression latency. Defaults are unchanged.
+            return '.bmp', []
         return '.png', []
 
     def _framedump_discard_pending(self):
@@ -6734,7 +6861,7 @@ class RemotePlayOrchestrator:
                 self._framedump_finish_item(item)
         return discarded
 
-    def _framedump_info(self, frame, result, now):
+    def _framedump_info(self, frame, result, now, frame_context=None):
         """The per-frame index row this dump carries alongside the pixels.
 
         WALL-CLOCK OF THE FRAME, not of the write. Without this the dump is index-only,
@@ -6744,7 +6871,7 @@ class RemotePlayOrchestrator:
         ms, appear->tip) read off the index is therefore silently wrong -- and looks
         perfectly plausible.
         """
-        return {
+        info = {
             't': now,
             'wall': time.time(),
             'det': bool(getattr(result, 'detected', False)) if result else False,
@@ -6758,8 +6885,26 @@ class RemotePlayOrchestrator:
             'ge': int(getattr(result, 'green_window_end_row', -1) or -1) if result else -1,
             'park': bool(getattr(self._meter_detector, 'last_debug', {}).get('park', False)) if self._meter_detector else False,
         }
+        # Captured detection inputs, never mutable latest-frame globals. Wall time
+        # now identifies the same sample as dense CSV/native telemetry, not the
+        # later time this optional diagnostic happens to enqueue it.
+        info['frame_context'] = dict(frame_context or {})
+        wall_ms = info['frame_context'].get('wall_ms')
+        if isinstance(wall_ms, (float, int)) and math.isfinite(wall_ms) and wall_ms > 0:
+            info['wall'] = wall_ms / 1000.0
+        info['frame_context'].update(
+            frame_w=int(frame.shape[1]), frame_h=int(frame.shape[0]),
+            sample_shot_epoch=_parse_pose_arm_token(getattr(result, 'gameplay_sample_epoch', 0)),
+            structure_verified=int(bool(getattr(result, 'gameplay_structure_verified', False))),
+            structure_epoch=_parse_pose_arm_token(getattr(result, 'gameplay_structure_epoch', 0)),
+            raw_fed=int(bool(self._is_raw_accepted(result))),
+            green_start_pct=getattr(result, 'green_window_start_pct', -1.0),
+            green_end_pct=getattr(result, 'green_window_end_pct', -1.0),
+            green_width_pct=getattr(result, 'green_window_width_pct', -1.0),
+            green_confidence=getattr(result, 'green_window_confidence', 0.0))
+        return info
 
-    def _dump_frame(self, frame, result, now=None):
+    def _dump_frame(self, frame, result, now=None, frame_context=None):
         """ENQUEUE a frame for the async writer (opt-in, ORION_FRAMEDUMP=1). The capture thread does
         only a throttle check plus a NON-BLOCKING one-slot handoff.  Queue saturation is tested
         before ``frame.copy()`` so backpressure does not even copy a 1080p array.  If the writer is
@@ -6794,7 +6939,7 @@ class RemotePlayOrchestrator:
             # 826/1421) and no gameplay gate (a press IS gameplay).
             # ---------------------------------------------------------------- #
             if getattr(self, '_framedump_press_window', False):
-                info = self._framedump_info(frame, result, now)
+                info = self._framedump_info(frame, result, now, frame_context)
                 written = False
                 if self._framedump_press_active(now):
                     written = bool(self._framedump_offer(frame, info, now))
@@ -6868,6 +7013,132 @@ class RemotePlayOrchestrator:
         except Exception as exc:
             logger.warning("frame dump enqueue error: %s", exc)
 
+    @staticmethod
+    def _capture_device_name(index) -> str:
+        """DirectShow friendly name at ``index`` from the native inventory, or ''."""
+        try:
+            raw = str(os.environ.get('ORION_VIDEO_DEVICE_NAMES', '') or '')
+            names = [n.strip() for n in raw.split('|')] if raw.strip() else []
+            i = int(index)
+            return names[i] if 0 <= i < len(names) else ''
+        except Exception:
+            return ''
+
+    def _post_capture_notice(self, code: str, **kwargs) -> bool:
+        """Publish one plain-language capture notice for the sidecar to relay to the customer.
+
+        [CL2-P3-005 2026-09-23] The busy/absent/invalid/degraded diagnostics used to reach only
+        the developer log. The sidecar telemetry thread relays each new notice once (seq
+        changes) as a "Capture: ..." line that native shows in the Activity feed. The same code
+        is repeated at most once a minute so the ~2 s card retry cannot flood the feed; a
+        DIFFERENT code is published immediately. Returns whether a notice was published.
+        """
+        try:
+            from capture_card_backend import capture_notice_text
+            text = capture_notice_text(code, **kwargs)
+        except Exception:
+            return False
+        now = time.monotonic()
+        last_map = getattr(self, '_capture_notice_last', None)
+        if last_map is None:
+            last_map = {}
+            self._capture_notice_last = last_map
+        prev_seq, prev_code, _prev_text = getattr(self, '_capture_notice', (0, '', ''))
+        last = last_map.get(code)
+        if code == prev_code and last is not None and (now - last) < 60.0:
+            return False
+        last_map[code] = now
+        self._capture_notice = (int(prev_seq) + 1, str(code), text)
+        # ERROR, not WARNING: the native relay throttles sidecar WARNING lines (see
+        # _scope_reject) and a cause-of-bench line must never be sampled.
+        logger.error('Capture notice [%s]: %s', code, text)
+        return True
+
+    def _update_capture_feed_qualification(self, now: float) -> None:
+        """Grant or revoke fire authority from the MEASURED capture feed (once per second).
+
+        [CL2-P3-002/004 2026-09-23] Qualify after 3 consecutive passing 2 s windows; revoke
+        after 2 consecutive failing ones, so one loading-screen hiccup cannot bench a shot
+        while a feed that is genuinely slow or stuttering loses authority within ~2 s.
+        """
+        if not getattr(self, '_cc_mode', False):
+            return
+        backend = getattr(self, '_frame_backend', None)
+        if backend is None or str(getattr(self, '_frame_backend_mode', '') or '') != 'capture_card':
+            self._capture_feed_qualified = False
+            self._capture_feed_pass_run = 0
+            self._capture_feed_reason = 'no_capture_backend'
+            return
+        # [CL2-P3-001 2026-09-23 r2] Identity before measurement: a live picture from a device
+        # nobody identified as the customer's card (no enumeration, a cached/scan hit, a webcam
+        # name) never earns fire authority, however steady it is. Missing method -> unverified.
+        identity_fn = getattr(backend, 'identity_verified', None)
+        try:
+            identified = bool(identity_fn()) if callable(identity_fn) else False
+        except Exception:
+            identified = False
+        if not identified:
+            self._capture_feed_qualified = False
+            self._capture_feed_pass_run = 0
+            if str(getattr(self, '_capture_feed_reason', '') or '') != 'unidentified':
+                logger.warning('Capture feed NOT qualified for timing: unidentified device')
+            self._capture_feed_reason = 'unidentified'
+            try:
+                dev = self._capture_device_name(backend.active_route()[1])
+            except Exception:
+                dev = ''
+            self._post_capture_notice('unidentified', device=dev)
+            return
+        stats_fn = getattr(backend, 'cadence_stats', None)
+        try:
+            stats = (stats_fn(window_s=2.0) if callable(stats_fn) else {}) or {}
+        except Exception:
+            stats = {}
+        requested = int(getattr(self, '_requested_capture_fps', CAPTURE_FPS_DEFAULT)
+                        or CAPTURE_FPS_DEFAULT)
+        try:
+            from capture_card_backend import qualify_capture_feed
+            ok, code, detail = qualify_capture_feed(
+                stats.get('fps', 0.0), stats.get('gap_p95_ms', 0.0),
+                getattr(self, '_duplicate_frame_pct', 0.0),
+                getattr(self, '_unique_frame_fps', 0), requested,
+                samples=int(stats.get('samples', 0) or 0))
+        except Exception as exc:
+            ok, code, detail = False, 'no_frames', 'qualifier error: %s' % exc
+        if ok:
+            self._capture_feed_pass_run = int(getattr(self, '_capture_feed_pass_run', 0)) + 1
+            self._capture_feed_fail_run = 0
+            if (not self._capture_feed_qualified
+                    and self._capture_feed_pass_run >= 3):
+                self._capture_feed_qualified = True
+                prior = str(getattr(self, '_capture_feed_reason', '') or '')
+                self._capture_feed_reason = ''
+                logger.warning('Capture feed QUALIFIED for timing (%s)', detail)
+                # Announce the recovery only if the customer was told about a problem.
+                if str(getattr(self, '_capture_notice', (0, '', ''))[1]) in (
+                        'low_fps', 'gappy', 'duplicated', 'no_frames',
+                        'bad_measurement') and prior:  # [CL2-P3-004 2026-09-23 r2]
+                    self._post_capture_notice('ok', fps=float(stats.get('fps', 0.0) or 0.0),
+                                              requested_fps=requested)
+            return
+        self._capture_feed_fail_run = int(getattr(self, '_capture_feed_fail_run', 0)) + 1
+        self._capture_feed_pass_run = 0
+        if self._capture_feed_fail_run < 2:
+            return
+        was_qualified = bool(self._capture_feed_qualified)
+        prior_reason = str(getattr(self, '_capture_feed_reason', '') or '')
+        self._capture_feed_qualified = False
+        self._capture_feed_reason = code
+        if was_qualified or prior_reason != code:
+            logger.warning('Capture feed NOT qualified for timing: %s (%s)', code, detail)
+        fps_for_text = (float(getattr(self, '_unique_frame_fps', 0) or 0)
+                        if code == 'duplicated' else float(stats.get('fps', 0.0) or 0.0))
+        try:
+            dev = self._capture_device_name(backend.active_route()[1])
+        except Exception:
+            dev = ''
+        self._post_capture_notice(code, fps=fps_for_text, requested_fps=requested, device=dev)
+
     def _reclaim_dshow_route_if_invalid(self, now: float) -> None:
         """Periodically retry the configured DirectShow route while the card is on MSMF.
 
@@ -6915,15 +7186,36 @@ class RemotePlayOrchestrator:
             api = str(backend.active_route()[0] or '').upper()
         except Exception:
             return
+        wrong_index = False
         if api == 'DSHOW':
-            return          # already on the configured API; the guard decides the rest
+            # [CL2-P3-001 2026-09-23] A DirectShow route on the WRONG index used to return here
+            # and stay forever: a healthy non-card device (a webcam the walk fell onto while the
+            # card was busy or asleep) satisfies no other reopen trigger, so the real card was
+            # never retried and the session was benched until restart. Detach it on the same
+            # cooldown so the configured card is retried first. An ADOPTED card-name route has
+            # already moved the expected index, so it is never on the "wrong" index here.
+            try:
+                resolved_index = int(backend.active_route()[1])
+                expected_index = int(getattr(self, '_capture_warm_cache_expected_index', -1))
+            except Exception:
+                return
+            if expected_index < 0 or resolved_index == expected_index:
+                return      # on the configured route; the guard decides the rest
+            wrong_index = True
         last = float(getattr(self, '_cc_route_reclaim_last', 0.0) or 0.0)
         if last and (now - last) < cooldown:
             return
         self._cc_route_reclaim_last = now
-        logger.warning(
-            'Capture route is %s, not the configured DirectShow route, so shot timing is '
-            'fail-closed; releasing the card to retry DirectShow', api or 'UNKNOWN')
+        if wrong_index:
+            self._post_capture_notice('not_card', device=self._capture_device_name(resolved_index))
+            logger.warning(
+                'Capture route is DirectShow index %d, not the configured index %d, so shot '
+                'timing is fail-closed; releasing the device to retry DirectShow on the '
+                'configured card', resolved_index, expected_index)
+        else:
+            logger.warning(
+                'Capture route is %s, not the configured DirectShow route, so shot timing is '
+                'fail-closed; releasing the card to retry DirectShow', api or 'UNKNOWN')
         try:
             backend.stop()
         except Exception:
@@ -6960,19 +7252,35 @@ class RemotePlayOrchestrator:
                 _pth = os.path.join(self._framedump_dir, 'frames.csv')
                 _new = not os.path.exists(_pth) or os.path.getsize(_pth) == 0
                 _capture_clock_schema = _new
+                _context_schema = _new
+                _context_columns = _FRAMEDUMP_CONTEXT_COLUMNS
                 if not _new:
                     try:
                         with open(_pth, 'r', encoding='utf-8', errors='replace') as _rfh:
-                            _capture_clock_schema = 'write_wall' in _rfh.readline().strip().split(',')
+                            _columns = _rfh.readline().strip().split(',')
+                            _capture_clock_schema = 'write_wall' in _columns
+                            _context_schema = 'processed_seq' in _columns
+                            _context_columns = tuple(k for k in _columns if k in _FRAMEDUMP_CONTEXT_COLUMNS)
                     except OSError:
                         _capture_clock_schema = False
+                        _context_schema = False
                 fh = open(_pth, 'a', encoding='utf-8', newline='')
                 if _new:
                     fh.write('idx,t_ms,t_wall,detected,fill_pct,conf,green_center_pct,'
-                             'bbox_x,bbox_y,bbox_w,bbox_h,rejection,write_wall\n')
+                             'bbox_x,bbox_y,bbox_w,bbox_h,rejection,write_wall,'
+                             + ','.join(_FRAMEDUMP_CONTEXT_COLUMNS) + '\n')
                 self._framedump_index_fh = fh
                 self._framedump_index_capture_clock_schema = _capture_clock_schema
+                self._framedump_index_context_schema = _context_schema
+                self._framedump_index_context_columns = _context_columns
                 self._framedump_index_t0 = float(info.get('t', 0.0))
+            if (getattr(self, '_framedump_format', '') == 'huffyuv'
+                    and 'container_frame' not in self._framedump_index_context_columns):
+                # An older header cannot describe frames inside a shared chunk.
+                # Keep raw pixels, but never claim an ambiguous row was indexed.
+                self._framedump_index_failed = True
+                logger.warning('frame dump index disabled: archive requires container_frame column')
+                return False
             t0 = getattr(self, '_framedump_index_t0', 0.0)
             t_ms = (float(info.get('t', 0.0)) - t0) * 1000.0
             bbox = info.get('bbox') or (0, 0, 0, 0)
@@ -6988,9 +7296,15 @@ class RemotePlayOrchestrator:
                     # Defensive compatibility for direct/unit callers.  The live
                     # producer always supplies wall at enqueue time.
                     capture_wall = write_wall
-                fh.write(f"{idx},{t_ms:.2f},{float(capture_wall):.6f},"
+                row = (f"{idx},{t_ms:.2f},{float(capture_wall):.6f},"
                          f"{int(bool(info['det']))},{info['fill']:.2f},{info['conf']:.3f},"
-                         f"{info['gc']:.2f},{bx},{by},{bw},{bh},{rej},{write_wall:.6f}\n")
+                         f"{info['gc']:.2f},{bx},{by},{bw},{bh},{rej},{write_wall:.6f}")
+                if getattr(self, '_framedump_index_context_schema', False):
+                    ctx = dict(info.get('frame_context') or {})
+                    ctx.update(epoch=info.get('epoch', 0), filename=info.get('filename', ''))
+                    row += ',' + ','.join(str(ctx.get(key, '')).replace(',', ';').replace('\n', ' ')
+                                          for key in self._framedump_index_context_columns)
+                fh.write(row + '\n')
             else:
                 # Legacy append: t_wall historically meant writer time.  Keeping
                 # the old width is safer than producing a malformed mixed-schema
@@ -7005,7 +7319,71 @@ class RemotePlayOrchestrator:
             logger.warning("frame dump index disabled (%s); PNG stream continues", exc)
             return False
 
+    def _framedump_release_buffer(self, item):
+        # Idempotent: an encoded receipt and its producer item share one info dict.
+        if not isinstance(item, tuple) or len(item) != 3 or not isinstance(item[2], dict):
+            return
+        lock = getattr(self, '_framedump_census_lock', None)
+        if lock is None:
+            return
+        with lock:
+            size = int(item[2].pop('_framedump_buffer_bytes', 0))
+            self._framedump_buffer_bytes = max(
+                0, int(getattr(self, '_framedump_buffer_bytes', 0)) - size)
+
+    def _framedump_archive_commit(self, item, filename, ordinal):
+        idx, _, info = item
+        info['filename'] = filename
+        info['frame_context'] = dict(info.get('frame_context') or {}, container_frame=ordinal)
+        info['_framedump_raw_saved'] = True
+        info['_framedump_indexed'] = bool(self._framedump_write_index(idx, info))
+        self._framedump_finish_item(item)
+
+    def _framedump_flush_archive(self):
+        archive = getattr(self, '_framedump_archive', None)
+        if archive is not None:
+            archive.flush()
+
+    def _framedump_write_archive_item(self, item):
+        # Opt-in diagnostic storage only. Encoding, verification and disk I/O are
+        # deferred past the physical press/release critical interval; capture
+        # never waits for this worker and the queue has both byte and item caps.
+        try:
+            stop = self._framedump_writer_stop
+            while getattr(self, '_framedump_enabled', False) and not stop.is_set():
+                wait = self._framedump_archive_protected_until - time.perf_counter()
+                if wait <= 0.0:
+                    break
+                stop.wait(min(0.020, wait))
+            if not getattr(self, '_framedump_enabled', False) or stop.is_set():
+                self._framedump_finish_item(item)
+                return False
+            ok, free, floor, error = self._framedump_disk_status()
+            if not ok:
+                self._framedump_disable('disk_check_failed' if error else 'low_disk',
+                                        free_bytes=free, floor_bytes=floor, detail=error)
+                self._framedump_finish_item(item)
+                return False
+            if self._framedump_archive is None:
+                from lossless_frame_archive import LosslessFrameArchive
+                self._framedump_archive = LosslessFrameArchive(
+                    self._framedump_dir, self._framedump_archive_commit, self._framedump_finish_item)
+            started = time.perf_counter()
+            self._framedump_archive.append(item)
+            self._framedump_release_buffer(item)
+            self._framedump_note_healthy_write(time.perf_counter() - started)
+            return True
+        except Exception as exc:
+            archive = getattr(self, '_framedump_archive', None)
+            if archive is not None:
+                archive.discard_pending()
+            self._framedump_finish_item(item)
+            self._framedump_disable('archive_write_failed', detail=str(exc))
+            return False
+
     def _framedump_write_item(self, item):
+        if getattr(self, '_framedump_format', '') == 'huffyuv':
+            return self._framedump_write_archive_item(item)
         try:
             return self._framedump_write_item_impl(item)
         finally:
@@ -7042,6 +7420,7 @@ class RemotePlayOrchestrator:
             else:
                 base = os.path.join(self._framedump_dir, f"f{idx:05d}_{int(bool(info['det']))}")
             ext, params = self._framedump_encoding()
+            info['filename'] = os.path.basename(base + '_raw' + ext)
             # raw = exactly what the detector received. cv2 reports disk/full/path failures by
             # returning False on several builds, so an unchecked call can create an index row for a
             # file that does not exist.
@@ -7132,17 +7511,27 @@ class RemotePlayOrchestrator:
             except Exception:
                 pass
         q = self._framedump_q
-        while q is not None:
+        try:
+            while q is not None:
+                try:
+                    item = q.get(timeout=0.15)
+                except queue.Empty:
+                    if time.perf_counter() >= getattr(self, '_framedump_archive_protected_until', 0.0):
+                        self._framedump_flush_archive()
+                    continue
+                if item is None:
+                    return
+                if not self._framedump_write_item(item):
+                    self._framedump_discard_pending()
+                    return
+        except Exception as exc:
+            self._framedump_disable('writer_failed', detail=str(exc))
+            self._framedump_discard_pending()
+        finally:
             try:
-                item = q.get()
+                self._framedump_flush_archive()
             except Exception as exc:
-                self._framedump_disable('queue_read_failed', detail=str(exc))
-                return
-            if item is None:
-                return
-            if not self._framedump_write_item(item):
-                self._framedump_discard_pending()
-                return
+                self._framedump_disable('archive_flush_failed', detail=str(exc))
 
     def _stop_framedump_writer(self, timeout=0.5):
         """Stop the diagnostic worker without draining queued PNG work.
@@ -7342,13 +7731,19 @@ class RemotePlayOrchestrator:
             # Gated on the ENV opt-in, not the live flag: _dump_frame owns the heartbeat, and a
             # dump that has stopped is exactly the state that has to keep reporting itself.
             if getattr(self, '_framedump_env_enabled', False):
-                self._dump_frame(frame, result)
+                self._dump_frame(frame, result, frame_context={
+                    'wall_ms': _frame_wall_ms, 'processed_seq': _snap_seq,
+                    'frame_no': _snap_source_frame_number, 'source_pts': _snap_frame_pts,
+                    'source_epoch_ms': _snap_frame_epoch_ms,
+                    'source_identity': _snap_source_identity,
+                    'frame_integrity_generation': _snap_integrity_generation})
             # [ORION_SHOT_RECORDS 2026-09-16] Fallback onset + the opt-in nameplate cell.
             # Guarded on the recorder existing, so a session with ORION_SHOT_RECORDS=0 runs
             # exactly one attribute read more than before.
             if getattr(self, '_shot_records', None) is not None:
                 try:
-                    self._shot_record_frame_hook(frame, result, time.perf_counter())
+                    self._shot_record_frame_hook(frame, result, time.perf_counter(),
+                                                 frame_seq=_snap_seq, sample_wall_ms=_frame_wall_ms)
                 except Exception:
                     pass
             # [ORION_SHOT_RANGE 2026-09-17] The press+40..120 ms range window.  Two attribute

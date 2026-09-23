@@ -52,15 +52,18 @@ Item {
                 // Detector combo it also dimmed was removed with the rest of the proposer
                 // surface); nothing on this card binds it now that the Style combo is live.
                 //
-                // The combo trades in LABELS, the setting in style names: "Pill (beta)" persists
-                // as "Pill". A persisted style that is neither (a 2K26 "Dial"/"Sword") displays as
-                // Arrow2 without being rewritten -- the same display-only contract the lock had.
-                readonly property var styleOptions: ["Arrow2", "Pill (beta)"]
+                // [ORION_PILL_REMOVED 2026-09-21 owner] "Pill (beta)" is withdrawn from the
+                // beta: Arrow2 is the only offered style. AppConfig no longer accepts "pill",
+                // so a persisted Pill loads as Arrow2 (the same fallback a 2K26 "Dial"/"Sword"
+                // already takes). The Pill -> yolo launch route (applyPillYoloRoute) stays in
+                // the tree but can no longer be reached. The combo still trades in LABELS.
+                // [ORION_PILL_REMOVED 2026-09-21, re-withdrawn 2026-09-23 owner] Arrow2 only.
+                readonly property var styleOptions: ["Arrow2"]
                 function styleLabelFor(style) {
-                    return String(style).trim().toLowerCase() === "pill" ? "Pill (beta)" : "Arrow2"
+                    return "Arrow2"
                 }
                 function styleValueFor(label) {
-                    return label === "Pill (beta)" ? "Pill" : "Arrow2"
+                    return "Arrow2"
                 }
 
 
@@ -72,9 +75,8 @@ Item {
                         Layout.fillWidth: true
                         spacing: 6
                         Text { text: "Style"; color: Theme.textMuted; font.family: Theme.fontUi; font.pixelSize: 11; font.weight: Font.DemiBold }
-                        // The two styles the shipped build can actually READ: Arrow2 on the
-                        // pure-CV locator, Pill on the packaged detector (which the launch
-                        // routes to automatically when this says Pill). The retired 2K26
+                        // Arrow2 is the one style the shipped build reads on the pure-CV
+                        // locator. Pill (beta) was withdrawn 2026-09-21; the retired 2K26
                         // entries (Arrow/Dial/Sword) and Straight -- which no proposer has
                         // been measured on -- stay off the list rather than offering a choice
                         // that lands the user on a blind session.
@@ -83,6 +85,12 @@ Item {
                             objectName: "meterStyleCombo"
                             Layout.fillWidth: true
                             model: meterDetectionCol.styleOptions
+                            // [2026-09-21] One supported style: shown locked, exactly like the
+                            // Color combo beside it, so a single-entry dropdown does not read
+                            // as unfinished (Astra, bug sweep). Bindings + objectName kept for
+                            // the contract tests and the C++ smoke probes.
+                            enabled: meterDetectionCol.styleOptions.length > 1
+                            opacity: enabled ? 1.0 : 0.55
                             value: meterDetectionCol.styleLabelFor(orion.meterStyle)
                             onValueChanged: {
                                 // Compare LABEL to LABEL, never label-to-style: a persisted
@@ -126,12 +134,13 @@ Item {
                     }
                 }
 
-                // [ORION_PILL_YOLO_ROUTE 2026-09-17] Sits under the Style/Color row rather than
-                // inside the Style column so the two combos keep the row height they share today.
+                // Sits under the Style/Color row rather than inside the Style column so the
+                // two combos keep the row height they share today. objectName retained for
+                // the panel tests; the Pill caption went with the option (2026-09-21).
                 Text {
                     objectName: "meterStyleCaption"
                     Layout.fillWidth: true
-                    text: "Pill: uses the packaged detector; timing validation in progress."
+                    text: "Arrow2 is the supported NBA 2K27 meter style."
                     color: Theme.textMuted
                     wrapMode: Text.WordWrap
                     font.family: Theme.fontUi
@@ -193,8 +202,11 @@ Item {
                 // "<Pure CV | YOLO · DirectML> · <infer> ms · <idle|pending|locked> · locks N
                 // · <refused|drops> N". Native formats it; this only paints it. "--" until the
                 // first report and again after the sidecar exits, so it never quotes a ghost.
+                // [COPY-FIX 2026-09-23 NEW-A8] Engineering telemetry ("Pure CV · 0.6 ms ·
+                // refused 340", "YOLO · DirectML"): dev builds only, never customers.
                 Text {
                     objectName: "detectorHealthLine"
+                    visible: orion.debugUiEnabled === true
                     Layout.fillWidth: true
                     text: orion.detectorHealthLine && orion.detectorHealthLine.length > 0
                           ? orion.detectorHealthLine : "--"

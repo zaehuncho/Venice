@@ -17,17 +17,19 @@ int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
 #if defined(ORION_OWNER_TOOL)
-    QApplication::setApplicationName(QStringLiteral("Orion Owner"));
+    QApplication::setApplicationName(QStringLiteral("Venice Owner"));
     constexpr orion::AdminToolController::Mode mode = orion::AdminToolController::Mode::Owner;
     const QUrl qmlEntry(QStringLiteral("qrc:/qt/qml/OrionOwner/qml/admin/AdminMain.qml"));
     const QUrl legacyEntry(QStringLiteral("qrc:/OrionOwner/qml/admin/AdminMain.qml"));
 #else
-    QApplication::setApplicationName(QStringLiteral("Orion Staff"));
+    QApplication::setApplicationName(QStringLiteral("Venice Staff"));
     constexpr orion::AdminToolController::Mode mode = orion::AdminToolController::Mode::Staff;
     const QUrl qmlEntry(QStringLiteral("qrc:/qt/qml/OrionStaff/qml/admin/AdminMain.qml"));
     const QUrl legacyEntry(QStringLiteral("qrc:/OrionStaff/qml/admin/AdminMain.qml"));
 #endif
-    QApplication::setOrganizationName(QStringLiteral("Orion"));
+    // Customer-facing identity is Venice (2026-09-21). Safe to rename: the consoles keep no
+    // QSettings/QStandardPaths state under the organisation name - credentials live in memory.
+    QApplication::setOrganizationName(QStringLiteral("Venice"));
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
     const QString appDir = QCoreApplication::applicationDirPath();

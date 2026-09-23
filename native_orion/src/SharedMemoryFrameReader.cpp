@@ -275,6 +275,7 @@ QImage SharedMemoryFrameReader::readFrame(int& frameNumber)
 {
     frameNumber = 0;
     lastError_.clear();
+    lastMutexWaitResult_ = 0xffffffffu;
 #ifdef Q_OS_WIN
     if (!view_ || !mutex_) {
         lastError_ = QStringLiteral("SHM reader is not open");
@@ -302,6 +303,7 @@ QImage SharedMemoryFrameReader::readFrame(int& frameNumber)
     for (int attempt = 0; attempt < kGeometryAttempts; ++attempt) {
         const DWORD waitResult = WaitForSingleObject(
             static_cast<HANDLE>(mutex_), kMutexWaitMs);
+        lastMutexWaitResult_ = static_cast<std::uint32_t>(waitResult);
         if (waitResult == WAIT_TIMEOUT) {
             // Ordinary latest-wins contention: a newer producer copy is in flight.
             // The next frame_shm notification will read that committed generation.

@@ -1,5 +1,7 @@
 #include "NetworkSecurity.h"
 
+#include "PinnedSpki.h"
+
 #include <QtCore/QCryptographicHash>
 #include <QtCore/QList>
 #include <QtNetwork/QNetworkReply>
@@ -37,23 +39,13 @@ constexpr auto kProductionApiBaseUrl = "https://api.zaeorion.com";
 // Services today and can fail over to Let's Encrypt, so both families are
 // pinned (primary + disaster-recovery backups). Rotate this set during release
 // prep if Cloudflare ever moves to another CA family (e.g. SSL.com).
-const char* const kProductionApiPinnedSpkiSha256[] = {
-    // ── Google Trust Services (current issuer) ──
-    "908769e8d34477cc2cba0632c88605b22d7294c0840f78596d247c645b1afc0e", // GTS WE1 (live issuer; primary pin)
-    "be1efc292835472e0d6aa183575d30fdc4dbf551f7050519a0258d6bddd6fc46", // GTS WE2 (ECC sibling, backup)
-    "9847e5653e5e9e847516e5cb818606aa7544a19be67fd7366d506988e8d84347", // GTS Root R4 (served in the live chain)
-    // ── Let's Encrypt / ISRG (Cloudflare Universal SSL fallback CA) ──
-    "3586d4ecf070578cbd27aedce20b964e48bc149faeb9dad72f46b857869172b8", // E5
-    "d016e1fe311948aca64f2de44ce86c9a51ca041df6103bb52a88eb3f761f57d7", // E6
-    "cbbc559b44d524d6a132bdac672744da3407f12aae5d5f722c5f6c7913871c75", // E7
-    "885bf0572252c6741dc9a52f5044487fef2a93b811cdedfad7624cc283b7cdd5", // E8
-    "f1440a9b76e1e41e53a4cb461329bf6337b419726be513e42e19f1c691c5d4b2", // E9
-    "2bbad93ab5c79279ec121507f272cbe0c6647a3aae52e22f388afab426b4adba", // R10
-    "6ddac18698f7f1f7e1c69b9bce420d974ac6f94ca8b2c761701623f99c767dc7", // R11
-    "919c0df7a787b597ed056ace654b1de9c0387acf349f73734a4fd7b58cf612a4", // R12
-    "025490860b498ab73c6a12f27a49ad5fe230fafe3ac8f6112c9b7d0aad46941d", // R13
-    "f1647a5ee3efac54c892e930584fe47979b7acd1c76c1271bca1c5076d869888", // R14
-};
+//
+// [SERVER-SHARD blocker #5] The pin VALUES now live in the shared header
+// src/PinnedSpki.h (orion::kApiPinnedSpkiSha256) so the WinHTTP activation
+// broker and the Lethe shard fetch pin the SAME issuer keys as this client.
+// Kept here as an aliased reference; do not re-list the hex here.
+const char* const* const kProductionApiPinnedSpkiSha256 = orion::kApiPinnedSpkiSha256;
+constexpr std::size_t kProductionApiPinnedSpkiSha256Count = orion::kApiPinnedSpkiSha256Count;
 
 } // namespace
 
@@ -72,9 +64,9 @@ QString productionApiPinnedCertificateSha256()
 QStringList productionApiPinnedSpkiSha256()
 {
     QStringList pins;
-    pins.reserve(static_cast<qsizetype>(std::size(kProductionApiPinnedSpkiSha256)));
-    for (const char* pin : kProductionApiPinnedSpkiSha256) {
-        pins.append(QString::fromLatin1(pin));
+    pins.reserve(static_cast<qsizetype>(kProductionApiPinnedSpkiSha256Count));
+    for (std::size_t i = 0; i < kProductionApiPinnedSpkiSha256Count; ++i) {
+        pins.append(QString::fromLatin1(kProductionApiPinnedSpkiSha256[i]));
     }
     return pins;
 }

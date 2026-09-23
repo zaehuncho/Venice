@@ -16,6 +16,7 @@ param(
     [string]$PackageDir = "",
     [string]$Iscc = "",
     [string]$SignToolCommand = "",
+    [string]$Python = "",
     [switch]$AllowUnsigned
 )
 
@@ -39,17 +40,68 @@ if (-not (Test-Path -LiteralPath (Join-Path $PackageDir "release_manifest.sig"))
     }
     Write-Warning "release_manifest.sig missing: building an UNSIGNED DEV installer. Never ship this artifact."
 }
-foreach ($required in @("OrionNative.exe", "OrionSidecar.exe", "security_policy.json",
-                        # WAVE 3 (2026-08-08): the C++ packet-bridge service is a required
-                        # payload — orion.iss registers packet_bridge\VeniceNetSvc.exe as
-                        # the VeniceNetSvc service; a package without it would fail-soft
-                        # into "Meter Delay unavailable" on every customer machine.
-                        "packet_bridge\VeniceNetSvc.exe",
-                        "packet_bridge\WinDivert64.dll",
-                        "packet_bridge\WinDivert64.sys")) {
+$Required = @("OrionNative.exe", "OrionSidecar.exe", "security_policy.json",
+              # WAVE 3 (2026-08-08): the C++ packet-bridge service is a required
+              # payload — orion.iss registers packet_bridge\VeniceNetSvc.exe as
+              # the VeniceNetSvc service; a package without it would fail-soft
+              # into "Meter Delay unavailable" on every customer machine.
+              "packet_bridge\VeniceNetSvc.exe",
+              "packet_bridge\WinDivert64.dll",
+              "packet_bridge\WinDivert64.sys")
+
+# SERVER-SHARD: when the packed package carries the unpacked activation broker, the
+# packed inner payload MUST also be present (orion.iss registers the broker as the
+# orion:// handler + launch target, and the bootstrap staged as OrionNative.exe needs
+# OrionNative.packed.exe to decrypt). A broker-without-payload package is incomplete.
+$IsServerShard = Test-Path -LiteralPath (Join-Path $PackageDir "OrionActivate.exe")
+if ($IsServerShard) {
+    $Required += "OrionActivate.exe"
+    $Required += "OrionNative.packed.exe"
+    # The broker's own import set. Windows resolves these BEFORE the broker's first
+    # instruction runs, so a shard package missing any of them cannot activate at all
+    # (and an installer built from it would ship a dead launch target).
+    $Required += "SecurityCore.dll"
+    $Required += "Qt6Core.dll"
+    $Required += "Qt6Network.dll"
+    $Required += "libcrypto-3-x64.dll"
+    Write-Host "[orion-installer] server-shard package detected (OrionActivate.exe present)"
+}
+
+foreach ($required in $Required) {
     if (-not (Test-Path -LiteralPath (Join-Path $PackageDir $required))) {
-        throw "Package is incomplete (missing $required): $PackageDir`nA pre-wave-3 package (Nuitka NexusVisionSvc bundle) cannot build this installer - re-run tools\package_orion_release.py."
+        throw "Package is incomplete (missing $required): $PackageDir`nA pre-wave-3 package (Nuitka NexusVisionSvc bundle) or an incomplete server-shard chain cannot build this installer - re-run tools\package_orion_release.py / tools\security\pack_lethe_release.py --server-shard."
     }
+}
+
+# --- 1b. CRYPTOGRAPHIC verification of the package, before anything is compiled. -----
+# Presence checks prove nothing about integrity: ISCC would happily compile (and the
+# owner would happily EV-sign) an installer built from a tampered or internal-audience
+# package. The pinned-key customer verifier is the gate - it validates the Ed25519
+# manifest signature, every file hash, manifest COVERAGE (zero unmanifested runtime
+# files), audience=customer, absence of Owner/Staff, the fail-closed security policy,
+# and profile-aware executable admission. It is read-only: it never re-signs.
+if (-not $AllowUnsigned) {
+    if ([string]::IsNullOrWhiteSpace($Python)) {
+        $Python = @("C:\Python314\python.exe", "C:\Python313\python.exe", "C:\Python312\python.exe") |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace($Python)) {
+            $pyCmd = Get-Command "python.exe" -ErrorAction SilentlyContinue
+            if ($pyCmd) { $Python = $pyCmd.Source }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Python) -or -not (Test-Path -LiteralPath $Python)) {
+        throw "Python not found for the package verification gate. Pass -Python <path to python.exe> (or -AllowUnsigned for a local dev build that is never shipped)."
+    }
+    $VerifyArgs = @((Join-Path $Root "tools\security\pack_lethe_release.py"), "--verify-only", "--input", $PackageDir)
+    if ($IsServerShard) { $VerifyArgs += "--server-shard" }
+    Write-Host "[orion-installer] verifying package against the pinned release key..."
+    & $Python @VerifyArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Package verification FAILED (exit $LASTEXITCODE) for $PackageDir - refusing to build an installer from an unverified package. Re-run tools\security\pack_lethe_release.py."
+    }
+    Write-Host "[orion-installer] package verification OK"
+} else {
+    Write-Warning "-AllowUnsigned: skipping the pinned-key package verification gate. Never ship this artifact."
 }
 
 # --- 2. Version from the signed manifest (never hand-typed). -------------------------
@@ -127,8 +179,13 @@ $IsccArgs = @(
 if (-not [string]::IsNullOrWhiteSpace($SignToolCommand)) {
     $IsccArgs += "/DSignToolName=signtool"
     $IsccArgs += "/Ssigntool=$SignToolCommand"
+} elseif ($AllowUnsigned) {
+    Write-Warning "No -SignToolCommand: building an UNSIGNED DEV installer (SmartScreen/Defender will flag it). Never ship this artifact."
 } else {
-    Write-Warning "No -SignToolCommand: the installer exe will be UNSIGNED (SmartScreen/Defender will flag it). Supply the EV signing command for a shippable build."
+    # [2026-09-21 release gate] An unsigned installer exe is a release blocker, the same
+    # way an unsigned package manifest is (step 1 above). Make the two gates agree:
+    # unsigned output only ever comes from an explicit -AllowUnsigned local build.
+    throw "No -SignToolCommand supplied: refusing to build an UNSIGNED installer. Supply the EV signing command for a shippable build, or pass -AllowUnsigned for a local test build (never ship it)."
 }
 $IsccArgs += $IssPath
 
@@ -177,7 +234,27 @@ if (Test-Path -LiteralPath $Preprocessed) {
         }
     }
     Write-Host "[orion-installer] service registration verified in $Preprocessed"
+
+    # SERVER-SHARD: the compiled script must point the launch target / shortcuts / protocol
+    # registration at the broker, or first launch of a shard build cannot activate.
+    if ($IsServerShard) {
+        $ShardChecks = @(
+            '{app}\OrionActivate.exe',                  # launch target + protocol registration
+            'RegisterActivationBroker',                 # the [Code] install hook that calls --register
+            'Activation broker registration failed'     # registration failure is FATAL on a shard build
+        )
+        foreach ($needle in $ShardChecks) {
+            if (-not $Script.Contains($needle)) {
+                throw "Server-shard installer is missing the expected broker launch/registration string: $needle"
+            }
+        }
+        Write-Host "[orion-installer] server-shard broker launch/registration verified in $Preprocessed"
+    }
 } else {
-    Write-Warning "Preprocessed script not emitted ($Preprocessed missing) - service-registration read-back skipped."
+    # [2026-09-21] The read-back is the build's own proof that the compiled installer still
+    # registers the service correctly. Skipping it silently printed OK on an unverified
+    # artifact (Astra, bug sweep). /DEmitPreprocessed is always passed above, so a missing
+    # file means iscc did not do what we asked -- fail, do not warn.
+    throw "Preprocessed script not emitted ($Preprocessed missing): the service-registration read-back could not run, so this installer is UNVERIFIED. Do not ship it."
 }
 Write-Host "[orion-installer] OK"

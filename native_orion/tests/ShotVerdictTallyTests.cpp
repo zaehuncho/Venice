@@ -1301,6 +1301,79 @@ private slots:
         QCOMPARE(restarted.snapshot().size(), 4);   // the three junk keys are refused
     }
 
+    void firstRangeUpdateStartsFromTheInheritedLiveTrim()
+    {
+        using Range = BannerLeadTrim::Range;
+        using Tempo = BannerLeadTrim::Tempo;
+        const QString type = QStringLiteral("Left Fade");
+        BannerLeadTrimLimits limits;
+        limits.holdShots = 2;
+        const QMap<QString, double> inherited{{QStringLiteral("Left Fade/normal"), 24.0}};
+        auto restored = [&]() {
+            BannerLeadTrim trim;
+            trim.restoreDecayed(inherited, limits.maxMs);
+            return trim;
+        };
+        {
+            auto trim = restored();
+            QCOMPARE(trim.trimMsForType(type, Tempo::Normal, Range::Mid), 12.0);
+            trim.observe(type, QStringLiteral("LATE"), limits, 840.0, Range::Mid);
+            const auto step = trim.observe(type, QStringLiteral("LATE"), limits,
+                                           840.0, Range::Mid);
+            QCOMPARE(step.beforeMs, 12.0);
+            QCOMPARE(step.afterMs, 15.0);
+            QCOMPARE(trim.snapshot().value(QStringLiteral("Left Fade/normal")), 12.0);
+            QCOMPARE(trim.trimMsForType(type, Tempo::Normal, Range::Three), 12.0);
+            QCOMPARE(trim.trimMsForType(type, Tempo::Normal, Range::Unknown), 12.0);
+        }
+        {
+            auto trim = restored();
+            trim.observe(type, QStringLiteral("EARLY"), limits, 840.0, Range::Mid);
+            const auto step = trim.observe(type, QStringLiteral("EARLY"), limits,
+                                           840.0, Range::Mid);
+            QCOMPARE(step.beforeMs, 12.0);
+            QCOMPARE(step.afterMs, 9.0);
+        }
+        {
+            auto trim = restored();
+            for (int i = 0; i < 2; ++i) {
+                trim.observeOracle(type, 10.8, false, limits, 840.0, Range::Mid);
+            }
+            const auto step = trim.observeOracle(type, 10.8, false, limits,
+                                                 840.0, Range::Mid);
+            QCOMPARE(step.beforeMs, 12.0);
+            QCOMPARE(step.afterMs, 15.0);
+        }
+        {
+            auto trim = restored();
+            trim.observe(type, QStringLiteral("EXCELLENT"), limits, 840.0, Range::Mid);
+            const auto decay = trim.observe(type, QStringLiteral("EXCELLENT"), limits,
+                                            840.0, Range::Mid);
+            QCOMPARE(decay.beforeMs, 12.0);
+            QCOMPARE(decay.afterMs, 11.0);
+        }
+        {
+            BannerLeadTrim trim;
+            trim.restoreDecayed({{QStringLiteral("Left Fade/normal"), -24.0}}, limits.maxMs);
+            trim.observe(type, QStringLiteral("EARLY"), limits, 840.0, Range::Mid);
+            const auto step = trim.observe(type, QStringLiteral("EARLY"), limits,
+                                           840.0, Range::Mid);
+            QCOMPARE(step.beforeMs, -12.0);
+            QCOMPARE(step.afterMs, -15.0);
+        }
+        // Kill switches still collapse to the bucket whose value was inherited.
+        {
+            auto trim = restored();
+            limits.rangeBuckets = false;
+            trim.observe(type, QStringLiteral("LATE"), limits, 840.0, Range::Mid);
+            const auto step = trim.observe(type, QStringLiteral("LATE"), limits,
+                                           840.0, Range::Mid);
+            QCOMPARE(step.key, QStringLiteral("Left Fade/normal"));
+            QCOMPARE(step.beforeMs, 12.0);
+            QCOMPARE(step.afterMs, 15.0);
+        }
+    }
+
     void theRangeKillSwitchCollapsesToTheTempoBucket()
     {
         using Range = BannerLeadTrim::Range;

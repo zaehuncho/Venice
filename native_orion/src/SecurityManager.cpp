@@ -3,6 +3,7 @@
 #include "OrionPaths.h"
 #include "ReleaseManifestTrust.h"
 #include "UpdateManifest.h"
+#include "MachineIdentity.h"
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QCryptographicHash>
@@ -40,10 +41,6 @@ namespace orion {
 
 namespace {
 
-QString hexSha256(const QByteArray& data)
-{
-    return QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
-}
 
 // [ORION_HASH_CACHE 2026-08-07] Memoize by (canonical path, size, mtime_ns). Solves
 // the SAFE MODE freeze on packaged installs: verifyReleaseIntegrity() iterates 2828
@@ -142,25 +139,6 @@ QString sha256FileHex(const QString& path)
     return hex;
 }
 
-QByteArray registryValueMachineGuid()
-{
-#ifdef Q_OS_WIN
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
-        return {};
-    }
-    wchar_t buffer[256] = {};
-    DWORD bytes = sizeof(buffer);
-    const auto status = RegQueryValueExW(key, L"MachineGuid", nullptr, nullptr, reinterpret_cast<LPBYTE>(buffer), &bytes);
-    RegCloseKey(key);
-    if (status != ERROR_SUCCESS || bytes == 0) {
-        return {};
-    }
-    return QString::fromWCharArray(buffer).trimmed().toUtf8();
-#else
-    return {};
-#endif
-}
 
 bool debuggerPresent()
 {
@@ -366,13 +344,11 @@ SecurityManager::SecurityManager(QString rootDir, QObject* parent)
 
 QString SecurityManager::machineId() const
 {
-    QByteArray material;
-    material += QSysInfo::machineHostName().toUtf8();
-    material += '|';
-    material += QSysInfo::machineUniqueId();
-    material += '|';
-    material += registryValueMachineGuid();
-    return hexSha256(material).left(64);
+    // [SERVER-SHARD D3] Single source of truth, shared verbatim with the
+    // OrionActivate broker via native_orion/src/MachineIdentity.cpp. Never
+    // re-derive the machine_id here — that reintroduces the stub-vs-manager
+    // drift design D3 forbids. OrionMachineIdParityTests pins the equality.
+    return deriveMachineId();
 }
 
 SecurityStatus SecurityManager::evaluate()
@@ -500,10 +476,12 @@ bool SecurityManager::verifySettingsSignature() const
     return !stored.isEmpty() && stored == digest.toHex();
 }
 
-bool SecurityManager::verifyReleaseIntegrity(QString* detail) const
+bool SecurityManager::verifyReleaseIntegrity(QString* detail, bool exactRoot) const
 {
-    const QString manifestPath = releaseManifestPath();
-    const bool required = releaseManifestRequired();
+    const QString manifestPath = exactRoot
+        ? QDir(rootDir_).absoluteFilePath(QStringLiteral("release_manifest.json"))
+        : releaseManifestPath();
+    const bool required = exactRoot || releaseManifestRequired();
     if (!QFileInfo::exists(manifestPath)) {
         if (detail) {
             *detail = required
@@ -617,7 +595,7 @@ bool SecurityManager::verifyReleaseIntegrity(QString* detail) const
         }
 
         QString candidate = root.absoluteFilePath(rel);
-        if (!QFileInfo::exists(candidate)) {
+        if (!exactRoot && !QFileInfo::exists(candidate)) {
             candidate = appDir.absoluteFilePath(rel);
         }
         if (!QFileInfo::exists(candidate)) {

@@ -92,8 +92,13 @@ def test_main_refuses_dll_before_copy_or_signing_key(monkeypatch, tmp_path, caps
     assert not copied
 
 
-def test_packed_release_cannot_regenerate_unsigned_manifest(monkeypatch, tmp_path):
+def test_verify_only_needs_existing_package_and_never_requires_a_key(monkeypatch, tmp_path):
+    # FIX #3: --verify-only is READ-ONLY. It validates an existing package against the
+    # pinned key and never copies/regenerates/signs, so it must NOT demand a signing key.
+    # With an absent input it fails because the package is missing, not for lack of a key.
     monkeypatch.delenv("ORION_UPDATE_SIGNING_KEY_PEM", raising=False)
     with pytest.raises(SystemExit) as exc:
         pack.main(["--verify-only", "--input", str(tmp_path / "unused")])
-    assert exc.value.code == 2
+    message = str(exc.value).lower()
+    assert "signing-key" not in message and "signing key" not in message
+    assert "verify-only" in message or "package" in message

@@ -112,6 +112,8 @@ add_library(OrionCommon SHARED
     # [ORION_BANNER_LEAD_TRIM 2026-09-15] header-only policy, listed so it shows in the IDE tree
     # and so the settings/learning layer's dependency on it is explicit.
     src/BannerLeadTrim.h
+    # [ORION_ONSET_FF 2026-09-21] header-only policy, listed for the same two reasons.
+    src/OnsetFeedforward.h
     src/Diagnostics.cpp
     src/Diagnostics.h
     src/OrionTypes.h
@@ -261,38 +263,30 @@ if(ORION_OBFUSCATE_SECURITY)
     endif()
     add_dependencies(SecurityCore SecurityCore_Obfs)
 
-    # Stage the obfuscated SecurityCore.dll next to each consumer exe.
-    # In the OFF path SecurityCore builds inline and is already colocated.
-    foreach(_sc_consumer OrionNative OrionUpdater)
-        add_custom_command(TARGET ${_sc_consumer} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "$<TARGET_FILE:SecurityCore>"
-                    "$<TARGET_FILE_DIR:${_sc_consumer}>/"
-            COMMENT "Staging obfuscated SecurityCore.dll next to ${_sc_consumer}"
-            VERBATIM)
-    endforeach()
-    if(ORION_LIBCRYPTO_PATH)
-        foreach(_sc_consumer OrionNative OrionUpdater)
-            add_custom_command(TARGET ${_sc_consumer} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_sc_obfs_build_dir}/libcrypto-3-x64.dll"
-                        "$<TARGET_FILE_DIR:${_sc_consumer}>/"
-                COMMENT "Staging libcrypto-3-x64.dll next to ${_sc_consumer}"
-                VERBATIM)
-        endforeach()
-    endif()
+    # [OLLVM staging moved 2026-09-20] The SecurityCore.dll + libcrypto staging
+    # foreach loops that used to live here referenced OrionNative/OrionUpdater,
+    # which are not declared until far below -> configure error "TARGET not created
+    # in this directory". They now run inside the if(WIN32) block after the
+    # OrionNative windeployqt step, still guarded by if(ORION_OBFUSCATE_SECURITY).
+    # _sc_obfs_build_dir and the imported SecurityCore target are directory-scope,
+    # so they remain visible there.
 endif()
 
 if(NOT ORION_OBFUSCATE_SECURITY)
 add_library(SecurityCore SHARED
+    src/BrokerInstallTrust.cpp
+    src/BrokerInstallTrust.h
     src/Ed25519.cpp
     src/Ed25519.h
     src/LeaseGate.cpp
     src/LeaseGate.h
     src/LicenseClient.cpp
     src/LicenseClient.h
+    src/MachineIdentity.cpp
+    src/MachineIdentity.h
     src/NetworkSecurity.cpp
     src/NetworkSecurity.h
+    src/PinnedSpki.h
     src/ReleaseManifestTrust.h
     src/SecurityManager.cpp
     src/SecurityManager.h
@@ -324,8 +318,82 @@ target_link_libraries(SecurityCore PUBLIC
     Qt6::Network
 )
 if(WIN32)
-    target_link_libraries(SecurityCore PUBLIC advapi32 crypt32 user32)
+    # wintrust: BrokerInstallTrust.cpp's Authenticode gate (WinVerifyTrust).
+    target_link_libraries(SecurityCore PUBLIC advapi32 crypt32 user32 wintrust)
 endif()
+endif()
+
+# ── OrionActivate — Venice activation broker (server-shard blocker #5) ────────
+# UNPACKED helper that performs /api/activate on a clean install and writes the
+# DPAPI session Lethe/bootstrap/shard_bootstrap.c reads. It compiles the SHARED
+# machine-id TU (src/MachineIdentity.cpp) directly so its machine_id byte-matches
+# SecurityManager::machineId() (design D3). Qt is used ONLY for that TU; the rest
+# is WinHTTP + DPAPI + Win32. Code signing + installer registration are OWNER
+# steps (see docs/ACTIVATION_BROKER_2026-09-19.md).
+if(WIN32)
+    add_executable(OrionActivate WIN32
+        broker/OrionActivate.cpp
+        broker/BrokerContract.cpp
+        broker/BrokerContract.h
+        broker/SpkiPin.cpp
+        broker/SpkiPin.h
+        broker/SessionStore.cpp
+        broker/SessionStore.h
+        src/MachineIdentity.cpp
+        src/MachineIdentity.h
+        src/PinnedSpki.h
+    )
+    orion_apply_target_defaults(OrionActivate)
+    set_target_properties(OrionActivate PROPERTIES AUTORCC OFF AUTOUIC OFF)
+    target_include_directories(OrionActivate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/broker")
+    target_compile_definitions(OrionActivate PRIVATE
+        ORION_NATIVE_VERSION="${PROJECT_VERSION}"
+    )
+    # [2026-09-20 round 2] Link SecurityCore so runningFromVerifiedInstallRoot()
+    # reuses the EXISTING signed-manifest + pinned-Ed25519 verifier and the shared
+    # Authenticode gate (BrokerInstallTrust) rather than inventing a second one.
+    # SecurityCore pulls Qt6::Network + wintrust transitively; both SecurityCore.dll
+    # and libcrypto-3-x64.dll ship beside the broker in the server-shard package.
+    target_link_libraries(OrionActivate PRIVATE
+        SecurityCore
+        Qt6::Core
+        winhttp crypt32 advapi32 bcrypt ole32 shell32
+    )
+
+    # [FIX C — 2026-09-20 hardening round 3] OLLVM broker dependency staging.
+    # The obfuscated-SecurityCore staging further up copies SecurityCore.dll +
+    # libcrypto next to OrionNative/OrionUpdater but NOT the broker. A broker-only
+    # obfuscated build (ORION_OBFUSCATE_SECURITY=ON) must carry its OWN runtime deps
+    # beside OrionActivate.exe: the obfuscated SecurityCore.dll, libcrypto-3-x64.dll
+    # (when a libcrypto is configured), and the Qt6 runtime the broker links
+    # (Qt6Core + the Qt6Network SecurityCore pulls transitively). windeployqt only
+    # targets OrionNative, so the broker's Qt deps are staged explicitly here. This
+    # block is placed AFTER the OrionActivate target so add_custom_command(TARGET ..)
+    # resolves it. In the inline (OFF) build SecurityCore/Qt are already colocated.
+    if(ORION_OBFUSCATE_SECURITY)
+        add_custom_command(TARGET OrionActivate POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:SecurityCore>"
+                    "$<TARGET_FILE_DIR:OrionActivate>/"
+            COMMENT "Staging obfuscated SecurityCore.dll next to OrionActivate"
+            VERBATIM)
+        if(ORION_LIBCRYPTO_PATH)
+            add_custom_command(TARGET OrionActivate POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_sc_obfs_build_dir}/libcrypto-3-x64.dll"
+                        "$<TARGET_FILE_DIR:OrionActivate>/"
+                COMMENT "Staging libcrypto-3-x64.dll next to OrionActivate"
+                VERBATIM)
+        endif()
+        foreach(_broker_qt_dep Qt6::Core Qt6::Network)
+            add_custom_command(TARGET OrionActivate POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "$<TARGET_FILE:${_broker_qt_dep}>"
+                        "$<TARGET_FILE_DIR:OrionActivate>/"
+                COMMENT "Staging ${_broker_qt_dep} next to OrionActivate"
+                VERBATIM)
+        endforeach()
+    endif()
 endif()
 
 # UpdaterCore holds the path-traversal-safe archive extraction and backup/restore
@@ -334,6 +402,8 @@ endif()
 add_library(UpdaterCore SHARED
     src/UpdaterArchive.cpp
     src/UpdaterArchive.h
+    src/UpdaterTrust.cpp
+    src/UpdaterTrust.h
 )
 orion_apply_shared_defaults(UpdaterCore)
 target_compile_definitions(UpdaterCore PRIVATE ORION_UPDATER_BUILD)
@@ -358,6 +428,19 @@ target_compile_definitions(OrionUpdater PRIVATE
     ORION_UPDATE_ED25519_PUBKEY_ID="orion-ed25519-v1"
     ORION_UPDATE_ED25519_PUBKEY="OJQ2E7ZAFClOCM4S4/5QzLeQjjEMSZjPiGMzbiLZdWs="
 )
+# [2026-09-21 Codex F5] Optional SECOND embedded key for a planned rotation: build with
+# both ids for one release cycle, sign with the new key once every client has it, then
+# drop the old pair here. Empty by default. See docs/UPDATER_CLIENT.md "Key rotation".
+set(ORION_UPDATE_ED25519_PUBKEY2_ID "" CACHE STRING "Rotation: second trusted update-signing key id")
+set(ORION_UPDATE_ED25519_PUBKEY2 "" CACHE STRING "Rotation: second trusted update-signing PUBLIC key (base64/hex)")
+if(ORION_UPDATE_ED25519_PUBKEY2_ID AND ORION_UPDATE_ED25519_PUBKEY2)
+    target_compile_definitions(OrionUpdater PRIVATE
+        ORION_UPDATE_ED25519_PUBKEY2_ID="${ORION_UPDATE_ED25519_PUBKEY2_ID}"
+        ORION_UPDATE_ED25519_PUBKEY2="${ORION_UPDATE_ED25519_PUBKEY2}"
+    )
+elseif(ORION_UPDATE_ED25519_PUBKEY2_ID OR ORION_UPDATE_ED25519_PUBKEY2)
+    message(FATAL_ERROR "ORION_UPDATE_ED25519_PUBKEY2_ID and ORION_UPDATE_ED25519_PUBKEY2 must be set together")
+endif()
 target_link_libraries(OrionUpdater PRIVATE
     OrionCommon
     SecurityCore
@@ -427,6 +510,7 @@ set(ORION_ADMIN_QML_FILES
     qml/admin/AdminAuditPage.qml
     qml/admin/AdminConfigPage.qml
     qml/admin/AdminAccountPage.qml
+    qml/admin/AdminBrandMark.qml
     qml/admin/AdminButton.qml
     qml/admin/AdminCard.qml
     qml/admin/AdminCombo.qml
@@ -472,6 +556,22 @@ function(orion_add_admin_tool target mode_def uri)
     if(WIN32)
         target_link_libraries(${target} PRIVATE advapi32 crypt32 user32)
         set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE)
+        # [2026-09-21 owner: "it isn't Orion anymore, it's Venice"] The internal consoles get the
+        # same customer-facing identity as the launcher (Task Manager, Explorer, the embedded
+        # icon). Filenames stay OrionOwner/OrionStaff: the packager, audit and docs pin them.
+        set(VENICE_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../assets/orion.ico")
+        if(EXISTS "${VENICE_ICON_PATH}")
+            file(TO_CMAKE_PATH "${VENICE_ICON_PATH}" VENICE_ICON_PATH)
+            if(target STREQUAL "OrionOwner")
+                set(VENICE_FILE_DESCRIPTION "Venice Owner console")
+            else()
+                set(VENICE_FILE_DESCRIPTION "Venice Staff console")
+            endif()
+            set(VENICE_INTERNAL_NAME "${VENICE_FILE_DESCRIPTION}")
+            set(VENICE_ORIGINAL_FILENAME "${target}.exe")
+            configure_file(venice.rc.in "${CMAKE_CURRENT_BINARY_DIR}/venice_${target}.rc" @ONLY)
+            target_sources(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/venice_${target}.rc")
+        endif()
     endif()
 endfunction()
 
@@ -544,8 +644,18 @@ if(WIN32)
     if(EXISTS "${VENICE_ICON_PATH}")
         # The RC compiler treats backslashes as escapes; forward slashes are safe.
         file(TO_CMAKE_PATH "${VENICE_ICON_PATH}" VENICE_ICON_PATH)
+        set(VENICE_FILE_DESCRIPTION "Venice")
+        set(VENICE_INTERNAL_NAME "Venice")
+        set(VENICE_ORIGINAL_FILENAME "OrionNative.exe")
         configure_file(venice.rc.in "${CMAKE_CURRENT_BINARY_DIR}/venice.rc" @ONLY)
         target_sources(OrionNative PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/venice.rc")
+        # [2026-09-21] The updater is a customer-visible process too (it runs alone while the
+        # launcher is closed); same template, its own description, filename untouched.
+        set(VENICE_FILE_DESCRIPTION "Venice Updater")
+        set(VENICE_INTERNAL_NAME "Venice Updater")
+        set(VENICE_ORIGINAL_FILENAME "OrionUpdater.exe")
+        configure_file(venice.rc.in "${CMAKE_CURRENT_BINARY_DIR}/venice_updater.rc" @ONLY)
+        target_sources(OrionUpdater PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/venice_updater.rc")
     else()
         message(WARNING "assets/orion.ico not found; OrionNative will build without "
                         "an embedded icon or version resource (Task Manager will show "
@@ -615,6 +725,35 @@ if(WIN32)
         )
     else()
         message(WARNING "windeployqt not found near ${_orion_qt_bin}; the build will not be self-contained (run windeployqt manually).")
+    endif()
+
+    # [OLLVM staging — moved here 2026-09-20] Stage the obfuscated SecurityCore.dll
+    # (+ libcrypto) next to each consumer exe. This MUST run after OrionNative and
+    # OrionUpdater are declared (both above), so it lives here rather than in the
+    # top OLLVM block, which is processed before those targets exist and errored
+    # with "TARGET not created in this directory" on configure. Still guarded by
+    # if(ORION_OBFUSCATE_SECURITY); _sc_obfs_build_dir and the imported SecurityCore
+    # target are directory-scope and remain available. In the inline (OFF) build
+    # SecurityCore is built with the normal toolchain and is already colocated.
+    if(ORION_OBFUSCATE_SECURITY)
+        foreach(_sc_consumer OrionNative OrionUpdater)
+            add_custom_command(TARGET ${_sc_consumer} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "$<TARGET_FILE:SecurityCore>"
+                        "$<TARGET_FILE_DIR:${_sc_consumer}>/"
+                COMMENT "Staging obfuscated SecurityCore.dll next to ${_sc_consumer}"
+                VERBATIM)
+        endforeach()
+        if(ORION_LIBCRYPTO_PATH)
+            foreach(_sc_consumer OrionNative OrionUpdater)
+                add_custom_command(TARGET ${_sc_consumer} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${_sc_obfs_build_dir}/libcrypto-3-x64.dll"
+                            "$<TARGET_FILE_DIR:${_sc_consumer}>/"
+                    COMMENT "Staging libcrypto-3-x64.dll next to ${_sc_consumer}"
+                    VERBATIM)
+            endforeach()
+        endif()
     endif()
 endif()
 
@@ -802,6 +941,7 @@ if(ORION_BUILD_TESTS)
     # controller or the automation stack.
     add_executable(OrionActivityFeedPolicyTests
         tests/ActivityFeedPolicyTests.cpp
+        src/OrderedFileLogSink.cpp
     )
     orion_apply_target_defaults(OrionActivityFeedPolicyTests)
     target_link_libraries(OrionActivityFeedPolicyTests PRIVATE
@@ -809,9 +949,162 @@ if(ORION_BUILD_TESTS)
         SecurityCore
         Qt6::Core
         Qt6::Network
+        Qt6::Gui
         Qt6::Test
     )
     orion_add_qtest(OrionActivityFeedPolicyTests)
+    # [CL2-P8-002/006/008 2026-09-23] Licence heartbeat recovery policy
+    # (src/LicenseHeartbeatPolicy.h, header-only: 15/30/60 s retry ladder, resume /
+    # network-online debounce, lease notice copy) + licenseErrorUserText mapping of
+    # timestamp_expired / device_mismatch (SecurityCore). Standalone.
+    add_executable(OrionLicenseHeartbeatPolicyTests
+        tests/LicenseHeartbeatPolicyTests.cpp
+    )
+    orion_apply_target_defaults(OrionLicenseHeartbeatPolicyTests)
+    target_link_libraries(OrionLicenseHeartbeatPolicyTests PRIVATE
+        OrionCommon
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    orion_add_qtest(OrionLicenseHeartbeatPolicyTests)
+
+    # [SERVER-SHARD D3] machine_id parity: broker's own compiled deriveMachineId()
+    # vs SecurityManager::machineId() from SecurityCore — the two must be equal.
+    add_executable(OrionMachineIdParityTests
+        tests/MachineIdParityTests.cpp
+        src/MachineIdentity.cpp
+    )
+    orion_apply_target_defaults(OrionMachineIdParityTests)
+    target_link_libraries(OrionMachineIdParityTests PRIVATE
+        OrionCommon
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    if(WIN32)
+        target_link_libraries(OrionMachineIdParityTests PRIVATE advapi32 crypt32 user32)
+    endif()
+    orion_add_qtest(OrionMachineIdParityTests)
+
+    # [SERVER-SHARD blocker #5] Broker contract: DPAPI round-trip readable by the
+    # verbatim shard_bootstrap.c parser, activate request shape, D6 error mapping.
+    add_executable(OrionActivateContractTests
+        tests/ActivateBrokerContractTests.cpp
+        broker/BrokerContract.cpp
+    )
+    orion_apply_target_defaults(OrionActivateContractTests)
+    target_include_directories(OrionActivateContractTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/broker")
+    target_link_libraries(OrionActivateContractTests PRIVATE
+        Qt6::Core
+        Qt6::Test
+    )
+    if(WIN32)
+        target_link_libraries(OrionActivateContractTests PRIVATE crypt32 advapi32)
+    endif()
+    orion_add_qtest(OrionActivateContractTests)
+
+    # [SERVER-SHARD blocker #5, Codex finding #1] Broker WinHTTP issuer-SPKI pin:
+    # SHA-256/membership/chain-match accept+reject against fixtures, AND parity
+    # proving the broker pins the SAME set as NetworkSecurity/LicenseClient.
+    add_executable(OrionBrokerSpkiPinTests
+        tests/BrokerSpkiPinTests.cpp
+        broker/SpkiPin.cpp
+    )
+    orion_apply_target_defaults(OrionBrokerSpkiPinTests)
+    target_include_directories(OrionBrokerSpkiPinTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/broker")
+    target_link_libraries(OrionBrokerSpkiPinTests PRIVATE
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    if(WIN32)
+        target_link_libraries(OrionBrokerSpkiPinTests PRIVATE bcrypt crypt32 advapi32)
+    endif()
+    orion_add_qtest(OrionBrokerSpkiPinTests)
+
+    # [SERVER-SHARD blocker #5, Codex finding #3/#4] Broker DPAPI session store:
+    # owner-only DACL applied, atomic replace (temp cleaned), rollback removes
+    # the file, and the protected blob round-trips — all against a TEMP path.
+    add_executable(OrionBrokerSessionStoreTests
+        tests/BrokerSessionStoreTests.cpp
+        broker/SessionStore.cpp
+    )
+    orion_apply_target_defaults(OrionBrokerSessionStoreTests)
+    target_include_directories(OrionBrokerSessionStoreTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/broker")
+    target_link_libraries(OrionBrokerSessionStoreTests PRIVATE
+        Qt6::Core
+        Qt6::Test
+    )
+    if(WIN32)
+        target_link_libraries(OrionBrokerSessionStoreTests PRIVATE crypt32 advapi32)
+    endif()
+    orion_add_qtest(OrionBrokerSessionStoreTests)
+
+    # [SERVER-SHARD blocker #5, Codex finding #1/#2 — round 2] Broker install-trust
+    # matrix: only a correctly SIGNED release_manifest.json (pinned key id, valid
+    # Ed25519 over the exact bytes, customer audience) covering the target by exact
+    # SHA-256 is trusted; unsigned/wrong-key/bad-sig/wrong-key-id/wrong-audience/
+    # hash-mismatch all fail. Links SecurityCore for the SHARED verify path + the
+    # ephemeral-key signing helpers. Needs libcrypto-3-x64.dll on PATH (staged in
+    # the build output dir) for ed25519Available().
+    add_executable(OrionBrokerInstallTrustTests
+        tests/BrokerInstallTrustTests.cpp
+    )
+    orion_apply_target_defaults(OrionBrokerInstallTrustTests)
+    target_link_libraries(OrionBrokerInstallTrustTests PRIVATE
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    if(WIN32)
+        target_link_libraries(OrionBrokerInstallTrustTests PRIVATE advapi32 crypt32 user32 wintrust)
+    endif()
+    orion_add_qtest(OrionBrokerInstallTrustTests)
+    if(WIN32)
+        set(_orion_broker_trust_path_mods
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>"
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Test>"
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:OrionCommon>"
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:SecurityCore>"
+        )
+        set_tests_properties(OrionBrokerInstallTrustTests PROPERTIES
+            ENVIRONMENT_MODIFICATION "${_orion_broker_trust_path_mods}")
+    endif()
+
+    # [SERVER-SHARD blocker #5, FIX A — round 3] Broker self-trust ENFORCEMENT gate.
+    # Drives the REAL shared trust TU (genuineBrokerInstallPresent, SecurityCore) to
+    # produce false verdicts (tampered self / missing sig / blank sig) and a true
+    # verdict (correctly Ed25519-signed manifest, EPHEMERAL key), then asserts the
+    # pure planBrokerActions() planner wWinMain consults FIRST blocks every entry
+    # mode on a false verdict (no registry/WinHTTP/DPAPI/CreateProcess, nonzero
+    # exit) and permits exactly the mode's action on a true verdict. Compiles the
+    # broker's BrokerContract.cpp (the planner) directly; needs libcrypto on PATH.
+    add_executable(OrionBrokerSelfTrustGateTests
+        tests/BrokerSelfTrustGateTests.cpp
+        broker/BrokerContract.cpp
+    )
+    orion_apply_target_defaults(OrionBrokerSelfTrustGateTests)
+    target_include_directories(OrionBrokerSelfTrustGateTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/broker")
+    target_link_libraries(OrionBrokerSelfTrustGateTests PRIVATE
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    if(WIN32)
+        target_link_libraries(OrionBrokerSelfTrustGateTests PRIVATE advapi32 crypt32 user32 wintrust)
+    endif()
+    orion_add_qtest(OrionBrokerSelfTrustGateTests)
+    if(WIN32)
+        set_tests_properties(OrionBrokerSelfTrustGateTests PROPERTIES
+            ENVIRONMENT_MODIFICATION "${_orion_broker_trust_path_mods}")
+    endif()
     # [ORION_BANNER_VERDICT_LIVE 2026-09-14] The live shot-verdict tally's rules
     # (orion::ShotVerdictTally, header-only): bucketing, the 10-shot window, seq de-dupe,
     # the two resets, and THE suggestion sentence. Standalone like the policy suite above --
@@ -843,6 +1136,7 @@ if(ORION_BUILD_TESTS)
         src/OrionInputClient.cpp
     )
     orion_apply_target_defaults(OrionInputProtocolTests)
+    target_compile_definitions(OrionInputProtocolTests PRIVATE ORION_INPUT_TEST_HOOKS)
     target_link_libraries(OrionInputProtocolTests PRIVATE
         OrionCommon
         Qt6::Core
@@ -877,6 +1171,23 @@ if(ORION_BUILD_TESTS)
             Qt6::Test
         )
         orion_add_qtest(OrionShmInteropTests)
+
+        # A2 route handoff: an isolated self-copy acts as a protocol-only fake
+        # sidecar, never the packaged OrionSidecar or a real capture/console app.
+        add_executable(OrionRouteTransitionTests
+            tests/RouteTransitionIntegrationTests.cpp
+        )
+        orion_apply_target_defaults(OrionRouteTransitionTests)
+        set_target_properties(OrionRouteTransitionTests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/a2_route_fixture")
+        target_link_libraries(OrionRouteTransitionTests PRIVATE
+            RemotePlayCore OrionCommon Qt6::Core Qt6::Gui Qt6::Test)
+        add_custom_command(TARGET OrionRouteTransitionTests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:OrionRouteTransitionTests>"
+                "$<TARGET_FILE_DIR:OrionRouteTransitionTests>/OrionSidecar.exe"
+            VERBATIM)
+        orion_add_qtest(OrionRouteTransitionTests)
 
         add_executable(OrionShmNotificationTests
             tests/SharedMemoryFramePumpNotificationTests.cpp
@@ -972,7 +1283,7 @@ if(ORION_BUILD_TESTS)
                 list(APPEND _orion_test_path_mods "PATH=path_list_prepend:${_orion_opencv_bin}")
             endif()
         endif()
-        set_tests_properties(OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionShmNotificationTests OrionPreciseWaitTests PROPERTIES
+        set_tests_properties(OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionLicenseHeartbeatPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionRouteTransitionTests OrionShmNotificationTests OrionPreciseWaitTests PROPERTIES
             ENVIRONMENT "${_orion_test_env}"
             ENVIRONMENT_MODIFICATION "${_orion_test_path_mods}"
         )

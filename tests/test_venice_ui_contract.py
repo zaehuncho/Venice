@@ -145,40 +145,48 @@ def test_meter_controls_are_autonomous_not_a_setup_batch() -> None:
     assert "id: previewOnlyLabel" not in live
 
 
-def test_meter_style_combo_offers_pill_and_routes_it_to_the_packaged_detector() -> None:
-    """[ORION_PILL_YOLO_ROUTE 2026-09-17]
+def test_meter_style_combo_offers_arrow2_only_after_pill_withdrawal() -> None:
+    """[ORION_PILL_REMOVED 2026-09-21 owner]
 
-    The Style combo was pinned to a single "Arrow2" entry by `pureCv` while
-    `meter_style` could still be persisted as "Pill" -- a park player on the Pill
-    meter then ran the CV contour locator, which proposes a box on 0 of 642
-    labelled Pill frames (docs/PILL_STYLE_STATUS.md), while this panel displayed
-    "Arrow2". The combo now offers both styles, and the sidecar launch routes a
-    Pill style onto the packaged (Pill-trained) detector.
+    History: 2026-09-17 the Style combo offered "Pill (beta)" and a Pill launch was
+    routed onto the packaged (Pill-trained) detector (ORION_PILL_YOLO_ROUTE), because
+    the CV contour locator proposes a box on 0 of 642 labelled Pill frames. On
+    2026-09-21 the owner withdrew Pill from the beta ("remove the pill option").
+
+    The contract now: the combo offers Arrow2 ONLY; a persisted "Pill" is MIGRATED to
+    Arrow2 on load (AppConfig) and cannot be set (OrionAppController::setMeterStyle);
+    the Pill -> yolo route stays COMPILED (its unit tests still exercise the pure
+    function) but is unreachable from any settings file. The combo still WRITES the
+    setting and the old `pureCv` pin must not return.
     """
     meter = source("native_orion/qml/components/MeterConfigPanel.qml")
 
-    # Both styles are offered, and the beta label persists as the style name "Pill".
-    assert 'readonly property var styleOptions: ["Arrow2", "Pill (beta)"]' in meter
+    # Arrow2 is the only offered style: the two-entry list is gone and no label maps
+    # to the style name "Pill" any more. (Matched structurally, not as a bare
+    # substring -- the withdrawal note in the QML legitimately names the old label.)
+    # [ORION_PILL_REMOVED, re-withdrawn 2026-09-23] Arrow2 is the only offered style.
+    assert 'readonly property var styleOptions: ["Arrow2"]' in meter
+    assert 'styleOptions: ["Arrow2", "Pill (beta)"]' not in meter
     assert "model: meterDetectionCol.styleOptions" in meter
-    assert 'return label === "Pill (beta)" ? "Pill" : "Arrow2"' in meter
-    # Picking one WRITES the setting (the old combo was display-only under the pin),
-    # and the label-to-label guard keeps merely SHOWING the panel from rewriting a
-    # persisted style that is not on the list.
+    # Picking WRITES the setting, and the label-to-label guard keeps merely SHOWING
+    # the panel from rewriting a persisted style that is not on the list.
     assert "orion.meterStyle = meterDetectionCol.styleValueFor(value)" in meter
     assert "if (value === meterDetectionCol.styleLabelFor(orion.meterStyle))" in meter
-    # The single-entry pin and the disabled/dimmed lock are gone from the Style combo.
+    # The single-entry pin and the disabled/dimmed lock are still gone.
     assert "model: meterDetectionCol.pureCv" not in meter
-    assert '? ["Arrow2"]' not in meter
     assert 'value: meterDetectionCol.pureCv ? "Arrow2" : orion.meterStyle' not in meter
     assert "enabled: !meterDetectionCol.pureCv" not in meter
-    # The caption that says what choosing Pill actually means today.
+    # The caption keeps its objectName for the panel probes; its text no longer sells Pill.
     assert 'objectName: "meterStyleCaption"' in meter
-    assert "Pill: uses the packaged detector; timing validation in progress." in meter
-    # The objectName every existing UI probe uses is unchanged.
+    assert "Pill: uses the packaged detector" not in meter
     assert 'objectName: "meterStyleCombo"' in meter
 
-    # The native half: the style picks the proposer at launch, and the kill switch
-    # is a real persisted setting, not a compile-time constant.
+    # MIGRATION GUARD: the one shared rule does not accept "pill" (AppConfig.h normalizedMeterStyle).
+    header = source("native_orion/src/AppConfig.h")
+    assert 'lower == QLatin1String("pill")' not in header
+
+    # The native route half stays compiled and its kill-switch key still round-trips
+    # (dormant, not deleted -- a deliberate beta decision, easy to re-enable).
     profile = source("native_orion/src/SidecarReaderProfile.h")
     assert 'kMeterStyleEnvKey[] = "ORION_METER_STYLE"' in profile
     assert 'kPillYoloRouteEnvKey[] = "ORION_PILL_YOLO_ROUTE"' in profile
@@ -365,7 +373,9 @@ def test_meter_blind_advisor_is_generic_and_silent_in_no_meter_mode() -> None:
     panel = source("native_orion/qml/components/MeterConfigPanel.qml")
 
     # Generic wording, naming the two controls that sit directly above it on the card.
-    assert "Check the Style and Color settings match your in-game meter." in controller_h
+    # [CL2-P9-001 2026-09-23] The hint now says what the bot is DOING first (not timing shots),
+    # then the one setting to check; it still never names a colour the game no longer has.
+    assert "Meter detection unavailable. Venice is not timing your shots" in controller_h
     assert "If your in-game shot meter is" not in controller_h
     assert "Detection is set to" not in controller_h
 
@@ -515,12 +525,17 @@ def test_activity_log_is_copy_pasteable_for_support() -> None:
     # never silently no-ops.
     controller = source("native_orion/src/OrionAppController.h")
     implementation = source("native_orion/src/OrionAppController.cpp")
+    clipboard_copy = source("native_orion/src/ActivityLogClipboard.h")
     policy = source("native_orion/src/UiNotificationPolicy.h")
     assert "Q_INVOKABLE void copyActivityLog();" in controller
     assert "void OrionAppController::copyActivityLog()" in implementation
-    assert "readLogTailForSharing" in implementation
+    assert "copyActivityLogToClipboard(" in implementation
     assert '/logs/orion_native.log"' in implementation
-    assert "serializeActivityLogForSharing(logs_)" in implementation  # ring fallback
+    assert "readLogTailForSharing(" in clipboard_copy
+    assert "activityLogCopyForSharing(" in clipboard_copy  # partial/ring fallback
+    assert "clipboard->setText(" in clipboard_copy
+    assert "serializeActivityLogForSharing(ring)" in policy
+    assert "Disk log incomplete; recent session events follow." in policy
     assert "redactActivityLineForSharing" in policy
     # The tail bounds are named constants, not magic numbers.
     assert "kActivityShareTailMaxBytes = 256 * 1024" in policy
@@ -827,10 +842,16 @@ def test_footer_bubbles_are_gone_and_the_tour_is_first_launch_only() -> None:
     assert "root.licenseChipText.toUpperCase()" in sidebar
     # A tidy two-column key/value grid instead of seven bespoke rows.
     assert "component DetailRow: RowLayout {" in sidebar
-    for label in ('label: "Key"', 'label: "Discord"', 'label: "Name"',
+    for label in ('label: "Key"', 'label: "Discord"',
                   'label: "PC resets"', 'label: "Activated"', 'label: "Machine"',
                   'label: "Build"'):
         assert label in sidebar
+    # [2026-09-21 owner] "profile card displaying the user's discord name and days left":
+    # the Discord NAME is the card's headline (identity block with an initial tile), no
+    # longer a 'label: "Name"' row. The ID stays a copyable row.
+    assert 'objectName: "licenseFlyoutDiscordName"' in sidebar
+    assert 'label: "Name"' not in sidebar
+    assert '"Discord not linked"' in sidebar
     # Inline components may only reference ones declared above them.
     assert sidebar.index("component CopyChip:") < sidebar.index("component DetailRow:")
     # Card.qml's elevation idiom: drop halo + 1px top light catch under the surface.

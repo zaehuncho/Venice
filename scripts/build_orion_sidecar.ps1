@@ -281,6 +281,11 @@ try {
         --noinclude-dlls=onnxruntime/capi/onnxruntime_providers_tensorrt* `
         $ModelDataOptions `
         --windows-console-mode=disable `
+        --company-name=Venice `
+        --product-name=Venice `
+        --file-description="Venice detection engine" `
+        --product-version=1.0.0.0 `
+        --file-version=1.0.0.0 `
         --nofollow-import-to=torch,torchvision,ultralytics,scipy,mediapipe `
         --output-dir=$OutputDir `
         -o OrionSidecar.exe `

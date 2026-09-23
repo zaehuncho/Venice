@@ -121,7 +121,7 @@ Item {
                         lineHeight: 1.25
                         textFormat: Text.StyledText
                         text: "<b style='color:" + Theme.textPrimary + "'>Rules of Use</b><br>" +
-                              "• For personal use only. Do not resell, redistribute, or share your license key.<br>" +
+                              "• For personal use only. Do not resell, redistribute, or share your account access or one-time codes.<br>" +
                               "• Do not use Venice to harass, defraud, or harm other players.<br>" +
                               "• You are solely responsible for complying with all applicable laws and the terms of any service you use it with.<br>" +
                               "• Do not reverse-engineer, tamper with, or attempt to bypass the licensing or security."

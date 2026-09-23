@@ -177,6 +177,12 @@ def lf(monkeypatch):
         import lambda_function as mod
         importlib.reload(mod)
 
+        # The backend suite must never reach the real Discord API. Tests that
+        # assert role delivery/removal replace these stubs with explicit mocks;
+        # unrelated licence/order tests get a deterministic successful service.
+        monkeypatch.setattr(mod, "_discord_add_role", lambda *args, **kwargs: True)
+        monkeypatch.setattr(mod, "_discord_remove_role", lambda *args, **kwargs: True)
+
         # Clean edge-auth env
         monkeypatch.delenv("EDGE_AUTH_ENFORCE", raising=False)
 
