@@ -650,6 +650,8 @@ def license_profile(item):
     }
 
 # ── /api/activate ─────────────────────────────────────────────────────────────
+# Stable installer link (releases/VeniceSetup.exe, replaced in place each release).
+VENICE_DOWNLOAD_URL = "https://venice-releases.s3.amazonaws.com/releases/VeniceSetup.exe"
 DISCORD_SIGNIN_MESSAGE = ("Connect your Discord account at zaeorion.com/connect, "
                           "then unlock with the one-time code.")
 
@@ -2456,6 +2458,7 @@ def handle_bot_trial(event):
                 "The trial locks to that PC.\n\n"
                 "When it runs out, run `/purchase` to keep going."),
             "fields": [
+                {"name": "Download Venice", "value": VENICE_DOWNLOAD_URL, "inline": False},
                 {"name": "Connect Venice", "value": "https://zaeorion.com/connect", "inline": False},
                 {"name": "When it ends", "value": "The trial ends automatically, with no card and no charge. Subscribe any time at https://zaeorion.com", "inline": False},
                 {"name": "Support", "value": "Open a ticket if you hit any trouble.", "inline": False},
@@ -2921,6 +2924,7 @@ def _notify_stripe_provision(discord_id, key, order_id, *, renewed=False):
         "title": "✅ Venice subscription active",
         "description": "Your Venice membership is active and linked to this Discord account. Sign in with Discord on the PC where you use Venice; your public Discord ID is not a password or activation code.",
         "fields": [
+            {"name": "Download Venice", "value": VENICE_DOWNLOAD_URL, "inline": False},
             {"name": "Connect Venice", "value": "https://zaeorion.com/connect", "inline": False},
             {"name": "Check membership", "value": "Run `/status` privately in the Venice server.", "inline": False},
             {"name": "Manage or cancel", "value": BILLING_PORTAL_URL, "inline": False},

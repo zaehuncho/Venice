@@ -157,6 +157,9 @@ function pairConfigured(env) {
     && Boolean(env.PAIR_ISSUER_SECRET) && Boolean(env.ORION_EDGE_AUTH);
 }
 
+// Stable installer link: releases/VeniceSetup.exe is replaced in place each release.
+const VENICE_DOWNLOAD_URL = "https://venice-releases.s3.amazonaws.com/releases/VeniceSetup.exe";
+
 function checkoutConfigured(env) {
   const mode = env.STRIPE_MODE;
   return env.CHECKOUT_PROVIDER === "stripe"
@@ -548,11 +551,14 @@ function discordAccountPage(session, purchaseComplete = false) {
   const notice = purchaseComplete
     ? '<p class="account-notice" role="status">Checkout complete. The Venice bot will DM your subscription confirmation in Discord as soon as activation finishes.</p>'
     : '';
+  // [2026-09-24] Every signed-in account page offers the installer (stable S3 link,
+  // replaced in place each release). It is useless without an unlocked account.
+  const download = `<a class="button secondary" href="${VENICE_DOWNLOAD_URL}" rel="noopener">Download Venice</a>`;
   // [COPY-FIX 2026-09-23 CW-4] After checkout the one-time code is the ONLY next step:
   // no Subscribe button (they just paid) and no trial block.
   const actions = purchaseComplete
-    ? '<div class="account-actions"><a class="button primary" href="/connect">Get your one-time code</a></div>'
-    : '<div class="account-actions"><a class="button primary" href="/buy">Subscribe · $14.99/month beta</a><a class="button secondary" href="/connect">Get your one-time code</a></div><div class="account-trial"><strong>Starting the 7-day trial?</strong><p>Start it on the Venice home page with this same account — 7 days free, no card needed. Then choose Get your one-time code and paste that code into Venice on your PC. Need help? Open a ticket in the server.</p></div>';
+    ? `<div class="account-actions">${download}<a class="button primary" href="/connect">Get your one-time code</a></div>`
+    : '<div class="account-actions"><a class="button primary" href="/buy">Subscribe · $14.99/month beta</a>' + download + '<a class="button secondary" href="/connect">Get your one-time code</a></div><div class="account-trial"><strong>Starting the 7-day trial?</strong><p>Start it on the Venice home page with this same account — 7 days free, no card needed. Then choose Get your one-time code and paste that code into Venice on your PC. Need help? Open a ticket in the server.</p></div>';
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#05070b"><title>Your Discord account · Venice</title><link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="/styles.css"></head><body><main class="shell account-page" id="main"><a class="brand" href="/"><span class="brand-mark"><img src="/orion.png" width="28" height="28" alt=""></span><span>VENICE</span></a><section class="account-panel" aria-labelledby="account-title"><p class="kicker">VENICE ACCOUNT</p><h1 id="account-title">Discord connected.</h1>${notice}<div class="account-identity"><div class="account-avatar">${avatar}</div><div><strong>${name}</strong><span>Discord ID ${id}</span></div></div><p>This is the Discord profile linked to this browser. Venice uses this verified account for checkout and launcher access; your Discord ID by itself is not a sign-in code.</p>${actions}<form action="/logout" method="post"><button class="account-switch" type="submit">Use a different Discord account</button></form></section></main></body></html>`;
   const response = withHeaders(new Response(html, {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store', 'Vary': 'Cookie' },

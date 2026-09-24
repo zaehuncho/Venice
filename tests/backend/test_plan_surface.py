@@ -194,6 +194,7 @@ class TestMonthlyRenewal:
         assert _real_rows(lf)[0]["oauth_pair_required"] is True
         assert sent[0][1]["title"] == "✅ Venice subscription active"
         assert "https://zaeorion.com/connect" in str(sent[0][1])
+        assert "https://venice-releases.s3.amazonaws.com/releases/VeniceSetup.exe" in str(sent[0][1])
         assert "License Key" not in str(sent[0][1])
         assert private_key not in str(sent[0][1])
         s2, b2, _ = invoke(lf, "POST", "/api/bot/provision", headers=WORKER_H, body=body)

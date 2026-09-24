@@ -1212,6 +1212,8 @@ test('CW-4: the account page after checkout offers only Get your one-time code',
   assert.match(html, /Checkout complete\./u);
   assert.match(html, /<a class="button primary" href="\/connect">Get your one-time code<\/a>/u);
   assert.equal((html.match(/class="button primary"/gu) || []).length, 1);
+  // [2026-09-24] the installer is one click away on every signed-in account page.
+  assert.match(html, /href="https:\/\/venice-releases\.s3\.amazonaws\.com\/releases\/VeniceSetup\.exe"[^>]*>Download Venice<\/a>/u);
   assert.doesNotMatch(html, /href="\/buy"|Subscribe · \$14\.99\/month beta|Starting the 7-day trial\?|account-trial/u);
 
   // Without the purchase flag the page still sells: Subscribe primary, code secondary, trial block.
