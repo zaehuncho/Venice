@@ -302,6 +302,11 @@ async function stripeRequest(env, path, options = {}) {
   return payload;
 }
 
+function betaCouponId(env) {
+  const id = String(env.STRIPE_BETA_COUPON || "").trim();
+  return /^[A-Za-z0-9_-]{1,64}$/u.test(id) ? id : "";
+}
+
 async function createCheckoutSession(request, env, url) {
   if (!checkoutConfigured(env)) return json({ error: "Checkout is not configured." }, 503);
   const session = await currentSession(request, env);
@@ -326,6 +331,12 @@ async function createCheckoutSession(request, env, url) {
     "subscription_data[metadata][discord_user_id]": session.discordId,
     "subscription_data[metadata][source]": "zaeorion.com",
   });
+  // Beta pricing (owner 2026-09-24): 25% off the $19.99 price for the first 3
+  // months, via a Stripe coupon applied here so customers never type a code.
+  // Unset STRIPE_BETA_COUPON to end the sale; existing discounts run out on
+  // their own. A malformed id is ignored rather than sent to Stripe.
+  const betaCoupon = betaCouponId(env);
+  if (betaCoupon) body.set("discounts[0][coupon]", betaCoupon);
   try {
     const checkout = await stripeRequest(env, "/v1/checkout/sessions", {
       method: "POST",
@@ -541,7 +552,7 @@ function discordAccountPage(session, purchaseComplete = false) {
   // no Subscribe button (they just paid) and no trial block.
   const actions = purchaseComplete
     ? '<div class="account-actions"><a class="button primary" href="/connect">Get your one-time code</a></div>'
-    : '<div class="account-actions"><a class="button primary" href="/buy">Subscribe · $19.99/month</a><a class="button secondary" href="/connect">Get your one-time code</a></div><div class="account-trial"><strong>Starting the 7-day trial?</strong><p>Start it on the Venice home page with this same account — 7 days free, no card needed. Then choose Get your one-time code and paste that code into Venice on your PC. Need help? Open a ticket in the server.</p></div>';
+    : '<div class="account-actions"><a class="button primary" href="/buy">Subscribe · $14.99/month beta</a><a class="button secondary" href="/connect">Get your one-time code</a></div><div class="account-trial"><strong>Starting the 7-day trial?</strong><p>Start it on the Venice home page with this same account — 7 days free, no card needed. Then choose Get your one-time code and paste that code into Venice on your PC. Need help? Open a ticket in the server.</p></div>';
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#05070b"><title>Your Discord account · Venice</title><link rel="icon" href="/favicon.ico"><link rel="stylesheet" href="/styles.css"></head><body><main class="shell account-page" id="main"><a class="brand" href="/"><span class="brand-mark"><img src="/orion.png" width="28" height="28" alt=""></span><span>VENICE</span></a><section class="account-panel" aria-labelledby="account-title"><p class="kicker">VENICE ACCOUNT</p><h1 id="account-title">Discord connected.</h1>${notice}<div class="account-identity"><div class="account-avatar">${avatar}</div><div><strong>${name}</strong><span>Discord ID ${id}</span></div></div><p>This is the Discord profile linked to this browser. Venice uses this verified account for checkout and launcher access; your Discord ID by itself is not a sign-in code.</p>${actions}<form action="/logout" method="post"><button class="account-switch" type="submit">Use a different Discord account</button></form></section></main></body></html>`;
   const response = withHeaders(new Response(html, {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store', 'Vary': 'Cookie' },

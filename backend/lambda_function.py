@@ -2917,7 +2917,7 @@ def _notify_stripe_provision(discord_id, key, order_id, *, renewed=False):
         "footer": {"text": "Venice • Need help? Open a ticket"},
     } if renewed else {
         "title": "✅ Venice subscription active",
-        "description": "Your $19.99/month membership is active and linked to this Discord account. Sign in with Discord on the PC where you use Venice; your public Discord ID is not a password or activation code.",
+        "description": "Your Venice membership is active and linked to this Discord account. Sign in with Discord on the PC where you use Venice; your public Discord ID is not a password or activation code.",
         "fields": [
             {"name": "Connect Venice", "value": "https://zaeorion.com/connect", "inline": False},
             {"name": "Check membership", "value": "Run `/status` privately in the Venice server.", "inline": False},

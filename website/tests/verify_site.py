@@ -27,7 +27,10 @@ def main() -> int:
         # down must be the $19.99 recurring price. Stripe prices are immutable, so changing the
         # amount means a NEW price object in Stripe and new ids here and in wrangler.jsonc. Never
         # ship copy that advertises a different number than the price the Worker charges.
-        "monthly_price": "Get Venice — $19.99/mo",
+        "monthly_price": "Get Venice — <s>$19.99</s> $14.99/month",
+        # [2026-09-24 owner] beta sale: 25% off for the first 3 months via the Stripe coupon
+        # the Worker applies (STRIPE_BETA_COUPON). The charged price object stays $19.99.
+        "beta_terms": "Beta price for your first 3 months, then $19.99/month",
         "buy_route": 'href="/buy"',
         "discord_route": 'href="/discord"',
         "trial_copy": "Try it free for 7 days",
@@ -144,6 +147,10 @@ def main() -> int:
         return fail("production_live_key_missing")
     if production.get("STRIPE_PRICE_ID") != "price_1UIHrNGniZwGqtXL2b5zfS1M":
         return fail("production_live_price_missing")
+    # The page advertises the beta price, so production must apply the coupon that makes
+    # the charge match it. Drop both together when the sale ends.
+    if ("$14.99" in text) != bool(production.get("STRIPE_BETA_COUPON")):
+        return fail("beta_price_copy_and_coupon_out_of_step")
     digest = hashlib.sha256(index.read_bytes()).hexdigest().upper()
     print(
         "VERIFY_OK=single_plan_19_99_month,plain_storefront,no_synthetic_preview,no_invented_social_proof,"

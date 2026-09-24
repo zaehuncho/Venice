@@ -558,7 +558,8 @@ FAQ_TOPICS = {
             "• **Is there a free trial?** Yes — start it on the https://zaeorion.com home page, signed in with this "
             "Discord account. Full features, no card. One per Discord account and per PC. Then open "
             "https://zaeorion.com/connect to sign in; your public Discord ID is not an activation code.\n"
-            "• **What does it cost?** A free 7-day trial, then one **$19.99/month** recurring membership.\n"
+            "• **What does it cost?** A free 7-day trial, then one **$19.99/month** recurring membership. "
+            "Beta price: **$14.99/month for your first 3 months** (applied automatically at checkout).\n"
             "• **Can I use it on two PCs at once?** No — single-user, one machine. Use `/hwid_reset` to move it.\n"
             "• **Which setups work?** PS5 with a 60 Hz capture card or PS5 Remote Play: both fully supported. "
             "Xbox is experimental and untested.\n"
@@ -667,12 +668,13 @@ async def on_ready():
     print(f"{client.user} is online")
 
 
-@tree.command(name="purchase", description="Buy Venice securely — $19.99 per month", guild=GUILD)
+@tree.command(name="purchase", description="Buy Venice securely — $14.99/month beta price", guild=GUILD)
 async def purchase(interaction: discord.Interaction):
     e = discord.Embed(
-        title="🛒 Venice — $19.99 / month",
+        title="🛒 Venice — $14.99 / month (beta)",
         description=(
             "One recurring monthly plan at **zaeorion.com**, paid by card through Stripe's secure checkout. "
+            "Beta price: **$14.99/month for your first 3 months**, then $19.99/month — applied automatically, no code needed. "
             "Cancel anytime.\n\n"
             "Connect the **same Discord account** you use in this server on the website; your membership is tied to its Discord ID. After payment, the Venice bot "
             "DMs a subscription confirmation and connection link, then grants Customer access. Your Discord ID alone cannot unlock the launcher.\n\n"

@@ -52,6 +52,7 @@
         "DISCORD_INVITE_URL": "https://discord.gg/yTuekgdgEN",
         "STRIPE_PUBLISHABLE_KEY": "pk_live_51UGADhGniZwGqtXLGqsTF6H7U9gtJ6TRlJkUPoYsmMmZDSucXIhLjquHkhK499uaN5eC3saUwL9oxotwPTqGYfeS00QL7TWHvq",
         "STRIPE_PRICE_ID": "price_1UIHrNGniZwGqtXL2b5zfS1M",
+        "STRIPE_BETA_COUPON": "venice-beta-3mo",
         "ORION_API_BASE": "https://v348t5hg3i.execute-api.us-east-1.amazonaws.com"
       }
     }

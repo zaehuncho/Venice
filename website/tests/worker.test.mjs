@@ -739,6 +739,30 @@ test('members proceed to Stripe Checkout stamped with the session Discord ID', a
   });
 });
 
+test('beta coupon is applied at checkout only when a well-formed coupon id is configured', async () => {
+  const cookie = await sessionCookieFor();
+  const cases = [
+    [undefined, undefined],
+    ['', undefined],
+    ['venice-beta-3mo', 'venice-beta-3mo'],
+    ['bad coupon&x=1', undefined],
+  ];
+  for (const [configured, expected] of cases) {
+    const env = configured === undefined ? liveStripeEnv : { ...liveStripeEnv, STRIPE_BETA_COUPON: configured };
+    await withMocks((path) => {
+      if (path === '/api/bot/guild-member') return memberOk();
+      if (path === '/v1/checkout/sessions') return Response.json({ id: 'cs_test_beta', client_secret: 'cs_secret_fixture' });
+      throw Error(`unexpected path ${path}`);
+    }, async (calls) => {
+      const response = await worker.fetch(new Request('https://zaeorion.com/api/checkout/session', {
+        method: 'POST', headers: { Cookie: cookie } }), env);
+      assert.equal(response.status, 200);
+      assert.equal(calls[1].body['discounts[0][coupon]'], expected);
+      assert.equal(calls[1].body.allow_promotion_codes, undefined);
+    });
+  }
+});
+
 test('checkout config exposes the connected Discord avatar without leaking the id', async () => {
   // [2026-09-19] The header shows the connected account. The URL is built server-side from
   // the signed session so the page never receives the raw Discord id, and a forged or absent
@@ -1188,13 +1212,13 @@ test('CW-4: the account page after checkout offers only Get your one-time code',
   assert.match(html, /Checkout complete\./u);
   assert.match(html, /<a class="button primary" href="\/connect">Get your one-time code<\/a>/u);
   assert.equal((html.match(/class="button primary"/gu) || []).length, 1);
-  assert.doesNotMatch(html, /href="\/buy"|Subscribe · \$19\.99\/month|Starting the 7-day trial\?|account-trial/u);
+  assert.doesNotMatch(html, /href="\/buy"|Subscribe · \$14\.99\/month beta|Starting the 7-day trial\?|account-trial/u);
 
   // Without the purchase flag the page still sells: Subscribe primary, code secondary, trial block.
   const before = await worker.fetch(new Request('https://zaeorion.com/discord',
     { headers: { Cookie: cookie } }), stripeEnv);
   const plain = await before.text();
-  assert.match(plain, /<a class="button primary" href="\/buy">Subscribe · \$19\.99\/month<\/a>/u);
+  assert.match(plain, /<a class="button primary" href="\/buy">Subscribe · \$14\.99\/month beta<\/a>/u);
   assert.match(plain, /<a class="button secondary" href="\/connect">Get your one-time code<\/a>/u);
   assert.match(plain, /Starting the 7-day trial\?/u);
   assert.doesNotMatch(plain, /Checkout complete/u);

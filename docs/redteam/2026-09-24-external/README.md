@@ -1,6 +1,33 @@
 # External (black-box) AI red team: Venice paid beta
 
-**When:** after the final internal round is patched and the **real Lethe-protected package + Venice installer** exists. Not before.
+**Preparation snapshot (2026-09-24): prompt files are ready, dispatch is pending.**
+The previously frozen candidate still passes its recorded signed-inventory check,
+but its installer is not Authenticode-signed and it is not the final protected
+deployment unit. Its candidate sheet does not record a StrictSecurity run, an
+installed VM canary, or an installed play test. Freeze and verify a new exact
+installer/package/update-manifest set before giving any prompt to a tester.
+This README is for the owner; do **not** give it or the repository to testers.
+
+For each independent tester, supply only that tester's prompt and this filled
+candidate card in the VM/shared channel (never passwords or signing material):
+
+```
+INSTALLER_PATH=<path inside disposable VM>
+CANDIDATE_SHA256=<SHA-256 of those exact installer bytes>
+PACKAGE_SHA256=<SHA-256 of the exact update ZIP, if supplied>
+TEST_LICENSE_LABEL=<throwaway test account identifier, not the licence secret>
+LIVE_ENDPOINT_WINDOW=<approved UTC window or OFFLINE_ONLY>
+REPORT_DROP=<VM shared-folder path>
+```
+
+Before dispatch, record the matching final source/build identity privately,
+run Standard and StrictSecurity on the final candidate, verify the signed
+manifest and complete package inventory, verify installer Authenticode status,
+and complete the installed VM/play canary. A changed installer or ZIP hash
+requires a new candidate card and affected re-tests. Give each AI a fresh VM
+snapshot; serialize any live endpoint work and record its UTC window.
+
+**When:** after the final internal round is patched and the **frozen beta candidate (rc5: package + Venice installer)** exists. Not before. The owner moved packing to the first update (2026-09-23), so the beta candidate is unpacked and the installer is unsigned by decision; testers should still report anything those choices expose.
 
 **What "external" means:** each AI acts as an outside attacker. It has **no repo, no source, no docs from this repo, no memory of the internal findings**. It has only what a customer or cracker would have:
 - the installer;
