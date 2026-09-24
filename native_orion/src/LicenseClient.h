@@ -123,6 +123,24 @@ ORION_SECURITY_API LicenseProfile parseLicenseProfile(const QJsonValue& value);
 //                                                     (contract §5, revoke-fast)
 ORION_SECURITY_API bool isLicenseKillCode(const QString& code);
 
+// [P-H 2026-09-23] Remembered sign-in: does this server verdict mean the stored
+// canonical key itself will never work again on this PC (so it must be deleted and the
+// customer sent back to AuthGate)? Exact CODE match over BOTH endpoints' spellings:
+//   /api/license/redeem : invalid_key | license_revoked | license_expired |
+//                         license_invalid_status | frozen | blacklisted | device_mismatch |
+//                         device_limit_reached | subscription_required |
+//                         discord_signin_required | trial_used | pair_invalid
+//   /api/license/check  : invalid_key | revoked | expired | inactive | frozen |
+//                         blacklisted | device_mismatch | subscription_required
+// Deliberately NOT a refusal (the key is kept; the server still refuses, so nothing
+// unlocks): transport failures (empty code), 5xx / internal_error,
+// entitlement_unavailable, kill_state_unavailable, config_unavailable, rate_limited,
+// timestamp_expired / replay_* (clock or retry), license_record_invalid (backend data),
+// version_blocked (update, then the same key works) and service_disabled (owner-wide
+// pause: wiping every customer's sign-in on a pause would force every keyless customer
+// back through Discord on resume). Unknown codes keep the key.
+ORION_SECURITY_API bool isRememberedSignInRefusalCode(const QString& code);
+
 // Copy shown to the user for a failed activate / heartbeat verdict. Distinct text
 // for frozen, blacklisted and version_blocked (the latter names min_client_version
 // when the server sent it); [CL2-P8-006/008 2026-09-23] timestamp_expired and

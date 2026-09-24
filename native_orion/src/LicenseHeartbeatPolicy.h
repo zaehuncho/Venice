@@ -278,4 +278,29 @@ private:
     return QStringLiteral("Subscription confirmed: shots re-enabled.");
 }
 
+// [P-H 2026-09-23] Remembered sign-in: what the controller does after an activation
+// that was started from the stored key FAILED. `definitiveRefusal` is
+// isRememberedSignInRefusalCode(result.error) (LicenseClient.h). A refusal deletes the
+// stored key and stops retrying; anything else keeps it and schedules the next
+// re-submit on the heartbeat ladder (15 s / 30 s / 60 s, then the 5-min cadence;
+// rate_limited jumps to 60 s). Retrying only re-asks the server - it never unlocks.
+struct RememberedSignInDecision {
+    bool clearStoredKey = false;
+    int retryDelayMs = -1;   // >= 0: start the retry timer with this delay
+};
+
+[[nodiscard]] inline RememberedSignInDecision rememberedSignInAfterFailure(
+    bool definitiveRefusal, bool rateLimited, LicenseHeartbeatBackoff& backoff) noexcept
+{
+    RememberedSignInDecision d;
+    if (definitiveRefusal) {
+        backoff.reset();
+        d.clearStoredKey = true;
+        return d;
+    }
+    backoff.recordFailure(rateLimited);
+    d.retryDelayMs = backoff.nextDelayMs();
+    return d;
+}
+
 } // namespace orion

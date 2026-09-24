@@ -86,7 +86,8 @@ WizardBackColor=#06080c
 WizardImageBackColor=#06080c
   WizardImageFile=C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-100.bmp,C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-150.bmp,C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-200.bmp
   WizardSmallImageFile=C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-small-100.bmp,C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-small-150.bmp,C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-small-200.bmp
-  WizardBackImageFile=C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-back-100.png,C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-back-150.png,C:\Users\aaron\Desktop\NexusVision\installer\assets\venice-wizard-back-200.png
+; [2026-09-23 owner screenshot] No WizardBackImageFile: the one-screen hero is drawn on the flat
+; #06080c canvas, and a glow texture behind it showed the hero's rectangle as a black box.
 ; Venice branding on the installer itself. Icon comes from the same assets\orion.ico
 ; that OrionNative.exe embeds (blue V), so shortcut + installer + running app all match.
 ; Kept optional-with-fallback because the .ico is gitignored on some clones.
@@ -108,89 +109,12 @@ FinishedLabel=Next:%n  1.  Open Venice.%n  2.  Get your one-time code at zaeorio
 ClickFinish=
 SetupWindowTitle=Venice Setup
 ; [2026-09-23 one-screen look] No Tasks page: the desktop shortcut is always created.
-[Files]
-; --- The signed application package (native exe + 6 DLLs + Qt runtime + OrionStream.exe
-;     + OrionSidecar.exe and its Nuitka dep dir + assets + the shipped model subset). ---
-; recursesubdirs pulls the OrionSidecar.exe dependency directory too. The packager's
-; crown-jewel .py name-gate guarantees no readable reader source is present here.
-; Excludes: admin/staff tooling is present in the strict release package so the
-; release-manifest hash gate covers every binary the DEVELOPER can run, but customers
-; never see those tools. Excluding them here keeps the shipping install surface to what
-; the customer actually uses. AppId + release_manifest.sig are unaffected.
-;   OrionOwner.exe / OrionStaff.exe : internal admin/staff GUIs
-;   OrionUpdater.exe / OrionSidecar.exe / OrionNative.exe : SHIP (customer-facing)
-Source: "C:\Users\aaron\Desktop\NexusVision\release\orion-package\*"; DestDir: "{app}"; Excludes: "OrionOwner.exe,OrionStaff.exe"; Flags: recursesubdirs createallsubdirs ignoreversion
-; --- Redistributable driver installers (nefarius, vendor-signed .exe bundles; downloaded to
-;     redist\ at build time — see installer\README.md). Kept out of {app}; extracted to a temp
-;     dir, run in [Run], not shipped permanently. Pin the versions you validated. ---
-Source: "redist\ViGEmBus_1.22.0_x64_x86_arm64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsViGEmBus
-Source: "redist\HidHide_1.5.230_x64.exe";           DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsHidHide
-; VC++ 2015-2022 x64 runtime. REQUIRED: the Orion binaries are built /MD (dynamic CRT)
-; and windeployqt is invoked without --compiler-runtime, so the package carries no
-; msvcp140/vcruntime140 -- on a clean machine OrionNative.exe would fail to launch with
-; a missing-DLL error before any Orion code runs. Skipped when the runtime is present.
-Source: "redist\vc_redist.x64.exe";    DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsVCRedist
-[Icons]
-; LaunchExeName == OrionActivate.exe for a server-shard build (the broker is the launch
-; entry point), else OrionNative.exe. See the LaunchExeName define above.
-Name: "{group}\Venice"; Filename: "{app}\OrionNative.exe"
-Name: "{group}\{cm:UninstallProgram,Venice}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Venice"; Filename: "{app}\OrionNative.exe"
-[Run]
-; --- Driver installs (ViGEmBus, HidHide) MOVED to [Code] (InstallDriverChecked, run from
-;     CurStepChanged/ssPostInstall) on 2026-09-21: a [Run] entry cannot inspect the exit
-;     code, so a failed or reboot-pending driver install let Setup finish and Venice then
-;     reported only "virtual controller required" at Connect (Astra, bug sweep). Both are
-;     still idempotent (skip-if-present) and still run silently before first launch. ---
-; VC++ runtime BEFORE first launch (see the [Files] note: the package is /MD with no
-; app-local CRT, so without this a clean machine cannot start OrionNative.exe at all).
-; NOTE: installed from [Code] (CurStepChanged/ssPostInstall) instead of here so the
-; redist exit code is actually inspected. A bare [Run] entry cannot check the result,
-; and on a Windows SKU missing Windows Update the redist can fail silently -> msvcp140.dll
-; won't load -> OrionNative dies at launch with no diagnostic. See InstallVCRedistChecked.
-; --- Optional: launch Orion at the end (the broker on a server-shard build). ---
-; [COPY-FIX 2026-09-23] Hidden while a driver/runtime restart is pending (RestartPending in [Code]).
-Filename: "{app}\OrionNative.exe"; Description: "{cm:LaunchProgram,Venice}"; Flags: nowait postinstall skipifsilent; Check: not RestartPending
-[UninstallRun]
-; Leave the shared drivers installed on uninstall (other software may use ViGEmBus/HidHide).
-; If a clean removal is wanted, add msiexec /x steps here guarded by an "also remove drivers?" task.
-; The packet-bridge service (VeniceNetSvc, plus any legacy NexusVisionSvc leftover) is
-; removed from [Code] CurUninstallStepChanged via RemoveBridgeService, which waits for
-; the asynchronous sc stop to reach STOPPED before deleting — a declarative entry here
-; cannot do that and can leave the service marked delete-pending until reboot.
-[InstallDelete]
-; WAVE 3: purge the retired Nuitka packet-bridge bundle before the new payload lands.
-; Old installs carried a full Python runtime under packet_bridge\ (NexusVisionSvc.exe,
-; python312.dll, pydivert\, ...). Inno upgrades never remove files absent from the new
-; package, so without this the stale ~60 MB bundle — including a second, orphaned
-; WinDivert pair — would survive next to VeniceNetSvc.exe forever. The legacy service
-; registration itself is stopped in CurStepChanged(ssInstall) below (so nothing here is
-; file-locked) and deleted in RegisterPacketBridgeService before VeniceNetSvc is created.
-Type: filesandordirs; Name: "{app}\packet_bridge"
-[UninstallDelete]
-; Inno removes the files it installed. Never recursively erase {app}: a pre-existing
-; folder can contain unrelated user files, and a silent /DIR= override is also
-; possible. Remove the directory only when it is empty after tracked-file cleanup.
-Type: dirifempty; Name: "{app}"
-; The packet-bridge bearer token. The SCM service publishes it to
-; %ProgramData%\NexusVision\nexus_bridge.token (LocalSystem mode); an unelevated debug
-; bridge publishes to %LOCALAPPDATA%\NexusVision\ instead (IpcServer.h publishToken).
-; Both are Venice-private secrets with no value once the service is deleted — remove
-; them, then fold the parent NexusVision dir away only when nothing else remains
-; (dirifempty: the "Orion Native" data dir survives unless the user chose removal in
-; MaybeRemoveUserData, and a sibling product's files always keep the dir alive).
-Type: files; Name: "{commonappdata}\NexusVision\nexus_bridge.token"
-Type: dirifempty; Name: "{commonappdata}\NexusVision"
-Type: files; Name: "{localappdata}\NexusVision\nexus_bridge.token"
-Type: dirifempty; Name: "{localappdata}\NexusVision"
-; The user's mutable state — %LOCALAPPDATA%\NexusVision\Orion Native\ (settings.json,
-; learning.json + per-profile variants, logs\, calibration) — is deliberately NOT listed
-; here. Surviving a reinstall is the right default; removal is an explicit interactive
-; CHOICE handled by MaybeRemoveUserData in CurUninstallStepChanged (never in silent mode).
 ; [2026-09-23 owner: option A] One-screen Venice look: restyles the welcome, progress and
 ; finished pages only (its own [Files] art + [Code] page events). Every install step and
-; security rule in this script is unchanged. Included before [Code] on purpose: its header
-; comments use ';', which is not a comment inside a Pascal [Code] section.
+; security rule in this script is unchanged. Included HERE, before the main [Files], so its
+; hero frames are the FIRST files in the solid LZMA stream: Setup extracts them at start-up,
+; and at the end of the stream that meant decompressing ~600 MB first (a ~1 minute blank
+; start). Also before [Code] because its ';' comments are not comments inside Pascal.
 ; Venice one-screen installer look (option A, owner 2026-09-23: "the iss looks janky").
 ; -----------------------------------------------------------------------------------------
 ; Included by installer\orion.iss (and the scratch preview). It only restyles pages; every
@@ -376,6 +300,85 @@ begin
   if VeniceTimer <> 0 then
     VeniceKillTimer(0, VeniceTimer);
 end;
+[Files]
+; --- The signed application package (native exe + 6 DLLs + Qt runtime + OrionStream.exe
+;     + OrionSidecar.exe and its Nuitka dep dir + assets + the shipped model subset). ---
+; recursesubdirs pulls the OrionSidecar.exe dependency directory too. The packager's
+; crown-jewel .py name-gate guarantees no readable reader source is present here.
+; Excludes: admin/staff tooling is present in the strict release package so the
+; release-manifest hash gate covers every binary the DEVELOPER can run, but customers
+; never see those tools. Excluding them here keeps the shipping install surface to what
+; the customer actually uses. AppId + release_manifest.sig are unaffected.
+;   OrionOwner.exe / OrionStaff.exe : internal admin/staff GUIs
+;   OrionUpdater.exe / OrionSidecar.exe / OrionNative.exe : SHIP (customer-facing)
+Source: "C:\Users\aaron\Desktop\NexusVision\release\orion-package\*"; DestDir: "{app}"; Excludes: "OrionOwner.exe,OrionStaff.exe"; Flags: recursesubdirs createallsubdirs ignoreversion
+; --- Redistributable driver installers (nefarius, vendor-signed .exe bundles; downloaded to
+;     redist\ at build time — see installer\README.md). Kept out of {app}; extracted to a temp
+;     dir, run in [Run], not shipped permanently. Pin the versions you validated. ---
+Source: "redist\ViGEmBus_1.22.0_x64_x86_arm64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsViGEmBus
+Source: "redist\HidHide_1.5.230_x64.exe";           DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsHidHide
+; VC++ 2015-2022 x64 runtime. REQUIRED: the Orion binaries are built /MD (dynamic CRT)
+; and windeployqt is invoked without --compiler-runtime, so the package carries no
+; msvcp140/vcruntime140 -- on a clean machine OrionNative.exe would fail to launch with
+; a missing-DLL error before any Orion code runs. Skipped when the runtime is present.
+Source: "redist\vc_redist.x64.exe";    DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsVCRedist
+[Icons]
+; LaunchExeName == OrionActivate.exe for a server-shard build (the broker is the launch
+; entry point), else OrionNative.exe. See the LaunchExeName define above.
+Name: "{group}\Venice"; Filename: "{app}\OrionNative.exe"
+Name: "{group}\{cm:UninstallProgram,Venice}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Venice"; Filename: "{app}\OrionNative.exe"
+[Run]
+; --- Driver installs (ViGEmBus, HidHide) MOVED to [Code] (InstallDriverChecked, run from
+;     CurStepChanged/ssPostInstall) on 2026-09-21: a [Run] entry cannot inspect the exit
+;     code, so a failed or reboot-pending driver install let Setup finish and Venice then
+;     reported only "virtual controller required" at Connect (Astra, bug sweep). Both are
+;     still idempotent (skip-if-present) and still run silently before first launch. ---
+; VC++ runtime BEFORE first launch (see the [Files] note: the package is /MD with no
+; app-local CRT, so without this a clean machine cannot start OrionNative.exe at all).
+; NOTE: installed from [Code] (CurStepChanged/ssPostInstall) instead of here so the
+; redist exit code is actually inspected. A bare [Run] entry cannot check the result,
+; and on a Windows SKU missing Windows Update the redist can fail silently -> msvcp140.dll
+; won't load -> OrionNative dies at launch with no diagnostic. See InstallVCRedistChecked.
+; --- Optional: launch Orion at the end (the broker on a server-shard build). ---
+; [COPY-FIX 2026-09-23] Hidden while a driver/runtime restart is pending (RestartPending in [Code]).
+Filename: "{app}\OrionNative.exe"; Description: "{cm:LaunchProgram,Venice}"; Flags: nowait postinstall skipifsilent; Check: not RestartPending
+[UninstallRun]
+; Leave the shared drivers installed on uninstall (other software may use ViGEmBus/HidHide).
+; If a clean removal is wanted, add msiexec /x steps here guarded by an "also remove drivers?" task.
+; The packet-bridge service (VeniceNetSvc, plus any legacy NexusVisionSvc leftover) is
+; removed from [Code] CurUninstallStepChanged via RemoveBridgeService, which waits for
+; the asynchronous sc stop to reach STOPPED before deleting — a declarative entry here
+; cannot do that and can leave the service marked delete-pending until reboot.
+[InstallDelete]
+; WAVE 3: purge the retired Nuitka packet-bridge bundle before the new payload lands.
+; Old installs carried a full Python runtime under packet_bridge\ (NexusVisionSvc.exe,
+; python312.dll, pydivert\, ...). Inno upgrades never remove files absent from the new
+; package, so without this the stale ~60 MB bundle — including a second, orphaned
+; WinDivert pair — would survive next to VeniceNetSvc.exe forever. The legacy service
+; registration itself is stopped in CurStepChanged(ssInstall) below (so nothing here is
+; file-locked) and deleted in RegisterPacketBridgeService before VeniceNetSvc is created.
+Type: filesandordirs; Name: "{app}\packet_bridge"
+[UninstallDelete]
+; Inno removes the files it installed. Never recursively erase {app}: a pre-existing
+; folder can contain unrelated user files, and a silent /DIR= override is also
+; possible. Remove the directory only when it is empty after tracked-file cleanup.
+Type: dirifempty; Name: "{app}"
+; The packet-bridge bearer token. The SCM service publishes it to
+; %ProgramData%\NexusVision\nexus_bridge.token (LocalSystem mode); an unelevated debug
+; bridge publishes to %LOCALAPPDATA%\NexusVision\ instead (IpcServer.h publishToken).
+; Both are Venice-private secrets with no value once the service is deleted — remove
+; them, then fold the parent NexusVision dir away only when nothing else remains
+; (dirifempty: the "Orion Native" data dir survives unless the user chose removal in
+; MaybeRemoveUserData, and a sibling product's files always keep the dir alive).
+Type: files; Name: "{commonappdata}\NexusVision\nexus_bridge.token"
+Type: dirifempty; Name: "{commonappdata}\NexusVision"
+Type: files; Name: "{localappdata}\NexusVision\nexus_bridge.token"
+Type: dirifempty; Name: "{localappdata}\NexusVision"
+; The user's mutable state — %LOCALAPPDATA%\NexusVision\Orion Native\ (settings.json,
+; learning.json + per-profile variants, logs\, calibration) — is deliberately NOT listed
+; here. Surviving a reinstall is the right default; removal is an explicit interactive
+; CHOICE handled by MaybeRemoveUserData in CurUninstallStepChanged (never in silent mode).
 [Code]
 { Skip a driver install if it is already present. ViGEmBus/HidHide register a service; probing
   the service key is a cheap, reliable presence check that avoids reinstalling on every run. }

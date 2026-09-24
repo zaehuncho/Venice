@@ -256,6 +256,22 @@ bool isLicenseKillCode(const QString& code)
         || code == QLatin1String("subscription_required");
 }
 
+bool isRememberedSignInRefusalCode(const QString& code)
+{
+    static const char* const kRefusals[] = {
+        "invalid_key", "revoked", "license_revoked", "expired", "license_expired",
+        "inactive", "license_invalid_status", "frozen", "blacklisted", "device_mismatch",
+        "device_limit_reached", "subscription_required", "discord_signin_required",
+        "trial_used", "pair_invalid",
+    };
+    for (const char* refusal : kRefusals) {
+        if (code == QLatin1String(refusal)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 QString licenseErrorUserText(const LicenseResult& result, const QString& fallback)
 {
     const QString& code = result.error;

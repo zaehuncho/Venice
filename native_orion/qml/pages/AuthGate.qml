@@ -14,7 +14,11 @@ Item {
         return s.length > 0 && !/offline|unreach|error|down|fail|wait/.test(s)
     }
     readonly property bool locked: orion.licenseState === "Locked"
-    readonly property bool ready: keyField.text.trim().length > 0 && !orion.authBusy
+    // [P-H 2026-09-23] With a remembered sign-in, Unlock works on an EMPTY field: it
+    // re-asks the licence server with the key Venice kept on this PC (never unlocks by itself).
+    readonly property bool remembered: orion.rememberedSignInAvailable === true
+    readonly property bool resumeReady: remembered && keyField.text.trim().length === 0
+    readonly property bool ready: (keyField.text.trim().length > 0 || resumeReady) && !orion.authBusy
     // True while the field holds a key delivered by the orion://activate deep link
     // (cleared the moment the user edits the field or unlock starts).
     property bool deepLinkFilled: false
@@ -56,7 +60,8 @@ Item {
         if (isServicePaused(m))
             return "Check #announcements in the Venice Discord for when it's back, then press Unlock again."
         // The message already says exactly what to do: no second line.
-        if (/discord id is public|clock is off|timestamp_expired|paused|frozen|contact support/.test(m))
+        // [P-H 2026-09-23] "Signed out. ..." / "Signing you in…" already say what to do.
+        if (/discord id is public|clock is off|timestamp_expired|paused|frozen|contact support|signed out|signing you in/.test(m))
             return ""
         if (/update required|version_blocked|no longer (allowed|supported)/.test(m))
             return "Restart Venice to update, or reinstall from #downloads."
@@ -94,6 +99,9 @@ Item {
             root.attempted = true
             root.deepLinkFilled = false
             orion.authenticate(k.trim())
+        } else if (root.resumeReady) {
+            root.attempted = true
+            orion.resumeRememberedSignIn()
         }
     }
 
@@ -296,6 +304,39 @@ Item {
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSmall
                     wrapMode: Text.WordWrap
+                }
+            }
+
+            // [P-H 2026-09-23] Remembered sign-in: the customer does not need a new code.
+            RowLayout {
+                objectName: "authRememberedRow"
+                visible: root.resumeReady && !orion.authBusy
+                Layout.fillWidth: true
+                Layout.topMargin: -8
+                spacing: 7
+                Text {
+                    Layout.fillWidth: true
+                    text: "Venice remembers this PC. Press Unlock to sign in again."
+                    color: Theme.textSecondary
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSmall
+                    wrapMode: Text.WordWrap
+                }
+                Button {
+                    objectName: "authForgetPc"
+                    hoverEnabled: true
+                    onClicked: {
+                        root.attempted = false
+                        orion.signOut()
+                    }
+                    contentItem: Text {
+                        text: "Sign out"
+                        color: parent.hovered ? Theme.textPrimary : Theme.accent
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontSmall
+                        font.weight: Font.DemiBold
+                    }
+                    background: null
                 }
             }
 

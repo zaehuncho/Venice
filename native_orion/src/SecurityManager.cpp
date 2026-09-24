@@ -816,7 +816,215 @@ bool atomicWriteBytes(const QString& path, const QByteArray& bytes, QString* err
     return true;
 }
 
+// [P-H 2026-09-23] DPAPI (CURRENT_USER scope) with a caller-chosen, app-specific entropy
+// blob. protectBytes()/unprotectBytes() (entitlement cache) and the remembered sign-in
+// both go through these two, so there is exactly one CryptProtectData call site shape.
+// `ok` reports whether DPAPI actually ran; there is NO plaintext fallback here.
+QByteArray dpapiProtect(const QByteArray& plain, const QByteArray& entropy,
+                        const wchar_t* description, bool* ok)
+{
+    if (ok) *ok = false;
+#ifdef Q_OS_WIN
+    DATA_BLOB in {};
+    in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plain.constData()));
+    in.cbData = static_cast<DWORD>(plain.size());
+    DATA_BLOB entropyBlob {};
+    entropyBlob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(entropy.constData()));
+    entropyBlob.cbData = static_cast<DWORD>(entropy.size());
+    DATA_BLOB out {};
+    if (CryptProtectData(&in, description, &entropyBlob, nullptr, nullptr,
+                         CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        QByteArray result(reinterpret_cast<const char*>(out.pbData), static_cast<int>(out.cbData));
+        LocalFree(out.pbData);
+        if (ok) *ok = true;
+        return result;
+    }
+#else
+    Q_UNUSED(plain);
+    Q_UNUSED(entropy);
+    Q_UNUSED(description);
+#endif
+    return {};
+}
+
+QByteArray dpapiUnprotect(const QByteArray& blob, const QByteArray& entropy, bool* ok)
+{
+    if (ok) *ok = false;
+#ifdef Q_OS_WIN
+    if (blob.isEmpty()) {
+        return {};
+    }
+    DATA_BLOB in {};
+    in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(blob.constData()));
+    in.cbData = static_cast<DWORD>(blob.size());
+    DATA_BLOB entropyBlob {};
+    entropyBlob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(entropy.constData()));
+    entropyBlob.cbData = static_cast<DWORD>(entropy.size());
+    DATA_BLOB out {};
+    if (CryptUnprotectData(&in, nullptr, &entropyBlob, nullptr, nullptr,
+                           CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        QByteArray result(reinterpret_cast<const char*>(out.pbData), static_cast<int>(out.cbData));
+        // Wipe DPAPI's copy of the plaintext before handing the buffer back.
+        SecureZeroMemory(out.pbData, out.cbData);
+        LocalFree(out.pbData);
+        if (ok) *ok = true;
+        return result;
+    }
+#else
+    Q_UNUSED(blob);
+    Q_UNUSED(entropy);
+#endif
+    return {};
+}
+
+// Remembered sign-in file format (P-H). Outer JSON carries only the DPAPI blob; the key,
+// the binding and the timestamp live inside the protected payload.
+constexpr auto kRememberedOuterSchema = "venice.remembered_signin_file.v1";
+constexpr auto kRememberedPayloadSchema = "venice.remembered_signin.v1";
+constexpr qsizetype kRememberedFileMaxBytes = 64 * 1024;
+
 } // namespace
+
+bool isRememberableLicenseKey(const QString& key)
+{
+    // Exactly the canonical private key the backend mints (gen_license_key: 4 groups of
+    // 4 [A-Z0-9]) - the same shape OrionAppController requires of a PAIR- exchange.
+    // A PAIR- one-time code, an NVDEV- dev key or any other shape is never persisted.
+    // \A...\z, not ^...$: PCRE's $ also matches before a trailing newline, so "KEY\n" passed.
+    static const QRegularExpression canonicalKey(
+        QStringLiteral("\\A[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}\\z"));
+    // [2026-09-23] A one-time code "PAIR-XXXX-XXXX-XXXX" has the SAME 4x4 shape (PAIR is four
+    // letters), so the shape alone would remember a spent one-time code. The client treats any
+    // "PAIR-" key as a pairing code (activationFinished), so refuse that prefix explicitly.
+    // A minted key that happens to start with "PAIR" (1 in ~1.7M) is merely not remembered.
+    if (key.startsWith(QStringLiteral("PAIR-")) || key.startsWith(QStringLiteral("NVDEV-"))) {
+        return false;
+    }
+    return canonicalKey.match(key).hasMatch();
+}
+
+QByteArray SecurityManager::rememberedSignInEntropy() const
+{
+    return QByteArrayLiteral("venice-remembered-signin-v1|") + machineId().toUtf8();
+}
+
+QString SecurityManager::rememberedLicenseKeyPath() const
+{
+    return orionDataDir(rootDir_) + QStringLiteral("/.vault/venice_signin.dat");
+}
+
+bool SecurityManager::hasRememberedLicenseKey() const
+{
+    return QFileInfo::exists(rememberedLicenseKeyPath());
+}
+
+bool SecurityManager::storeRememberedLicenseKey(const QString& canonicalKey, QString* error) const
+{
+    // Never trims/uppercases on the caller's behalf: only the exact canonical key the
+    // server verdict produced is accepted (a PAIR- code can never slip through a
+    // normalisation step).
+    if (!isRememberableLicenseKey(canonicalKey)) {
+        if (error) *error = QStringLiteral("not a canonical licence key; not remembered");
+        return false;
+    }
+    const QString mid = machineId();
+    if (mid.trimmed().isEmpty()) {
+        if (error) *error = QStringLiteral("machine fingerprint unavailable; not remembered");
+        return false;
+    }
+    QJsonObject binding;
+    binding.insert(QStringLiteral("machine_id"), mid);
+    binding.insert(QStringLiteral("user"), currentUserBinding());
+    QJsonObject payload;
+    payload.insert(QStringLiteral("schema"), QString::fromLatin1(kRememberedPayloadSchema));
+    payload.insert(QStringLiteral("license_key"), canonicalKey);
+    payload.insert(QStringLiteral("stored_at"), QDateTime::currentDateTimeUtc().toSecsSinceEpoch());
+    // Deliberately NOT bound to the build hash (unlike the entitlement cache): an update
+    // must not sign the customer out. The server re-checks the key on every launch.
+    payload.insert(QStringLiteral("binding"), binding);
+
+    QByteArray plain = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    bool dpapiOk = false;
+    const QByteArray blob = dpapiProtect(plain, rememberedSignInEntropy(), L"Venice sign-in", &dpapiOk);
+    plain.fill('\0');
+    if (!dpapiOk || blob.isEmpty()) {
+        // Fail closed: no plaintext fallback. The customer simply signs in next launch.
+        if (error) *error = QStringLiteral("Windows data protection unavailable; not remembered");
+        return false;
+    }
+    QJsonObject outer;
+    outer.insert(QStringLiteral("schema"), QString::fromLatin1(kRememberedOuterSchema));
+    outer.insert(QStringLiteral("blob_b64"), QString::fromLatin1(blob.toBase64()));
+
+    const QString path = rememberedLicenseKeyPath();
+    QFileInfo(path).absoluteDir().mkpath(QStringLiteral("."));
+    return atomicWriteBytes(path, QJsonDocument(outer).toJson(QJsonDocument::Indented), error);
+}
+
+QString SecurityManager::loadRememberedLicenseKey(RememberedKeyLoad* outcome, QString* detail) const
+{
+    if (outcome) *outcome = RememberedKeyLoad::None;
+    const QString path = rememberedLicenseKeyPath();
+    if (!QFileInfo::exists(path)) {
+        if (detail) *detail = QStringLiteral("no remembered sign-in");
+        return {};
+    }
+    // Every failure below deletes the file: a damaged, foreign-user, other-PC or
+    // tampered record is never retried and never unlocks anything.
+    const auto reject = [&](const QString& why) -> QString {
+        QFile::remove(path);
+        if (outcome) *outcome = RememberedKeyLoad::Cleared;
+        if (detail) *detail = why;
+        return {};
+    };
+    const QByteArray raw = readFileLimited(path, kRememberedFileMaxBytes + 1);
+    if (raw.isEmpty() || raw.size() > kRememberedFileMaxBytes) {
+        return reject(QStringLiteral("remembered sign-in file empty or oversized"));
+    }
+    const QJsonDocument outerDoc = QJsonDocument::fromJson(raw);
+    const QJsonObject outer = outerDoc.isObject() ? outerDoc.object() : QJsonObject{};
+    if (outer.value(QStringLiteral("schema")).toString() != QLatin1String(kRememberedOuterSchema)) {
+        return reject(QStringLiteral("remembered sign-in file schema invalid"));
+    }
+    const QByteArray blob = QByteArray::fromBase64(
+        outer.value(QStringLiteral("blob_b64")).toString().toLatin1());
+    bool dpapiOk = false;
+    QByteArray plain = dpapiUnprotect(blob, rememberedSignInEntropy(), &dpapiOk);
+    if (!dpapiOk) {
+        return reject(QStringLiteral("remembered sign-in could not be decrypted"));
+    }
+    const QJsonDocument payloadDoc = QJsonDocument::fromJson(plain);
+    plain.fill('\0');
+    const QJsonObject payload = payloadDoc.isObject() ? payloadDoc.object() : QJsonObject{};
+    if (payload.value(QStringLiteral("schema")).toString() != QLatin1String(kRememberedPayloadSchema)) {
+        return reject(QStringLiteral("remembered sign-in payload schema invalid"));
+    }
+    const QJsonObject binding = payload.value(QStringLiteral("binding")).toObject();
+    if (binding.value(QStringLiteral("machine_id")).toString() != machineId()
+        || binding.value(QStringLiteral("user")).toString() != currentUserBinding()) {
+        return reject(QStringLiteral("remembered sign-in belongs to another PC or Windows user"));
+    }
+    const QString key = payload.value(QStringLiteral("license_key")).toString();
+    if (!isRememberableLicenseKey(key)) {
+        return reject(QStringLiteral("remembered sign-in holds no canonical key"));
+    }
+    if (outcome) *outcome = RememberedKeyLoad::Loaded;
+    if (detail) *detail = QStringLiteral("remembered sign-in loaded (key_suffix=%1)").arg(key.right(4));
+    return key;
+}
+
+bool SecurityManager::clearRememberedLicenseKey(QString* error) const
+{
+    const QString path = rememberedLicenseKeyPath();
+    if (!QFileInfo::exists(path)) {
+        return true;
+    }
+    if (!QFile::remove(path)) {
+        if (error) *error = QStringLiteral("Failed to remove the remembered sign-in");
+        return false;
+    }
+    return true;
+}
 
 SecurityManager::SettingsWriteGate SecurityManager::beginSettingsWrite(QString* detail) const
 {
@@ -1156,22 +1364,11 @@ QByteArray SecurityManager::protectBytes(const QByteArray& plain, bool* protecte
 {
     if (protectedByDpapi) *protectedByDpapi = false;
 #ifdef Q_OS_WIN
-    DATA_BLOB in {};
-    in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plain.constData()));
-    in.cbData = static_cast<DWORD>(plain.size());
     const QByteArray entropy = QByteArrayLiteral("orion-entitlement-v1|") + machineId().toUtf8();
-    DATA_BLOB entropyBlob {};
-    entropyBlob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(entropy.constData()));
-    entropyBlob.cbData = static_cast<DWORD>(entropy.size());
-    DATA_BLOB out {};
-    if (CryptProtectData(&in, L"Orion local entitlement", &entropyBlob, nullptr, nullptr,
-                         CRYPTPROTECT_UI_FORBIDDEN, &out)) {
-        QByteArray result(reinterpret_cast<const char*>(out.pbData), static_cast<int>(out.cbData));
-        LocalFree(out.pbData);
-        if (protectedByDpapi) *protectedByDpapi = true;
-        return result;
-    }
-    return {};
+    bool ok = false;
+    const QByteArray result = dpapiProtect(plain, entropy, L"Orion local entitlement", &ok);
+    if (ok && protectedByDpapi) *protectedByDpapi = true;
+    return ok ? result : QByteArray{};
 #else
     return plain;
 #endif
@@ -1189,23 +1386,11 @@ QByteArray SecurityManager::unprotectBytes(const QByteArray& blob, bool dpapiPro
 #endif
     }
 #ifdef Q_OS_WIN
-    DATA_BLOB in {};
-    in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(blob.constData()));
-    in.cbData = static_cast<DWORD>(blob.size());
     const QByteArray entropy = QByteArrayLiteral("orion-entitlement-v1|") + machineId().toUtf8();
-    DATA_BLOB entropyBlob {};
-    entropyBlob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(entropy.constData()));
-    entropyBlob.cbData = static_cast<DWORD>(entropy.size());
-    DATA_BLOB out {};
-    if (CryptUnprotectData(&in, nullptr, &entropyBlob, nullptr, nullptr,
-                           CRYPTPROTECT_UI_FORBIDDEN, &out)) {
-        QByteArray result(reinterpret_cast<const char*>(out.pbData), static_cast<int>(out.cbData));
-        LocalFree(out.pbData);
-        if (ok) *ok = true;
-        return result;
-    }
-#endif
+    return dpapiUnprotect(blob, entropy, ok);
+#else
     return {};
+#endif
 }
 
 QJsonObject SecurityManager::entitlementBinding() const

@@ -726,6 +726,40 @@ Rectangle {
                         lineHeight: 1.25
                         wrapMode: Text.WordWrap
                     }
+
+                    // [P-H 2026-09-23] Venice remembers the sign-in on this PC; this is
+                    // the one way to end it. Ends the session and forgets this PC, so the
+                    // next unlock needs a fresh one-time code from zaeorion.com/connect.
+                    Button {
+                        id: signOutButton
+                        objectName: "licenseFlyoutSignOut"
+                        Layout.fillWidth: true
+                        Layout.topMargin: 2
+                        Layout.preferredHeight: 32
+                        hoverEnabled: true
+                        enabled: orion.authBusy !== true
+                        onClicked: {
+                            licenseFlyout.close()
+                            orion.signOut()
+                        }
+                        contentItem: Text {
+                            text: "Sign out"
+                            color: signOutButton.hovered ? Theme.textPrimary : Theme.textSecondary
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.fontSmall
+                            font.weight: Font.DemiBold
+                            Behavior on color { ColorAnimation { duration: Theme.motionFast } }
+                        }
+                        background: Rectangle {
+                            radius: Theme.radiusControl
+                            color: signOutButton.hovered ? Theme.bgCardHover : Theme.bgCard
+                            border.color: signOutButton.hovered ? Theme.borderStrong : Theme.borderSoft
+                            border.width: 1
+                            Behavior on color { ColorAnimation { duration: Theme.motionFast } }
+                        }
+                    }
                 }
             }
         }

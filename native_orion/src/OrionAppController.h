@@ -161,6 +161,9 @@ class OrionAppController final : public QObject, public QAbstractNativeEventFilt
     Q_PROPERTY(bool authenticated READ authenticated NOTIFY authChanged)
     Q_PROPERTY(bool authBusy READ authBusy NOTIFY authChanged)
     Q_PROPERTY(QString authMessage READ authMessage NOTIFY authChanged)
+    // [P-H 2026-09-23] A DPAPI-protected canonical key is remembered on this PC. It is
+    // NOT authority: AuthGate uses it only to offer Unlock without a new one-time code.
+    Q_PROPERTY(bool rememberedSignInAvailable READ rememberedSignInAvailable NOTIFY authChanged)
     // MOTD (docs/ADMIN_PANEL_V2_CONTRACT.md §5): the owner's notice, carried by the
     // /api/license/check heartbeat and /api/version as `motd {text, level, until}`.
     // RemotePlayPage shows it in the top-centre banner slot while motdVisible is
@@ -903,6 +906,7 @@ public:
     [[nodiscard]] bool authenticated() const noexcept { return authenticated_; }
     [[nodiscard]] bool authBusy() const noexcept { return authBusy_; }
     [[nodiscard]] QString authMessage() const noexcept { return authMessage_; }
+    [[nodiscard]] bool rememberedSignInAvailable() const noexcept { return rememberedSignInAvailable_; }
     [[nodiscard]] QString motdText() const noexcept { return motd_.text; }
     [[nodiscard]] QString motdLevel() const noexcept { return motd_.level; }
     [[nodiscard]] double motdUntil() const noexcept { return static_cast<double>(motd_.untilEpochS); }
@@ -1591,6 +1595,13 @@ public:
     [[nodiscard]] int cheaterCount() const noexcept { return cheaterCount_; }
 
     Q_INVOKABLE void authenticate(const QString& key);
+    // [P-H 2026-09-23] Re-submit the remembered canonical key to the server (AuthGate's
+    // Unlock with an empty field). No-op when nothing is remembered or a request is busy.
+    Q_INVOKABLE void resumeRememberedSignIn();
+    // [P-H 2026-09-23] Customer sign-out: ends the session exactly like a server kill
+    // (stream down, lease dropped, heartbeat stopped) and deletes the remembered key and
+    // the local entitlement cache. Refused while an activation is in flight.
+    Q_INVOKABLE void signOut();
     Q_INVOKABLE void checkBackend();
     // Hands off to OrionUpdater.exe (manifest URL + this PID + install dir) and
     // quits so the updater can replace files. Called by the startup update gate
@@ -2501,6 +2512,16 @@ private:
     QString authMessage_ = QStringLiteral("Paste the one-time code from zaeorion.com/connect, then press Unlock.");
     QString licenseState_ = QStringLiteral("Locked");
     QString authLicenseKey_;   // stashed on activation, used by the license heartbeat
+    // [P-H 2026-09-23] Remembered sign-in state. rememberedSignInAttempt_ marks the ONE
+    // in-flight activation that was started from the stored key (only its definitive
+    // refusal deletes the store). The retry timer walks LicenseHeartbeatBackoff after a
+    // transient failure; it only ever re-submits to the server.
+    bool rememberedSignInAvailable_ = false;
+    bool rememberedSignInAttempt_ = false;
+    LicenseHeartbeatBackoff rememberedSignInBackoff_;
+    QTimer rememberedSignInRetryTimer_;
+    void beginRememberedSignIn(const QString& trigger);
+    void forgetRememberedSignIn(const QString& reason);
     QString pendingActivationKey_;   // orion://activate deep-link key awaiting AuthGate pickup
     // CRIT-1 (docs/SECURITY_REDTEAM.md): the /api/activate session token is kept
     // client-side (it used to be discarded at the activationFinished handler)

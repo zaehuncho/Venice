@@ -75,6 +75,24 @@ public:
     [[nodiscard]] QJsonObject loadLocalEntitlement(bool* ok = nullptr, QString* state = nullptr) const;
     bool clearLocalEntitlement(QString* error = nullptr) const;
 
+    // [P-H 2026-09-23] Remembered sign-in. The CANONICAL licence key (never a PAIR- code)
+    // is kept DPAPI-protected (CURRENT_USER, app-specific entropy bound to this machine
+    // id) at <data dir>/.vault/venice_signin.dat, bound to machine id + Windows user.
+    // It is only a convenience credential for the NEXT server activation: loading it
+    // never grants authenticated state, automation or a fire lease - the server verdict
+    // does. No plaintext fallback: without DPAPI the key is simply not remembered.
+    enum class RememberedKeyLoad {
+        None,     // no file
+        Loaded,   // decrypted, binding matched, canonical key returned
+        Cleared,  // corrupt / undecryptable / foreign binding / non-canonical -> file deleted
+    };
+    bool storeRememberedLicenseKey(const QString& canonicalKey, QString* error = nullptr) const;
+    // `detail` never contains the key (suffix only).
+    [[nodiscard]] QString loadRememberedLicenseKey(RememberedKeyLoad* outcome = nullptr,
+                                                   QString* detail = nullptr) const;
+    bool clearRememberedLicenseKey(QString* error = nullptr) const;
+    [[nodiscard]] bool hasRememberedLicenseKey() const;
+
     // [ORION_FIRST_RUN_SIG_BOOTSTRAP] Narrow public accessor for the OrionAppController
     // first-run bootstrap. Only the presence of the signature file is exposed -- callers
     // still cannot see settingsPath / settingsSigPath / the digest bytes.
@@ -124,6 +142,8 @@ private:
     [[nodiscard]] QString settingsJournalPath() const;
     [[nodiscard]] QString settingsSignedOnceMarkerPath() const;
     [[nodiscard]] QString localEntitlementPath() const;
+    [[nodiscard]] QString rememberedLicenseKeyPath() const;
+    [[nodiscard]] QByteArray rememberedSignInEntropy() const;
     [[nodiscard]] QString releaseManifestPath() const;
     [[nodiscard]] QString releaseManifestSignaturePath(const QString& manifestPath) const;
     [[nodiscard]] QString securityPolicyPath() const;
@@ -137,6 +157,10 @@ private:
     QString rootDir_;
     QString lastSecurityAuditEvent_;
 };
+
+// [P-H 2026-09-23] True only for the canonical private key shape the backend mints
+// (XXXX-XXXX-XXXX-XXXX, [A-Z0-9]). PAIR- one-time codes and NVDEV- dev keys are false.
+[[nodiscard]] ORION_SECURITY_API bool isRememberableLicenseKey(const QString& key);
 
 // A monotonic authority epoch for asynchronous security work. Synchronous
 // checkpoints (startup, connect, settings/license mutation, explicit integrity

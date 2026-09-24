@@ -982,6 +982,21 @@ if(ORION_BUILD_TESTS)
         Qt6::Test
     )
     orion_add_qtest(OrionSettingsSignatureTransactionTests)
+    # [P-H 2026-09-23] Remembered sign-in: DPAPI store/load/clear of the canonical key
+    # (SecurityManager), the keep/clear refusal classifier (LicenseClient) and the retry
+    # decision (LicenseHeartbeatPolicy.h). File tests skip in a production-configured build.
+    add_executable(OrionRememberedSignInTests
+        tests/RememberedSignInTests.cpp
+    )
+    orion_apply_target_defaults(OrionRememberedSignInTests)
+    target_link_libraries(OrionRememberedSignInTests PRIVATE
+        OrionCommon
+        SecurityCore
+        Qt6::Core
+        Qt6::Network
+        Qt6::Test
+    )
+    orion_add_qtest(OrionRememberedSignInTests)
     # [RT-MED-10 2026-09-23] GUI-freeze watchdog decision (src/GuiFreezeWatchdogPolicy.h,
     # header-only): sleep/resume and clock steps are not a GUI freeze.
     add_executable(OrionGuiFreezeWatchdogPolicyTests
@@ -1323,7 +1338,7 @@ if(ORION_BUILD_TESTS)
                 list(APPEND _orion_test_path_mods "PATH=path_list_prepend:${_orion_opencv_bin}")
             endif()
         endif()
-        set_tests_properties(OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionLicenseHeartbeatPolicyTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionRouteTransitionTests OrionShmNotificationTests OrionPreciseWaitTests PROPERTIES
+        set_tests_properties(OrionNativeTests OrionFireEpochClockTests OrionMeterDelayTests OrionMeterDelaySettingsTests OrionRemotePlayPathTests OrionInputRetryTests OrionVeniceProfileTests OrionPassiveCourtFlowTests OrionPreviewPresentationTests OrionActivityFeedPolicyTests OrionLicenseHeartbeatPolicyTests OrionRememberedSignInTests OrionShotVerdictTallyTests OrionOrderedFileLogSinkTests OrionInputProtocolTests OrionDeepLinkTargetPolicyTests OrionShmInteropTests OrionRouteTransitionTests OrionShmNotificationTests OrionPreciseWaitTests PROPERTIES
             ENVIRONMENT "${_orion_test_env}"
             ENVIRONMENT_MODIFICATION "${_orion_test_path_mods}"
         )

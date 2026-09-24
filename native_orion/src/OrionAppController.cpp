@@ -40,6 +40,7 @@
 #include "SidecarWatchdog.h"  // isCaptureCardSource / sidecarRestartDelayMs for the capture preview handoff
 #include "WinMmButtonMapping.h"  // Sony-order dwButtons/dwPOV mapping for the WinMM fallback route
 #include <chrono>
+#include <utility>   // [P-H 2026-09-23] std::exchange
 #include <QtCore/QScopedValueRollback>
 #include <QtCore/QTextStream>
 #include <QtCore/QTimer>
@@ -2296,6 +2297,9 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
 
     connect(&licenseClient_, &LicenseClient::activationFinished, this, [this](const LicenseResult& result) {
         authBusy_ = false;
+        // [P-H 2026-09-23] Was THIS activation started from the remembered key? Consumed
+        // here so a later typed attempt can never delete the store by accident.
+        const bool rememberedAttempt = std::exchange(rememberedSignInAttempt_, false);
         if (result.ok && authLicenseKey_.startsWith(QStringLiteral("PAIR-"))) {
             static const QRegularExpression canonicalKey(
                 QStringLiteral("^[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}$"));
@@ -2357,6 +2361,25 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 entitlementState_ = QStringLiteral("Entitlement cache failed: %1").arg(cacheError);
                 appendLog(entitlementState_);
             }
+            // [P-H 2026-09-23] Remember the sign-in for the next launch. Only the CANONICAL
+            // key the server just accepted is stored (a PAIR- code was replaced above and
+            // isRememberableLicenseKey refuses anything else), DPAPI-protected. Storing is
+            // convenience only: the next launch re-submits it and the server decides.
+            rememberedSignInRetryTimer_.stop();
+            rememberedSignInBackoff_.reset();
+            {
+                QString rememberError;
+                if (security_.storeRememberedLicenseKey(authLicenseKey_, &rememberError)) {
+                    rememberedSignInAvailable_ = true;
+                    appendLog(QStringLiteral("Sign-in remembered on this PC (key_suffix=%1).")
+                                  .arg(authLicenseKey_.right(4)));
+                } else {
+                    // The newest sign-in wins: an OLDER remembered key (another account)
+                    // must not be the one used next launch.
+                    appendLog(QStringLiteral("Sign-in not remembered: %1").arg(rememberError));
+                    forgetRememberedSignIn(QStringLiteral("this sign-in could not be remembered"));
+                }
+            }
             emit navigationChanged();
             // [CL2-P8-002 2026-09-23] Fresh session: clean retry ladder, normal cadence.
             applyHeartbeatAction(heartbeatCoordinator_.onSessionStarted());
@@ -2389,6 +2412,28 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
                 authMessage_ = QStringLiteral("Venice is paused by the service right now. Nothing is wrong with your PC or internet.");
             }
             appendLog(QStringLiteral("License activation failed: %1").arg(authMessage_));
+            // [P-H 2026-09-23] Remembered sign-in: a definitive verdict on the stored key
+            // deletes it (AuthGate then asks for a fresh one-time code with the reason
+            // above); a transient failure keeps it and retries on the heartbeat ladder.
+            // Nothing here grants authority - authenticated_ stays false either way.
+            if (rememberedAttempt) {
+                const RememberedSignInDecision next = rememberedSignInAfterFailure(
+                    isRememberedSignInRefusalCode(result.error),
+                    result.error == QLatin1String("rate_limited"),
+                    rememberedSignInBackoff_);
+                if (next.clearStoredKey) {
+                    forgetRememberedSignIn(QStringLiteral("server refused the remembered sign-in (%1)")
+                                               .arg(result.error));
+                    authLicenseKey_.clear();
+                } else if (next.retryDelayMs >= 0) {
+                    rememberedSignInRetryTimer_.start(next.retryDelayMs);
+                    appendLog(QStringLiteral("Remembered sign-in kept after a temporary failure (%1); "
+                                             "retrying in %2 s.")
+                                  .arg(result.error.isEmpty() ? QStringLiteral("no server answer")
+                                                              : result.error)
+                                  .arg(next.retryDelayMs / 1000));
+                }
+            }
         }
         // License authority/cache mutation is a synchronous checkpoint. This
         // also invalidates any periodic result that began before the mutation.
@@ -2469,6 +2514,11 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
             return;
         }
         appendLog(QStringLiteral("License heartbeat: session disabled (%1)").arg(e));
+        // [P-H 2026-09-23] A verdict on the key itself also deletes the remembered sign-in;
+        // a service pause / version block keeps it (see isRememberedSignInRefusalCode).
+        if (isRememberedSignInRefusalCode(e)) {
+            forgetRememberedSignIn(QStringLiteral("licence heartbeat refused the key (%1)").arg(e));
+        }
         applyHeartbeatAction(heartbeatCoordinator_.onResult(HeartbeatOutcome::Kill));   // [CL2-P8-002] stops the timer
         licenseHeartbeatTimer_.stop();
         disconnectRemotePlay(true);   // stop the bot/capture immediately
@@ -2497,6 +2547,12 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
         emit statusChanged();
     });
     licenseHeartbeatTimer_.setInterval(LicenseHeartbeatBackoff::kNormalIntervalMs);   // 5-min server re-check
+    // [P-H 2026-09-23] Remembered sign-in retry after a transient failure (single shot,
+    // re-armed by each failure through rememberedSignInAfterFailure()).
+    rememberedSignInRetryTimer_.setSingleShot(true);
+    connect(&rememberedSignInRetryTimer_, &QTimer::timeout, this, [this]() {
+        beginRememberedSignIn(QStringLiteral("automatic retry"));
+    });
     connect(&licenseHeartbeatTimer_, &QTimer::timeout, this, [this]() {
         if (authenticated_ && !authLicenseKey_.isEmpty()) {
             licenseClient_.validate(authLicenseKey_, security_.machineId());
@@ -4904,6 +4960,16 @@ OrionAppController::OrionAppController(QString rootDir, QObject* parent)
     }
 #endif
 
+    // [P-H 2026-09-23] Remembered sign-in. Runs AFTER the dev hooks so ORION_AUTO_UNLOCK_LOCAL
+    // / ORION_LICENSE_KEY still win in a dev launch (authenticated_ / authBusy_ is then set).
+    // The stored canonical key only re-submits to the server through the normal
+    // authenticate() -> /api/license/redeem path: device binding, revocation, kill switch,
+    // subscription and version gate are all decided there. Until that verdict arrives the
+    // app stays on AuthGate (busy "Signing you in…"), unauthenticated, with no lease.
+    if (!authenticated_ && !authBusy_) {
+        beginRememberedSignIn(QStringLiteral("launch"));
+    }
+
     // --- Watchdogs -------------------------------------------------------
     // Sidecar crash while streaming: restart it once; a repeat inside the
     // 5-minute window escalates to safe mode. Any trip disarms + neutrals first.
@@ -5700,6 +5766,105 @@ void OrionAppController::authenticate(const QString& key)
         .arg(licenseClient_.serverUrl().host()));
     authLicenseKey_ = normalized;
     licenseClient_.activate(normalized, machineId);
+}
+
+void OrionAppController::beginRememberedSignIn(const QString& trigger)
+{
+    // [P-H 2026-09-23] Never while a session is live or another activation is in flight.
+    if (authenticated_ || authBusy_ || applicationShutdownActive(applicationShutdownPhase_)) {
+        return;
+    }
+    rememberedSignInRetryTimer_.stop();
+    // Read from disk every time (not cached in memory between attempts): a sign-out or
+    // a damaged file is honoured immediately, and a failed decrypt deletes the file.
+    SecurityManager::RememberedKeyLoad outcome = SecurityManager::RememberedKeyLoad::None;
+    QString detail;
+    const QString key = security_.loadRememberedLicenseKey(&outcome, &detail);
+    if (outcome != SecurityManager::RememberedKeyLoad::Loaded || key.isEmpty()) {
+        const bool wasAvailable = rememberedSignInAvailable_;
+        rememberedSignInAvailable_ = false;
+        if (outcome == SecurityManager::RememberedKeyLoad::Cleared) {
+            // Corrupt / undecryptable / another PC or Windows user: already deleted.
+            appendLog(QStringLiteral("Remembered sign-in discarded: %1").arg(detail));
+        }
+        if (wasAvailable) {
+            emit authChanged();
+        }
+        return;
+    }
+    rememberedSignInAvailable_ = true;
+    appendLog(QStringLiteral("Remembered sign-in: asking the licence server (%1, key_suffix=%2).")
+                  .arg(trigger, key.right(4)));
+    rememberedSignInAttempt_ = true;
+    authenticate(key);
+    if (authBusy_) {
+        // Request is in flight: say what is happening instead of "Checking your code…".
+        authMessage_ = QStringLiteral("Signing you in…");
+        emit authChanged();
+    } else {
+        // Either the verdict already arrived synchronously (the handler consumed the
+        // flag) or authenticate() refused locally without a request: never leave the
+        // flag armed for an unrelated later activation.
+        rememberedSignInAttempt_ = false;
+    }
+}
+
+void OrionAppController::resumeRememberedSignIn()
+{
+    beginRememberedSignIn(QStringLiteral("Unlock pressed"));
+}
+
+void OrionAppController::forgetRememberedSignIn(const QString& reason)
+{
+    rememberedSignInRetryTimer_.stop();
+    rememberedSignInBackoff_.reset();
+    rememberedSignInAttempt_ = false;
+    QString error;
+    if (!security_.clearRememberedLicenseKey(&error)) {
+        appendLog(QStringLiteral("Remembered sign-in could not be deleted: %1").arg(error));
+    }
+    rememberedSignInAvailable_ = security_.hasRememberedLicenseKey();
+    appendLog(QStringLiteral("Remembered sign-in removed: %1").arg(reason));
+}
+
+void OrionAppController::signOut()
+{
+    if (authBusy_) {
+        // An activation is in flight; its verdict would land after the sign-out. The
+        // button is disabled while busy, so this is only a defensive no-op.
+        appendLog(QStringLiteral("Sign out ignored: a sign-in request is in flight."));
+        return;
+    }
+    // Same teardown as a server kill verdict (validationFinished), minus the server.
+    applyHeartbeatAction(heartbeatCoordinator_.onResult(HeartbeatOutcome::Kill));   // stops the timer
+    licenseHeartbeatTimer_.stop();
+    if (authenticated_) {
+        disconnectRemotePlay(true);   // stop the bot/capture immediately
+    }
+    authenticated_ = false;
+    leaseGate_.recordHeartbeatKill();
+    authToken_.clear();
+    authTokenId_.clear();
+    authTokenExpires_ = 0;
+    authLicenseKey_.clear();
+    licenseState_ = QStringLiteral("Locked");
+    forgetRememberedSignIn(QStringLiteral("signed out by the customer"));
+    QString entitlementError;
+    if (!security_.clearLocalEntitlement(&entitlementError)) {
+        appendLog(entitlementError);
+    }
+    entitlementState_ = security_.entitlementState();
+    if (profile_.known) {
+        profile_ = LicenseProfile{};
+        emit profileChanged();
+    }
+    authMessage_ = QStringLiteral("Signed out. To sign in again, get a one-time code from zaeorion.com/connect and press Unlock.");
+    appendCustomerEvent(QStringLiteral("Signed out of Venice on this PC."));
+    updateSecurityStatus();
+    refreshLeaseNotice();
+    emit authChanged();
+    emit navigationChanged();
+    emit statusChanged();
 }
 
 void OrionAppController::checkBackend()
