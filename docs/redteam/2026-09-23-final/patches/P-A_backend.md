@@ -183,3 +183,48 @@ P-F reported two backend issues in the step-up flow. Both are fixed in `backend/
 - If the role lacks `PutParameter` on the new name, `totp_enroll` returns 500 `ssm_write_failed` and nothing changes.
 - A staged secret has no expiry. An abandoned enrolment stays staged, inert (it authorises nothing but its own confirm), until the next enrol or disable overwrites or clears it.
 - **Lost-device runbook:** also delete the staged parameter.
+
+## Follow-up: remembered sign-in, bound-machine resume (P-H, owner-approved 2026-09-23)
+
+**Problem.** `handle_activate` refused a canonical key sent without a `PAIR-` exchange whenever the row had `oauth_pair_required`. That flag is set on every new trial and every Stripe key. So the P-H client's remembered sign-in (re-submitting the stored canonical key at launch) got `discord_signin_required` for every launch customer.
+
+**Change** (`backend/lambda_function.py`, `handle_activate`). An **unpaired** activation of an `oauth_pair_required` key is now allowed **only** when the submitted `machine_id` equals the machine the row is **already** bound to (constant-time compare).
+
+- **Every existing check still runs first**, in the same order:
+  - nonce and timestamp replay;
+  - per-key and per-IP rate limits;
+  - global kill, including the fail-closed `kill_state_unavailable`;
+  - version gate;
+  - machine and Discord blacklist;
+  - revoked, frozen and bad status;
+  - expiry;
+  - the Discord subscription/entitlement check.
+- **The binding is not changed.** The resume write is `SET last_activated, last_resume_at` with `ConditionExpression machine_id = :m`. There is no `machine_id` write and no `activations` increment. An HWID reset racing the request fails the condition and returns `discord_signin_required`; it never re-binds.
+- **Still refused with `discord_signin_required`** (behaviour unchanged): a different machine, an unbound key, a post-HWID-reset key (`machine_id` empty), and any new bind. The trial per-machine guard and the device-cap path are untouched for all real binds.
+- **Audit:** `activate_success` now carries `details.reason` = `bound_machine_resume`, `paired` or `key`. A concurrent-reset refusal is logged as `activate_discord_signin_required` with reason `binding_changed_during_resume`.
+- **Disclosure:** the resume response contains no `canonical_license_key`. Only a paired exchange returns it, as before.
+
+The P-H doc's proposed one-line diff was verified and extended. The proposal as written would have fallen through to the normal bind path, which increments `activations` and re-writes `machine_id` without an atomic re-check of the binding. It is replaced by the dedicated conditional resume write above.
+
+**Justification.** `/api/license/check` (the heartbeat) already accepts key + bound machine without pairing every 5 minutes and returns a signed lease. The resume therefore grants no capability that the key holder on that machine did not already have.
+
+**Residual.** The same as the existing one: `machine_id` is a client-claimed string, not device attestation. Anyone who holds both the canonical key and the exact bound machine id could also run the heartbeat today. The resume adds a 30-day session token on top of that existing heartbeat capability. The token is still bound to the same key and machine and is checked against revoke/expiry by `/api/verify`.
+
+**Tests.** New file `tests/backend/test_rc1_bound_resume.py`, 8 tests.
+- Before the fix: **4 failed, 4 passed**. The 4 that passed are the refusal controls: other machine, unbound key, post-reset key, and a concurrent-reset race, all correctly refused before and after.
+- After the fix: **8 passed**, together with `test_pairing.py` (14 passed).
+- The 8 tests cover:
+  - resume on the bound machine with binding and activation count unchanged, an audit reason recorded, and no canonical key returned;
+  - a different machine;
+  - an unbound key;
+  - a post-HWID-reset key;
+  - every validity check still refusing: revoked, frozen, expired, global kill, machine blacklist;
+  - nonce replay → 401 `replay_detected`, stale timestamp → 401 `timestamp_expired`;
+  - an HWID reset between read and write → `discord_signin_required` with the binding still empty;
+  - a Stripe-style `oauth_pair_required` paid key resuming on its bound PC and refused on another.
+
+**Full suite:** `tests/backend` **443 passed**, `A7_OFFLINE_GUARD_BLOCKS 0`, exit 0.
+
+**Deploy note (addition).** No schema change. The row gains a `last_resume_at` attribute on resume. Deploy together with the rest of P-A, from `backend/lambda_function.py`.
+
+**Stale bundle warning.** `discord_launch/deployed_bundle/orion-activate/lambda_function.py` is a stale 1,572-line snapshot (last commit `7d19686`). Live is about 5,042 lines (= `0eca7d2` + `session_only`). I added `discord_launch/deployed_bundle/orion-activate/README_DO_NOT_DEPLOY.md` next to it: deploying that folder would roll production back past every security fix above. Deploy only from `backend/lambda_function.py`.

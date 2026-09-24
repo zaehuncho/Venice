@@ -650,6 +650,9 @@ def license_profile(item):
     }
 
 # ── /api/activate ─────────────────────────────────────────────────────────────
+DISCORD_SIGNIN_MESSAGE = ("Connect your Discord account at zaeorion.com/connect, "
+                          "then unlock with the one-time code.")
+
 def handle_activate(event):
     # ── Parse body ───────────────────────────────────────────────────────────
     try:
@@ -822,15 +825,24 @@ def handle_activate(event):
     # New trials never authorize by the private database key alone. The person
     # must connect the owning Discord account and redeem its one-use code.
     # Older trial rows lack this flag and remain usable until their short expiry.
-    if item.get("oauth_pair_required") and not paired:
-        audit_log("activate_discord_signin_required", license_key)
-        return err("discord_signin_required", 403,
-                   message="Connect your Discord account at zaeorion.com/connect, then unlock with the one-time code.")
-
     # ── Machine binding ───────────────────────────────────────────────────────
     bound_machine = item.get("machine_id", "")
     activations   = int(item.get("activations", 0))
     max_devices   = int(item.get("max_devices", 1))
+
+    # [2026-09-23 rc1 P-H, owner-approved] Remembered sign-in: an oauth_pair_required
+    # key may re-activate WITHOUT a PAIR- exchange only on the machine it is ALREADY
+    # bound to. /api/license/check already accepts key + bound machine unpaired every
+    # heartbeat, so this grants no new capability. It never binds or re-binds: a new
+    # bind, another machine, an unbound key or a post-HWID-reset key still needs the
+    # Discord pairing. Every check above (replay, rate limit, kill, version,
+    # blacklist, revoke, frozen, expiry, entitlement) has already run.
+    bound_resume = False
+    if item.get("oauth_pair_required") and not paired:
+        if not (bound_machine and secrets.compare_digest(str(bound_machine), machine_id)):
+            audit_log("activate_discord_signin_required", license_key)
+            return err("discord_signin_required", 403, message=DISCORD_SIGNIN_MESSAGE)
+        bound_resume = True
 
     if bound_machine and bound_machine != machine_id:
         if activations >= max_devices:
@@ -859,25 +871,43 @@ def handle_activate(event):
     # a fresh max_devices=1 key can no longer both read activations=0 and both win.
     # Allowed iff re-binding the SAME machine, OR there is still device capacity.
     activated_at = now_ts()
-    try:
-        licenses_table().update_item(
-            Key={"license_key": license_key},
-            UpdateExpression="ADD activations :one SET machine_id = :m, last_activated = :t",
-            ConditionExpression=(
-                "machine_id = :m OR attribute_not_exists(machine_id) OR machine_id = :empty "
-                "OR activations < :max OR attribute_not_exists(activations)"
-            ),
-            ExpressionAttributeValues={
-                ":one": 1, ":m": machine_id, ":t": activated_at,
-                ":empty": "", ":max": max_devices,
-            },
-        )
-    except get_ddb().meta.client.exceptions.ConditionalCheckFailedException:
-        audit_log("activate_device_cap", license_key)
-        return err("device_limit_reached", 403)
-    except Exception as e:
-        print(f"[ERROR] license bind update_item failed: {e}")
-        return err("internal_error", 500)
+    if bound_resume:
+        # Binding unchanged: no machine_id write, no activation count. The condition
+        # re-checks the binding atomically, so an HWID reset racing this request
+        # fails closed to the pairing requirement instead of re-binding.
+        try:
+            licenses_table().update_item(
+                Key={"license_key": license_key},
+                UpdateExpression="SET last_activated = :t, last_resume_at = :t",
+                ConditionExpression="machine_id = :m",
+                ExpressionAttributeValues={":m": machine_id, ":t": activated_at})
+        except get_ddb().meta.client.exceptions.ConditionalCheckFailedException:
+            audit_log("activate_discord_signin_required", license_key,
+                      {"reason": "binding_changed_during_resume"})
+            return err("discord_signin_required", 403, message=DISCORD_SIGNIN_MESSAGE)
+        except Exception as e:
+            print(f"[ERROR] license resume update_item failed: {e}")
+            return err("internal_error", 500)
+    else:
+        try:
+            licenses_table().update_item(
+                Key={"license_key": license_key},
+                UpdateExpression="ADD activations :one SET machine_id = :m, last_activated = :t",
+                ConditionExpression=(
+                    "machine_id = :m OR attribute_not_exists(machine_id) OR machine_id = :empty "
+                    "OR activations < :max OR attribute_not_exists(activations)"
+                ),
+                ExpressionAttributeValues={
+                    ":one": 1, ":m": machine_id, ":t": activated_at,
+                    ":empty": "", ":max": max_devices,
+                },
+            )
+        except get_ddb().meta.client.exceptions.ConditionalCheckFailedException:
+            audit_log("activate_device_cap", license_key)
+            return err("device_limit_reached", 403)
+        except Exception as e:
+            print(f"[ERROR] license bind update_item failed: {e}")
+            return err("internal_error", 500)
 
     # ── Issue session token (only after the bind is durably claimed) ──────────
     token    = gen_token()
@@ -921,7 +951,10 @@ def handle_activate(event):
     except Exception as e:
         print(f"[FRAUD] signal pass failed key=...{license_key[-4:]}: {e}")
 
-    audit_log("activate_success", license_key, {"machine_suffix": machine_id[-4:] if len(machine_id) >= 4 else machine_id})
+    audit_log("activate_success", license_key,
+              {"machine_suffix": machine_id[-4:] if len(machine_id) >= 4 else machine_id,
+               "reason": "bound_machine_resume" if bound_resume
+                         else ("paired" if paired else "key")})
     print(f"[INFO] AUDIT activate success: key ...{license_key[-4:]}")
 
     resp = {
