@@ -35,3 +35,20 @@ Note: Codex read the candidate card before the `$t` path fix and resolved it cor
 | chiaki-ng fork licensing; game-specific tailoring | Claude M-7, M-8 | Legal and business questions, not code. | owner/legal |
 | Discord ID as identity; privacy policy | Claude L-5 | Check that privacy.html names the Discord ID. | copy check |
 | Named pipes same-user; ViGEmClient unsigned; duplicate OpenSSL/Qt; SecurityCore single key | Claude H-2, H-5, H-4, L-3, L-4 | Same-user or local-admin threat model, or footprint. No privilege boundary crossed. | post-launch hardening list |
+
+## Final round: Codex in Windows Sandbox, rc6 (installer c787ea2e…), 2026-09-24 18:19–18:57Z
+
+No exploit reproduced. The lane verdicts were blocked on untested authenticated flows and on the unsigned build.
+
+| ID | Codex | White-box verdict | Action |
+|---|---|---|---|
+| VEN-EXT-006 updater exits 2 on the pristine signed fixture | MEDIUM | **Expected, by design.** The production updater refuses `--manifest-file` ("a local manifest file is not permitted in production builds", `updater_main.cpp:854`) and ignores `--current-version`. It accepts only the pinned `/api/update`. The fault is the silent exit: it writes to its log file, not stdout. | Post-launch: print the refusal reason to stderr. Before the first real update, rehearse it end-to-end via `/api/update` on a staging install. |
+| VEN-EXT-005 `ok`/`release_notes` outside the update signature | LOW | Confirmed. `release_notes` is parsed as `notes` (`UpdateManifest.cpp:175`). Altering it requires breaking the SPKI-pinned TLS to `api.zaeorion.com`. | Post-launch: sign all consumed fields. |
+| VEN-EXT-008 unsigned installer and PEs | HIGH | Accepted for the beta by the owner. | Publish the SHA-256 in #downloads; code-sign post-launch. |
+| VEN-EXT-003 build inventory, exports, test hooks in the package | LOW | Confirmed. Reverse-engineering cost only; no bypass. | First update, with packing. |
+| VEN-EXT-001 `/S` did not run silently | LOW | Tester error: Inno uses `/SILENT` or `/VERYSILENT`. The small-screen clipping is worth checking. | Post-launch UI pass. |
+| VEN-EXT-002 "Online" shown while the process was firewalled | LOW | Cosmetic; the gate stayed locked. | Post-launch. |
+| VEN-EXT-004 / 007 recovery text names Discord channels; no in-app privacy/refund links | LOW / MEDIUM | Confirmed. The site has the pages; the app does not link them. | First update: add links next to "I Agree" and in the recovery messages. |
+| Tampered `AutomationCore.dll` still launches to the locked gate | control | Expected: the integrity lock applies to automation after sign-in. The post-auth assertion is covered by the security tests, and a live check is below. | Owner live check |
+
+**Gaps that remain:** the authenticated lifecycle was covered live by claude2 in the on-disk round (replay, clock skew, device binding, 15-minute lease). What no tester has done is revoke a licence on a running client. That is a release blocker if it fails ("kill switch written but not enforced"), so the owner runs it: see the launch checks.
