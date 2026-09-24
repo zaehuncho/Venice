@@ -40,14 +40,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $PackageDir "release_manifest.sig"))
     }
     Write-Warning "release_manifest.sig missing: building an UNSIGNED DEV installer. Never ship this artifact."
 }
-$Required = @("OrionNative.exe", "OrionSidecar.exe", "security_policy.json",
-              # WAVE 3 (2026-08-08): the C++ packet-bridge service is a required
-              # payload — orion.iss registers packet_bridge\VeniceNetSvc.exe as
-              # the VeniceNetSvc service; a package without it would fail-soft
-              # into "Meter Delay unavailable" on every customer machine.
-              "packet_bridge\VeniceNetSvc.exe",
-              "packet_bridge\WinDivert64.dll",
-              "packet_bridge\WinDivert64.sys")
+$Required = @("OrionNative.exe", "OrionSidecar.exe", "security_policy.json")
+# [2026-09-24 owner] No packet-level driver ships: the packet bridge (VeniceNetSvc +
+# WinDivert) is retired with meter delay. A package that still carries it is refused.
+foreach ($bridge in @("packet_bridge\VeniceNetSvc.exe", "packet_bridge\WinDivert64.dll",
+                      "packet_bridge\WinDivert64.sys")) {
+    if (Test-Path -LiteralPath (Join-Path $PackageDir $bridge)) {
+        throw "Package still contains the retired packet bridge ($bridge); re-run the packager."
+    }
+}
 
 # SERVER-SHARD: when the packed package carries the unpacked activation broker, the
 # packed inner payload MUST also be present (orion.iss registers the broker as the
@@ -222,13 +223,16 @@ Write-Host "[orion-installer] sha256   $hash"
 $Preprocessed = Join-Path $OutputDir "orion.preprocessed.iss"
 if (Test-Path -LiteralPath $Preprocessed) {
     $Script = Get-Content -LiteralPath $Preprocessed -Raw
+    # [2026-09-24] The bridge is retired: the installer must REMOVE any earlier
+    # registration and must never create one again.
+    foreach ($forbidden in @('create VeniceNetSvc', '--arm-meter-delay', 'ORION_METER_DELAY_ARMED=1')) {
+        if ($Script.Contains($forbidden)) {
+            throw "Compiled installer script still registers the retired packet bridge: $forbidden"
+        }
+    }
     $ServiceChecks = @(
-        'create VeniceNetSvc binPath= ',
-        'packet_bridge\VeniceNetSvc.exe',
-        '--arm-meter-delay',
-        'ORION_METER_DELAY_ARMED=1',
+        'RetireLegacyPacketBridge',
         'RemoveBridgeService(''NexusVisionSvc'')',
-        '(A;;CCLCSWRPWPLOCRRC;;;IU)',
         # Uninstall path (2026-08-08): both bridge names removed at usUninstall
         # (stop -> poll STOPPED -> delete), the WinDivert safety-net stop, the
         # ProgramData token cleanup, and the interactive user-data choice.

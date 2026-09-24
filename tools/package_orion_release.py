@@ -31,6 +31,7 @@ try:
         COMPILED_SERVICE_REQUIRED_FILES,
         COMPILED_SIDECAR_REQUIRED_FILES,
         CROWN_JEWEL_PY_NAMES,
+        RETIRED_PACKET_BRIDGE_FILES,
         FORBIDDEN_FILE_SUFFIXES as FORBIDDEN_SUFFIXES,
         FORBIDDEN_NAME_SUFFIXES,
         FORBIDDEN_PATH_COMPONENTS as FORBIDDEN_NAMES,
@@ -46,6 +47,7 @@ except ModuleNotFoundError:  # Imported by path from the repository root in test
         COMPILED_SERVICE_REQUIRED_FILES,
         COMPILED_SIDECAR_REQUIRED_FILES,
         CROWN_JEWEL_PY_NAMES,
+        RETIRED_PACKET_BRIDGE_FILES,
         FORBIDDEN_FILE_SUFFIXES as FORBIDDEN_SUFFIXES,
         FORBIDDEN_NAME_SUFFIXES,
         FORBIDDEN_PATH_COMPONENTS as FORBIDDEN_NAMES,
@@ -576,9 +578,10 @@ def copy_runtime(sidecar_dist: Path | None = None,
     copy_compiled_sidecar(package_dir, selected_sidecar_dist)
     print(f"[orion-package] included source-bound OrionSidecar.exe bundle from {selected_sidecar_dist}")
 
-    selected_service_dist = (service_dist or SERVICE_DIST_DEFAULT).resolve()
-    copy_compiled_service(package_dir, selected_service_dist)
-    print(f"[orion-package] included compiled {VENICE_SERVICE_EXE} + WinDivert bridge from {selected_service_dist}")
+    # [2026-09-24 owner] The packet bridge (VeniceNetSvc + WinDivert) is retired with
+    # meter delay: no packet-level driver ships. copy_compiled_service() is kept for a
+    # future reintroduction but is not called; scan_forbidden refuses any bridge file.
+    del service_dist
 
     write_security_policy(package_dir)
     write_runtime_readme(package_dir)
@@ -601,6 +604,11 @@ def scan_forbidden(package_dir: Path) -> list[str]:
     for path in package_dir.rglob("*"):
         rel = path.relative_to(package_dir).as_posix()
         parts = {part.lower() for part in path.relative_to(package_dir).parts}
+        if (path.is_file() and (rel in RETIRED_PACKET_BRIDGE_FILES
+                                or path.name.lower().startswith("windivert"))):
+            # Retired packet bridge / any WinDivert component: never ship a packet driver.
+            findings.append(rel)
+            continue
         if any(part in FORBIDDEN_NAMES for part in parts):
             findings.append(rel)
             continue

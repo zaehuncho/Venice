@@ -141,15 +141,12 @@ COMPILED_SIDECAR_REQUIRED_FILES = frozenset(
 )
 
 
-# The inbound-meter-delay bridge is a shipped, customer-facing feature. Its elevated
-# host and the WinDivert driver it loads must be present in a published package or the
-# meter delay silently cannot engage on the install. Paths are package-relative POSIX
-# (the bundle ships under packet_bridge/, see package_orion_release.PACKET_BRIDGE_SUBDIR).
-# WAVE 3 (2026-08-08): the host is the C++ VeniceNetSvc.exe (native_orion/
-# venicenet_service, wave 2A) — the Nuitka NexusVisionSvc.exe bundle no longer ships.
-# The installer registers it under the customer-facing service name VeniceNetSvc
-# (installer/orion.iss RegisterPacketBridgeService).
-COMPILED_SERVICE_REQUIRED_FILES = frozenset(
+# [2026-09-24 owner] The inbound-meter-delay packet bridge (VeniceNetSvc.exe + the
+# WinDivert driver pair under packet_bridge/) is RETIRED: meter delay is shelved and no
+# packet-level driver ships. Nothing is required, and every bridge path below is
+# forbidden in a published package (scan_forbidden + the audit's nested-exe rule).
+COMPILED_SERVICE_REQUIRED_FILES = frozenset()
+RETIRED_PACKET_BRIDGE_FILES = frozenset(
     {
         "packet_bridge/VeniceNetSvc.exe",
         "packet_bridge/WinDivert64.dll",
@@ -200,7 +197,7 @@ def security_policy_violations(policy: object) -> list[str]:
 #
 # Subdirectory executables are intentionally NOT listed here — they are staged by
 # dedicated allow-list copiers to fixed relative paths (OrionStream.exe under
-# chiaki-ng-orion/, VeniceNetSvc.exe under packet_bridge/) and the audit reasons
+# chiaki-ng-orion/) and the audit reasons
 # about those by the denylist below, never by this top-level positive set.
 RELEASE_ADMITTED_EXECUTABLES = frozenset(
     {
@@ -230,7 +227,6 @@ SERVER_SHARD_ADMITTED_EXECUTABLES = frozenset(
 RELEASE_ADMITTED_NESTED_EXECUTABLES = frozenset(
     {
         "chiaki-ng-orion/chiaki-ng-Win/OrionStream.exe",
-        "packet_bridge/VeniceNetSvc.exe",
     }
 )
 

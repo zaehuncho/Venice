@@ -1,4 +1,6 @@
 #include "SecurityManager.h"
+
+#include <QSet>
 #include "Ed25519.h"
 #include "OrionPaths.h"
 #include "ReleaseManifestTrust.h"
@@ -298,19 +300,34 @@ bool remoteDebuggerPresent()
 
 bool knownAnalysisToolRunning()
 {
-    static const QStringList toolNames = {
-        QStringLiteral("cheat engine"), QStringLiteral("x64dbg"), QStringLiteral("x32dbg"),
-        QStringLiteral("ollydbg"), QStringLiteral("ida"), QStringLiteral("ghidra"),
-        QStringLiteral("dnspy"), QStringLiteral("process hacker"), QStringLiteral("processhacker"),
-        QStringLiteral("systeminformer"), QStringLiteral("pestudio"), QStringLiteral("detect it easy"),
-        QStringLiteral("die.exe"), QStringLiteral("scylla"), QStringLiteral("reclass"),
-        QStringLiteral("wireshark"), QStringLiteral("fiddler"), QStringLiteral("procmon"),
-        QStringLiteral("process monitor"), QStringLiteral("autoruns"), QStringLiteral("debugview"),
-        QStringLiteral("windbg"), QStringLiteral("windbgx"), QStringLiteral("apimonitor"),
-        QStringLiteral("hxd"), QStringLiteral("hxd.exe"), QStringLiteral("cff explorer"),
-        QStringLiteral("pe-bear"), QStringLiteral("pebear"), QStringLiteral("binary ninja"),
-        QStringLiteral("radare2"), QStringLiteral("r2"), QStringLiteral("frida"),
-        QStringLiteral("magnifier"), QStringLiteral("magnify")
+    // [2026-09-24 external red team] EXACT executable names, lower-case. The old list
+    // matched any SUBSTRING of a process name, so ordinary customer software locked
+    // automation with an "integrity" message: AIDA64 ("ida"), Windows Magnifier
+    // ("magnify"), anything containing "r2" or "hxd". Accessibility tools are never
+    // analysis tools. This is a deterrent, not a boundary: the server lease is the gate.
+    static const QSet<QString> toolNames = {
+        QStringLiteral("cheatengine-x86_64.exe"), QStringLiteral("cheatengine-x86_64-sse4-avx2.exe"),
+        QStringLiteral("cheatengine-i386.exe"), QStringLiteral("cheat engine.exe"),
+        QStringLiteral("x64dbg.exe"), QStringLiteral("x32dbg.exe"), QStringLiteral("x96dbg.exe"),
+        QStringLiteral("ollydbg.exe"),
+        QStringLiteral("ida.exe"), QStringLiteral("ida64.exe"), QStringLiteral("idaq.exe"),
+        QStringLiteral("idaq64.exe"), QStringLiteral("idat.exe"), QStringLiteral("idat64.exe"),
+        QStringLiteral("dnspy.exe"), QStringLiteral("dnspy-x86.exe"),
+        QStringLiteral("processhacker.exe"), QStringLiteral("systeminformer.exe"),
+        QStringLiteral("pestudio.exe"), QStringLiteral("die.exe"), QStringLiteral("diec.exe"),
+        QStringLiteral("scylla.exe"), QStringLiteral("scylla_x64.exe"), QStringLiteral("scylla_x86.exe"),
+        QStringLiteral("reclass.net.exe"), QStringLiteral("reclassex64.exe"),
+        QStringLiteral("wireshark.exe"), QStringLiteral("fiddler.exe"),
+        QStringLiteral("fiddler everywhere.exe"), QStringLiteral("httpdebuggerui.exe"),
+        QStringLiteral("procmon.exe"), QStringLiteral("procmon64.exe"), QStringLiteral("procmon64a.exe"),
+        QStringLiteral("autoruns.exe"), QStringLiteral("autoruns64.exe"),
+        QStringLiteral("dbgview.exe"), QStringLiteral("dbgview64.exe"),
+        QStringLiteral("windbg.exe"), QStringLiteral("windbgx.exe"), QStringLiteral("dbgx.shell.exe"),
+        QStringLiteral("apimonitor-x64.exe"), QStringLiteral("apimonitor-x86.exe"),
+        QStringLiteral("hxd.exe"), QStringLiteral("hxd64.exe"), QStringLiteral("cff explorer.exe"),
+        QStringLiteral("pe-bear.exe"), QStringLiteral("binaryninja.exe"),
+        QStringLiteral("radare2.exe"), QStringLiteral("r2.exe"),
+        QStringLiteral("frida.exe"), QStringLiteral("frida-server.exe")
     };
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
@@ -320,12 +337,7 @@ bool knownAnalysisToolRunning()
     if (Process32FirstW(snap, &pe)) {
         do {
             const QString name = QString::fromWCharArray(pe.szExeFile).toLower();
-            for (const auto& tool : toolNames) {
-                if (name.contains(tool)) {
-                    found = true;
-                    break;
-                }
-            }
+            found = toolNames.contains(name);
         } while (!found && Process32NextW(snap, &pe));
     }
     CloseHandle(snap);

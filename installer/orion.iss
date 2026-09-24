@@ -232,7 +232,7 @@ Filename: "{app}\{#LaunchExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}
 ; package, so without this the stale ~60 MB bundle — including a second, orphaned
 ; WinDivert pair — would survive next to VeniceNetSvc.exe forever. The legacy service
 ; registration itself is stopped in CurStepChanged(ssInstall) below (so nothing here is
-; file-locked) and deleted in RegisterPacketBridgeService before VeniceNetSvc is created.
+; file-locked) and deleted in RetireLegacyPacketBridge (the bridge no longer ships).
 Type: filesandordirs; Name: "{app}\packet_bridge"
 
 [UninstallDelete]
@@ -562,85 +562,16 @@ begin
   Sleep(600);  { let the SCM finish the delete before anything recreates a bridge }
 end;
 
-{ Register the WinDivert packet-bridge service (VeniceNetSvc) with a real exit-code
-  check, mirroring InstallVCRedistChecked. This is the elevated host that makes the
-  inbound Meter Delay actually apply on an installed build: it runs as LocalSystem so it
-  can open a WinDivert handle (which loads the WinDivert64.sys kernel driver on demand),
-  while the unelevated Venice app drives it over 127.0.0.1.
-
-  WAVE 3 (2026-08-08): the host is the C++ VeniceNetSvc.exe (wave 2A) registered under
-  the customer-facing name VeniceNetSvc. The LEGACY NexusVisionSvc (Nuitka nexus_svc.py
-  from older installs) binds the same exclusive TCP 47291, so on upgrade it is stopped
-  and deleted FIRST — exactly one bridge service may exist at a time
-  (scripts/owner_venice_setup.ps1 enforces the same mutual exclusion on the dev rig).
-
-  DEMAND-START (not auto): the app sc-starts it only when the delay is needed; the kernel
-  driver is never loaded at boot. --arm-meter-delay is baked into binPath (arms a bare
-  developer launch of the exe), but in SCM service mode the C++ service reads the arm
-  switch from its ENVIRONMENT — venicenet_service/main.cpp runService reads
-  ORION_METER_DELAY_ARMED via ServiceArgs.h — so the per-service Environment registry
-  value written below is the actual service-mode arm. A service registered without
-  either still reports DISARMED honestly. A permissive-but-scoped DACL grants
-  Interactive Users START/STOP so the non-admin app can start it (driving it is still
-  bearer-token gated). }
-procedure RegisterPacketBridgeService;
-var
-  ExePath, BinPath, Sddl, EnvKey: string;
-  ArmRead: string;
-  ResultCode: Integer;
+{ [2026-09-24 owner] The packet bridge (VeniceNetSvc + the WinDivert kernel driver) is NOT
+  shipped: meter delay is shelved and the beta needs no packet-level driver. An upgrade
+  from an earlier build must still retire the bridge that build registered, so a SYSTEM
+  service never outlives the feature. [InstallDelete] purges {app}\packet_bridge; this
+  removes the registrations (legacy NexusVisionSvc and VeniceNetSvc). Stopping the bridge
+  unloads WinDivert64.sys (venicenet_service/main.cpp::unloadWinDivertDriver). }
+procedure RetireLegacyPacketBridge;
 begin
-  ExePath := ExpandConstant('{app}\packet_bridge\VeniceNetSvc.exe');
-  if not FileExists(ExePath) then
-  begin
-    { build_installer.ps1 already refuses a package without the bridge; reaching this
-      branch means the pipeline was bypassed. Do not ship a silent no-Meter-Delay install. }
-    FailInstall('The Venice network-delay service (packet_bridge\VeniceNetSvc.exe) is missing '
-                + 'from this installer package.');
-  end;
-
-  { ROLLBACK COMPATIBILITY: an upgrade from a pre-Venice install must remove the legacy
-    service BEFORE the new one is created — both bind exclusive TCP 47291. Then a clean
-    re-register of VeniceNetSvc itself so an upgrade never leaves a stale binPath. }
   RemoveBridgeService('NexusVisionSvc');
   RemoveBridgeService('VeniceNetSvc');
-
-  { binPath = "<exe>" --arm-meter-delay  (inner quotes escaped for sc/CommandLineToArgvW). }
-  BinPath := '"\"' + ExePath + '\" --arm-meter-delay"';
-  if not RunSc('create VeniceNetSvc binPath= ' + BinPath
-               + ' start= demand type= own obj= LocalSystem DisplayName= "Venice Packet Service"',
-               ResultCode) or (ResultCode <> 0) then
-  begin
-    FailInstallDetailed('Venice''s network service could not be set up on this PC.',
-                        'VNSVC-01', 'sc create exit code ' + IntToStr(ResultCode));
-  end;
-
-  RunSc('description VeniceNetSvc "Privileged WinDivert packet bridge for Venice. Lets '
-        + 'the app apply the inbound meter delay without running as Administrator."', ResultCode);
-
-  { SERVICE-MODE ARM: the C++ service reads ORION_METER_DELAY_ARMED from its per-service
-    Environment (REG_MULTI_SZ under the service key) when launched by the SCM — the
-    binPath flag alone does NOT arm service mode (venicenet_service/main.cpp runService).
-    Written after sc create so the key exists; read back so a silent write failure can
-    never ship a service that starts DISARMED without the operator being told. }
-  EnvKey := 'SYSTEM\CurrentControlSet\Services\VeniceNetSvc';
-  if not RegWriteMultiStringValue(HKLM, EnvKey, 'Environment',
-                                  'ORION_METER_DELAY_ARMED=1')
-     or not RegQueryMultiStringValue(HKLM, EnvKey, 'Environment', ArmRead)
-     or (Pos('ORION_METER_DELAY_ARMED=1', ArmRead) = 0) then
-    { A service that starts DISARMED is the silent-broken state; never complete setup on it. }
-    FailInstallDetailed('Venice''s network service was installed but could not be configured.',
-                        'VNSVC-02', 'ORION_METER_DELAY_ARMED env write/readback failed under ' + EnvKey);
-
-  { Grant Interactive Users SERVICE_START(RP)/STOP(WP)/QUERY so the unelevated app can
-    start the demand-start service; SYSTEM/Admins keep full control. Same SDDL as
-    scripts/owner_venice_setup.ps1 — keep the two in lockstep. }
-  Sddl := 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)'
-        + '(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)';
-  if not RunSc('sdset VeniceNetSvc ' + Sddl, ResultCode) or (ResultCode <> 0) then
-    { Without the DACL the unelevated app cannot start the service: Meter Delay is dead for
-      every customer who does not run Venice as administrator, i.e. all of them. }
-    FailInstallDetailed('Venice''s network service was installed but could not be given the '
-                        + 'permissions it needs.', 'VNSVC-03', 'sc sdset exit code ' + IntToStr(ResultCode));
 end;
 
 (* SERVER-SHARD only: register the activation broker as the orion:// protocol handler and
@@ -687,7 +618,7 @@ begin
   // any running bridge service NOW so the [InstallDelete] purge of the stale
   // packet_bridge\ Nuitka bundle and the file copy over VeniceNetSvc.exe never hit a
   // file lock held by a running SYSTEM service. Deletion/re-registration happens later
-  // in RegisterPacketBridgeService; if the user aborts mid-install, a stopped-but-
+  // in RetireLegacyPacketBridge; if the user aborts mid-install, a stopped-but-
   // still-registered service is the recoverable state.
   if CurStep = ssInstall then
   begin
@@ -710,7 +641,7 @@ begin
     InstallVCRedistChecked;
     InstallDriverChecked('ViGEmBus virtual controller', 'ViGEmBus_1.22.0_x64_x86_arm64.exe', 'ViGEmBus');
     InstallDriverChecked('HidHide controller', 'HidHide_1.5.230_x64.exe', 'HidHide');
-    RegisterPacketBridgeService;
+    RetireLegacyPacketBridge;
     RegisterActivationBroker;
     if DriverRestartNeeded then
       MsgBox('A controller driver was installed and Windows needs a restart to finish. '

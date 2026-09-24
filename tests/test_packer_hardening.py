@@ -753,12 +753,18 @@ def test_audit_flags_every_unadmitted_executable(tmp_path, rel_path):
     "OrionUpdater.exe",
     "OrionSidecar.exe",
     "chiaki-ng-orion/chiaki-ng-Win/OrionStream.exe",
-    "packet_bridge/VeniceNetSvc.exe",
 ])
 def test_audit_admits_the_real_release_executables(tmp_path, rel_path):
     _write_files(tmp_path, {rel_path: b"MZ"})
     findings = audit.audit_executable_admission(tmp_path)
     assert not findings, [f.format() for f in findings]
+
+
+def test_audit_rejects_the_retired_packet_bridge(tmp_path):
+    """[2026-09-24 owner] The packet bridge (VeniceNetSvc + WinDivert) no longer ships."""
+    _write_files(tmp_path, {"packet_bridge/VeniceNetSvc.exe": b"MZ"})
+    findings = audit.audit_executable_admission(tmp_path)
+    assert any("VeniceNetSvc.exe" in f.path for f in findings), [f.format() for f in findings]
 
 
 def test_packed_payload_is_admitted_only_in_shard_mode(tmp_path):

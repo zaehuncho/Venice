@@ -2020,7 +2020,9 @@ def handle_validate(event):
     lease_expires_at = now + LEASE_TTL_S
     resp_body = {
         "ok": True,
-        "license_key": license_key,
+        # [2026-09-24 external red team] never echo the full key; the client already
+        # holds it and the lease signature binds it server-side.
+        "license_key_suffix": license_key[-4:],
         "machine_id": machine_id,
         "lease_expires_at": lease_expires_at,
         "tier": item.get("tier", "standard"),

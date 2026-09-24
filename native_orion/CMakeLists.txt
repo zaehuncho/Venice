@@ -54,6 +54,11 @@ if(ORION_PRODUCTION)
             "-DORION_LIBCRYPTO_PATH=<exact libcrypto-3-x64.dll> so CMake computes it.")
     endif()
     add_compile_definitions(ORION_PRODUCTION_BUILD=1)
+    # [2026-09-24 external red team] Record only the PDB file name in shipped binaries,
+    # not the build machine's absolute path (it disclosed the developer's user and tree).
+    if(MSVC)
+        add_link_options("/PDBALTPATH:%_PDB%")
+    endif()
 endif()
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Network Qml Quick QuickControls2)

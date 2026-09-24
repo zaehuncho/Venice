@@ -1850,6 +1850,17 @@ QString RemotePlaySession::pythonExecutable() const
     const QString root = rootDir_.isEmpty()
                              ? QDir::toNativeSeparators(QDir::homePath() + QStringLiteral("/Desktop/NexusVision"))
                              : QDir::toNativeSeparators(rootDir_);
+    // [2026-09-24 external red team] Developer interpreters (env override, the repo venv,
+    // Miniconda) are compiled out of a shipping build: only an app-local runtime or the
+    // user's own PATH interpreter is ever probed.
+#ifdef ORION_PRODUCTION_BUILD
+    Q_UNUSED(env);
+    Q_UNUSED(root);
+    const QStringList candidates = {
+        QDir::toNativeSeparators(QCoreApplication::applicationDirPath() + QStringLiteral("/python/python.exe")),
+        QStringLiteral("python.exe")
+    };
+#else
     const QStringList candidates = {
         env,
         QDir::toNativeSeparators(root + QStringLiteral("/.venv311/Scripts/python.exe")),
@@ -1858,6 +1869,7 @@ QString RemotePlaySession::pythonExecutable() const
         QDir::toNativeSeparators(QDir::homePath() + QStringLiteral("/Miniconda3/envs/cosmic_env/python.exe")),
         QStringLiteral("python.exe")
     };
+#endif
     // Prefer an interpreter that can actually import cv2 (the orchestrator's core CV dep).
     // A freshly created but UNPOPULATED venv (e.g. one made for the pose deps before its
     // requirements are installed) exists on disk but can't run the sidecar — selecting it by
@@ -1913,10 +1925,14 @@ QString RemotePlaySession::pythonExecutable() const
 
 QString RemotePlaySession::helperPath() const
 {
+    // [2026-09-24 external red team] A shipping build resolves only the app directory;
+    // the developer-tree fallbacks (a user-writable Desktop path) are compiled out.
     const QStringList candidates = {
         QDir::toNativeSeparators(QCoreApplication::applicationDirPath() + QStringLiteral("/backend/ps5_remoteplay_helper.py")),
+#ifndef ORION_PRODUCTION_BUILD
         QDir::toNativeSeparators(QDir::homePath() + QStringLiteral("/Desktop/NexusVision/native_orion/backend/ps5_remoteplay_helper.py")),
         QDir::toNativeSeparators(QFileInfo(__FILE__).absolutePath() + QStringLiteral("/../backend/ps5_remoteplay_helper.py"))
+#endif
     };
     for (const auto& candidate : candidates) {
         if (QFileInfo::exists(candidate)) {
@@ -1928,10 +1944,14 @@ QString RemotePlaySession::helperPath() const
 
 QString RemotePlaySession::sidecarScriptPath() const
 {
+    // [2026-09-24 external red team] A shipping build resolves only the app directory;
+    // the developer-tree fallbacks (a user-writable Desktop path) are compiled out.
     const QStringList candidates = {
         QDir::toNativeSeparators(QCoreApplication::applicationDirPath() + QStringLiteral("/backend/autogreen_sidecar.py")),
+#ifndef ORION_PRODUCTION_BUILD
         QDir::toNativeSeparators(QDir::homePath() + QStringLiteral("/Desktop/NexusVision/native_orion/backend/autogreen_sidecar.py")),
         QDir::toNativeSeparators(QFileInfo(__FILE__).absolutePath() + QStringLiteral("/../backend/autogreen_sidecar.py"))
+#endif
     };
     for (const auto& candidate : candidates) {
         if (QFileInfo::exists(candidate)) {

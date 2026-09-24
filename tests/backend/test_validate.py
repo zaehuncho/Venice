@@ -12,7 +12,8 @@ class TestValidate:
             "license_key": "ORION-VALID-BBBB-CCCC", "machine_id": "MACHINE-1"})
         assert status == 200
         assert body["ok"] is True
-        assert body["license_key"] == "ORION-VALID-BBBB-CCCC"
+        assert "license_key" not in body  # [2026-09-24] never echo the full key
+        assert body["license_key_suffix"] == "CCCC"
         assert body["machine_id"] == "MACHINE-1"
         assert body["tier"] == "pro"
         assert body["lease_expires_at"] > int(time.time())

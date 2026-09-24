@@ -251,8 +251,8 @@ def test_copy_compiled_service_ships_exe_windivert_and_notice(tmp_path):
     assert (bridge / "WinDivert64.sys").read_bytes() == b"windivert-sys"
     # LGPL attribution ships with the driver.
     assert "WinDivert" in (bridge / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
-    # Nothing the release scan would reject.
-    assert pkg.scan_forbidden(package) == []
+    # [2026-09-24] The bridge is retired: the (retained) copier's output is refused.
+    assert set(pkg.scan_forbidden(package)) >= set(pkg.RETIRED_PACKET_BRIDGE_FILES)
 
 
 def test_copy_compiled_service_requires_the_compiled_exe(tmp_path):
@@ -301,16 +301,14 @@ def test_copy_compiled_service_never_ships_build_dir_strays(tmp_path):
         "WinDivert64.dll",
         "WinDivert64.sys",
     ]
-    assert pkg.scan_forbidden(package) == []
+    assert set(pkg.scan_forbidden(package)) >= set(pkg.RETIRED_PACKET_BRIDGE_FILES)
 
 
-def test_copy_runtime_ships_the_packet_bridge_service(monkeypatch, tmp_path):
-    """Revert-trace: copy_runtime wires in the compiled bridge, so a packaged
-    layout contains packet_bridge/VeniceNetSvc.exe + WinDivert. Before this
-    change copy_runtime never produced that payload at all."""
-    real_copy_service = pkg.copy_compiled_service  # capture BEFORE the helper stubs it
+def test_copy_runtime_never_ships_the_packet_bridge(monkeypatch, tmp_path):
+    """[2026-09-24 owner] No packet-level driver ships: copy_runtime must not stage the
+    bridge even when a built service dir is supplied, and nothing is required of it."""
+    real_copy_service = pkg.copy_compiled_service
     root, _build = _configure_minimal_runtime(monkeypatch, tmp_path)
-    # Undo the helper's stub for THIS test — we want the real service copy to run.
     monkeypatch.setattr(pkg, "copy_compiled_service", real_copy_service)
     dist = tmp_path / "sidecar.dist"
     _write_fake_sidecar_bundle(dist)
@@ -321,12 +319,9 @@ def test_copy_runtime_ships_the_packet_bridge_service(monkeypatch, tmp_path):
     package = tmp_path / "package"
     pkg.copy_runtime(dist, package_dir=package, service_dist=service_dist)
 
-    bridge = package / pkg.PACKET_BRIDGE_SUBDIR
-    assert (bridge / pkg.VENICE_SERVICE_EXE).is_file()
-    assert (bridge / "WinDivert64.sys").is_file()
-    # And the required-files gate for publish now covers them.
-    for rel in pkg.COMPILED_SERVICE_REQUIRED_FILES:
-        assert (package / rel).is_file(), rel
+    assert not (package / pkg.PACKET_BRIDGE_SUBDIR).exists()
+    assert pkg.COMPILED_SERVICE_REQUIRED_FILES == frozenset()
+    assert not any(p.name.lower().startswith("windivert") for p in package.rglob("*"))
     assert pkg.scan_forbidden(package) == []
 
 
