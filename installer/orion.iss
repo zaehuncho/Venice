@@ -565,7 +565,7 @@ end;
 { [2026-09-24 owner] The packet bridge (VeniceNetSvc + the WinDivert kernel driver) is NOT
   shipped: meter delay is shelved and the beta needs no packet-level driver. An upgrade
   from an earlier build must still retire the bridge that build registered, so a SYSTEM
-  service never outlives the feature. [InstallDelete] purges {app}\packet_bridge; this
+  service never outlives the feature. [InstallDelete] purges the app packet_bridge folder; this
   removes the registrations (legacy NexusVisionSvc and VeniceNetSvc). Stopping the bridge
   unloads WinDivert64.sys (venicenet_service/main.cpp::unloadWinDivertDriver). }
 procedure RetireLegacyPacketBridge;
