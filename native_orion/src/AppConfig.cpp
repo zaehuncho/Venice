@@ -278,6 +278,8 @@ AppConfig::AppConfig(QString rootDir, QObject* parent)
     data_.meterEnabled = true;
     data_.noMeterEnabled = false;
     normalizeRemotePlayBackend(data_, rootDir_);
+    // [SHIP_PARITY R7] learning() before the first load() already carries the factory aim.
+    applyShippedPhasePrior(learning_);
 }
 
 QString AppConfig::settingsPath() const
@@ -433,10 +435,41 @@ QStringList AppConfig::learningSemanticViolations(const QJsonObject& obj)
     return violations;
 }
 
+bool AppConfig::applyShippedPhasePrior(LearningData& learning)
+{
+    // [SHIP_PARITY R7 2026-09-23 owner-approved] See LearningData::kShippedPhasePhysicalMs.
+    // Only a slot with NO prior is filled (a never-measured install, a fresh profile, a file
+    // whose value was out of band and dropped by the loader); a real prior is never replaced
+    // here -- the one-time upgrade reset lives in load() and is gated on the settings version.
+    if (std::isfinite(learning.learnedPhasePhysicalMs) && learning.learnedPhasePhysicalMs > 0.0) {
+        return false;
+    }
+    learning.learnedPhasePhysicalMs = LearningData::kShippedPhasePhysicalMs;
+    return true;
+}
+
+bool AppConfig::aimIsUserOwned(const QJsonObject& settings)
+{
+    for (const QString& key : {QStringLiteral("tip_timing_user_set"),
+                               QStringLiteral("tip_phase_aim_frozen")}) {
+        const QJsonValue v = settings.value(key);
+        if (!v.isUndefined() && (!v.isBool() || v.toBool(true))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void AppConfig::reloadLearning()
 {
     learning_ = LearningData{};
     learningLoadNote_.clear();
+    // Every exit path below (ok, missing, quarantined, restored from backup) ends with the
+    // factory aim prior installed when the slot has none.
+    struct ShippedPriorOnExit {
+        LearningData& learning;
+        ~ShippedPriorOnExit() { AppConfig::applyShippedPhasePrior(learning); }
+    } shippedPriorOnExit{learning_};
     QJsonObject learningJson;
     const ObjectReadStatus status = readObjectStatus(learningPath(), &learningJson);
     if (status == ObjectReadStatus::Ok) {
@@ -542,12 +575,16 @@ const QList<AppConfig::SettingsMigration>& AppConfig::settingsMigrations()
     // ALSO DELIBERATELY NOT MIGRATED (2026-08-08). Flags that change live
     // release timing ship only behind a counted live batch (project standing
     // rule), never silently via a migration:
-    //   * ownership_proof_two_frame  -- ~14ms median saving measured offline, but
-    //     never confirmed by a counted live batch, and it must not be paired with
-    //     a 4.0pp anchor_rise_min_pct (that pairing saves 0ms).
+    //   * ownership_proof_two_frame  -- ~14ms median saving measured offline; at the
+    //     time (08-08) not yet confirmed live, and it must not be paired with a 4.0pp
+    //     anchor_rise_min_pct (that pairing saves 0ms). [2026-09-23] Since flipped live
+    //     on the owner's rig 2026-09-14 18:47 (HANDOFF_2026-09-14_UI_POLISH.md:309-317)
+    //     and played on since, with anchor_rise_min_pct 3.0 -> migrated in v3 below.
     //   * tip_phase_anchor_base20    -- requires the coordinated ~58.3ms constant
-    //     shift across four coupled terms; flipping the flag by itself via a
-    //     migration would be actively wrong.
+    //     shift across four coupled terms. [2026-09-23] The engine now moves that whole
+    //     constellation itself on the flag transition (AutomationEngine::applyConfig,
+    //     pinned by anchorBase20ConstellationMovesTogether), and the flag was banner-graded
+    //     live 2026-09-11 23:26 (108/108 armed from phase) -> migrated in v3 below.
     //   * stop_dating_subframe, goto_tip_parity, stop_reopen_corroborate -- same
     //     class: no live validation yet.
     //   * user_lead_satisfies_authority -- default flipped ON in code 2026-08-07
@@ -572,6 +609,49 @@ const QList<AppConfig::SettingsMigration>& AppConfig::settingsMigrations()
          QJsonValue(false),
          QString{},
          QStringLiteral("anchor-to-freeze measures the release landing; legacy auto-unlock can move the aim in the wrong direction")},
+        // [SHIP_PARITY 2026-09-23, docs/redteam/2026-09-23-final/SHIP_PARITY_AUDIT.md R4-R8/R10]
+        // The owner's validated DEV configuration, carried to existing installs. The installer-
+        // repaired file stores the old defaults EXPLICITLY, so a default flip alone would never
+        // reach them. None of the four booleans has ever been exposed in the customer UI (only a
+        // hand edit could have set them), and the no_meter_fade_trim_ms slider lives on the
+        // NO METER card, which is unmounted in the customer build -- so a stored old default is
+        // the save() echo of the default, not a choice. Any other stored value is left alone
+        // (the runner only rewrites absent / old-default values), and post-v3 choices are never
+        // re-migrated.
+        {3,
+         QStringLiteral("tip_phase_anchor_base20"),
+         QJsonValue(false),
+         QJsonValue(true),
+         QString{},
+         QStringLiteral("owner-validated base-20 anchor (09-11 22:27; 108/108 armed from phase): runway 71 -> 129 ms")},
+        {3,
+         QStringLiteral("tip_phase_type_trim_enabled"),
+         QJsonValue(false),
+         QJsonValue(true),
+         QString{},
+         QStringLiteral("per-type fade trim LF -4 / RF -6, banner-graded 09-11 23:26 (fades p=0.0019)")},
+        {3,
+         QStringLiteral("ownership_proof_two_frame"),
+         QJsonValue(false),
+         QJsonValue(true),
+         QString{},
+         QStringLiteral("two-frame ownership proof, live on the owner's rig since 09-14 18:47 (anchor_rise_min_pct 3.0)")},
+        {3,
+         QStringLiteral("no_meter_fade_trim_ms"),
+         QJsonValue(0.0),
+         QJsonValue(6.0),
+         QString{},
+         QStringLiteral("owner's 6 ms fade trim on the blind backstop hold (09-14)")},
+        // [SHIP_PARITY R7 owner-approved 2026-09-23] Freeze the aim. Vetoed by the Tip Timing
+        // companion; the matching learned-aim reset to LearningData::kShippedPhasePhysicalMs is
+        // done once by load() for the same version step (it touches learning.json, which this
+        // registry cannot express).
+        {3,
+         QStringLiteral("tip_phase_aim_frozen"),
+         QJsonValue(false),
+         QJsonValue(true),
+         QStringLiteral("tip_timing_user_set"),
+         QStringLiteral("ship the owner's validated aim frozen: the unfrozen learner rides the release and drifted 20.6 ms late (291.6 vs 271)")},
     };
     return registry;
 }
@@ -626,6 +706,18 @@ bool AppConfig::load()
 {
     const auto settings = readObject(settingsPath());
     bool settingsMigrated = false;
+    // [SHIP_PARITY R7 owner-approved 2026-09-23] ONE-TIME learned-aim reset for an EXISTING
+    // install crossing the v3 step: its learning.json aim (the unfrozen learner's, e.g. the
+    // owner's installed 291.6) is replaced by the validated LearningData::kShippedPhasePhysicalMs
+    // and the v3 registry freezes it. Decided from the PRE-migration file: a fresh install (no
+    // settings.json) gets the factory prior through reloadLearning() instead and never writes;
+    // an aim the user owns (typed on the Tip Timing card, or locked) is never touched; and once
+    // the file is stamped v3 this can never run again for this install.
+    const bool resetLearnedAimOnce = !settings.isEmpty()
+        && settingsVersionOf(settings) < kAimResetSettingsVersion
+        && !aimIsUserOwned(settings);
+    static_assert(kSettingsVersion >= kAimResetSettingsVersion,
+                  "the aim reset must land in a shipped settings_version step");
     if (!settings.isEmpty()) {
         QJsonObject effective = settings;
         const int onDiskVersion = settingsVersionOf(settings);
@@ -657,6 +749,25 @@ bool AppConfig::load()
     // [2026-09-22 GM-002 / CX-001] one loader: reloadLearning() distinguishes a missing file from
     // a damaged one, restores the last-good copy and records what it did (learningLoadNote()).
     reloadLearning();
+
+    if (resetLearnedAimOnce) {
+        const double previous = learning_.learnedPhasePhysicalMs;
+        LearningData reset = learning_;
+        reset.learnedPhasePhysicalMs = LearningData::kShippedPhasePhysicalMs;
+        // Persist ONCE, together with the v3 stamp below. A failed learning save is non-fatal:
+        // the in-memory learning already carries the reset, so this session flies the shipped
+        // aim; saveLearning() only assigns learning_ on success, so assign it here as well.
+        QString learningErr;
+        const bool persisted = saveLearning(reset, &learningErr);
+        learning_ = reset;
+        qInfo().noquote()
+            << QStringLiteral("[AppConfig] settings migration v%1 applied: learned_phase_physical_ms "
+                              "%2 -> %3 (one-time ship-parity aim reset; frozen by tip_phase_aim_frozen)%4")
+                   .arg(kAimResetSettingsVersion)
+                   .arg(previous, 0, 'f', 1)
+                   .arg(LearningData::kShippedPhasePhysicalMs, 0, 'f', 1)
+                   .arg(persisted ? QString() : QStringLiteral(" -- learning.json save failed: ") + learningErr);
+    }
 
     // One-time migration: the global early_late_offset_ms knob is retired. Fold any persisted
     // value into the per-type learned offsets, then zero AND persist BOTH files in the same
@@ -707,7 +818,7 @@ bool AppConfig::save(const AppConfigData& requested, QString* error)
     data.noMeterFadeTrimMs = std::isfinite(data.noMeterFadeTrimMs)
         ? std::clamp(data.noMeterFadeTrimMs, AppConfigData::kNoMeterFadeTrimMinMs,
                      AppConfigData::kNoMeterFadeTrimMaxMs)
-        : 0.0;
+        : 6.0;   // [SHIP_PARITY R8] the ship default, not the retired 0
     // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] Same policy as the hold: the grid is
     // clamped on the way out too, so no write path can persist a frame period the engine would
     // then have to re-clamp (a zero or a NaN here would divide the whole blind law by nothing).
@@ -2039,7 +2150,7 @@ void AppConfig::loadSettingsObject(const QJsonObject& obj)
                                       AppConfigData::kNoMeterHoldMaxMs);
     // [ORION_NO_METER_FADE_TRIM 2026-09-14] The fade-only trim. Clamped into the slider's band
     // for the same reason as the hold.
-    data_.noMeterFadeTrimMs = cleanDouble(obj, "no_meter_fade_trim_ms", 0.0,
+    data_.noMeterFadeTrimMs = cleanDouble(obj, "no_meter_fade_trim_ms", 6.0,
                                           AppConfigData::kNoMeterFadeTrimMinMs,
                                           AppConfigData::kNoMeterFadeTrimMaxMs);
     // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] The console's frame period. A missing or

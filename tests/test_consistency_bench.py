@@ -55,7 +55,7 @@ def test_replay_profile_is_the_shipped_armed_detector_profile(tmp_path):
     assert profile["ORION_METER_PARTIAL_OCCLUSION_MIN_COLS"] == "2"
     assert profile["ORION_METER_DETECTOR_CONF"] == "0.35"
     assert profile["ORION_METER_PROVIDER_PRIORITY"] == "dml,cpu"
-    assert profile["ORION_TIMING_PROFILE_ID"] == "2k27-2026-09-04-v2"
+    assert profile["ORION_TIMING_PROFILE_ID"] == "2k27-2026-09-23-v3"
     # Mode 2 continuously prioritizes inference and was the old unrealistic
     # benchmark. Production uses hardware-armed mode 1.
     assert profile["ORION_METER_DETECTOR_SYNC_ACQUIRE"] == "1"

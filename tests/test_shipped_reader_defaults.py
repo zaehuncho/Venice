@@ -61,6 +61,12 @@ SHIPPED_PROFILE_VALUES = {
 NATIVE_TIMING_PROFILE = {
     "ORION_HORIZON_DEBIAS",
     "ORION_RAMP_SHAPE",
+    "ORION_TIP_PHASE_SOLO",  # [SHIP_PARITY R1 2026-09-23]
+}
+
+# [SHIP_PARITY R2 2026-09-23] numeric native pins (kShippedNativeTimingProfileValues).
+NATIVE_TIMING_PROFILE_VALUES = {
+    "ORION_CURVE_STRETCH_ALPHA": "0",
 }
 
 
@@ -132,6 +138,8 @@ def test_native_profile_contains_every_live_only_timing_flag_and_is_applied():
     )
     for flag in NATIVE_TIMING_PROFILE:
         assert f'"{flag}"' in header
+    for name, value in NATIVE_TIMING_PROFILE_VALUES.items():
+        assert f'{{"{name}", "{value}"}}' in header
     assert '#include "SidecarReaderProfile.h"' in main
     assert "applyShippedNativeTimingProfile(preserveTimingOverrides)" in main
     assert "ORION_TIMING_PROFILE_ID" in header

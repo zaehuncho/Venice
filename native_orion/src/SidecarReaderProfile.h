@@ -122,10 +122,30 @@ inline const ShippedReaderProfileValue kShippedReaderProfileValues[] = {
 inline const char* const kShippedNativeTimingProfileFlags[] = {
     "ORION_HORIZON_DEBIAS",
     "ORION_RAMP_SHAPE",
+    // [SHIP_PARITY R1 2026-09-23] A dated, horizon-plausible phase member can no longer be
+    // withdrawn by the extrapolating sampler (+37.9 ms late bias). Live on the owner's rig
+    // since 2026-09-11 (run_orion.local.ps1); the fix that removed the random EARLIES. The
+    // compiled default (AutomationEngine.h tipPhaseSolo=false) stays so the engine's own
+    // fixtures are untouched -- the same pattern as HORIZON_DEBIAS / RAMP_SHAPE above.
+    "ORION_TIP_PHASE_SOLO",
+};
+
+// Native numeric pins, resolved exactly like the flags above (production force-pins,
+// development preserves an explicit operator value).
+struct ShippedNativeTimingProfileValue {
+    const char* name;
+    const char* value;
+};
+inline const ShippedNativeTimingProfileValue kShippedNativeTimingProfileValues[] = {
+    // [SHIP_PARITY R2 2026-09-23] Curve-model rate stretch OFF. The compiled 0.6 latches on
+    // the slow first segment and produced +57..+101 ms LATE fires (09-09: 5/5 of the severe
+    // lates). The owner's rig has pinned 0 since 2026-09-09. The compiled default stays 0.6
+    // only because 46 mechanism tests pin it (AutomationEngine.h curveRateStretchAlpha).
+    {"ORION_CURVE_STRETCH_ALPHA", "0"},
 };
 
 inline constexpr const char kShippedTimingProfileId[] =
-    "2k27-2026-09-04-v2";
+    "2k27-2026-09-23-v3";
 
 // DELIBERATELY NOT IN THE PROFILE, with the reason, so this list is not
 // re-litigated:
@@ -341,6 +361,24 @@ struct MeterStyleRouteResult
         } else {
             value = QByteArrayLiteral("1");
             qputenv(name, value);
+            if (!preserveExplicitOverrides) {
+                origin = QLatin1String("production");
+            }
+        }
+        resolved.append(QString::fromLatin1(key) + QLatin1Char('=')
+                        + QString::fromLatin1(value) + QLatin1Char('(') + origin
+                        + QLatin1Char(')'));
+    }
+    for (const auto& setting : kShippedNativeTimingProfileValues) {
+        const QByteArray key(setting.name);
+        QByteArray value;
+        QLatin1String origin("profile");
+        if (preserveExplicitOverrides && qEnvironmentVariableIsSet(setting.name)) {
+            value = qgetenv(setting.name);
+            origin = QLatin1String("env");
+        } else {
+            value = QByteArray(setting.value);
+            qputenv(setting.name, value);
             if (!preserveExplicitOverrides) {
                 origin = QLatin1String("production");
             }

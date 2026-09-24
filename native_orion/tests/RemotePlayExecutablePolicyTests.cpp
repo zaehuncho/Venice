@@ -8,8 +8,11 @@
 #include <QtCore/QDir>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QHash>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
+#include <QtCore/QScopeGuard>
+#include <QtCore/QSet>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QTimer>
 #include <limits>
@@ -634,6 +637,63 @@ private slots:
         QVERIFY(route.log.isEmpty());
         QCOMPARE(env.value(QString::fromLatin1(kMeterProposerEnvKey)), QStringLiteral("cv"));
         QVERIFY(!env.contains(QString::fromLatin1(kMeterStyleEnvKey)));
+    }
+
+    // [SHIP_PARITY R1-R3 2026-09-23] The native timing profile carries the owner's two dev-launch
+    // timing pins into every production process: ORION_TIP_PHASE_SOLO=1 and
+    // ORION_CURVE_STRETCH_ALPHA=0, under the bumped profile id. Production overrides an inherited
+    // value; development preserves an explicit one and fills silence with the profile.
+    void nativeTimingProfilePinsSoloAndStretchInProduction()
+    {
+        const QByteArray keys[] = {"ORION_TIP_PHASE_SOLO", "ORION_CURVE_STRETCH_ALPHA",
+                                   "ORION_HORIZON_DEBIAS", "ORION_RAMP_SHAPE",
+                                   "ORION_TIMING_PROFILE_ID"};
+        QHash<QByteArray, QByteArray> saved;
+        QSet<QByteArray> wasSet;
+        for (const QByteArray& k : keys) {
+            if (qEnvironmentVariableIsSet(k.constData())) {
+                wasSet.insert(k);
+                saved.insert(k, qgetenv(k.constData()));
+            }
+        }
+        const auto restore = qScopeGuard([&] {
+            for (const QByteArray& k : keys) {
+                if (wasSet.contains(k)) {
+                    qputenv(k.constData(), saved.value(k));
+                } else {
+                    qunsetenv(k.constData());
+                }
+            }
+        });
+
+        // Production: hostile inherited values lose.
+        qputenv("ORION_TIP_PHASE_SOLO", "0");
+        qputenv("ORION_CURVE_STRETCH_ALPHA", "0.6");
+        const QString production = applyShippedNativeTimingProfile(false);
+        QCOMPARE(qgetenv("ORION_TIP_PHASE_SOLO"), QByteArray("1"));
+        QCOMPARE(qgetenv("ORION_CURVE_STRETCH_ALPHA"), QByteArray("0"));
+        QCOMPARE(qgetenv("ORION_TIMING_PROFILE_ID"), QByteArray("2k27-2026-09-23-v3"));
+        QVERIFY2(production.contains(QStringLiteral("ORION_TIP_PHASE_SOLO=1(production)")),
+                 qPrintable(production));
+        QVERIFY2(production.contains(QStringLiteral("ORION_CURVE_STRETCH_ALPHA=0(production)")),
+                 qPrintable(production));
+        QVERIFY(production.startsWith(QStringLiteral("id=2k27-2026-09-23-v3")));
+
+        // Development: an explicit operator value survives (A/B work).
+        qputenv("ORION_TIP_PHASE_SOLO", "0");
+        qputenv("ORION_CURVE_STRETCH_ALPHA", "0.6");
+        const QString dev = applyShippedNativeTimingProfile(true);
+        QCOMPARE(qgetenv("ORION_TIP_PHASE_SOLO"), QByteArray("0"));
+        QCOMPARE(qgetenv("ORION_CURVE_STRETCH_ALPHA"), QByteArray("0.6"));
+        QVERIFY(dev.contains(QStringLiteral("ORION_CURVE_STRETCH_ALPHA=0.6(env)")));
+
+        // Development with silence: the profile fills it.
+        qunsetenv("ORION_TIP_PHASE_SOLO");
+        qunsetenv("ORION_CURVE_STRETCH_ALPHA");
+        const QString silent = applyShippedNativeTimingProfile(true);
+        QCOMPARE(qgetenv("ORION_TIP_PHASE_SOLO"), QByteArray("1"));
+        QCOMPARE(qgetenv("ORION_CURVE_STRETCH_ALPHA"), QByteArray("0"));
+        QVERIFY(silent.contains(QStringLiteral("ORION_TIP_PHASE_SOLO=1(profile)")));
     }
 
     // [ORION_LEFT_FADE_LATER 2026-09-22] The old +8 left-fade default is migrated to -6 exactly once:

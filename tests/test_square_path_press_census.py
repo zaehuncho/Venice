@@ -116,7 +116,10 @@ def parse(text: str) -> Census:
             continue
         ts, body = matched.group(1), matched.group(2)
 
-        if _SESSION_MARK in body:
+        # [2026-09-23] Also split at app shutdown: once the installer registers VeniceNetSvc,
+        # "Packet bridge service not installed" never prints, and two launches merged -- a
+        # later launch's epoch-1 PRESS UNDELIVERABLE was pinned on an earlier owned press.
+        if _SESSION_MARK in body or "Application shutdown teardown started." in body:
             session += 1
             prev_up_phase = None
             continue

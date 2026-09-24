@@ -400,13 +400,20 @@ struct AppConfigData {
     // additional false-lock admissions (tools/timing/validate_ownership_proof.py).
     // Do not pair with a raised anchorRiseMinPct: 4.0pp re-creates the 3rd-frame
     // wait (median saving 0ms) and was measured to buy nothing on false locks.
-    bool ownershipProofTwoFrame = false;
+    // [SHIP_PARITY R6 2026-09-23] Default TRUE: flipped live on the owner's rig 2026-09-14 18:47
+    // (HANDOFF_2026-09-14_UI_POLISH.md:309-317) and played on since; anchor_rise_min_pct stays
+    // 3.0, so the "never pair with 4.0 pp" rule holds. v3 settings migration carries it to
+    // existing installs (AppConfig::settingsMigrations).
+    bool ownershipProofTwoFrame = true;
     // Candidate-B decision-budget flag (2026-08-05, default OFF): move the tip-phase base
     // anchor 30 -> 20, widening the anchor->deadline decision budget 93 -> ~151ms. ONE flag
     // moves the whole coupled constellation (constant/seed/learn-band shift by the measured
     // 58.3ms, ladder count 2 -> 4, per-rung measured dating offsets) -- see
     // RemapConfig::anchorBase20. learning.json stays canonically base-30 either way.
-    bool tipPhaseAnchorBase20 = false;
+    // [SHIP_PARITY R4 2026-09-23] Default TRUE: the owner's validated setup since 2026-09-11
+    // 22:27 (runway 71 -> 129 ms at lead 274; 108/108 armed from phase, banner-graded 23:26).
+    // The engine moves the whole constellation itself on the transition (applyConfig).
+    bool tipPhaseAnchorBase20 = true;
     // [ORION_ANCHOR_CONSENSUS] Refine a witnessed base-20 phase date once the same
     // shot has independently crossed 25 and 30. The three observed crossings are
     // mapped onto the base-20 clock and median-combined; no curve extrapolation or
@@ -435,7 +442,10 @@ struct AppConfigData {
     // already carrying live learned values). CAVEAT the defaults ship on: the historical
     // fade-labelled samples are stick-deflected presses, not confirmed deliberate fadeaways --
     // flip tip_phase_type_trim_enabled only after a dedicated counted fade batch confirms.
-    bool tipPhaseTypeTrimEnabled = false;
+    // [SHIP_PARITY R5 2026-09-23] Default TRUE: that batch landed -- 2026-09-11 23:26,
+    // banner-graded, fades p=0.0019 (HANDOFF_2026-09-01_TIMING_LANE.md:1686-1690); the owner
+    // has played on it since.
+    bool tipPhaseTypeTrimEnabled = true;
     QMap<QString, double> tipPhaseTypeTrimMs {
         {QStringLiteral("Left Fade"), -4.0},
         {QStringLiteral("Right Fade"), -6.0},
@@ -480,7 +490,11 @@ struct AppConfigData {
     // session. Measured: the aim walked 8.2ms across one 70-release batch (landing sd 10.5ms), and
     // that session's second half measured worse than its first. Demo/batch tool — freeze a
     // known-good aim; clear it when the equipped jumpshot changes.
-    bool tipPhaseAimFrozen = false;
+    // [SHIP_PARITY R7 2026-09-23 owner-approved] Default TRUE, paired with the factory aim prior
+    // LearningData::kShippedPhasePhysicalMs (271 canonical base-30) that AppConfig installs when
+    // learning.json carries none. Unfrozen, the aim walked 388 -> 369 while the lead sat still
+    // (09-11 20:20) and the installed copy drifted to 291.6 (20.6 ms late vs the validated 271).
+    bool tipPhaseAimFrozen = true;
     // [ORION_AIM_AUTOUNLOCK 2026-08-13] When the locked aim above is contradicted by this rig's
     // own full-window instrument for ten consecutive windows, hand the value back to the learner
     // instead of only logging it. Was default ON from 2026-08-13 because the warn-only path is
@@ -1103,7 +1117,9 @@ struct AppConfigData {
     // never to a type the blind law does not fade-correct. The UI is a −20..+20 slider at 3 ms a
     // step (the same step as Release timing), so the band below is exactly the slider's reach.
     // Env override ORION_NO_METER_FADE_TRIM_MS for offline sweeps.
-    double noMeterFadeTrimMs = 0.0;
+    // [SHIP_PARITY R8 2026-09-23] Default 6 (was 0): the owner's slider value since 09-14. It is
+    // live in meter mode too -- blindReleaseHold() feeds the meter blind backstop for fades.
+    double noMeterFadeTrimMs = 6.0;
     static constexpr double kNoMeterFadeTrimMinMs = -60.0;
     static constexpr double kNoMeterFadeTrimMaxMs = 60.0;
     // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14 owner] The console's input-sampling period in ms
@@ -1802,6 +1818,14 @@ struct LearningData {
     // and re-measuring it from the seed every session means every session opens with the same
     // rough patch the owner hit when testing on a build with different jumpshots.
     // -1 = never measured, so the seed carries the session exactly as before.
+    //
+    // [SHIP_PARITY R7 2026-09-23 owner-approved] The struct default stays -1 (the engine's own
+    // fixtures build LearningData{} and must keep the seed path), but a PRODUCT install never
+    // sees -1: AppConfig::applyShippedPhasePrior() installs kShippedPhasePhysicalMs whenever the
+    // loaded learning slot has no prior, so a fresh install flies the owner's validated, frozen
+    // aim (dev learning.json learned_phase_physical_ms = 271, canonical base-30; effective
+    // 271 + (393 - 319) = 345 at base 30, +58.3 on the base-20 clock).
+    static constexpr double kShippedPhasePhysicalMs = 271.0;
     double learnedPhasePhysicalMs = -1.0;
     // [ORION_AIM_FREEZE] What the phase instrument last MEASURED (full-window median, canonical
     // base-30 physical ms), regardless of what the aim consumes. Distinct from
@@ -2204,7 +2228,22 @@ public:
     // v2 (2026-09-01): retire the legacy auto-persisted
     // tip_timing_auto_unlock=true default.  The anchor-to-freeze instrument measures
     // the release landing, so that value can walk an already-early aim earlier.
-    static constexpr int kSettingsVersion = 2;
+    // v3 (2026-09-23, SHIP_PARITY): carry the owner's validated timing configuration to existing
+    // installs -- tip_phase_anchor_base20, tip_phase_type_trim_enabled,
+    // ownership_proof_two_frame, no_meter_fade_trim_ms 6, tip_phase_aim_frozen -- plus the
+    // one-time aim reset to LearningData::kShippedPhasePhysicalMs (see load()).
+    static constexpr int kSettingsVersion = 3;
+    // The settings_version step that carries the one-time learned-aim reset. A file stamped at
+    // or above it has already had its chance and is never reset again.
+    static constexpr int kAimResetSettingsVersion = 3;
+    // True when the pre-migration settings object shows the user owns the aim: a Tip Timing
+    // value they typed (tip_timing_user_set) or a lock they set (tip_phase_aim_frozen, which
+    // defaulted false before v3 and so is evidence of a choice). Present-but-malformed counts
+    // as owned -- the conservative reading, same as the migration companion veto.
+    [[nodiscard]] static bool aimIsUserOwned(const QJsonObject& settings);
+    // Installs the factory aim prior into a learning slot that carries none. Idempotent; never
+    // overwrites a real prior. Returns true when it changed the slot.
+    static bool applyShippedPhasePrior(LearningData& learning);
 
     struct SettingsMigration {
         int targetVersion;        // the settings_version this rule lands in

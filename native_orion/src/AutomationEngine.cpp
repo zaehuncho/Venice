@@ -1415,12 +1415,9 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
     phaseShrinkBaseMs_ = learning.learnedPhasePhysicalMs > 0.0
         ? learning.learnedPhasePhysicalMs + phaseRestoreShiftMs
         : -1.0;
-    // [ORION_AIM_FREEZE] Latch the session's starting aim ONCE, from the restored prior when there
-    // is one, else the seed. Learning never writes this, so the frozen value is exactly what the
-    // session opened with -- the value a previous session converged on and a counted batch graded.
-    frozenAimPhysicalMs_ = learning.learnedPhasePhysicalMs > 0.0
-        ? learning.learnedPhasePhysicalMs + phaseRestoreShiftMs
-        : config_.tipPhaseSeedPhysicalMs;
+    // [ORION_AIM_FREEZE] The frozen-aim latch is taken further down, AFTER the base-20
+    // constellation block (see [SHIP_PARITY R7 ORDERING] there): its seed fallback reads
+    // config_.tipPhaseSeedPhysicalMs, which that block moves by +58.3 on a regime transition.
     const bool priorRouteEnabled = config_.enabled;
     const bool priorLiveMeterAuthority = autonomousLiveMeterTimingEnabled();
     const bool pendingOwnershipAtConfigBoundary =
@@ -2518,6 +2515,20 @@ void AutomationEngine::applyConfig(const AppConfigData& settings, const Learning
         config_.tipPhaseAnchorLadderCount = settings.tipPhaseAnchorBase20
             ? 4 : remapDefaults.tipPhaseAnchorLadderCount;
     }
+    // [ORION_AIM_FREEZE] Latch the session's starting aim ONCE, from the restored prior when there
+    // is one, else the seed. Learning never writes this, so the frozen value is exactly what the
+    // session opened with -- the value a previous session converged on and a counted batch graded.
+    // [SHIP_PARITY R7 ORDERING 2026-09-23] Taken HERE, after the constellation above, not at the
+    // top of applyConfig. The prior branch was always right (it adds phaseRestoreShiftMs, derived
+    // from `settings`), but the SEED fallback read config_.tipPhaseSeedPhysicalMs BEFORE this
+    // pass's base-30 -> base-20 transition had moved it: frozen + no learned prior + base-20
+    // turning on in the same pass latched the base-30 seed (319) on the base-20 clock, i.e. an aim
+    // 58.3 ms EARLY from the first landing on (recordPhaseConstantSample copies the latch into
+    // learnedPhasePhysicalMs_), until some later applyConfig re-latched it. Nothing between the
+    // old site and here reads frozenAimPhysicalMs_.
+    frozenAimPhysicalMs_ = learning.learnedPhasePhysicalMs > 0.0
+        ? learning.learnedPhasePhysicalMs + phaseRestoreShiftMs
+        : config_.tipPhaseSeedPhysicalMs;
     // T4 tip gate: defer a due clock to the predicted tip crossing when vision is healthy.
     config_.tipGateEnabled = settings.tipGateEnabled;
     config_.tipGateCapMs = settings.tipGateCapMs;

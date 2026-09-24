@@ -1,6 +1,6 @@
 # SHIP CONFIG — what a packaged install runs on
 
-**Status:** current as of 2026-09-17. Owned jointly by `tests/test_ship_defaults.py` (Python)
+**Status:** current as of 2026-09-23 (ship-parity pass, §7). Owned jointly by `tests/test_ship_defaults.py` (Python)
 and `AutomationEngineTests::shipConfigDefaultsArePinned` /
 `::shipConfigDefaultsSurviveAKeylessSettingsFile` (C++). A change to any row below without a
 change to those tests is a bug in one of the two.
@@ -41,7 +41,7 @@ None of them touches the knobs in §3.
 
 | Where | What it sets | Contract |
 |---|---|---|
-| `native_orion/src/main.cpp:265` → `applyShippedNativeTimingProfile()` (`SidecarReaderProfile.h:233`) | `ORION_HORIZON_DEBIAS=1`, `ORION_RAMP_SHAPE=1`, `ORION_TIMING_PROFILE_ID=2k27-2026-09-04-v2` into the **current process**, before `AutomationEngine` is constructed | production force-pins; dev preserves an explicit value |
+| `native_orion/src/main.cpp:346` → `applyShippedNativeTimingProfile()` (`SidecarReaderProfile.h`) | `ORION_HORIZON_DEBIAS=1`, `ORION_RAMP_SHAPE=1`, `ORION_TIP_PHASE_SOLO=1`, `ORION_CURVE_STRETCH_ALPHA=0`, `ORION_TIMING_PROFILE_ID=2k27-2026-09-23-v3` into the **current process**, before `AutomationEngine` is constructed | production force-pins; dev preserves an explicit value |
 | `native_orion/src/OrionAppController.cpp:1930-2040` | `ORION_AUTONOMOUS_VISION`, `ORION_INPUT_HOOK`, `ORION_FRAME_PIPE`, `ORION_FREEZE_CAL`, `ORION_GREEN_SELF_GRADE`, `ORION_QML_RENDER` — all "default ON, `=0` opts out" (`envDefaultOn`) | process env, inherited by the sidecar |
 | `native_orion/src/RemotePlaySession.cpp:2282-2464` → `startSidecar()` | `applyShippedReaderProfile(env, !productionBuild)` (the 11 reader flags + 6 numeric values in `SidecarReaderProfile.h`), `ORION_METER_MODEL`, `ORION_METER_PROPOSER` (from the user's Meter Detection setting), `ORION_SIMPLE_READER=1`, `PYTHONUNBUFFERED=1`, `ORION_PREVIEW_SHM*`, the frame-pipe / capture-card / video-device transport keys, and `SDL_*`. **Strips** `ORION_DETDIAG*` unless explicitly truthy | production ignores an inherited value; dev keeps an explicit one |
 
@@ -128,7 +128,7 @@ key-less `settings.json` gets). They have to agree, which is what
 | `lead_auto_seed` | `true` | `ORION_LEAD_AUTO_SEED=0` | `AppConfig.h:1235` |
 | `aim_margin_ms` | `69.0` | `ORION_AIM_MARGIN_MS` | `AppConfig.h:1243` |
 | `lead_factory_placeholder_ms` | `269.0` | — (settings/UI) | `AppConfig.h:1250` |
-| `lead_offset_left_fade_ms` | `8.0` | `ORION_LEAD_OFFSET_FADE_MS`, `ORION_LEAD_OFFSET_BY_TYPE=0` | `AppConfig.h:1205` |
+| `lead_offset_left_fade_ms` | `-6.0` (left fades fire 6 ms LATER; a pre-rev-2 file still holding the old +8 is migrated once, `lead_offset_left_fade_rev`) | `ORION_LEAD_OFFSET_FADE_MS`, `ORION_LEAD_OFFSET_BY_TYPE=0` | `AppConfig.h`, loader `AppConfig.cpp` |
 | `lead_offset_fade_mid_ms` | `6.0` (used instead of the +-8 when `range=mid`) | `ORION_LEAD_OFFSET_FADE_MID_MS` | `AppConfig.h` |
 | `lead_offset_right_fade_ms` | `8.0` | same | `AppConfig.h:1206` |
 | `lead_offset_standstill_ms` / `_other_ms` | `0.0` | same | `AppConfig.h:1207-1208` |
@@ -137,6 +137,11 @@ key-less `settings.json` gets). They have to agree, which is what
 | `meter_backstop_never_seen_probe_ms` | `0.0` (collapse OFF, 2026-09-17) | `ORION_METER_BACKSTOP_NEVER_SEEN_PROBE_MS` | `AppConfig.h:1381` |
 | `meter_backstop_never_seen_probe_fade_ms` | `0.0` (fades excluded) | `ORION_METER_BACKSTOP_NEVER_SEEN_PROBE_FADE_MS` | `AppConfig.h:1403` |
 | `tip_frame_native` | `true` | `ORION_TIP_FRAME_NATIVE=0` | `AppConfig.h:440` |
+| `tip_phase_anchor_base20` | **`true`** → *(was false; 2026-09-23)* | settings only | `AppConfig.h` (loader inherits the member) |
+| `tip_phase_type_trim_enabled` | **`true`** → *(was false)*; map LF `-4` / RF `-6` | settings only | `AppConfig.h` |
+| `ownership_proof_two_frame` | **`true`** → *(was false)*; paired with `anchor_rise_min_pct` `3.0` (never 4.0) | settings only | `AppConfig.h` |
+| `no_meter_fade_trim_ms` | **`6.0`** → *(was 0.0)* | `ORION_NO_METER_FADE_TRIM_MS` | `AppConfig.h`, loader + save clamp `AppConfig.cpp` |
+| `tip_phase_aim_frozen` | **`true`** → *(was false)*, with the factory aim prior `LearningData::kShippedPhasePhysicalMs` = **271** (canonical base-30) installed by `AppConfig` whenever `learning.json` has none | Tip Timing card Reset/Unlock | `AppConfig.h`, `AppConfig::applyShippedPhasePrior` |
 | `input_timed_enabled` (NO METER) | `false`, **and fenced** | none — `AppConfig::inputTimedAllowed()` returns `false` process-wide, so the loader ANDs a disk `true` to `false` | `AppConfig.h:1030`, fence `AppConfig.cpp:36/39`, load `AppConfig.cpp:1604` |
 
 ---
@@ -187,3 +192,29 @@ but it should become `AppConfigData{}.visionHoldBandMs` (or 0.0) with the next
    `AutomationEngineTests.cpp` — that note has to say what the compiled default *does* to an
    existing install.
 4. Move the row here, and say **why** in §4 if the direction is "off".
+
+---
+
+## 7. Ship-parity pass (2026-09-23)
+
+Source: `docs/redteam/2026-09-23-final/SHIP_PARITY_AUDIT.md`; patch notes
+`docs/redteam/2026-09-23-final/patches/P-G_ship_parity.md`. The installed build differed from
+the owner's validated dev setup in seven timing-relevant ways; all seven now ship.
+
+* **Env (native timing profile, every install):** `ORION_TIP_PHASE_SOLO=1` and
+  `ORION_CURVE_STRETCH_ALPHA=0` are force-pinned in production by
+  `applyShippedNativeTimingProfile` (`kShippedNativeTimingProfileFlags` /
+  `kShippedNativeTimingProfileValues`); profile id `2k27-2026-09-23-v3`. The compiled engine
+  defaults (`tipPhaseSolo=false`, `curveRateStretchAlpha=0.6`) are unchanged on purpose, the
+  same pattern as `ORION_HORIZON_DEBIAS` / `ORION_RAMP_SHAPE`.
+* **Settings (§3b rows above):** new compiled defaults for a fresh install, plus the
+  **settings_version 3** migration for existing installs (`AppConfig::settingsMigrations`): each
+  key moves only when absent or still at its old default (`false` / `0`), never over any other
+  value, and never again once the file is stamped v3. `tip_phase_aim_frozen` is vetoed by
+  `tip_timing_user_set`.
+* **Aim (owner-approved):** a fresh install flies `learned_phase_physical_ms` 271, frozen. An
+  existing install crossing v3 whose aim is not user-owned (neither `tip_timing_user_set` nor
+  `tip_phase_aim_frozen` true in the pre-migration file) has its learned aim reset to 271 once,
+  logged as `settings migration v3 applied: learned_phase_physical_ms`.
+* **Meter delay** stays shelved: `kMeterDelayShelved` (`OrionAppController.cpp`) makes a stored
+  `meter_delay_enabled=true` a no-op.

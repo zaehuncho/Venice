@@ -464,6 +464,13 @@ def test_the_rest_of_the_native_ship_list_is_where_the_launch_line_left_it(ship_
         "bannerTrimBiasVotes": "0",
         "tipFrameNative": "true",
         "inputTimedEnabled": "false",              # NO METER shelved
+        # [SHIP_PARITY 2026-09-23] the owner's validated dev timing set (SHIP_PARITY_AUDIT.md R4-R8)
+        "tipPhaseAnchorBase20": "true",
+        "tipPhaseTypeTrimEnabled": "true",
+        "ownershipProofTwoFrame": "true",
+        "noMeterFadeTrimMs": "6.0",
+        "tipPhaseAimFrozen": "true",
+        "anchorRiseMinPct": "3.0",                 # two-frame pairing rule: never 4.0
     }
     for member, value in expected.items():
         pattern = (r"\b(?:bool|double|int)\s+" + re.escape(member) + r"\s*=\s*"

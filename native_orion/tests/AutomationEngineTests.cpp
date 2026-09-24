@@ -1281,6 +1281,11 @@ private slots:
     // [SHIP CONFIG 2026-09-17] Every compiled default a packaged install runs on.
     void shipConfigDefaultsArePinned();
     void shipConfigDefaultsSurviveAKeylessSettingsFile();
+    // [SHIP_PARITY 2026-09-23] The packaged build must run the owner's validated DEV setup.
+    void shipParityV3MigrationCarriesTheValidatedConfig();
+    void shipParityV3MigrationKeepsDeliberateValuesAndUserOwnedAim();
+    void shipParityFreshInstallFiresLikeTheOwnersDevSetup();
+    void shipParityFrozenSeedLatchIncludesTheBase20Shift();
 
 private:
     // [ORION_ROLLING_LEASE] shared fixture: an armed engine holding a genuine, confident meter
@@ -2396,6 +2401,7 @@ void AutomationEngineTests::inputTimedUsesTheBlindHoldLaw()
     AppConfigData cfg;
     cfg.inputTimedEnabled = true;
     cfg.noMeterHoldMs = 650.0;
+    cfg.noMeterFadeTrimMs = 0.0;   // [SHIP_PARITY R8] assert the bare law, not the shipped trim
     // Deliberately hostile leftovers: a big learned prior, a big weight and both retired knobs
     // at extreme values. None of them may move the deadline by one millisecond.
     cfg.inputTimedDelayMs = 2500.0;
@@ -2494,6 +2500,7 @@ void AutomationEngineTests::noMeterHoldLearnerRoundTripsAndOverridesTheTable()
     AppConfigData cfg;
     cfg.inputTimedEnabled = true;
     cfg.noMeterHoldMs = 650.0;
+    cfg.noMeterFadeTrimMs = 0.0;   // [SHIP_PARITY R8] assert the bare law, not the shipped trim
     ControllerState neutral;
     ControllerState leftFade; leftFade.buttons = XINPUT_GAMEPAD_X; leftFade.leftStickX = -127;
     // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14] holdWith() returns the law's PRE-GRID hold, so
@@ -2664,6 +2671,10 @@ static AppConfigData meterBlindBackstopConfig(double holdRefMs, double userLeadM
     // default, so the fade presses in this family stay on the law + grace arithmetic they assert
     // even if that default ever moves.
     config.meterBackstopNeverSeenProbeFadeMs = 0.0;
+    // [SHIP_PARITY R8 2026-09-23] Fourth exception, same reason: the shipped fade trim (6 ms,
+    // pinned by shipConfigDefaultsArePinned) is a separate term on top of the law's Δ table, so
+    // this family keeps the pre-trim arithmetic its assertions spell out (926 / 954 raw).
+    config.noMeterFadeTrimMs = 0.0;
     return config;
 }
 
@@ -5447,6 +5458,9 @@ static AppConfigData noMeterConfig(double holdRefMs, bool rhythm)
     cfg.noMeterHoldMs = holdRefMs;
     cfg.inputTimedRhythmEnabled = rhythm;
     cfg.autonomousVision = true;
+    // [SHIP_PARITY R8 2026-09-23] The fade trim now ships at 6 ms; this family asserts the bare
+    // law (Δ table + grid), and noMeterFadeTrimMovesBothFadesAndNotStandstill owns the trim.
+    cfg.noMeterFadeTrimMs = 0.0;
     return cfg;
 }
 
@@ -14912,10 +14926,14 @@ void AutomationEngineTests::settingsMigrationVersion0FileAppliesOnlyTheRatifiedS
 
     AppConfig cfg(dir.path());
     QVERIFY(cfg.load());
-    // Nothing moves in memory -- including the pulled candidate:
+    // Nothing else moves in memory -- including the pulled candidate. [SHIP_PARITY v3
+    // 2026-09-23] ...except the owner-validated v3 set: two-frame and base-20 were stored at the
+    // old default false and now carry the validated true (the rules are pinned in
+    // settingsMigrationRegistryIsAnExplicitAllowlist; the rest of v3 in
+    // shipParityV3MigrationCarriesTheValidatedConfig).
     QVERIFY(!cfg.data().phaseVetoDirectional);
-    QVERIFY(!cfg.data().ownershipProofTwoFrame);
-    QVERIFY(!cfg.data().tipPhaseAnchorBase20);
+    QVERIFY(cfg.data().ownershipProofTwoFrame);
+    QVERIFY(cfg.data().tipPhaseAnchorBase20);
     QVERIFY(!cfg.data().stopDatingSubframe);
     QVERIFY(!cfg.data().stopReopenCorroborate);
     QVERIFY(!cfg.data().gotoTipParity);
@@ -14932,8 +14950,8 @@ void AutomationEngineTests::settingsMigrationVersion0FileAppliesOnlyTheRatifiedS
     QCOMPARE(persisted.value(QStringLiteral("settings_version")).toInt(-1),
              AppConfig::kSettingsVersion);
     QCOMPARE(persisted.value(QStringLiteral("phase_veto_directional")).toBool(true), false);
-    QCOMPARE(persisted.value(QStringLiteral("ownership_proof_two_frame")).toBool(true), false);
-    QCOMPARE(persisted.value(QStringLiteral("tip_phase_anchor_base20")).toBool(true), false);
+    QCOMPARE(persisted.value(QStringLiteral("ownership_proof_two_frame")).toBool(false), true);
+    QCOMPARE(persisted.value(QStringLiteral("tip_phase_anchor_base20")).toBool(false), true);
     QCOMPARE(persisted.value(QStringLiteral("stop_dating_subframe")).toBool(true), false);
     QCOMPARE(persisted.value(QStringLiteral("stop_reopen_corroborate")).toBool(true), false);
     QCOMPARE(persisted.value(QStringLiteral("goto_tip_parity")).toBool(true), false);
@@ -14942,6 +14960,11 @@ void AutomationEngineTests::settingsMigrationVersion0FileAppliesOnlyTheRatifiedS
     QCOMPARE(persisted.value(QStringLiteral("tip_timing_auto_unlock")).toBool(true), false);
     QCOMPARE(persisted.value(QStringLiteral("actuation_lead_ms")).toDouble(-1.0), 320.0);
     QCOMPARE(persisted.value(QStringLiteral("actuation_lead_user_set")).toBool(false), true);
+    // [SHIP_PARITY v3] the rest of the v3 set, and the aim (not user-owned here) is the shipped one.
+    QCOMPARE(persisted.value(QStringLiteral("tip_phase_type_trim_enabled")).toBool(false), true);
+    QCOMPARE(persisted.value(QStringLiteral("tip_phase_aim_frozen")).toBool(false), true);
+    QCOMPARE(persisted.value(QStringLiteral("no_meter_fade_trim_ms")).toDouble(-1.0), 6.0);
+    QCOMPARE(cfg.learning().learnedPhasePhysicalMs, LearningData::kShippedPhasePhysicalMs);
 }
 
 void AutomationEngineTests::settingsMigrationLeavesCurrentVersionFileUntouched()
@@ -15123,24 +15146,47 @@ void AutomationEngineTests::settingsMigrationRegistryIsAnExplicitAllowlist()
     // then a NEW version -- never back into v1). If this size check fires, someone
     // v2 contains exactly one fail-closed correction for the legacy auto-persisted
     // auto-unlock default. If this shape changes, verify the evidence and re-pin.
-    QVERIFY(AppConfig::kSettingsVersion == 2);
+    // [SHIP_PARITY v3 2026-09-23] v3 carries the owner's validated DEV configuration to
+    // existing installs (docs/redteam/2026-09-23-final/SHIP_PARITY_AUDIT.md R4-R8/R10): four
+    // booleans and one numeric, each single-key and old-default gated; the aim freeze is the
+    // only one with a companion veto (the Tip Timing card's tip_timing_user_set).
+    QVERIFY(AppConfig::kSettingsVersion == 3);
+    QVERIFY(AppConfig::kAimResetSettingsVersion == 3);
     const auto& rules = AppConfig::settingsMigrations();
-    QCOMPARE(rules.size(), 1);
+    QCOMPARE(rules.size(), 6);
     QCOMPARE(rules.at(0).targetVersion, 2);
     QCOMPARE(rules.at(0).key, QStringLiteral("tip_timing_auto_unlock"));
     QCOMPARE(rules.at(0).oldDefault, QJsonValue(true));
     QCOMPARE(rules.at(0).newValue, QJsonValue(false));
     QVERIFY(rules.at(0).userSetCompanion.isEmpty());
+    struct V3Rule { const char* key; QJsonValue oldDefault; QJsonValue newValue; const char* companion; };
+    const V3Rule v3[] = {
+        {"tip_phase_anchor_base20", QJsonValue(false), QJsonValue(true), ""},
+        {"tip_phase_type_trim_enabled", QJsonValue(false), QJsonValue(true), ""},
+        {"ownership_proof_two_frame", QJsonValue(false), QJsonValue(true), ""},
+        {"no_meter_fade_trim_ms", QJsonValue(0.0), QJsonValue(6.0), ""},
+        {"tip_phase_aim_frozen", QJsonValue(false), QJsonValue(true), "tip_timing_user_set"},
+    };
+    for (int i = 0; i < 5; ++i) {
+        const auto& rule = rules.at(i + 1);
+        QCOMPARE(rule.targetVersion, 3);
+        QCOMPARE(rule.key, QString::fromLatin1(v3[i].key));
+        QCOMPARE(rule.oldDefault, v3[i].oldDefault);
+        QCOMPARE(rule.newValue, v3[i].newValue);
+        QCOMPARE(rule.userSetCompanion, QString::fromLatin1(v3[i].companion));
+    }
 
     // Flags that change live release timing ship only behind a counted live batch
     // (project standing rule) -- they may NEVER appear in the migration registry
     // until that batch lands. phase_veto_directional joined this set when its rule
     // was pulled; user-lead authority is entangled with an in-flight fix. This
     // loop is the executable form of that decision for every FUTURE entry.
+    // [SHIP_PARITY v3 2026-09-23] ownership_proof_two_frame and tip_phase_anchor_base20 LEFT
+    // this set: both cleared their counted live batch on the owner's rig (base-20 banner-graded
+    // 09-11 23:26, 108/108 armed from phase; two-frame live since 09-14 18:47 with
+    // anchor_rise_min_pct 3.0) and are migrated in v3.
     const QSet<QString> countedBatchOnly{
         QStringLiteral("phase_veto_directional"),
-        QStringLiteral("ownership_proof_two_frame"),
-        QStringLiteral("tip_phase_anchor_base20"),
         QStringLiteral("tip_phase_anchor_consensus"),
         QStringLiteral("stop_dating_subframe"),
         QStringLiteral("goto_tip_parity"),
@@ -15886,6 +15932,36 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
             QCOMPARE(persisted.value(key), QJsonValue(false));
             continue;
         }
+        // [SHIP_PARITY v3 2026-09-23] An older stamp advances to the current version -- that is
+        // the migration itself, not calibration loss -- and only to the current version.
+        if (key == QLatin1String("settings_version")
+            && AppConfig::settingsVersionOf(original) < AppConfig::kSettingsVersion) {
+            QCOMPARE(persisted.value(key).toInt(-1), AppConfig::kSettingsVersion);
+            continue;
+        }
+        // [SHIP_PARITY v3 2026-09-23] The v3 rules are sanctioned rewrites exactly like the v2
+        // one above: a pre-v3 file holding a rule's OLD default (and not vetoed by its companion)
+        // must land on the rule's new value -- and on nothing else.
+        if (AppConfig::settingsVersionOf(original) < 3) {
+            bool sanctioned = false;
+            for (const auto& rule : AppConfig::settingsMigrations()) {
+                if (rule.targetVersion != 3 || rule.key != key) {
+                    continue;
+                }
+                const QJsonValue companion = rule.userSetCompanion.isEmpty()
+                    ? QJsonValue(QJsonValue::Undefined) : original.value(rule.userSetCompanion);
+                const bool vetoed = !companion.isUndefined()
+                    && (!companion.isBool() || companion.toBool(true));
+                if (!vetoed && original.value(key) == rule.oldDefault) {
+                    QVERIFY2(persisted.value(key) == rule.newValue,
+                             qPrintable(QStringLiteral("v3 rule did not land: %1").arg(key)));
+                    sanctioned = true;
+                }
+            }
+            if (sanctioned) {
+                continue;
+            }
+        }
         if (retiredKeys.contains(key)) {
             continue; // dropped above, by design
         }
@@ -15909,9 +15985,10 @@ void AutomationEngineTests::ownersSettingsFileRoundTripsLosslesslyThroughMigrati
         // fallback), never by a vision-timed shot. An owner who never leaves the meter path
         // cannot be affected by it at all.
         QStringLiteral("no_meter_hold_ms"),
-        // [ORION_NO_METER_FADE_TRIM 2026-09-14] The fade-only trim. Appears at its compiled
-        // default of 0.0, which is exactly the pre-trim behaviour: it is added to the two fade
-        // deltas and to nothing else, so a 0 trim is bit-for-bit the shipped table.
+        // [ORION_NO_METER_FADE_TRIM 2026-09-14] The fade-only trim. [SHIP_PARITY v3 2026-09-23]
+        // Appears at 6 ms (the owner's slider value, now the compiled default and the v3 rule's
+        // value for an absent key): it is added to the two fade deltas of the blind hold (NO
+        // METER and the meter blind backstop) and to nothing else.
         QStringLiteral("no_meter_fade_trim_ms"),
         // [ORION_CONSOLE_FRAME_QUANTIZE 2026-09-14] The console's frame grid and the snap
         // switch. console_frame_ms appears at the exact 1000/60 — a description of the console,
@@ -18224,6 +18301,12 @@ void AutomationEngineTests::measuredLeadValidatedUsesPosteriorMean()
     // install seed now stands in for. Off here so this stays a test of that path; the
     // seed is pinned by leadAutoSeed* below.
     config.leadAutoSeed = false;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: promoteStrictAutonomousSquare must own on its 3rd frame (13), not 9
+    // [SHIP_PARITY 2026-09-23] pre-ship defaults pinned: this test is about the authority LEAD,
+    // not the aim or anchor, so it runs on the configuration it was written against.
+    config.tipPhaseAnchorBase20 = false;
+    config.tipPhaseTypeTrimEnabled = false;
+    config.tipPhaseAimFrozen = false;
     engine.applyConfig(config, LearningData{});
 
     constexpr quint64 shotEpoch = 7041;
@@ -19506,6 +19589,7 @@ void AutomationEngineTests::strictSquareProofSurvivesRejectedDecoderBlink()
 {
     auto configure = [](AutomationEngine& engine) {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -19611,6 +19695,7 @@ void AutomationEngineTests::pendingSquareProofSurvivesInputPollDropoutRegularAnd
     for (const bool noDip : {false, true}) {
         AutomationEngine engine;
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -19850,6 +19935,7 @@ void AutomationEngineTests::sparseEarlyRiseCannotPrematurelyReleaseRegularOrNoDi
     for (const bool noDip : {false, true}) {
         AutomationEngine engine;
         AppConfigData config;
+        config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -20180,6 +20266,7 @@ void AutomationEngineTests::intermittentSquareProofAndConsecutiveRegularNoDipAre
     static constexpr double kMeasuredLeadMs = 1.0;
     auto configure = [](AutomationEngine& engine) {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -20669,6 +20756,7 @@ void AutomationEngineTests::readyStickRequiresCurrentEpochMeterProof()
 {
     auto configure = [](AutomationEngine& engine) {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -21888,6 +21976,7 @@ void AutomationEngineTests::frameBoundaryWobbleDoesNotRearmTheToken()
     AutomationEngine engine;
     engine.setTipPhaseConfigForTests(true, 30.0, 393.0, 319.0, 13.0);
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -22292,6 +22381,7 @@ void AutomationEngineTests::ownershipPromotionCensusPreservesRestartHistory()
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -22474,6 +22564,7 @@ void AutomationEngineTests::ownershipProofStillBreaksOnADetectorShapeChange()
     // exists for (jerseys / scoreboard / court lines, 2026-09-12).
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -22961,6 +23052,7 @@ void AutomationEngineTests::ownershipProofRunwayAwareGrantsSecondFrameOnlyWhenTi
     auto ownedAtFrame = [](bool runwayAware, double f1, double f2, double f3) -> int {
         AutomationEngine engine;
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -23160,6 +23252,7 @@ void AutomationEngineTests::slowMeterDeferHoldsUndercuttingArmThenFiresAtThePhas
     //        and the shot FIRES there — saved, not aborted, and never early.
     qunsetenv("ORION_SLOW_METER_DEFER");
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -23260,6 +23353,12 @@ void AutomationEngineTests::slowMeterDeferNormalProfileIsBitIdenticalToDefault()
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
     config.measuredLeadEnabled = true;
+    // [SHIP_PARITY 2026-09-23] pre-ship defaults pinned. The "normal profile" below is defined
+    // at anchor 30 (phase deadline = anchor + 393 - lead) and was measured on base-30 shots; the
+    // defer guard is an env-only lab flag (ORION_SLOW_METER_DEFER, OFF, not in the shipped
+    // profile or the dev launcher), so its base-20 behaviour is not a ship question.
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 fixture geometry
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: promoteStrictAutonomousSquare must own on its 3rd frame (13), not 9
     constexpr double kLeadMs = 40.0;
 
     AutomationEngine offEngine;
@@ -23555,6 +23654,7 @@ void AutomationEngineTests::tempoTipParityDefaultOffPinsTempoStickArmedDwell()
     for (const bool parity : {false, true}) {
         AutomationEngine engine;
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -24192,11 +24292,15 @@ void AutomationEngineTests::aimFreezeHoldsTheLearnedConstantStill()
     const auto learning = runLandings(false);
     QVERIFY2(std::abs(learning.second - learning.first) > 1.0,
              qPrintable(QStringLiteral(
-                 "DEFAULT build must still LEARN -- this failing means the freeze default flipped "
-                 "ON and a new jumpshot could never be found; opened=%1 ended=%2")
+                 "UNFROZEN engine must still LEARN -- this failing means the unlock path is dead "
+                 "and a new jumpshot could never be found; opened=%1 ended=%2")
                             .arg(learning.first).arg(learning.second)));
-    QVERIFY2(!AppConfigData{}.tipPhaseAimFrozen,
-             "tip_phase_aim_frozen must ship OFF");
+    // [SHIP_PARITY R7 2026-09-23 owner-approved] The freeze now SHIPS ON, paired with the factory
+    // aim prior (LearningData::kShippedPhasePhysicalMs, installed by AppConfig): a customer flies
+    // the owner's validated aim instead of a learner that rides the release. The learner leg above
+    // opts out explicitly, so the mechanism stays pinned.
+    QVERIFY2(AppConfigData{}.tipPhaseAimFrozen,
+             "tip_phase_aim_frozen ships ON (SHIP_PARITY R7)");
 }
 
 void AutomationEngineTests::tipPhaseSoloIgnoresTheSamplerVetoOnADatedPhaseMember()
@@ -24694,13 +24798,22 @@ void AutomationEngineTests::anchorBase20ConstellationMovesTogether()
     QCOMPARE(engine.config_.tipPhaseLearnMaxMs, defaults.tipPhaseLearnMaxMs);
     QCOMPARE(engine.config_.tipPhaseAnchorLadderCount, defaults.tipPhaseAnchorLadderCount);
 
-    // DEFAULT build: a plain applyConfig must not touch any tip-phase field at all --
-    // this failing means the Candidate-B default has silently flipped ON.
+    // [SHIP_PARITY R4 2026-09-23] Candidate B now SHIPS ON: a plain applyConfig on a fresh engine
+    // is a regime transition and must land on the whole base-20 constellation, not part of it.
     AutomationEngine stock;
     stock.applyConfig(AppConfigData{}, LearningData{});
-    QCOMPARE(stock.config_.tipPhaseAnchorPct, defaults.tipPhaseAnchorPct);
-    QCOMPARE(stock.config_.tipPhaseConstantMs, defaults.tipPhaseConstantMs);
-    QCOMPARE(stock.config_.tipPhaseAnchorLadderCount, defaults.tipPhaseAnchorLadderCount);
+    QCOMPARE(stock.config_.tipPhaseAnchorPct, 20.0);
+    QCOMPARE(stock.config_.tipPhaseConstantMs, defaults.tipPhaseConstantMs + 58.3);
+    QCOMPARE(stock.config_.tipPhaseSeedPhysicalMs, defaults.tipPhaseSeedPhysicalMs + 58.3);
+    QCOMPARE(stock.config_.tipPhaseAnchorLadderCount, 4);
+    // ...and base-30 is one explicit flag away, restoring the compiled RemapConfig exactly.
+    AppConfigData base30;
+    base30.tipPhaseAnchorBase20 = false;
+    AutomationEngine legacy;
+    legacy.applyConfig(base30, LearningData{});
+    QCOMPARE(legacy.config_.tipPhaseAnchorPct, defaults.tipPhaseAnchorPct);
+    QCOMPARE(legacy.config_.tipPhaseConstantMs, defaults.tipPhaseConstantMs);
+    QCOMPARE(legacy.config_.tipPhaseAnchorLadderCount, defaults.tipPhaseAnchorLadderCount);
 }
 
 void AutomationEngineTests::anchorBase20DatingUsesMeasuredRungOffsets()
@@ -24724,10 +24837,18 @@ void AutomationEngineTests::anchorBase20DatingUsesMeasuredRungOffsets()
                  "(the -5.235 slope would give -104.7 and fire ~8ms late)")
                             .arg(engine.tipPhaseLevelAdjustmentMsForTests(40.0))));
 
+    // [SHIP_PARITY R4 2026-09-23] The shipped default IS base-20 now, so a stock engine dates
+    // with the measured rungs; the base-30 slope arithmetic is one explicit flag away.
     AutomationEngine stock;
     stock.applyConfig(AppConfigData{}, LearningData{});
-    QVERIFY(near(stock.tipPhaseLevelAdjustmentMsForTests(30.0), 0.0));
-    QVERIFY(near(stock.tipPhaseLevelAdjustmentMsForTests(40.0), -52.35));
+    QVERIFY(near(stock.tipPhaseLevelAdjustmentMsForTests(30.0), -58.30));
+    QVERIFY(near(stock.tipPhaseLevelAdjustmentMsForTests(40.0), -112.58));
+    AppConfigData base30;
+    base30.tipPhaseAnchorBase20 = false;
+    AutomationEngine legacy;
+    legacy.applyConfig(base30, LearningData{});
+    QVERIFY(near(legacy.tipPhaseLevelAdjustmentMsForTests(30.0), 0.0));
+    QVERIFY(near(legacy.tipPhaseLevelAdjustmentMsForTests(40.0), -52.35));
 }
 
 void AutomationEngineTests::anchorBase20LearningPriorStaysCanonicalBase30()
@@ -24862,10 +24983,11 @@ void AutomationEngineTests::tipTimingManualValueRoundTripsAndOutranksLearner()
                  "after Reset the learner must adapt away from the manual value");
     }
 
-    // Ship-neutral defaults: a fresh install learns (nothing user-set, nothing frozen).
+    // Ship defaults: nothing user-set; [SHIP_PARITY R7 2026-09-23 owner-approved] the aim ships
+    // FROZEN at the factory prior (LearningData::kShippedPhasePhysicalMs), and Reset / Unlock on
+    // the card still hands it back to the learner.
     QVERIFY2(!AppConfigData{}.tipTimingUserSet, "tip_timing_user_set must ship OFF");
-    QVERIFY2(!AppConfigData{}.tipPhaseAimFrozen,
-             "tip_phase_aim_frozen must ship OFF or no customer's learner could ever run");
+    QVERIFY2(AppConfigData{}.tipPhaseAimFrozen, "tip_phase_aim_frozen ships ON (SHIP_PARITY R7)");
 }
 
 void AutomationEngineTests::tipTimingEntryClampsToTheLearnBandInBothRegimes()
@@ -25159,6 +25281,11 @@ void AutomationEngineTests::subtickMirrorHonoursThePhaseAnchorImminentHold()
     const auto runWithBand = [](double bandPct) {
         AutomationEngine engine;
         AppConfigData config;
+        config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
+        // [SHIP_PARITY 2026-09-23] pre-ship default pinned: with the two-frame proof the promotion
+        // owns at fill 9, so its fill-13 process() is a HOLDING tick that arms below the band --
+        // and "the tick is never run past this point" (below) stops being true.
+        config.ownershipProofTwoFrame = false;
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -25293,6 +25420,7 @@ void AutomationEngineTests::latencyCalibrationProbeRequiresGenuineRisingMeter()
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -26054,6 +26182,7 @@ void AutomationEngineTests::coldStickCalibrationRejectsUnsafeProofAndCancelledEp
 {
     auto coldConfig = []() {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -26378,6 +26507,7 @@ void AutomationEngineTests::stickCalibrationAbortFenceRequiresThreeNeutralSample
         for (const QString& reason : ownedAbortReasons) {
             AutomationEngine engine;
             AppConfigData config;
+            config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
             config.remotePlayInputSource = QStringLiteral("both");
             config.minimumHoldMs = 0.0;
             config.autonomousVision = true;
@@ -26402,6 +26532,7 @@ void AutomationEngineTests::stickCalibrationAbortFenceRequiresThreeNeutralSample
     for (const ShotMode mode : {ShotMode::GoToStick, ShotMode::TempoStick}) {
         AutomationEngine engine;
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -26512,6 +26643,7 @@ void AutomationEngineTests::calibrationOwnershipCeilingBoundsEveryMode()
                                 ShotMode::GoToStick, ShotMode::TempoStick}) {
         AutomationEngine engine;
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.maximumHoldMs = 400.0;
@@ -26651,6 +26783,7 @@ void AutomationEngineTests::calibrationOwnershipCeilingBoundsEveryMode()
     {
         AutomationEngine engine;
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.maximumHoldMs = 400.0;
@@ -26691,6 +26824,7 @@ void AutomationEngineTests::latencyCalibrationRequiresAutonomousLiveMeterAuthori
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = false;
@@ -26788,6 +26922,7 @@ void AutomationEngineTests::automaticLatencyLeadConvergenceDoesNotStrandHeldSqua
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -27022,6 +27157,7 @@ void AutomationEngineTests::cancellingOwnedLatencyCalibrationProbeRelinquishesWi
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -27203,6 +27339,7 @@ void AutomationEngineTests::automaticLatencyCalibrationPromotesOnlyGenuineRise()
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -27340,6 +27477,7 @@ void AutomationEngineTests::automaticLatencyCalibrationRejectsDelayedPriorShotEp
 {
     AutomationEngine engine;
     AppConfigData config;
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -29131,6 +29269,21 @@ void AutomationEngineTests::shipConfigDefaultsArePinned()
     // false as well, so neither a hand edit nor a restored backup can resurrect the mode.
     QCOMPARE(ship.inputTimedEnabled, false);
     QCOMPARE(AppConfig::inputTimedAllowed(), false);
+
+    // --- [SHIP_PARITY 2026-09-23] the owner's validated DEV timing configuration -------------
+    // docs/redteam/2026-09-23-final/SHIP_PARITY_AUDIT.md R4-R8 (+ R7 owner-approved): every one
+    // lived only in the owner's settings.json / learning.json, so a customer ran the opposite.
+    QCOMPARE(ship.tipPhaseAnchorBase20, true);       // R4 runway 71 -> 129 ms
+    QCOMPARE(ship.tipPhaseTypeTrimEnabled, true);    // R5 LF -4 / RF -6
+    QCOMPARE(ship.tipPhaseTypeTrimMs.value(QStringLiteral("Left Fade")), -4.0);
+    QCOMPARE(ship.tipPhaseTypeTrimMs.value(QStringLiteral("Right Fade")), -6.0);
+    QCOMPARE(ship.ownershipProofTwoFrame, true);     // R6 ...
+    QCOMPARE(ship.anchorRiseMinPct, 3.0);            // ...and its pairing rule (never 4.0)
+    QCOMPARE(ship.noMeterFadeTrimMs, 6.0);           // R8
+    QCOMPARE(ship.tipPhaseAimFrozen, true);          // R7 frozen...
+    QCOMPARE(LearningData::kShippedPhasePhysicalMs, 271.0);   // ...at the owner's canonical aim
+    QCOMPARE(LearningData{}.learnedPhasePhysicalMs, -1.0);    // engine fixtures keep the seed path
+    QCOMPARE(AppConfig::kSettingsVersion, 3);        // R10
 }
 
 // The OTHER route into the same defaults: an install that already has a settings.json written
@@ -29162,6 +29315,14 @@ void AutomationEngineTests::shipConfigDefaultsSurviveAKeylessSettingsFile()
     QVERIFY(obj.contains(QStringLiteral("vision_hold_band_ms")));
     obj.remove(QStringLiteral("vision_hold_band_ms"));
     obj.remove(QStringLiteral("vision_hold_band_fade_ms"));
+    // [SHIP_PARITY 2026-09-23] The file is stamped current (save() wrote v3), so no migration
+    // runs: these prove the LOADER's per-key fallback, not the v3 rules.
+    for (const char* key : {"tip_phase_anchor_base20", "tip_phase_type_trim_enabled",
+                            "ownership_proof_two_frame", "no_meter_fade_trim_ms",
+                            "tip_phase_aim_frozen"}) {
+        QVERIFY2(obj.contains(QString::fromLatin1(key)), key);
+        obj.remove(QString::fromLatin1(key));
+    }
     {
         QFile f(path);
         QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
@@ -29188,7 +29349,352 @@ void AutomationEngineTests::shipConfigDefaultsSurviveAKeylessSettingsFile()
     QCOMPARE(probe.data().meterBackstopNeverSeenProbeMs, 0.0);
     QCOMPARE(probe.data().meterBackstopNeverSeenProbeFadeMs, 0.0);
     QCOMPARE(probe.data().inputTimedEnabled, false);
+    QCOMPARE(probe.data().tipPhaseAnchorBase20, true);
+    QCOMPARE(probe.data().tipPhaseTypeTrimEnabled, true);
+    QCOMPARE(probe.data().ownershipProofTwoFrame, true);
+    QCOMPARE(probe.data().noMeterFadeTrimMs, 6.0);
+    QCOMPARE(probe.data().tipPhaseAimFrozen, true);
+    // No learning.json in this dir: the factory aim prior is what the install flies.
+    QCOMPARE(probe.learning().learnedPhasePhysicalMs, LearningData::kShippedPhasePhysicalMs);
 #endif
+}
+
+// === [SHIP_PARITY 2026-09-23] the packaged build runs the owner's validated DEV setup ========
+// docs/redteam/2026-09-23-final/SHIP_PARITY_AUDIT.md + patches/P-G_ship_parity.md. The dev rig
+// runs: tip_phase_anchor_base20, tip_phase_type_trim_enabled, ownership_proof_two_frame,
+// no_meter_fade_trim_ms 6, tip_phase_aim_frozen + tip_timing_user_set, and learning.json
+// learned_phase_physical_ms 271 (canonical base-30). A fresh install and an upgraded one must
+// land on exactly that.
+namespace {
+void writeLearningJson(const QString& dirPath, const QJsonObject& obj)
+{
+    QFile f(dirPath + QStringLiteral("/learning.json"));
+    QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QVERIFY(f.write(QJsonDocument(obj).toJson(QJsonDocument::Compact)) > 0);
+}
+
+double learnedAimOnDisk(const QString& dirPath)
+{
+    QFile f(dirPath + QStringLiteral("/learning.json"));
+    if (!f.open(QIODevice::ReadOnly)) {
+        return -2.0;   // no file
+    }
+    return QJsonDocument::fromJson(f.readAll()).object()
+        .value(QStringLiteral("learned_phase_physical_ms")).toDouble(-1.0);
+}
+
+// The owner's dev settings, as far as they touch the fire path (see the audit's table §2),
+// written over an otherwise identical configuration.
+AppConfigData ownersDevTimingConfig(AppConfigData dev)
+{
+    dev.tipPhaseAnchorBase20 = true;
+    dev.tipPhaseTypeTrimEnabled = true;
+    dev.ownershipProofTwoFrame = true;
+    dev.noMeterFadeTrimMs = 6.0;
+    dev.tipPhaseAimFrozen = true;
+    dev.tipTimingUserSet = true;
+    return dev;
+}
+} // namespace
+
+void AutomationEngineTests::shipParityV3MigrationCarriesTheValidatedConfig()
+{
+#ifdef ORION_PRODUCTION_BUILD
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
+    // The owner's INSTALLED copy before this change (audit §2): a v2 file the installer repaired,
+    // holding every old default explicitly, and a learner that had drifted to 291.63 unfrozen.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    writeSettingsJson(dir.path(), QJsonObject{
+        {QStringLiteral("settings_version"), 2},
+        {QStringLiteral("tip_phase_anchor_base20"), false},
+        {QStringLiteral("tip_phase_type_trim_enabled"), false},
+        {QStringLiteral("ownership_proof_two_frame"), false},
+        {QStringLiteral("no_meter_fade_trim_ms"), 0},
+        {QStringLiteral("tip_phase_aim_frozen"), false},
+        {QStringLiteral("tip_timing_user_set"), false},
+        {QStringLiteral("anchor_rise_min_pct"), 3.0},
+        {QStringLiteral("actuation_lead_ms"), 274.0},
+        {QStringLiteral("actuation_lead_user_set"), true},
+    });
+    writeLearningJson(dir.path(), QJsonObject{
+        {QStringLiteral("version"), 3},
+        {QStringLiteral("learned_phase_physical_ms"), 291.63},
+        {QStringLiteral("measured_phase_physical_ms"), 291.6},
+    });
+
+    AppConfig cfg(dir.path());
+    QVERIFY(cfg.load());
+    QVERIFY(cfg.data().tipPhaseAnchorBase20);
+    QVERIFY(cfg.data().tipPhaseTypeTrimEnabled);
+    QVERIFY(cfg.data().ownershipProofTwoFrame);
+    QCOMPARE(cfg.data().noMeterFadeTrimMs, 6.0);
+    QVERIFY(cfg.data().tipPhaseAimFrozen);
+    QVERIFY(!cfg.data().tipTimingUserSet);           // the migration never claims a user choice
+    QCOMPARE(cfg.data().anchorRiseMinPct, 3.0);      // two-frame's pairing rule untouched
+    QCOMPARE(cfg.data().actuationLeadMs, 274.0);     // the calibration is not touched
+    QVERIFY(cfg.data().actuationLeadUserSet);
+    // The one-time aim reset: in memory AND on disk; the measurement slot is left alone.
+    QCOMPARE(cfg.learning().learnedPhasePhysicalMs, LearningData::kShippedPhasePhysicalMs);
+    QCOMPARE(learnedAimOnDisk(dir.path()), LearningData::kShippedPhasePhysicalMs);
+    QCOMPARE(cfg.learning().measuredPhasePhysicalMs, 291.6);
+
+    const QJsonObject persisted = readSettingsJson(dir.path());
+    QCOMPARE(persisted.value(QStringLiteral("settings_version")).toInt(-1), 3);
+    QCOMPARE(persisted.value(QStringLiteral("tip_phase_anchor_base20")).toBool(false), true);
+    QCOMPARE(persisted.value(QStringLiteral("tip_phase_type_trim_enabled")).toBool(false), true);
+    QCOMPARE(persisted.value(QStringLiteral("ownership_proof_two_frame")).toBool(false), true);
+    QCOMPARE(persisted.value(QStringLiteral("no_meter_fade_trim_ms")).toDouble(-1.0), 6.0);
+    QCOMPARE(persisted.value(QStringLiteral("tip_phase_aim_frozen")).toBool(false), true);
+
+    // ONCE: the learner may move the aim again later (e.g. the owner unlocks it and it walks);
+    // a second launch of the now-v3 install must never reset it a second time.
+    writeLearningJson(dir.path(), QJsonObject{
+        {QStringLiteral("version"), 3},
+        {QStringLiteral("learned_phase_physical_ms"), 288.0},
+    });
+    const QByteArray settingsAfterFirst = readSettingsBytes(dir.path());
+    AppConfig second(dir.path());
+    QVERIFY(second.load());
+    QCOMPARE(second.learning().learnedPhasePhysicalMs, 288.0);
+    QCOMPARE(learnedAimOnDisk(dir.path()), 288.0);
+    QCOMPARE(readSettingsBytes(dir.path()), settingsAfterFirst);
+}
+
+void AutomationEngineTests::shipParityV3MigrationKeepsDeliberateValuesAndUserOwnedAim()
+{
+#ifdef ORION_PRODUCTION_BUILD
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
+    // 1) The owner's DEV file shape at v2: aim typed on the Tip Timing card (user_set + frozen),
+    //    271 on disk, a moved fade trim. Nothing the owner chose may move.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeSettingsJson(dir.path(), QJsonObject{
+            {QStringLiteral("settings_version"), 2},
+            {QStringLiteral("tip_phase_aim_frozen"), true},
+            {QStringLiteral("tip_timing_user_set"), true},
+            {QStringLiteral("no_meter_fade_trim_ms"), 9.0},
+        });
+        writeLearningJson(dir.path(), QJsonObject{
+            {QStringLiteral("version"), 3},
+            {QStringLiteral("learned_phase_physical_ms"), 300.0},
+        });
+        AppConfig cfg(dir.path());
+        QVERIFY(cfg.load());
+        QCOMPARE(cfg.data().noMeterFadeTrimMs, 9.0);
+        QVERIFY(cfg.data().tipPhaseAimFrozen);
+        QVERIFY(cfg.data().tipTimingUserSet);
+        QCOMPARE(cfg.learning().learnedPhasePhysicalMs, 300.0);
+        QCOMPARE(learnedAimOnDisk(dir.path()), 300.0);
+    }
+    // 2) A LOCK the user set on the learner's value (frozen, not typed): frozen=true could only
+    //    have come from a choice before v3 (the default was false), so the aim is theirs.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeSettingsJson(dir.path(), QJsonObject{
+            {QStringLiteral("settings_version"), 2},
+            {QStringLiteral("tip_phase_aim_frozen"), true},
+            {QStringLiteral("tip_timing_user_set"), false},
+        });
+        writeLearningJson(dir.path(), QJsonObject{
+            {QStringLiteral("version"), 3},
+            {QStringLiteral("learned_phase_physical_ms"), 305.0},
+        });
+        AppConfig cfg(dir.path());
+        QVERIFY(cfg.load());
+        QCOMPARE(cfg.learning().learnedPhasePhysicalMs, 305.0);
+        QCOMPARE(learnedAimOnDisk(dir.path()), 305.0);
+    }
+    // 3) A companion that is present but malformed counts as user-owned (conservative).
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeSettingsJson(dir.path(), QJsonObject{
+            {QStringLiteral("settings_version"), 2},
+            {QStringLiteral("tip_timing_user_set"), QStringLiteral("yes")},
+            {QStringLiteral("tip_phase_aim_frozen"), false},
+        });
+        writeLearningJson(dir.path(), QJsonObject{
+            {QStringLiteral("version"), 3},
+            {QStringLiteral("learned_phase_physical_ms"), 310.0},
+        });
+        AppConfig cfg(dir.path());
+        QVERIFY(cfg.load());
+        QCOMPARE(cfg.learning().learnedPhasePhysicalMs, 310.0);
+        QVERIFY(!cfg.data().tipPhaseAimFrozen);   // the companion vetoed the freeze rule too
+    }
+    // 4) A current (v3) file is a post-migration choice: an explicit false stays false and the
+    //    learned aim is never reset.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeSettingsJson(dir.path(), QJsonObject{
+            {QStringLiteral("settings_version"), 3},
+            {QStringLiteral("tip_phase_anchor_base20"), false},
+            {QStringLiteral("tip_phase_aim_frozen"), false},
+            {QStringLiteral("no_meter_fade_trim_ms"), 0},
+        });
+        writeLearningJson(dir.path(), QJsonObject{
+            {QStringLiteral("version"), 3},
+            {QStringLiteral("learned_phase_physical_ms"), 295.0},
+        });
+        const QByteArray before = readSettingsBytes(dir.path());
+        AppConfig cfg(dir.path());
+        QVERIFY(cfg.load());
+        QVERIFY(!cfg.data().tipPhaseAnchorBase20);
+        QVERIFY(!cfg.data().tipPhaseAimFrozen);
+        QCOMPARE(cfg.data().noMeterFadeTrimMs, 0.0);
+        QCOMPARE(cfg.learning().learnedPhasePhysicalMs, 295.0);
+        QCOMPARE(readSettingsBytes(dir.path()), before);
+    }
+    // 5) An upgraded install with NO learning.json flies the shipped aim (in memory) and the
+    //    reset writes it once, so the next launch restores it from disk.
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        writeSettingsJson(dir.path(), QJsonObject{{QStringLiteral("settings_version"), 2}});
+        AppConfig cfg(dir.path());
+        QVERIFY(cfg.load());
+        QCOMPARE(cfg.learning().learnedPhasePhysicalMs, LearningData::kShippedPhasePhysicalMs);
+        QCOMPARE(learnedAimOnDisk(dir.path()), LearningData::kShippedPhasePhysicalMs);
+    }
+}
+
+void AutomationEngineTests::shipParityFreshInstallFiresLikeTheOwnersDevSetup()
+{
+#ifdef ORION_PRODUCTION_BUILD
+    QSKIP("settings path redirects to the per-user data dir in production builds");
+#endif
+    // THE equivalence the owner asked for: a fresh customer install (no settings.json, no
+    // learning.json) computes the same fire time as the owner's dev setup for the same inputs.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    AppConfig fresh(dir.path());
+    QVERIFY(!fresh.load());                                  // nothing on disk
+    QVERIFY(!QFileInfo::exists(dir.path() + QStringLiteral("/settings.json")));
+    QVERIFY(!QFileInfo::exists(dir.path() + QStringLiteral("/learning.json")));   // memory only
+    QCOMPARE(fresh.learning().learnedPhasePhysicalMs, LearningData::kShippedPhasePhysicalMs);
+
+    AppConfigData freshData = fresh.data();
+    freshData.remotePlayInputSource = QStringLiteral("square");
+    freshData.autonomousVision = true;
+    freshData.measuredLeadEnabled = true;
+    freshData.minimumHoldMs = 0.0;
+    freshData.actuationLeadMs = 274.0;       // the owner's lead, the same input on both sides
+    freshData.actuationLeadUserSet = true;
+    // Every non-timing input identical; the dev side then states the owner's values EXPLICITLY,
+    // so any shipped default that differs from them shows up as a different engine below.
+    const AppConfigData devData = ownersDevTimingConfig(freshData);
+    QCOMPARE(freshData.tipPhaseAnchorBase20, devData.tipPhaseAnchorBase20);
+    QCOMPARE(freshData.tipPhaseTypeTrimEnabled, devData.tipPhaseTypeTrimEnabled);
+    QCOMPARE(freshData.ownershipProofTwoFrame, devData.ownershipProofTwoFrame);
+    QCOMPARE(freshData.noMeterFadeTrimMs, devData.noMeterFadeTrimMs);
+    QCOMPARE(freshData.tipPhaseAimFrozen, devData.tipPhaseAimFrozen);
+    LearningData devLearning;
+    devLearning.learnedPhasePhysicalMs = 271.0;   // dev learning.json
+
+    AutomationEngine shipped;
+    shipped.applyConfig(freshData, fresh.learning());
+    AutomationEngine dev;
+    dev.applyConfig(devData, devLearning);
+
+    // The constellation and the aim: 271 canonical -> +58.3 on the base-20 clock -> + the aim
+    // offset (393 - 319) = the effective constant the decision path consumes.
+    const RemapConfig defaults;
+    const double shift = dev.phasePriorShiftMsForTests();
+    QVERIFY(shift > 50.0);                                   // base-20 really is on
+    const double expectedEffective =
+        271.0 + shift + (defaults.tipPhaseConstantMs - defaults.tipPhaseSeedPhysicalMs);
+    QCOMPARE(dev.effectiveTipPhaseConstantMsForTests(), expectedEffective);
+    QCOMPARE(shipped.effectiveTipPhaseConstantMsForTests(), expectedEffective);
+    QCOMPARE(shipped.config_.tipPhaseAnchorPct, dev.config_.tipPhaseAnchorPct);
+    QCOMPARE(shipped.config_.tipPhaseAnchorPct, 20.0);
+    QCOMPARE(shipped.config_.tipPhaseAnchorLadderCount, dev.config_.tipPhaseAnchorLadderCount);
+    QCOMPARE(shipped.config_.tipPhaseSeedPhysicalMs, dev.config_.tipPhaseSeedPhysicalMs);
+    QCOMPARE(shipped.config_.ownershipProofTwoFrame, true);
+    QCOMPARE(shipped.config_.tipPhaseAimFrozen, true);
+    for (const QString& type : {QStringLiteral("Standstill"), QStringLiteral("Left Fade"),
+                                QStringLiteral("Right Fade")}) {
+        QCOMPARE(shipped.tipPhaseTypeTrimMsForTests(type), dev.tipPhaseTypeTrimMsForTests(type));
+        QCOMPARE(shipped.blindReleaseHold(type, false).holdMs, dev.blindReleaseHold(type, false).holdMs);
+    }
+    QCOMPARE(shipped.tipPhaseTypeTrimMsForTests(QStringLiteral("Right Fade")), -6.0);
+    QCOMPARE(shipped.tipPhaseTypeTrimMsForTests(QStringLiteral("Left Fade")), -4.0);
+
+    // The same staged shot -> the same decision, for a standing shot and a fade.
+    for (const QString& type : {QStringLiteral("Standstill"), QStringLiteral("Right Fade")}) {
+        double tips[2] = {-1.0, -1.0};
+        QString sources[2];
+        AutomationEngine* engines[2] = {&shipped, &dev};
+        for (int i = 0; i < 2; ++i) {
+            AutomationEngine& e = *engines[i];
+            constexpr double kBase = 40'000.0;
+            const double lastMs = stagePhaseDecision(e, kBase, 40.0, 0.18, 274.0);
+            e.shot_.fillPhaseAnchorMs = kBase - 60.0;
+            e.shot_.shotType = type;
+            const auto d = e.canonicalAutonomousTipDecision(lastMs);
+            tips[i] = d.tipAbsMs;
+            sources[i] = d.source;
+        }
+        QVERIFY2(tips[0] > 0.0, qPrintable(type));
+        QCOMPARE(sources[0], sources[1]);
+        QVERIFY2(std::abs(tips[0] - tips[1]) < 1e-9,
+                 qPrintable(QStringLiteral("%1: shipped tip %2 != dev tip %3")
+                                .arg(type).arg(tips[0], 0, 'f', 6).arg(tips[1], 0, 'f', 6)));
+    }
+
+    // Frozen on both: landings far from the aim move neither (the learner still measures).
+    auto land = [](AutomationEngine& e, double animationMs) {
+        for (int i = 0; i < 8; ++i) {
+            e.meterCapPhaseAnchorMs_ = 1'000.0;
+            e.meterCapPhaseAnchorLevelPct_ = e.config_.tipPhaseAnchorPct;
+            e.meterCapPhaseStopMs_ = 1'000.0 + animationMs;
+            e.meterCapPhaseStopConfirmed_ = true;
+            e.meterCapShotType_ = QStringLiteral("Standstill");
+            e.recordPhaseConstantSample();
+        }
+    };
+    land(shipped, 420.0);
+    land(dev, 420.0);
+    QCOMPARE(shipped.effectiveTipPhaseConstantMsForTests(), expectedEffective);
+    QCOMPARE(dev.effectiveTipPhaseConstantMsForTests(), expectedEffective);
+}
+
+void AutomationEngineTests::shipParityFrozenSeedLatchIncludesTheBase20Shift()
+{
+    // The audit's ordering risk (§5), fixed: frozen + NO learned prior + base-20 switching on in
+    // the SAME applyConfig pass used to latch the base-30 seed (319) onto the base-20 clock, so
+    // the first landing snapped the aim 58.3 ms EARLY. The latch must see the post-transition
+    // seed. (A product install always has the 271 prior now; this pins the fallback anyway.)
+    AppConfigData config;
+    config.remotePlayInputSource = QStringLiteral("square");
+    config.autonomousVision = true;
+    config.tipPhaseAnchorBase20 = true;
+    config.tipPhaseAimFrozen = true;
+    AutomationEngine engine;                          // fresh: config_.anchorBase20 starts false
+    engine.applyConfig(config, LearningData{});       // no prior
+    const double activeSeed = engine.tipPhaseSeedPhysicalMsForTests();
+    const double activeConstant = engine.tipPhaseConstantMsForTests();
+    QVERIFY(activeSeed > RemapConfig{}.tipPhaseSeedPhysicalMs + 50.0);   // base-20 seed
+    QCOMPARE(engine.effectiveTipPhaseConstantMsForTests(), activeConstant);   // no prior yet
+    for (int i = 0; i < 5; ++i) {                     // >= tipPhaseLearnMinSamples
+        engine.meterCapPhaseAnchorMs_ = 1'000.0;
+        engine.meterCapPhaseAnchorLevelPct_ = 20.0;
+        engine.meterCapPhaseStopMs_ = 1'000.0 + 400.0;
+        engine.meterCapPhaseStopConfirmed_ = true;
+        engine.meterCapShotType_ = QStringLiteral("Standstill");
+        engine.recordPhaseConstantSample();
+    }
+    QVERIFY2(engine.phaseConstantSampleCountForTests() >= 3, "the landings must be accepted");
+    QVERIFY2(std::abs(engine.learnedPhasePhysicalMsForTests() - activeSeed) < 1e-9,
+             qPrintable(QStringLiteral("frozen seed latch %1 != active base-20 seed %2")
+                            .arg(engine.learnedPhasePhysicalMsForTests(), 0, 'f', 3)
+                            .arg(activeSeed, 0, 'f', 3)));
+    QVERIFY(std::abs(engine.effectiveTipPhaseConstantMsForTests() - activeConstant) < 1e-9);
 }
 
 // === [ORION_TEMPO_RELEASE_STYLE 2026-09-15 owner] ==========================================
@@ -30769,6 +31275,12 @@ void AutomationEngineTests::tipFireFloorIgnoresNonsenseVelocity()
     config.tempoFallbackTimeoutMs = 8000.0;
     config.autonomousVision = true;
     config.measuredLeadEnabled = true;
+    // [SHIP_PARITY 2026-09-23] pre-ship defaults pinned. This test owns the SAMPLER's absolute
+    // fill floor. Its 5 -> 15 -> 25 burst is chosen to stay below the base-30 anchor; at base 20
+    // the 15 -> 25 straddle dates the phase member (overshoot 5 < 12), which hands the shot to
+    // the phase path's own reason code -- a different mechanism, not an early dump.
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 fixture geometry
+    config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: promoteStrictAutonomousSquare must own on its 3rd frame (13), not 9
     LearningData learning;
     learning.learnedLatencyMs = 75.0;
     engine.applyConfig(config, learning);
@@ -38021,6 +38533,7 @@ void AutomationEngineTests::sessionLeadProbeTrimsTheLeadOnceFromTheSessionsOwnFr
     // 95.6 across four sessions while the anchor->freeze median moved 322/342/335/331 with it.
     // The probe turns that per-connect constant into a bounded, once-per-session lead trim.
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.autonomousVision = true;
     config.actuationLeadMs = 290.0;
@@ -39478,6 +39991,7 @@ void AutomationEngineTests::shotLeadConflictDiagnosedAtConfigAndOnMissedDeadline
     QSignalSpy conflictSpy(&engine, &AutomationEngine::shotLeadConflictDiagnosed);
 
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -39863,6 +40377,11 @@ double AutomationEngineTests::stuffSchedulableDelayShot(orion::AutomationEngine&
     config.actuationLeadMs = baseLeadMs;
     config.actuationLeadUserSet = true;
     config.meterDelayLeadOffsetMs = delayOffsetMs;
+    // [SHIP_PARITY 2026-09-23] pre-ship default pinned. The callers' tipEtaMs values were chosen
+    // against the base-30 schedulable ceiling (393 - 30 = 363). Base-20 lifts it to 421.3, so
+    // the AUTO meter-delay offset grows from 51.3 to 109.6 and a 350 ms tip is no longer
+    // schedulable. Meter delay is shelved in the product (kMeterDelayShelved).
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 fixture geometry
     // [ORION_LEAD_AUTO_SEED 2026-09-15] This fixture pins the AUTHORITY path's own
     // arithmetic on an install whose Shot Lead is deliberately unconfigured, which is
     // exactly the state the untuned-install seed now stands in for. Off here so the
@@ -40129,6 +40648,7 @@ void AutomationEngineTests::meterDelayLeadOffsetHeadroomArithmeticIsOffsetBased(
     advisory.setMeterDelayCondition(175.0, true);
     QSignalSpy advisorySpy(&advisory, &AutomationEngine::engineDiagnostic);
     AppConfigData advisoryConfig;
+    advisoryConfig.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     advisoryConfig.remotePlayInputSource = QStringLiteral("square");
     advisoryConfig.autonomousVision = true;
     advisoryConfig.measuredLeadEnabled = true;
@@ -40653,6 +41173,7 @@ void AutomationEngineTests::tipTimingFreezeDivergenceWarnsAndPersistsMeasuredMed
     // next session can warn at restore before a single landing.
     AutomationEngine engine;
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.autonomousVision = true;
     config.tipPhaseAimFrozen = true;
@@ -41021,6 +41542,7 @@ void AutomationEngineTests::shotAbortIdentityCarriesTheClassifiedShotType()
     // being unconditional on shot_.shotType) and this QCOMPARE reports Standstill or nothing.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.autonomousVision = true;
         config.minimumHoldMs = 0.0;
@@ -41060,6 +41582,7 @@ void AutomationEngineTests::shotAbortIdentityCarriesTheClassifiedShotType()
     // is the only one that exists there.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.autonomousVision = true;
         config.minimumHoldMs = 0.0;
@@ -41105,6 +41628,7 @@ void AutomationEngineTests::shotAbortIdentityCarriesTheClassifiedShotType()
              QStringLiteral("No_Dip"));
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.autonomousVision = true;
         config.minimumHoldMs = 0.0;
@@ -41132,6 +41656,7 @@ void AutomationEngineTests::shotAbortIdentityCarriesTheClassifiedShotType()
     // absence of ownership.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -41194,6 +41719,7 @@ void AutomationEngineTests::shotAbortIdentityIsEmittedFromEveryAbortSite()
     // regression guard for capturing the epoch on the way past instead of after it is gone.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -41251,6 +41777,7 @@ void AutomationEngineTests::shotAbortIdentityIsEmittedFromEveryAbortSite()
     // proof_timeout stick paths), so patching it covers all of them.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -41319,6 +41846,7 @@ void AutomationEngineTests::shotAbortIdentityIsEmittedFromEveryAbortSite()
     // --- SITE 3/5: Square ownership proof timeout / stale-meter block.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("both");
         config.autonomousVision = true;
         config.minimumHoldMs = 0.0;
@@ -41360,6 +41888,7 @@ void AutomationEngineTests::shotAbortIdentityIsEmittedFromEveryAbortSite()
     // volume unattributed abort in the live log.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("square");
         config.minimumHoldMs = 0.0;
         config.autonomousVision = true;
@@ -41410,6 +41939,7 @@ void AutomationEngineTests::shotAbortIdentityIsEmittedFromEveryAbortSite()
     // through the shared emitter left its four original fields byte-identical.
     {
         AppConfigData config;
+        config.ownershipProofTwoFrame = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the test feeds exactly the 3rd-frame proof it asserts
         config.remotePlayInputSource = QStringLiteral("square");
         config.tempoFallbackTimeoutMs = 5000.0;
         config.minimumHoldMs = 0.0;
@@ -42015,6 +42545,7 @@ void AutomationEngineTests::tipPhaseAnchorDatesTheFirstUpwardCrossing()
     // into a constant whose entire claim is a 9.6 ms rMAD. It must interpolate.
     AutomationEngine engine;
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -43449,6 +43980,8 @@ void AutomationEngineTests::phaseLearnerShrinksTowardTheObservationBeforeTheWind
     // REVERT-TRACE: set tipPhaseLearnMinSamples to 0/1 (or restore the wait-for-window return)
     // and the partial-window assertions below fail.
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
+    config.tipPhaseAimFrozen = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the learner must move
     config.remotePlayInputSource = QStringLiteral("square");
     config.autonomousVision = true;
 
@@ -43580,19 +44113,24 @@ void AutomationEngineTests::tipPhaseTypeTrimIsSymmetricAndDefaultOff()
     // decision, subtracted from the learner observation, so the pooled learner keeps estimating
     // the base animation and cannot fight the trim.
     //
-    // DEFAULT-OFF LEG / REVERT-TRACE: flip the AppConfigData default to true and the inertness
-    // assertions below fail — the flag ships OFF because every historical fade-labelled sample
-    // is a stick-deflected press, not a confirmed deliberate fadeaway.
+    // [SHIP_PARITY R5 2026-09-23] The flag now SHIPS ON: the counted fade batch this comment
+    // used to wait for landed (09-11 23:26, banner-graded, fades p=0.0019). The OFF leg below is
+    // kept as the kill-switch contract, with the flag (and the other two shipped phase defaults
+    // that would change this fixture's arithmetic: base-20 and the frozen aim) set explicitly.
+    QVERIFY2(AppConfigData{}.tipPhaseTypeTrimEnabled, "tip_phase_type_trim ships ON (SHIP_PARITY R5)");
     AppConfigData config;
     config.remotePlayInputSource = QStringLiteral("square");
     config.autonomousVision = true;
+    config.tipPhaseTypeTrimEnabled = false;
+    config.tipPhaseAnchorBase20 = false;
+    config.tipPhaseAimFrozen = false;
 
-    // 1) Fresh install: flag OFF, measured map present but INERT — accessor returns exactly 0.
+    // 1) Flag OFF: measured map present but INERT — accessor returns exactly 0.
     {
         AutomationEngine engine;
         engine.applyConfig(config, LearningData{});
         QVERIFY2(!engine.config_.tipPhaseTypeTrimEnabled,
-                 "tip_phase_type_trim must ship default OFF until a counted fade batch grades it");
+                 "tip_phase_type_trim=false must switch the trim off");
         QCOMPARE(engine.config_.tipPhaseTypeTrims.value(QStringLiteral("Right Fade")), -6.0);
         QCOMPARE(engine.tipPhaseTypeTrimMsForTests(QStringLiteral("Right Fade")), 0.0);
         QCOMPARE(engine.tipPhaseTypeTrimMsForTests(QStringLiteral("Left Fade")), 0.0);
@@ -43805,6 +44343,7 @@ void AutomationEngineTests::phaseAnchorImminentHoldIsNarrowAndRisingOnly()
     // This predicate decides ONLY whether to wait one frame for the better estimate. Every
     // condition is a refusal, so the failure direction is "release as before", never "hold".
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -43879,6 +44418,7 @@ void AutomationEngineTests::rungImminentHoldExtendsToLadderRungsOnlyWhenFlagged(
     // DEFAULT OFF under the base20 constellation: the live kills stay kills. This leg failing
     // means the flag's default has silently flipped ON.
     AppConfigData base20;
+    base20.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     base20.remotePlayInputSource = QStringLiteral("square");
     base20.minimumHoldMs = 0.0;
     base20.autonomousVision = true;
@@ -43932,6 +44472,7 @@ void AutomationEngineTests::rungImminentHoldExtendsToLadderRungsOnlyWhenFlagged(
     // FLAG ON under the default base-30 regime (rungs {35,40}): the base case is unchanged and
     // the same protection now covers the corridors below the rungs.
     AppConfigData base30;
+    base30.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     base30.remotePlayInputSource = QStringLiteral("square");
     base30.minimumHoldMs = 0.0;
     base30.autonomousVision = true;
@@ -43971,6 +44512,7 @@ void AutomationEngineTests::tipPhaseLadderRescuesAMeterFirstSeenAboveTheBaseAnch
     // The ladder witnesses a HIGHER crossing the meter genuinely has not made yet. Nothing is
     // inferred; the straddle rules are unchanged, only the level moves.
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -44535,6 +45077,7 @@ void AutomationEngineTests::tipPhaseIsMeanNeutralAtTheFiringDecision()
     constexpr double kFlatUserLeadMs = 300.0;
 
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     AutomationEngine engine;
     engine.applyConfig(config, LearningData{});
     const double shippedConstantMs = engine.config().tipPhaseConstantMs;
@@ -45099,6 +45642,8 @@ void AutomationEngineTests::tipPhaseConstantLearnsPhysicalTermWithoutEatingTheAi
     // observable rather than by either bias estimate is why this survives the two measurements
     // disagreeing.
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
+    config.tipPhaseAimFrozen = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the learner must move
     AutomationEngine engine;
     engine.applyConfig(config, LearningData{});
     QSignalSpy diagSpy(&engine, &AutomationEngine::engineDiagnostic);
@@ -49125,6 +49670,7 @@ FrameNativeArmRun AutomationEngineTests::runFrameNativeVisionArm(bool frameNativ
     engine.setTipPhaseConfigForTests(true, 30.0, phaseConstantMs,
                                      phaseConstantMs - kAimOffsetMs, 13.0);
     AppConfigData config;
+    config.tipPhaseAnchorBase20 = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: base-30 arithmetic/fixture
     config.remotePlayInputSource = QStringLiteral("square");
     config.minimumHoldMs = 0.0;
     config.autonomousVision = true;
@@ -50119,6 +50665,7 @@ void AutomationEngineTests::fadePhaseLearnerUsesReleaseTimeTrim()
 {
     for (bool suppressAdvance : {false, true}) {
         AppConfigData config;
+        config.tipPhaseAimFrozen = false;   // [SHIP_PARITY 2026-09-23] pre-ship default pinned: the learner must move
         config.autonomousVision = true;
         config.remotePlayInputSource = QStringLiteral("square");
         config.tipPhaseTypeTrimEnabled = true;
